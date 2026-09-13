@@ -148,6 +148,18 @@ pub fn encode_payloads(payloads: &[(u8, Vec<u8>)]) -> (u8, Vec<u8>) {
     (first, out)
 }
 
+/// Reject a peer-supplied NONCE payload outside RFC 2409 §5's implied range
+/// (nonces are generally sized like a hash output; we allow 8-256 bytes,
+/// mirroring the range this crate's own IKEv2 nonce parser enforces per RFC
+/// 7296 §3.9's explicit 16-256, loosened slightly since IKEv1 sets no hard
+/// minimum).
+pub fn check_nonce_len(data: &[u8]) -> Result<(), IkeError> {
+    if data.len() < 8 || data.len() > 256 {
+        return Err(IkeError::Crypto("nonce length out of range (8-256 bytes)"));
+    }
+    Ok(())
+}
+
 /// Assemble a full ISAKMP message from a header template and payload chain,
 /// filling in `next_payload` and `length`. `message_id`, cookies, exchange type
 /// and flags come from `header`.
@@ -225,6 +237,14 @@ mod tests {
         assert_eq!(first, payload::NONE);
         assert!(body.is_empty());
         assert_eq!(parse_payloads(payload::NONE, &[]).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn check_nonce_len_rejects_out_of_range_lengths() {
+        assert!(check_nonce_len(&[0xAA; 7]).is_err());
+        assert!(check_nonce_len(&[0xAA; 257]).is_err());
+        assert!(check_nonce_len(&[0xAA; 8]).is_ok());
+        assert!(check_nonce_len(&[0xAA; 256]).is_ok());
     }
 
     #[test]

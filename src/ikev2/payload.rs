@@ -264,8 +264,12 @@ pub struct Nonce {
 }
 
 impl Nonce {
-    pub fn parse(body: &[u8]) -> Nonce {
-        Nonce { data: body.to_vec() }
+    /// RFC 7296 §3.9: a nonce MUST be between 16 and 256 bytes.
+    pub fn parse(body: &[u8]) -> Result<Nonce, IkeError> {
+        if body.len() < 16 || body.len() > 256 {
+            return Err(IkeError::Crypto("nonce length out of range (16-256 bytes)"));
+        }
+        Ok(Nonce { data: body.to_vec() })
     }
     pub fn to_bytes(&self) -> Vec<u8> {
         self.data.clone()
@@ -998,7 +1002,15 @@ mod tests {
     #[test]
     fn nonce_roundtrips() {
         let nonce = Nonce { data: (0..32).collect() };
-        assert_eq!(Nonce::parse(&nonce.to_bytes()), nonce);
+        assert_eq!(Nonce::parse(&nonce.to_bytes()).unwrap(), nonce);
+    }
+
+    #[test]
+    fn nonce_rejects_out_of_range_lengths() {
+        assert_eq!(Nonce::parse(&[0xAA; 15]), Err(IkeError::Crypto("nonce length out of range (16-256 bytes)")));
+        assert_eq!(Nonce::parse(&[0xAA; 257]), Err(IkeError::Crypto("nonce length out of range (16-256 bytes)")));
+        assert!(Nonce::parse(&[0xAA; 16]).is_ok());
+        assert!(Nonce::parse(&[0xAA; 256]).is_ok());
     }
 
     #[test]

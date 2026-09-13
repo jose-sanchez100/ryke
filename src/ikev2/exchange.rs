@@ -136,7 +136,7 @@ fn parse_sa_init(header: &IkeHeader, body: &[u8]) -> Result<SaInitPayloads, IkeE
         match payload.payload_type {
             PayloadType::SecurityAssociation => sa = Some(SecurityAssociation::parse(payload.data)?),
             PayloadType::KeyExchange => ke = Some(KeyExchange::parse(payload.data)?),
-            PayloadType::Nonce => nonce = Some(Nonce::parse(payload.data)),
+            PayloadType::Nonce => nonce = Some(Nonce::parse(payload.data)?),
             PayloadType::Notify => {
                 if let Ok(n) = Notify::parse(payload.data) {
                     if n.is_error() {

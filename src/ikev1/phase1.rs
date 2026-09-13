@@ -317,6 +317,7 @@ pub fn respond_aggressive(
     let sa_p = find(&ps, payload::SA).ok_or(IkeError::MissingPayload("SA"))?;
     let ke_p = find(&ps, payload::KE).ok_or(IkeError::MissingPayload("KE"))?;
     let nonce_p = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?;
+    isakmp::check_nonce_len(&nonce_p.data)?;
     let id_p = find(&ps, payload::ID).ok_or(IkeError::MissingPayload("ID"))?;
 
     let sai_b = sa_p.data.clone(); // signed as SAi_b
@@ -702,6 +703,7 @@ impl AggressiveInitiator {
         let ps = isakmp::parse_payloads(hdr.next_payload, &msg2[IsakmpHeader::LEN..])?;
         let gxr = find(&ps, payload::KE).ok_or(IkeError::MissingPayload("KE"))?.data.clone();
         let nr = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
+        isakmp::check_nonce_len(&nr)?;
         let hash_r_got = find(&ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
         let idr_b = find(&ps, payload::ID).ok_or(IkeError::MissingPayload("ID"))?.data.clone();
         let peer_supports_dpd = ps.iter().any(|p| p.payload_type == payload::VENDOR_ID && p.data == DPD_VENDOR_ID);
@@ -960,6 +962,7 @@ impl MainKeSent {
         let ps = isakmp::parse_payloads(hdr.next_payload, &msg4[IsakmpHeader::LEN..])?;
         let gxr = find(&ps, payload::KE).ok_or(IkeError::MissingPayload("KE"))?.data.clone();
         let nr = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
+        isakmp::check_nonce_len(&nr)?;
         let peer_supports_dpd = ps.iter().any(|p| p.payload_type == payload::VENDOR_ID && p.data == DPD_VENDOR_ID);
         let floated = natd_float_needed(&ps, self.peer_supports_natt, Prf::Sha256, self.cky_i, self.cky_r, self.our_addr, self.peer_addr);
 
@@ -1231,6 +1234,7 @@ impl MainRespSaSent {
         let ps = isakmp::parse_payloads(hdr.next_payload, &msg3[IsakmpHeader::LEN..])?;
         let gxi = find(&ps, payload::KE).ok_or(IkeError::MissingPayload("KE"))?.data.clone();
         let ni = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
+        isakmp::check_nonce_len(&ni)?;
         let peer_supports_dpd = ps.iter().any(|p| p.payload_type == payload::VENDOR_ID && p.data == DPD_VENDOR_ID);
         let floated = natd_float_needed(&ps, self.peer_supports_natt, self.prf, self.cky_i, self.cky_r, self.our_addr, self.peer_addr);
 

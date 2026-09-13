@@ -371,6 +371,7 @@ impl QuickInitiator {
     pub fn complete(self, msg2: &[u8]) -> Result<(Vec<u8>, ChildSa), IkeError> {
         let (_hdr, ps, iv2) = phase2::decrypt_payloads(msg2, &self.enc_key, &self.iv1)?;
         let nr = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
+        isakmp::check_nonce_len(&nr)?;
         let peer_spi = peer_esp_spi(&ps)?;
 
         // Verify HASH(2) = prf(SKEYID_a, M-ID | Ni_b | <payloads after HASH>).
@@ -447,6 +448,7 @@ pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) 
     let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
     let (_h, ps, iv1) = phase2::parse_encrypted(msg1, st.prf, &st.skeyid_a, &st.enc_key, &iv0)?; // verifies HASH(1)
     let ni = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
+    isakmp::check_nonce_len(&ni)?;
     let peer_spi = peer_esp_spi(&ps)?;
     let pfs_group = peer_pfs_group(&ps)?;
     let cipher = peer_esp_cipher(&ps)?;

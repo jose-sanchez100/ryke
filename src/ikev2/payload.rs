@@ -371,6 +371,33 @@ impl TrafficSelector {
         }
     }
 
+    /// If this selector's address range is exactly one CIDR block, returns it
+    /// as `(network, prefix_len)` -- covers both the full-tunnel grant
+    /// (`0.0.0.0/0`) and a single narrowed subnet, the two shapes a real
+    /// gateway actually sends. `None` for IPv6 selectors, a malformed range,
+    /// or a range that isn't CIDR-aligned (some other start/end pair with no
+    /// clean network/prefix representation) -- such a range would need more
+    /// than one route to express exactly, which isn't needed by any gateway
+    /// this has been tested against.
+    pub fn to_ipv4_cidr(&self) -> Option<(Ipv4Addr, u8)> {
+        if self.ts_type != ts_type::IPV4_ADDR_RANGE {
+            return None;
+        }
+        let start = u32::from_be_bytes(self.start_addr.clone().try_into().ok()?);
+        let end = u32::from_be_bytes(self.end_addr.clone().try_into().ok()?);
+        if start > end {
+            return None;
+        }
+        for prefix in 0..=32u8 {
+            let mask: u32 = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            let network = start & mask;
+            if network == start && (network | !mask) == end {
+                return Some((Ipv4Addr::from(network), prefix));
+            }
+        }
+        None
+    }
+
     fn parse(buf: &[u8]) -> Result<(TrafficSelector, usize), IkeError> {
         if buf.len() < 8 {
             return Err(IkeError::Truncated { need: 8, have: buf.len() });
@@ -863,6 +890,44 @@ mod tests {
     fn authentication_roundtrips() {
         let auth = Authentication { method: auth_method::SHARED_KEY, data: vec![0xAB; 32] };
         assert_eq!(Authentication::parse(&auth.to_bytes()).unwrap(), auth);
+    }
+
+    #[test]
+    fn traffic_selector_to_ipv4_cidr_covers_full_tunnel_and_a_narrowed_subnet() {
+        assert_eq!(TrafficSelector::ipv4_any().to_ipv4_cidr(), Some((Ipv4Addr::new(0, 0, 0, 0), 0)));
+
+        let subnet = TrafficSelector {
+            ts_type: ts_type::IPV4_ADDR_RANGE,
+            ip_protocol: 0,
+            start_port: 0,
+            end_port: 65535,
+            start_addr: vec![10, 0, 99, 0],
+            end_addr: vec![10, 0, 99, 255],
+        };
+        assert_eq!(subnet.to_ipv4_cidr(), Some((Ipv4Addr::new(10, 0, 99, 0), 24)));
+
+        assert_eq!(TrafficSelector::ipv4_host(Ipv4Addr::new(10, 8, 0, 4)).to_ipv4_cidr(), Some((Ipv4Addr::new(10, 8, 0, 4), 32)));
+
+        // Not CIDR-aligned -- no single prefix represents this exactly.
+        let odd = TrafficSelector {
+            ts_type: ts_type::IPV4_ADDR_RANGE,
+            ip_protocol: 0,
+            start_port: 0,
+            end_port: 65535,
+            start_addr: vec![10, 0, 0, 1],
+            end_addr: vec![10, 0, 0, 200],
+        };
+        assert_eq!(odd.to_ipv4_cidr(), None);
+
+        let ipv6 = TrafficSelector {
+            ts_type: ts_type::IPV6_ADDR_RANGE,
+            ip_protocol: 0,
+            start_port: 0,
+            end_port: 65535,
+            start_addr: vec![0; 16],
+            end_addr: vec![0xFF; 16],
+        };
+        assert_eq!(ipv6.to_ipv4_cidr(), None);
     }
 
     #[test]

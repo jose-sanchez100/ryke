@@ -128,6 +128,11 @@ struct AuthPayloads {
     /// (CFG_REPLY, INTERNAL_IP4_ADDRESS) — set only on the initiator's parse of
     /// the responder's response.
     assigned_ip4: Option<Ipv4Addr>,
+    /// The responder's actual granted `TSr` — what the negotiated CHILD_SA
+    /// really covers, independent of (and often more authoritative than) any
+    /// CFG_REPLY `INTERNAL_IP4_SUBNET`. `None` only if the payload is missing
+    /// or malformed, not if it narrows to nothing.
+    tsr: Option<TrafficSelectors>,
 }
 
 /// The ESP CHILD SA SPI carried by an IKE_AUTH SA payload — the 4-byte SPI of the
@@ -148,6 +153,7 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
     let mut certs = Vec::new();
     let mut child_spi = None;
     let mut assigned_ip4 = None;
+    let mut tsr = None;
     for payload in payloads(first, inner) {
         let payload = payload?;
         match payload.payload_type {
@@ -164,7 +170,12 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
                     assigned_ip4 = cp.assigned_ipv4();
                 }
             }
-            _ => {} // TS / N / CERTREQ not needed here
+            PayloadType::TrafficSelectorResponder => {
+                if let Ok(ts) = TrafficSelectors::parse(payload.data) {
+                    tsr = Some(ts);
+                }
+            }
+            _ => {} // TSi / N / CERTREQ not needed here
         }
     }
     Ok(AuthPayloads {
@@ -173,6 +184,7 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
         certs,
         child_spi,
         assigned_ip4,
+        tsr,
     })
 }
 
@@ -442,12 +454,15 @@ pub fn client_sent_certreq(sa: &CompletedSaInit, request: &[u8]) -> bool {
 }
 
 /// Initiator: decrypt + verify the responder's `IKE_AUTH` response. Returns the
-/// responder's verified identity.
+/// responder's verified identity, its chosen CHILD SA SPI, the assigned inner
+/// IPv4 (if any), and its actual granted `TSr` (if any) -- see
+/// [`AuthPayloads::tsr`] for why this is often more authoritative than the
+/// CFG_REPLY subnet for deciding what to route through the tunnel.
 pub fn initiator_verify_auth(
     sa: &CompletedSaInit,
     response: &[u8],
     cfg: &AuthConfig,
-) -> Result<(Identification, u32, Option<Ipv4Addr>), IkeError> {
+) -> Result<(Identification, u32, Option<Ipv4Addr>, Option<TrafficSelectors>), IkeError> {
     // The responder encrypts with SK_er.
     let (first, inner) = open_encrypted_gcm(response, &sa.keys.sk_er)?;
     let got = parse_auth_inner(first, &inner)?;
@@ -455,7 +470,7 @@ pub fn initiator_verify_auth(
     let octets = responder_signed_octets(&sa.resp_message, &sa.ni, &sa.keys.sk_pr, &got.id_body);
     verify_peer_auth(cfg, &got, &octets)?;
     let peer_child_spi = got.child_spi.ok_or(IkeError::MissingPayload("SA"))?;
-    Ok((Identification::parse(&got.id_body)?, peer_child_spi, got.assigned_ip4))
+    Ok((Identification::parse(&got.id_body)?, peer_child_spi, got.assigned_ip4, got.tsr))
 }
 
 #[cfg(test)]
@@ -487,7 +502,7 @@ mod tests {
         assert_eq!(learned_initiator, Identification::fqdn("client.example"));
         assert_eq!(init_spi, 0xDEADBEEF); // and learned its CHILD SA SPI
 
-        let (learned_responder, resp_spi, _assigned) = initiator_verify_auth(&init_sa, &resp, &icfg).unwrap();
+        let (learned_responder, resp_spi, _assigned, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg).unwrap();
         assert_eq!(learned_responder, Identification::fqdn("gw.example"));
         assert_eq!(resp_spi, 0xCAFEBABE); // initiator learned the responder's CHILD SA SPI
     }
@@ -510,7 +525,7 @@ mod tests {
         let (resp, learned_i, _spi) =
             responder_process_auth(&resp_sa, &req, &rcfg, 0xCAFEBABE, &[2u8; 8], Some(&assigned)).unwrap();
         assert_eq!(learned_i, Identification::fqdn("client.example"));
-        let (_learned_r, _rspi, got_ip) = initiator_verify_auth(&init_sa, &resp, &icfg).unwrap();
+        let (_learned_r, _rspi, got_ip, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg).unwrap();
         assert_eq!(got_ip, Some(Ipv4Addr::new(10, 8, 0, 4)));
     }
 
@@ -522,7 +537,7 @@ mod tests {
         let rcfg = AuthConfig::psk(Identification::fqdn("s"), psk);
         let req = initiator_auth_request(&init_sa, &icfg, 1, &[1u8; 8]).unwrap();
         let (resp, _, _) = responder_process_auth(&resp_sa, &req, &rcfg, 2, &[2u8; 8], None).unwrap();
-        let (_, _, got_ip) = initiator_verify_auth(&init_sa, &resp, &icfg).unwrap();
+        let (_, _, got_ip, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg).unwrap();
         assert_eq!(got_ip, None);
     }
 
@@ -577,7 +592,7 @@ mod tests {
         let req = initiator_auth_request(&init_sa, &cert_config(), 0xDEADBEEF, &[1u8; 8]).unwrap();
         let (resp, learned_i, _init_spi) = responder_process_auth(&resp_sa, &req, &cert_config(), 0xCAFEBABE, &[2u8; 8], None).unwrap();
         assert_eq!(learned_i, Identification::fqdn("vpn.example.com"));
-        let (learned_r, _resp_spi, _assigned) = initiator_verify_auth(&init_sa, &resp, &cert_config()).unwrap();
+        let (learned_r, _resp_spi, _assigned, _tsr) = initiator_verify_auth(&init_sa, &resp, &cert_config()).unwrap();
         assert_eq!(learned_r, Identification::fqdn("vpn.example.com"));
     }
 

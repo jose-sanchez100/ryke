@@ -59,7 +59,8 @@ impl<E: Entropy> Client<E> {
         let request = ike_auth::initiator_auth_request(sa, cfg, child_spi, &iv)?;
         self.transport.send_to(&request, server)?;
         let (response, _from) = self.transport.recv_from()?;
-        Ok(ike_auth::initiator_verify_auth(sa, &response, cfg)?)
+        let (id, spi, ip4, _tsr) = ike_auth::initiator_verify_auth(sa, &response, cfg)?;
+        Ok((id, spi, ip4))
     }
 
     /// Full handshake: `IKE_SA_INIT` then `IKE_AUTH`. Returns the established IKE

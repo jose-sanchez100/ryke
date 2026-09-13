@@ -152,6 +152,16 @@ pub struct EapInitiator {
     verify: ServerVerify,
     server_verified: bool,
     send_certreq: bool,
+    /// The responder's own CHILD SA SPI (from SAr2 in the final message) —
+    /// the SPI we must stamp on outbound ESP so the peer's inbound SA accepts
+    /// it. `None` until [`EapEvent::Established`].
+    peer_child_spi: Option<u32>,
+    /// The inner IPv4 the responder assigned us (CFG_REPLY), if any.
+    assigned_ip4: Option<std::net::Ipv4Addr>,
+    /// The responder's actual granted `TSr` from the final message, if any --
+    /// see [`crate::ikev2::ike_auth`]'s `AuthPayloads::tsr` doc for why this
+    /// is often more authoritative than CFG_REPLY's `INTERNAL_IP4_SUBNET`.
+    granted_ts: Option<TrafficSelectors>,
 }
 
 impl EapInitiator {
@@ -173,6 +183,9 @@ impl EapInitiator {
             verify,
             server_verified: false,
             send_certreq: false,
+            peer_child_spi: None,
+            assigned_ip4: None,
+            granted_ts: None,
         }
     }
 
@@ -180,6 +193,35 @@ impl EapInitiator {
     /// used to exercise a responder's CERTREQ-based cert selection.
     pub fn set_send_certreq(&mut self, on: bool) {
         self.send_certreq = on;
+    }
+
+    /// The completed `IKE_SA_INIT` state — `sk_d`/nonces/role, what
+    /// [`crate::esp::ChildSa::derive`] needs to key the data plane. Valid any
+    /// time; only meaningful once [`EapEvent::Established`] confirms the
+    /// CHILD SA actually exists.
+    pub fn ike_sa(&self) -> &CompletedSaInit {
+        &self.sa
+    }
+
+    /// The SPI we proposed for our own inbound CHILD SA.
+    pub fn child_spi(&self) -> u32 {
+        self.child_spi
+    }
+
+    /// The peer's CHILD SA SPI (from SAr2), once known — set only after
+    /// [`EapEvent::Established`].
+    pub fn peer_child_spi(&self) -> Option<u32> {
+        self.peer_child_spi
+    }
+
+    /// The inner IPv4 the responder assigned us via CFG_REPLY, if any.
+    pub fn assigned_ip4(&self) -> Option<std::net::Ipv4Addr> {
+        self.assigned_ip4
+    }
+
+    /// The responder's actual granted `TSr` from the final message, if any.
+    pub fn granted_ts(&self) -> Option<&TrafficSelectors> {
+        self.granted_ts.as_ref()
     }
 
     /// Authenticate the server from its first response (`SK{ IDr, [CERT,] AUTH,
@@ -261,7 +303,7 @@ impl EapInitiator {
             // No EAP → the responder's final message. Key-confirm its MSK-keyed
             // AUTH (mirroring what the responder does to us); presence alone is
             // not enough — it must prove it derived the same EAP MSK.
-            let (Some(auth_bytes), Some(_sa)) =
+            let (Some(auth_bytes), Some(sar2)) =
                 (find(&ps, PayloadType::Authentication), find(&ps, PayloadType::SecurityAssociation))
             else {
                 return Ok(EapEvent::Failed);
@@ -273,6 +315,15 @@ impl EapInitiator {
                 &responder_signed_octets(&self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, idr),
             );
             let got = Authentication::parse(auth_bytes)?;
+            if got.method == auth_method::SHARED_KEY && got.data == expect {
+                self.peer_child_spi = esp_spi_from_sa(sar2);
+                if let Some(cp) = find(&ps, PayloadType::Configuration).and_then(|d| Configuration::parse(d).ok()) {
+                    self.assigned_ip4 = cp.assigned_ipv4();
+                }
+                if let Some(ts) = find(&ps, PayloadType::TrafficSelectorResponder).and_then(|d| TrafficSelectors::parse(d).ok()) {
+                    self.granted_ts = Some(ts);
+                }
+            }
             return Ok(if got.method == auth_method::SHARED_KEY && got.data == expect {
                 EapEvent::Established(None)
             } else {

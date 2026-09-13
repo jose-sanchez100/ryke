@@ -17,6 +17,13 @@ pub enum IkeError {
     #[error("payload length {0} is smaller than the 4-byte generic header")]
     ShortPayload(u16),
 
+    /// The header's major version isn't one this crate speaks (RFC 7296
+    /// §3.1: a responder MUST reject a higher major version with
+    /// INVALID_MAJOR_VERSION; we reject any non-2 major version outright
+    /// since IKEv1 messages have their own parser and shouldn't reach here).
+    #[error("unsupported IKE major version {0}")]
+    UnsupportedVersion(u8),
+
     // --- exchange processing ---
     /// A payload required for this exchange was absent.
     #[error("required {0} payload is missing")]

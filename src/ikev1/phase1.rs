@@ -300,6 +300,9 @@ pub fn respond_aggressive(
     if hdr.exchange_type != exchange::AGGRESSIVE {
         return Err(IkeError::Crypto("not an Aggressive Mode message"));
     }
+    if hdr.message_id != 0 {
+        return Err(IkeError::Crypto("phase 1 message_id must be zero"));
+    }
     // Aggressive Mode is PSK-only in this crate -- RSA-sig needs Main Mode's
     // identity protection (IDi/IDr must go out encrypted, which Aggressive
     // Mode's single-round-trip shape can't give a CERT/SIG payload without
@@ -692,6 +695,9 @@ impl AggressiveInitiator {
         if hdr.exchange_type != exchange::AGGRESSIVE {
             return Err(IkeError::Crypto("not an Aggressive Mode message"));
         }
+        if hdr.init_cookie != self.cky_i {
+            return Err(IkeError::Crypto("cookie mismatch"));
+        }
         let cky_r = hdr.resp_cookie;
         let ps = isakmp::parse_payloads(hdr.next_payload, &msg2[IsakmpHeader::LEN..])?;
         let gxr = find(&ps, payload::KE).ok_or(IkeError::MissingPayload("KE"))?.data.clone();
@@ -859,6 +865,9 @@ impl MainSaSent {
         if hdr.exchange_type != exchange::MAIN {
             return Err(IkeError::Crypto("not a Main Mode message"));
         }
+        if hdr.init_cookie != self.cky_i {
+            return Err(IkeError::Crypto("cookie mismatch"));
+        }
         let cky_r = hdr.resp_cookie;
         let ps = isakmp::parse_payloads(hdr.next_payload, &msg2[IsakmpHeader::LEN..])?;
         find(&ps, payload::SA).ok_or(IkeError::MissingPayload("SA"))?;
@@ -944,6 +953,9 @@ impl MainKeSent {
         let hdr = IsakmpHeader::parse(msg4)?;
         if hdr.exchange_type != exchange::MAIN {
             return Err(IkeError::Crypto("not a Main Mode message"));
+        }
+        if hdr.init_cookie != self.cky_i || hdr.resp_cookie != self.cky_r {
+            return Err(IkeError::Crypto("cookie mismatch"));
         }
         let ps = isakmp::parse_payloads(hdr.next_payload, &msg4[IsakmpHeader::LEN..])?;
         let gxr = find(&ps, payload::KE).ok_or(IkeError::MissingPayload("KE"))?.data.clone();
@@ -1137,6 +1149,9 @@ pub fn respond_main(cfg: &Phase1Config, msg1: &[u8], entropy: &mut impl Entropy,
     let hdr = IsakmpHeader::parse(msg1)?;
     if hdr.exchange_type != exchange::MAIN {
         return Err(IkeError::Crypto("not a Main Mode message"));
+    }
+    if hdr.message_id != 0 {
+        return Err(IkeError::Crypto("phase 1 message_id must be zero"));
     }
     let cky_i = hdr.init_cookie;
     let ps = isakmp::parse_payloads(hdr.next_payload, &msg1[IsakmpHeader::LEN..])?;
@@ -1497,6 +1512,43 @@ mod tests {
     }
 
     #[test]
+    fn respond_aggressive_rejects_a_nonzero_phase1_message_id() {
+        let cfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(b"testpsk".to_vec()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 3, 204]),
+        };
+        let cky_i = [0xAB; 8];
+        let mut ie = SeedEntropy::new(7);
+        let i_priv = ie.next_array32();
+        let gxi = DhGroup::Modp1024.public(&i_priv);
+        let ni = vec![0x11; 16];
+        let idi = Id { id_type: id_type::KEY_ID, protocol: 0, port: 0, data: b"grp".to_vec() };
+
+        let hdr = IsakmpHeader {
+            init_cookie: cky_i,
+            resp_cookie: [0; 8],
+            next_payload: payload::NONE,
+            version: IsakmpHeader::VERSION_1_0,
+            exchange_type: exchange::AGGRESSIVE,
+            flags: 0,
+            message_id: 1, // RFC 2408 §3.1: Phase 1 must use message_id 0
+            length: 0,
+        };
+        let msg1 = isakmp::build_message(hdr, &[
+            (payload::SA, android_sa().to_bytes()),
+            (payload::KE, gxi.to_vec()),
+            (payload::NONCE, ni.to_vec()),
+            (payload::ID, idi.to_bytes()),
+        ]);
+        match respond_aggressive(&cfg, &msg1, &mut SeedEntropy::new(9), "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()) {
+            Err(IkeError::Crypto(_)) => {}
+            other => panic!("expected a Crypto error, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
     fn wrong_psk_fails_hash_i() {
         let cfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(b"right".to_vec()),
@@ -1630,6 +1682,62 @@ mod tests {
         let last_block = &msg6[msg6.len() - AES_BLOCK..];
         assert_eq!(istate.phase1_iv, last_block, "initiator's phase1_iv must chain from message 6's ciphertext");
         assert_eq!(rstate.phase1_iv, last_block, "responder's phase1_iv must chain from message 6's ciphertext");
+    }
+
+    #[test]
+    fn respond_main_rejects_a_nonzero_phase1_message_id() {
+        let psk = b"correct horse battery staple".to_vec();
+        let icfg = main_mode_icfg(psk.clone());
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(psk),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
+        let mut ie = SeedEntropy::new(0x3333);
+        let mut re = SeedEntropy::new(0x4444);
+        let (msg1, _sa_sent) = initiate_main(&icfg, &mut ie);
+
+        // Reparse and re-serialize msg1 with a nonzero message_id -- Phase 1
+        // must always use 0 (RFC 2408 §3.1).
+        let mut hdr = IsakmpHeader::parse(&msg1).unwrap();
+        hdr.message_id = 1;
+        let mut tampered = hdr.to_bytes();
+        tampered.extend_from_slice(&msg1[IsakmpHeader::LEN..]);
+
+        match respond_main(&rcfg, &tampered, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()) {
+            Err(IkeError::Crypto(_)) => {}
+            other => panic!("expected a Crypto error, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn complete_sa_rejects_a_mismatched_init_cookie() {
+        let psk = b"correct horse battery staple".to_vec();
+        let icfg = main_mode_icfg(psk.clone());
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(psk),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
+        let mut ie = SeedEntropy::new(0x3333);
+        let mut re = SeedEntropy::new(0x4444);
+        let (msg1, sa_sent) = initiate_main(&icfg, &mut ie);
+        let (msg2, _r1) = respond_main(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+
+        // A responder (or an attacker) that echoes back the wrong CKY-I in
+        // message 2 must be rejected -- RFC 2408 §3.1 requires both cookies
+        // to match on every message, not just the last one seen.
+        let mut hdr = IsakmpHeader::parse(&msg2).unwrap();
+        hdr.init_cookie[0] ^= 0xff;
+        let mut tampered = hdr.to_bytes();
+        tampered.extend_from_slice(&msg2[IsakmpHeader::LEN..]);
+
+        match sa_sent.complete_sa(&tampered, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()) {
+            Err(IkeError::Crypto(_)) => {}
+            other => panic!("expected a Crypto error, got {:?}", other.map(|_| ())),
+        }
     }
 
     /// The gateway is reachable at a fixed public address both sides agree

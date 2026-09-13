@@ -441,6 +441,9 @@ pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) 
         return Err(IkeError::Crypto("not a Quick Mode message"));
     }
     let msgid = hdr.message_id;
+    if msgid == 0 {
+        return Err(IkeError::Crypto("quick mode message_id must not be zero"));
+    }
     let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
     let (_h, ps, iv1) = phase2::parse_encrypted(msg1, st.prf, &st.skeyid_a, &st.enc_key, &iv0)?; // verifies HASH(1)
     let ni = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
@@ -565,6 +568,57 @@ mod tests {
         let sealed_r = rchild.outbound.seal(&pkt, 4).unwrap();
         let (got_r, _) = ichild.inbound.open(&sealed_r).unwrap();
         assert_eq!(got_r, pkt);
+    }
+
+    #[test]
+    fn respond_quick_rejects_a_zero_message_id() {
+        let psk = b"correct horse battery staple".to_vec();
+        let ts = ([10, 0, 99, 0], [255, 255, 255, 0]);
+        let icfg = InitiatorConfig {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            key_len: 32,
+            our_id: Id::ipv4([10, 1, 1, 1]),
+            group: DhGroup::Modp1024,
+            xauth: false,
+            xauth_creds: None,
+            ts_local: ts,
+            ts_remote: ts,
+            esp_cipher: SkCipher::Aes256Gcm,
+            pfs_group: None,
+            mode_cfg: false,
+            mode: Ikev1ExchangeMode::Aggressive,
+        };
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
+        let mut ie = SeedEntropy::new(0x1111);
+        let mut re = SeedEntropy::new(0x2222);
+
+        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+        let (msg3, istate) = ai.complete(&msg2, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
+        rstate.verify_hash_i(&msg3).unwrap();
+
+        let (qm1, _qi) = initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, ts, ts).unwrap();
+
+        // RFC 2408 §3.1: every Phase 2 (Quick Mode) message must carry a
+        // nonzero Message-ID -- tamper it down to 0 (the Phase-1 sentinel)
+        // and confirm the responder rejects it outright, before touching
+        // any crypto.
+        let mut hdr = IsakmpHeader::parse(&qm1).unwrap();
+        hdr.message_id = 0;
+        let mut tampered = hdr.to_bytes();
+        tampered.extend_from_slice(&qm1[IsakmpHeader::LEN..]);
+
+        match respond_quick(&rstate, &tampered, &mut re) {
+            Err(IkeError::Crypto(_)) => {}
+            other => panic!("expected a Crypto error, got {:?}", other.map(|_| ())),
+        }
     }
 
     /// The specific cipher a real FortiGate demanded live (see this crate's

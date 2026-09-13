@@ -187,6 +187,9 @@ impl IkeHeader {
             });
         }
         let version = input[17];
+        if version >> 4 != 2 {
+            return Err(IkeError::UnsupportedVersion(version >> 4));
+        }
         Ok(IkeHeader {
             initiator_spi: u64::from_be_bytes(input[0..8].try_into().unwrap()),
             responder_spi: u64::from_be_bytes(input[8..16].try_into().unwrap()),
@@ -378,6 +381,14 @@ mod tests {
         assert!(h.flags.initiator && !h.flags.response);
         assert_eq!(h.message_id, 0);
         assert_eq!(h.length, 28);
+    }
+
+    #[test]
+    fn parse_rejects_a_non_ikev2_major_version() {
+        let mut header = SA_INIT_HEADER;
+        header[17] = 0x10; // major version 1 (an IKEv1 message misrouted here)
+        let err = IkeHeader::parse(&header).unwrap_err();
+        assert_eq!(err, IkeError::UnsupportedVersion(1));
     }
 
     #[test]

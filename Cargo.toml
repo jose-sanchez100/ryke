@@ -17,15 +17,27 @@ hmac = "0.12"
 sha2 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 aes-gcm = "0.10"
+# Cipher-generic AEAD traits (Aead/AeadCore/KeyInit/Nonce) shared by AES-GCM and
+# ChaCha20-Poly1305 -- already pulled in transitively by both at the same 0.5.2,
+# just named directly here instead of reaching through `aes_gcm::aead::`.
+aead = "0.5"
 # EAP-MSCHAPv2 (RFC 2759) legacy crypto — required only for that auth method.
 md4 = "0.10"
 des = "0.8"
 sha1 = "0.10"
+# MD5 PRF/INTEG (IKEv2 transform IDs 1/1) and ChaCha20-Poly1305 (ENCR 28,
+# RFC 7634) -- legacy and modern ends of the algorithm-agility matrix.
+md-5 = "0.10"
+chacha20poly1305 = "0.10"
 # Certificate / RFC 7427 Digital Signature auth (the iOS/Android server-auth path).
 # Pinned to the sha2-0.10 / der-0.7 / spki-0.7 generation so everything unifies on
 # a single sha2 (p256 0.14 / rsa 0.10-rc pull sha2 0.11 and would duplicate it).
 rsa = { version = "0.9.10", default-features = false, features = ["std", "sha2", "pem"] }
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "ecdh", "pem", "std"] }
+# ECP-384 / ECP-521 (DH groups 20/21) -- same RustCrypto family as p256, pinned
+# to the 0.13 generation for the same sha2-0.10 reason as the p256 comment above.
+p384 = { version = "0.13", default-features = false, features = ["ecdh", "std"] }
+p521 = { version = "0.13", default-features = false, features = ["ecdh", "std"] }
 x509-cert = { version = "0.2.5", default-features = false, features = ["std"] }
 der = "0.7"
 # MODP (finite-field) Diffie-Hellman for DH groups 2/14 — bignum modexp. Already

@@ -12,7 +12,7 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use ryke::{
-    default_offer, initiator_auth_request, initiator_complete, initiator_request,
+    default_offer, esp_offer, initiator_auth_request, initiator_complete, initiator_request,
     initiator_verify_auth, is_ike_on_4500, notify_type, payloads, unwrap_ike_4500, wrap_ike_4500,
     AuthConfig, ChildSa, Entropy, Identification, IkeHeader, LocalSecret, Notify, OsEntropy,
     PayloadType, Role,
@@ -107,12 +107,12 @@ fn main() {
     let child_spi = 0xBEEF_0042u32;
     let mut iv = [0u8; 8];
     entropy.fill(&mut iv);
-    let auth_req = initiator_auth_request(&sa, &auth, child_spi, &iv).expect("build IKE_AUTH");
+    let auth_req = initiator_auth_request(&sa, &auth, child_spi, &esp_offer(0), &iv).expect("build IKE_AUTH");
     sock.send_to(&wrap_ike_4500(&auth_req), esp4500).unwrap();
 
     let (n, _) = sock.recv_from(&mut buf).expect("no IKE_AUTH response on :4500");
     let auth_resp = unwrap_ike_4500(&buf[..n]).expect("IKE_AUTH reply lacked non-ESP marker");
-    let (got_server_id, peer_child_spi, assigned, _tsr) =
+    let (got_server_id, peer_child_spi, _esp_suite, assigned, _tsr) =
         initiator_verify_auth(&sa, auth_resp, &auth).expect("IKE_AUTH verify");
     println!("✅ IKE_AUTH answered on :4500 (NAT-T float works) — server_id={got_server_id:?}");
     if got_server_id != Identification::fqdn(server_id) {
@@ -122,7 +122,7 @@ fn main() {
     println!("✅ Config-Payload inner IP: {inner_src}");
 
     // 3. ESP on :4500 (UDP-encapsulated, SPI-first, no marker).
-    let mut child = ChildSa::derive(&sa.keys.sk_d, &sa.ni, &sa.nr, Role::Initiator, child_spi, peer_child_spi);
+    let mut child = ChildSa::derive(sa.suite.prf_algorithm(), &sa.keys.sk_d, &sa.ni, &sa.nr, Role::Initiator, child_spi, peer_child_spi);
     for seq in 1..=5u16 {
         let sealed = child.outbound.seal(&icmp_echo(inner_src, dst, seq), 4).unwrap();
         sock.send_to(&sealed, esp4500).unwrap();

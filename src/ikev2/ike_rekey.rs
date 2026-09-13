@@ -20,7 +20,7 @@ use crate::ikev2::message::{
 };
 use crate::ikev2::negotiate;
 use crate::ikev2::payload::{protocol_id, KeyExchange, SecurityAssociation};
-use crate::ikev2::sk::{build_encrypted_gcm, open_encrypted_gcm};
+use crate::ikev2::sk::{build_encrypted, open_encrypted};
 use crate::role::Role;
 
 fn our_sk_e(sa: &CompletedSaInit) -> &[u8] {
@@ -29,10 +29,22 @@ fn our_sk_e(sa: &CompletedSaInit) -> &[u8] {
         Role::Responder => &sa.keys.sk_er,
     }
 }
+fn our_sk_a(sa: &CompletedSaInit) -> &[u8] {
+    match sa.role {
+        Role::Initiator => &sa.keys.sk_ai,
+        Role::Responder => &sa.keys.sk_ar,
+    }
+}
 fn peer_sk_e(sa: &CompletedSaInit) -> &[u8] {
     match sa.role {
         Role::Initiator => &sa.keys.sk_er,
         Role::Responder => &sa.keys.sk_ei,
+    }
+}
+fn peer_sk_a(sa: &CompletedSaInit) -> &[u8] {
+    match sa.role {
+        Role::Initiator => &sa.keys.sk_ar,
+        Role::Responder => &sa.keys.sk_ai,
     }
 }
 
@@ -61,7 +73,7 @@ pub fn responder_process_ike_rekey(
     iv: &[u8; 8],
 ) -> Result<(Vec<u8>, CompletedSaInit), IkeError> {
     let message_id = IkeHeader::parse(request)?.message_id;
-    let (first, inner) = open_encrypted_gcm(request, peer_sk_e(old_sa))?;
+    let (first, inner) = open_encrypted(old_sa.suite.sk_cipher(), request, peer_sk_e(old_sa), peer_sk_a(old_sa))?;
 
     let (mut sa_bytes, mut ni, mut ke_bytes) = (None, None, None);
     for p in payloads(first, &inner) {
@@ -93,6 +105,7 @@ pub fn responder_process_ike_rekey(
     let our_public = group.public(dh_private);
 
     let keys = crypto::derive_rekey_session_keys(
+        suite.prf_algorithm(),
         &old_sa.keys.sk_d,
         &shared,
         &ni,
@@ -127,7 +140,7 @@ pub fn responder_process_ike_rekey(
     };
     let first_out = first_payload_type(&inner_out);
     let bytes = encode_payload_chain(&inner_out);
-    let response = build_encrypted_gcm(header, first_out, &bytes, our_sk_e(old_sa), iv)?;
+    let response = build_encrypted(old_sa.suite.sk_cipher(), header, first_out, &bytes, our_sk_e(old_sa), our_sk_a(old_sa), iv)?;
 
     let new_sa = CompletedSaInit {
         role: Role::Responder,
@@ -151,6 +164,7 @@ mod tests {
     use crate::ikev2::exchange::{
         default_offer, initiator_complete, initiator_request, responder_respond, LocalSecret,
     };
+    use crate::ikev2::sk::{build_encrypted_gcm, open_encrypted_gcm};
 
     fn sa_pair() -> (CompletedSaInit, CompletedSaInit) {
         let init = LocalSecret { dh_private: [7u8; 32], nonce: vec![0x11; 32], spi: 0xA1 };
@@ -234,6 +248,7 @@ mod tests {
         }
         let shared = group.shared(&init_dh, &ker.unwrap().data).unwrap();
         let init_keys = crate::crypto::derive_rekey_session_keys(
+            suite.prf_algorithm(),
             &init_sa.keys.sk_d,
             &shared,
             &ni,

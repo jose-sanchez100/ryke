@@ -1,17 +1,28 @@
 //! CHILD SA rekey via the `CREATE_CHILD_SA` exchange (RFC 7296 §1.3.1, §2.8),
-//! without PFS.
+//! with optional PFS.
 //!
 //! ```text
-//! Initiator → SK { N(REKEY_SA, old_spi), SA(new_spi), Ni, TSi, TSr }
-//! Responder → SK { SA(new_spi), Nr, TSi, TSr }
+//! Initiator → SK { N(REKEY_SA, old_spi), SA(new_spi), Ni, [KEi,] TSi, TSr }
+//! Responder → SK { SA(new_spi), Nr, [KEr,] TSi, TSr }
 //! ```
 //!
-//! The new CHILD-SA keys come from `prf+(SK_d, Ni | Nr)` with the *rekey* nonces
-//! (see [`crate::esp::ChildSa::derive`]). Both sides end up with matching ESP
+//! Without PFS, the new CHILD-SA keys come from `prf+(SK_d, Ni | Nr)` with the
+//! *rekey* nonces (see [`crate::esp::ChildSa::derive`]). With PFS (the
+//! `_with_pfs` functions, gated on the caller supplying a DH group + our
+//! ephemeral private key), a fresh KE payload is exchanged and its shared
+//! secret is folded in per RFC 7296 §2.18's CHILD_SA analog:
+//! `KEYMAT = prf+(SK_d, g^ir(new) | Ni | Nr)` (see
+//! [`crate::esp::ChildSa::derive_pfs`]). Both sides end up with matching ESP
 //! SAs on freshly chosen SPIs.
+//!
+//! The ESP cipher itself stays the fixed AES-256-GCM `esp_offer` default in
+//! both cases -- rekey doesn't renegotiate the CHILD SA's algorithm (that's
+//! only wired at initial connect, via Phase G/H), only optionally adds PFS to
+//! whatever cipher the tunnel already uses.
 
 use std::net::Ipv4Addr;
 
+use crate::crypto::DhGroup;
 use crate::error::IkeError;
 use crate::esp::ChildSa;
 use crate::ikev2::exchange::CompletedSaInit;
@@ -19,9 +30,12 @@ use crate::ikev2::ike_auth::esp_offer;
 use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
 };
-use crate::ikev2::payload::{notify_type, protocol_id, Notify, SecurityAssociation, TrafficSelector, TrafficSelectors};
+use crate::ikev2::payload::{
+    notify_type, protocol_id, transform_type, KeyExchange, Notify, SecurityAssociation, Transform, TrafficSelector,
+    TrafficSelectors,
+};
 use crate::role::Role;
-use crate::ikev2::sk::{build_encrypted_gcm, open_encrypted_gcm};
+use crate::ikev2::sk::{build_encrypted, open_encrypted};
 
 fn our_sk_e(sa: &CompletedSaInit) -> &[u8] {
     match sa.role {
@@ -29,10 +43,22 @@ fn our_sk_e(sa: &CompletedSaInit) -> &[u8] {
         Role::Responder => &sa.keys.sk_er,
     }
 }
+fn our_sk_a(sa: &CompletedSaInit) -> &[u8] {
+    match sa.role {
+        Role::Initiator => &sa.keys.sk_ai,
+        Role::Responder => &sa.keys.sk_ar,
+    }
+}
 fn peer_sk_e(sa: &CompletedSaInit) -> &[u8] {
     match sa.role {
         Role::Initiator => &sa.keys.sk_er,
         Role::Responder => &sa.keys.sk_ei,
+    }
+}
+fn peer_sk_a(sa: &CompletedSaInit) -> &[u8] {
+    match sa.role {
+        Role::Initiator => &sa.keys.sk_ar,
+        Role::Responder => &sa.keys.sk_ai,
     }
 }
 
@@ -79,6 +105,29 @@ fn find_sa_and_nonce(first: PayloadType, inner: &[u8]) -> Result<(Vec<u8>, Vec<u
     Ok((sa.ok_or(IkeError::MissingPayload("SA"))?, nonce.ok_or(IkeError::MissingPayload("Nonce"))?))
 }
 
+/// The KE payload from a decrypted CREATE_CHILD_SA message, if any.
+fn find_ke(first: PayloadType, inner: &[u8]) -> Result<Option<KeyExchange>, IkeError> {
+    for payload in payloads(first, inner) {
+        let p = payload?;
+        if p.payload_type == PayloadType::KeyExchange {
+            return Ok(Some(KeyExchange::parse(p.data)?));
+        }
+    }
+    Ok(None)
+}
+
+/// The DH transform on an ESP proposal's first alternative, if any -- the
+/// PFS-wanted signal (its mere presence, not any negotiation of it) per this
+/// module's own doc comment.
+fn dh_transform_id(sa: &SecurityAssociation) -> Option<u16> {
+    sa.proposals.first()?.transforms.iter().find(|t| t.transform_type == transform_type::DH).map(|t| t.transform_id)
+}
+
+/// Our ephemeral share of a PFS exchange: the DH group both sides will use,
+/// plus our private key to derive the eventual shared secret from the peer's
+/// KE payload.
+pub type PfsKeyExchange<'a> = (DhGroup, &'a [u8]);
+
 /// Initiator: build a CHILD-SA rekey request for the CHILD SA `rekeyed_spi`,
 /// proposing a new SA on `new_spi` with fresh nonce `ni`.
 pub fn build_rekey_request(
@@ -89,23 +138,47 @@ pub fn build_rekey_request(
     ni: &[u8],
     iv: &[u8; 8],
 ) -> Result<Vec<u8>, IkeError> {
+    build_rekey_request_with_pfs(sa, message_id, rekeyed_spi, new_spi, ni, None, iv)
+}
+
+/// Like [`build_rekey_request`], but when `pfs` is `Some((group, our_dh_private))`
+/// also advertises `group` as a DH transform on the new ESP proposal and adds a
+/// `KeyExchange` payload built from `our_dh_private` -- PFS for the rekeyed
+/// CHILD SA. `None` reproduces `build_rekey_request`'s exact behavior.
+pub fn build_rekey_request_with_pfs(
+    sa: &CompletedSaInit,
+    message_id: u32,
+    rekeyed_spi: u32,
+    new_spi: u32,
+    ni: &[u8],
+    pfs: Option<PfsKeyExchange>,
+    iv: &[u8; 8],
+) -> Result<Vec<u8>, IkeError> {
     let rekey_notify = Notify {
         protocol_id: protocol_id::ESP,
         spi: rekeyed_spi.to_be_bytes().to_vec(),
         notify_type: notify_type::REKEY_SA,
         data: Vec::new(),
     };
-    let inner = vec![
+    let mut offer = esp_offer(new_spi);
+    if let Some((group, _)) = pfs {
+        offer.proposals[0].transforms.push(Transform { transform_type: transform_type::DH, transform_id: group.transform_id(), key_length: None });
+    }
+    let mut inner = vec![
         (PayloadType::Notify, rekey_notify.to_bytes()),
-        (PayloadType::SecurityAssociation, esp_offer(new_spi).to_bytes()),
+        (PayloadType::SecurityAssociation, offer.to_bytes()),
         (PayloadType::Nonce, ni.to_vec()),
-        (PayloadType::TrafficSelectorInitiator, full_tunnel_ts()),
-        (PayloadType::TrafficSelectorResponder, full_tunnel_ts()),
     ];
+    if let Some((group, dh_private)) = pfs {
+        let ke = KeyExchange { dh_group: group.transform_id(), data: group.public(dh_private) };
+        inner.push((PayloadType::KeyExchange, ke.to_bytes()));
+    }
+    inner.push((PayloadType::TrafficSelectorInitiator, full_tunnel_ts()));
+    inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
     let header = create_child_header(sa, message_id, false);
     let first = first_payload_type(&inner);
     let bytes = encode_payload_chain(&inner);
-    build_encrypted_gcm(header, first, &bytes, our_sk_e(sa), iv)
+    build_encrypted(sa.suite.sk_cipher(), header, first, &bytes, our_sk_e(sa), our_sk_a(sa), iv)
 }
 
 /// Responder: process a rekey request, derive the new CHILD SA, and build the
@@ -118,10 +191,32 @@ pub fn responder_process_rekey(
     iv: &[u8; 8],
     assigned_ip: Option<Ipv4Addr>,
 ) -> Result<(Vec<u8>, ChildSa), IkeError> {
+    responder_process_rekey_with_pfs(sa, request, new_spi, nr, None, iv, assigned_ip)
+}
+
+/// Like [`responder_process_rekey`], but honors PFS when the request's ESP
+/// proposal carries a DH transform: `dh_private` is our ephemeral private key
+/// for that group, required in that case (a `MissingPayload("KE")` error if
+/// the peer signaled PFS but we weren't given one, or vice versa) -- the
+/// caller is expected to have generated one as soon as it saw the DH
+/// transform, mirroring [`crate::ikev2::ike_rekey::responder_process_ike_rekey`]'s
+/// `dh_private` parameter for the IKE-SA-rekey analog.
+#[allow(clippy::too_many_arguments)]
+pub fn responder_process_rekey_with_pfs(
+    sa: &CompletedSaInit,
+    request: &[u8],
+    new_spi: u32,
+    nr: &[u8],
+    dh_private: Option<&[u8]>,
+    iv: &[u8; 8],
+    assigned_ip: Option<Ipv4Addr>,
+) -> Result<(Vec<u8>, ChildSa), IkeError> {
     let message_id = IkeHeader::parse(request)?.message_id;
-    let (first, inner) = open_encrypted_gcm(request, peer_sk_e(sa))?;
+    let (first, inner) = open_encrypted(sa.suite.sk_cipher(), request, peer_sk_e(sa), peer_sk_a(sa))?;
     let (sa_bytes, ni) = find_sa_and_nonce(first, &inner)?;
     let peer_spi = esp_spi_from_sa(&sa_bytes)?;
+    let peer_sa = SecurityAssociation::parse(&sa_bytes)?;
+    let pfs_group = dh_transform_id(&peer_sa).and_then(DhGroup::from_transform_id);
 
     // Traffic selectors: mirror exactly what IKE_AUTH did for this client. At AUTH we
     // narrow TSi to the client's assigned /32 and set TSr = full-tunnel; iOS installs
@@ -150,14 +245,37 @@ pub fn responder_process_rekey(
         ),
     };
 
-    let child = ChildSa::derive(&sa.keys.sk_d, &ni, nr, Role::Responder, new_spi, peer_spi);
+    let peer_ke = find_ke(first, &inner)?;
+    let pfs_secret = match (pfs_group, peer_ke, dh_private) {
+        (Some(group), Some(ke), Some(our_priv)) => {
+            if ke.dh_group != group.transform_id() {
+                return Err(IkeError::DhGroupMismatch { expected: group.transform_id(), got: ke.dh_group });
+            }
+            Some(group.shared(our_priv, &ke.data)?)
+        }
+        (None, _, _) => None,
+        _ => return Err(IkeError::MissingPayload("KE")),
+    };
 
-    let inner_out = vec![
-        (PayloadType::SecurityAssociation, esp_offer(new_spi).to_bytes()),
-        (PayloadType::Nonce, nr.to_vec()),
-        (PayloadType::TrafficSelectorInitiator, tsi),
-        (PayloadType::TrafficSelectorResponder, tsr),
-    ];
+    let child = match &pfs_secret {
+        Some(secret) => ChildSa::derive_pfs(sa.suite.prf_algorithm(), secret, &sa.keys.sk_d, &ni, nr, Role::Responder, new_spi, peer_spi),
+        None => ChildSa::derive(sa.suite.prf_algorithm(), &sa.keys.sk_d, &ni, nr, Role::Responder, new_spi, peer_spi),
+    };
+
+    let mut sa_out = esp_offer(new_spi);
+    let mut inner_out = Vec::new();
+    if let (Some(group), Some(our_priv)) = (pfs_group, dh_private) {
+        sa_out.proposals[0].transforms.push(Transform { transform_type: transform_type::DH, transform_id: group.transform_id(), key_length: None });
+        inner_out.push((PayloadType::SecurityAssociation, sa_out.to_bytes()));
+        inner_out.push((PayloadType::Nonce, nr.to_vec()));
+        let ke_out = KeyExchange { dh_group: group.transform_id(), data: group.public(our_priv) };
+        inner_out.push((PayloadType::KeyExchange, ke_out.to_bytes()));
+    } else {
+        inner_out.push((PayloadType::SecurityAssociation, sa_out.to_bytes()));
+        inner_out.push((PayloadType::Nonce, nr.to_vec()));
+    }
+    inner_out.push((PayloadType::TrafficSelectorInitiator, tsi));
+    inner_out.push((PayloadType::TrafficSelectorResponder, tsr));
     let header = create_child_header(sa, message_id, true);
     let first_out = first_payload_type(&inner_out);
     let bytes = encode_payload_chain(&inner_out);
@@ -165,7 +283,7 @@ pub fn responder_process_rekey(
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         eprintln!("[ryke/rekeyresp] first={first_out:?} inner ({} B) = {hex}", bytes.len());
     }
-    let response = build_encrypted_gcm(header, first_out, &bytes, our_sk_e(sa), iv)?;
+    let response = build_encrypted(sa.suite.sk_cipher(), header, first_out, &bytes, our_sk_e(sa), our_sk_a(sa), iv)?;
     Ok((response, child))
 }
 
@@ -177,10 +295,41 @@ pub fn initiator_complete_rekey(
     new_spi: u32,
     response: &[u8],
 ) -> Result<ChildSa, IkeError> {
-    let (first, inner) = open_encrypted_gcm(response, peer_sk_e(sa))?;
+    initiator_complete_rekey_with_pfs(sa, ni, new_spi, None, response)
+}
+
+/// Like [`initiator_complete_rekey`], but for a rekey started with
+/// [`build_rekey_request_with_pfs`]: `dh_private` must be the same ephemeral
+/// private key passed there whenever PFS was requested (`None` otherwise).
+pub fn initiator_complete_rekey_with_pfs(
+    sa: &CompletedSaInit,
+    ni: &[u8],
+    new_spi: u32,
+    dh_private: Option<&[u8]>,
+    response: &[u8],
+) -> Result<ChildSa, IkeError> {
+    let (first, inner) = open_encrypted(sa.suite.sk_cipher(), response, peer_sk_e(sa), peer_sk_a(sa))?;
     let (sa_bytes, nr) = find_sa_and_nonce(first, &inner)?;
     let peer_spi = esp_spi_from_sa(&sa_bytes)?;
-    Ok(ChildSa::derive(&sa.keys.sk_d, ni, &nr, Role::Initiator, new_spi, peer_spi))
+    let peer_sa = SecurityAssociation::parse(&sa_bytes)?;
+    let pfs_group = dh_transform_id(&peer_sa).and_then(DhGroup::from_transform_id);
+
+    let peer_ke = find_ke(first, &inner)?;
+    let pfs_secret = match (pfs_group, peer_ke, dh_private) {
+        (Some(group), Some(ke), Some(our_priv)) => {
+            if ke.dh_group != group.transform_id() {
+                return Err(IkeError::DhGroupMismatch { expected: group.transform_id(), got: ke.dh_group });
+            }
+            Some(group.shared(our_priv, &ke.data)?)
+        }
+        (None, _, _) => None,
+        _ => return Err(IkeError::MissingPayload("KE")),
+    };
+
+    Ok(match &pfs_secret {
+        Some(secret) => ChildSa::derive_pfs(sa.suite.prf_algorithm(), secret, &sa.keys.sk_d, ni, &nr, Role::Initiator, new_spi, peer_spi),
+        None => ChildSa::derive(sa.suite.prf_algorithm(), &sa.keys.sk_d, ni, &nr, Role::Initiator, new_spi, peer_spi),
+    })
 }
 
 #[cfg(test)]
@@ -188,6 +337,7 @@ mod tests {
     use super::*;
     use crate::esp::next_header;
     use crate::ikev2::exchange::{default_offer, initiator_complete, initiator_request, responder_respond, LocalSecret};
+    use crate::ikev2::sk::{build_encrypted_gcm, open_encrypted_gcm};
 
     fn sa_pair() -> (CompletedSaInit, CompletedSaInit) {
         let init = LocalSecret { dh_private: [7u8; 32], nonce: vec![0x11; 32], spi: 0xA1 };
@@ -217,6 +367,67 @@ mod tests {
         assert_eq!(resp_child.inbound.open(&pkt).unwrap().0, b"after rekey A->B");
         let pkt2 = resp_child.outbound.seal(b"after rekey B->A", next_header::IPV4).unwrap();
         assert_eq!(init_child.inbound.open(&pkt2).unwrap().0, b"after rekey B->A");
+    }
+
+    #[test]
+    fn child_rekey_with_pfs_yields_matching_esp_sas() {
+        let (init_sa, resp_sa) = sa_pair();
+        let ni = [0x33u8; 32];
+        let nr = [0x44u8; 32];
+        let init_new_spi = 0x1111_1111;
+        let resp_new_spi = 0x2222_2222;
+        let old_child_spi = 0xDEAD_BEEF;
+        let group = DhGroup::Modp2048;
+        let init_dh = [5u8; 32];
+        let resp_dh = [6u8; 32];
+
+        let req = build_rekey_request_with_pfs(&init_sa, 2, old_child_spi, init_new_spi, &ni, Some((group, &init_dh)), &[1u8; 8]).unwrap();
+        let (resp, mut resp_child) =
+            responder_process_rekey_with_pfs(&resp_sa, &req, resp_new_spi, &nr, Some(&resp_dh), &[2u8; 8], None).unwrap();
+        let mut init_child = initiator_complete_rekey_with_pfs(&init_sa, &ni, init_new_spi, Some(&init_dh), &resp).unwrap();
+
+        let pkt = init_child.outbound.seal(b"pfs A->B", next_header::IPV4).unwrap();
+        assert_eq!(resp_child.inbound.open(&pkt).unwrap().0, b"pfs A->B");
+        let pkt2 = resp_child.outbound.seal(b"pfs B->A", next_header::IPV4).unwrap();
+        assert_eq!(init_child.inbound.open(&pkt2).unwrap().0, b"pfs B->A");
+    }
+
+    /// The actual PFS property: two rekeys sharing the exact same nonces
+    /// still derive different keys, because each one runs a fresh DH
+    /// exchange -- without PFS (see `child_rekey_yields_matching_esp_sas`,
+    /// which reuses the same nonces across this test's two runs implicitly
+    /// via identical `Ni`/`Nr` in spirit) the keys would depend on the nonces
+    /// alone and could collide if a peer ever reused a nonce; with PFS the
+    /// fresh secret dominates regardless.
+    #[test]
+    fn pfs_rekey_derives_a_different_key_each_time_even_with_identical_nonces() {
+        let (init_sa, resp_sa) = sa_pair();
+        let ni = [0x33u8; 32];
+        let nr = [0x44u8; 32];
+        let group = DhGroup::Modp2048;
+
+        let req1 = build_rekey_request_with_pfs(&init_sa, 2, 0xDEAD_BEEF, 0x1111_1111, &ni, Some((group, &[5u8; 32])), &[1u8; 8]).unwrap();
+        let (resp1, _) = responder_process_rekey_with_pfs(&resp_sa, &req1, 0x2222_2222, &nr, Some(&[6u8; 32]), &[2u8; 8], None).unwrap();
+        let child1 = initiator_complete_rekey_with_pfs(&init_sa, &ni, 0x1111_1111, Some(&[5u8; 32]), &resp1).unwrap();
+
+        let req2 = build_rekey_request_with_pfs(&init_sa, 4, 0x1111_1111, 0x3333_3333, &ni, Some((group, &[7u8; 32])), &[3u8; 8]).unwrap();
+        let (resp2, _) = responder_process_rekey_with_pfs(&resp_sa, &req2, 0x4444_4444, &nr, Some(&[8u8; 32]), &[4u8; 8], None).unwrap();
+        let child2 = initiator_complete_rekey_with_pfs(&init_sa, &ni, 0x3333_3333, Some(&[7u8; 32]), &resp2).unwrap();
+
+        assert_ne!(child1.outbound.key_material(), child2.outbound.key_material(), "a fresh DH exchange must yield a fresh key even with identical nonces");
+    }
+
+    #[test]
+    fn pfs_rekey_without_a_matching_dh_private_is_a_clear_error() {
+        let (init_sa, resp_sa) = sa_pair();
+        let ni = [0x33u8; 32];
+        let nr = [0x44u8; 32];
+        let group = DhGroup::Modp2048;
+
+        // Initiator asks for PFS, but the responder wasn't given a private
+        // key to answer it with.
+        let req = build_rekey_request_with_pfs(&init_sa, 2, 0xDEAD_BEEF, 0x1111_1111, &ni, Some((group, &[5u8; 32])), &[1u8; 8]).unwrap();
+        assert!(responder_process_rekey_with_pfs(&resp_sa, &req, 0x2222_2222, &nr, None, &[2u8; 8], None).is_err());
     }
 
     fn extract_tsi(resp: &[u8], init_sa: &CompletedSaInit) -> Vec<u8> {

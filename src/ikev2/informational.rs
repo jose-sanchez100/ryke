@@ -11,12 +11,19 @@ use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
 };
 use crate::role::Role;
-use crate::ikev2::sk::{build_encrypted_gcm, open_encrypted_gcm};
+use crate::ikev2::sk::{build_encrypted, open_encrypted};
 
 fn our_sk_e(sa: &CompletedSaInit) -> &[u8] {
     match sa.role {
         Role::Initiator => &sa.keys.sk_ei,
         Role::Responder => &sa.keys.sk_er,
+    }
+}
+
+fn our_sk_a(sa: &CompletedSaInit) -> &[u8] {
+    match sa.role {
+        Role::Initiator => &sa.keys.sk_ai,
+        Role::Responder => &sa.keys.sk_ar,
     }
 }
 
@@ -27,11 +34,18 @@ fn peer_sk_e(sa: &CompletedSaInit) -> &[u8] {
     }
 }
 
+fn peer_sk_a(sa: &CompletedSaInit) -> &[u8] {
+    match sa.role {
+        Role::Initiator => &sa.keys.sk_ar,
+        Role::Responder => &sa.keys.sk_ai,
+    }
+}
+
 fn informational_header(sa: &CompletedSaInit, message_id: u32, is_response: bool) -> IkeHeader {
     IkeHeader {
         initiator_spi: sa.spi_i,
         responder_spi: sa.spi_r,
-        next_payload: PayloadType::NoNext, // set by build_encrypted_gcm
+        next_payload: PayloadType::NoNext, // set by build_encrypted
         major_version: 2,
         minor_version: 0,
         exchange_type: ExchangeType::Informational,
@@ -53,7 +67,7 @@ pub fn build_informational(
     let header = informational_header(sa, message_id, is_response);
     let first = first_payload_type(inner_payloads);
     let inner = encode_payload_chain(inner_payloads);
-    build_encrypted_gcm(header, first, &inner, our_sk_e(sa), iv)
+    build_encrypted(sa.suite.sk_cipher(), header, first, &inner, our_sk_e(sa), our_sk_a(sa), iv)
 }
 
 /// A DPD liveness check: an empty INFORMATIONAL request. A live peer must reply
@@ -65,7 +79,7 @@ pub fn dpd_request(sa: &CompletedSaInit, message_id: u32, iv: &[u8; 8]) -> Resul
 /// Decrypt an INFORMATIONAL from the peer, returning its inner payloads as
 /// `(type, body)` pairs. An empty result is a DPD liveness probe/ack.
 pub fn open_informational(sa: &CompletedSaInit, message: &[u8]) -> Result<Vec<(PayloadType, Vec<u8>)>, IkeError> {
-    let (first, inner) = open_encrypted_gcm(message, peer_sk_e(sa))?;
+    let (first, inner) = open_encrypted(sa.suite.sk_cipher(), message, peer_sk_e(sa), peer_sk_a(sa))?;
     let mut out = Vec::new();
     for payload in payloads(first, &inner) {
         let payload = payload?;

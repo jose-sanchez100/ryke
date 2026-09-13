@@ -68,8 +68,9 @@ mod tests {
         let init_spi = 0xAAAA_AAAA;
         let resp_spi = 0xBBBB_BBBB;
 
-        let a_sa = ChildSa::derive(&sk_d, &ni, &nr, Role::Initiator, init_spi, resp_spi);
-        let b_sa = ChildSa::derive(&sk_d, &ni, &nr, Role::Responder, resp_spi, init_spi);
+        let prf = crate::crypto::PrfAlgorithm::Sha256;
+        let a_sa = ChildSa::derive(prf, &sk_d, &ni, &nr, Role::Initiator, init_spi, resp_spi);
+        let b_sa = ChildSa::derive(prf, &sk_d, &ni, &nr, Role::Responder, resp_spi, init_spi);
 
         let a_tp = UdpTransport::bind("127.0.0.1:0").unwrap();
         let b_tp = UdpTransport::bind("127.0.0.1:0").unwrap();

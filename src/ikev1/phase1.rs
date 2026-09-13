@@ -292,6 +292,12 @@ pub struct InitiatorConfig {
     /// Quick-Mode traffic selectors offered as IDci/IDcr: `(address, netmask)`.
     pub ts_local: ([u8; 4], [u8; 4]),
     pub ts_remote: ([u8; 4], [u8; 4]),
+    /// PFS DH group to request for Quick Mode, if any (RFC 2409 §5.5) --
+    /// unlike IKEv2 (where PFS can only ever apply at a later
+    /// `CREATE_CHILD_SA` rekey, never the initial tunnel), IKEv1 negotiates
+    /// this on the very first Phase-2 exchange. `None` reproduces the
+    /// original no-PFS behavior. See [`crate::ikev1::quick::initiate_quick_with_pfs`].
+    pub pfs_group: Option<DhGroup>,
 }
 
 /// The initiator's SA offer: AES-256-CBC / SHA-256 / `group` / PSK (or XAUTH-PSK).

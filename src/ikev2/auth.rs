@@ -18,25 +18,26 @@
 //! - `RestOfID*` is the ID payload **body** (ID Type + RESERVED + ID data — no
 //!   generic payload header), i.e. [`crate::ikev2::payload::Identification::to_bytes`].
 
-use crate::crypto::prf;
+use crate::crypto::{prf, PrfAlgorithm};
 
 /// The fixed pad string for PSK auth (RFC 7296 §2.15) — 17 ASCII bytes, no NUL.
 const KEY_PAD: &[u8] = b"Key Pad for IKEv2";
 
 /// Signed octets for the **initiator's** AUTH:
-/// `RealMessageI | Nr | prf(SK_pi, RestOfIDi)`.
-pub fn initiator_signed_octets(real_message_i: &[u8], nr: &[u8], sk_pi: &[u8], idi_body: &[u8]) -> Vec<u8> {
-    signed_octets(real_message_i, nr, sk_pi, idi_body)
+/// `RealMessageI | Nr | prf(SK_pi, RestOfIDi)`. `algo` is the negotiated PRF
+/// (RFC 7296 §2.15 -- AUTH always uses whichever PRF `IKE_SA_INIT` chose).
+pub fn initiator_signed_octets(algo: PrfAlgorithm, real_message_i: &[u8], nr: &[u8], sk_pi: &[u8], idi_body: &[u8]) -> Vec<u8> {
+    signed_octets(algo, real_message_i, nr, sk_pi, idi_body)
 }
 
 /// Signed octets for the **responder's** AUTH:
 /// `RealMessageR | Ni | prf(SK_pr, RestOfIDr)`.
-pub fn responder_signed_octets(real_message_r: &[u8], ni: &[u8], sk_pr: &[u8], idr_body: &[u8]) -> Vec<u8> {
-    signed_octets(real_message_r, ni, sk_pr, idr_body)
+pub fn responder_signed_octets(algo: PrfAlgorithm, real_message_r: &[u8], ni: &[u8], sk_pr: &[u8], idr_body: &[u8]) -> Vec<u8> {
+    signed_octets(algo, real_message_r, ni, sk_pr, idr_body)
 }
 
-fn signed_octets(real_message: &[u8], peer_nonce: &[u8], sk_p: &[u8], id_body: &[u8]) -> Vec<u8> {
-    let maced_id = prf(sk_p, id_body);
+fn signed_octets(algo: PrfAlgorithm, real_message: &[u8], peer_nonce: &[u8], sk_p: &[u8], id_body: &[u8]) -> Vec<u8> {
+    let maced_id = prf(algo, sk_p, id_body);
     let mut out = Vec::with_capacity(real_message.len() + peer_nonce.len() + maced_id.len());
     out.extend_from_slice(real_message);
     out.extend_from_slice(peer_nonce);
@@ -46,28 +47,30 @@ fn signed_octets(real_message: &[u8], peer_nonce: &[u8], sk_p: &[u8], id_body: &
 
 /// The pre-shared-key AUTH value:
 /// `prf( prf(PSK, "Key Pad for IKEv2"), <signed_octets> )`.
-pub fn psk_auth(psk: &[u8], signed_octets: &[u8]) -> Vec<u8> {
-    let inner = prf(psk, KEY_PAD);
-    prf(&inner, signed_octets).to_vec()
+pub fn psk_auth(algo: PrfAlgorithm, psk: &[u8], signed_octets: &[u8]) -> Vec<u8> {
+    let inner = prf(algo, psk, KEY_PAD);
+    prf(algo, &inner, signed_octets)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const SHA256: PrfAlgorithm = PrfAlgorithm::Sha256;
+
     #[test]
     fn psk_auth_is_deterministic_and_key_sensitive() {
-        let octets = initiator_signed_octets(b"real message I", &[0x22; 32], &[0x11; 32], b"\x02\x00\x00\x00client");
-        let a1 = psk_auth(b"secret", &octets);
-        assert_eq!(a1, psk_auth(b"secret", &octets)); // deterministic
+        let octets = initiator_signed_octets(SHA256, b"real message I", &[0x22; 32], &[0x11; 32], b"\x02\x00\x00\x00client");
+        let a1 = psk_auth(SHA256, b"secret", &octets);
+        assert_eq!(a1, psk_auth(SHA256, b"secret", &octets)); // deterministic
         assert_eq!(a1.len(), 32); // HMAC-SHA256
-        assert_ne!(psk_auth(b"other-psk", &octets), a1); // key-sensitive
+        assert_ne!(psk_auth(SHA256, b"other-psk", &octets), a1); // key-sensitive
     }
 
     #[test]
     fn initiator_and_responder_octets_differ() {
-        let i = initiator_signed_octets(b"msgI", &[2; 32], &[9; 32], b"idi");
-        let r = responder_signed_octets(b"msgR", &[1; 32], &[8; 32], b"idr");
+        let i = initiator_signed_octets(SHA256, b"msgI", &[2; 32], &[9; 32], b"idi");
+        let r = responder_signed_octets(SHA256, b"msgR", &[1; 32], &[8; 32], b"idr");
         assert_ne!(i, r);
     }
 
@@ -80,12 +83,24 @@ mod tests {
         let sk_pi = [0xABu8; 32];
         let idi_body = b"\x02\x00\x00\x00initiator.example";
 
-        let sent = psk_auth(b"correct horse", &initiator_signed_octets(real_msg_i, &nr, &sk_pi, idi_body));
-        let verified = psk_auth(b"correct horse", &initiator_signed_octets(real_msg_i, &nr, &sk_pi, idi_body));
+        let sent = psk_auth(SHA256, b"correct horse", &initiator_signed_octets(SHA256, real_msg_i, &nr, &sk_pi, idi_body));
+        let verified = psk_auth(SHA256, b"correct horse", &initiator_signed_octets(SHA256, real_msg_i, &nr, &sk_pi, idi_body));
         assert_eq!(sent, verified);
 
         // A tampered RealMessage (e.g. a modified SA_INIT) changes the AUTH.
-        let tampered = psk_auth(b"correct horse", &initiator_signed_octets(b"different message", &nr, &sk_pi, idi_body));
+        let tampered =
+            psk_auth(SHA256, b"correct horse", &initiator_signed_octets(SHA256, b"different message", &nr, &sk_pi, idi_body));
         assert_ne!(sent, tampered);
+    }
+
+    #[test]
+    fn a_different_prf_changes_the_auth_value() {
+        // Using a different negotiated PRF (SHA-512 instead of SHA-256) must
+        // change the AUTH value -- confirms the PRF is actually threaded
+        // through, not silently ignored.
+        let octets256 = initiator_signed_octets(SHA256, b"msg", &[1; 32], &[2; 32], b"id");
+        let octets512 = initiator_signed_octets(PrfAlgorithm::Sha512, b"msg", &[1; 32], &[2; 32], b"id");
+        assert_ne!(octets256, octets512);
+        assert_ne!(psk_auth(SHA256, b"psk", &octets256), psk_auth(PrfAlgorithm::Sha512, b"psk", &octets512));
     }
 }

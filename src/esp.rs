@@ -1,29 +1,46 @@
-//! Userspace ESP (RFC 4303) in tunnel mode with AES-256-GCM (RFC 4106).
+//! Userspace ESP (RFC 4303) in tunnel mode, algorithm-agile.
 //!
-//! `ryke` encrypts and decrypts the tunneled IP packets itself — it does not use
-//! the OS kernel's IPsec stack. An ESP packet on the wire:
+//! `ryke` can encrypt and decrypt the tunneled IP packets itself — it does not
+//! have to use the OS kernel's IPsec stack (though `free-vpn-v2`'s live data
+//! plane does, via kernel XFRM; this module backs the test/interop harnesses
+//! and any userspace-ESP consumer). An ESP packet on the wire:
 //!
 //! ```text
-//! SPI(4) | SeqNum(4) | IV(8) | ciphertext | ICV(16)
+//! SPI(4) | SeqNum(4) | IV | ciphertext | ICV
 //! ```
 //!
-//! where the ciphertext covers `{ inner IP packet | padding | pad length | next
-//! header }` and the AEAD associated data is `SPI | SeqNum`. The GCM nonce is
-//! `salt(4) ‖ IV(8)`; the salt comes from the CHILD-SA key material (the last 4
-//! bytes of the 36-byte AES-GCM key), and the IV is the packet's sequence number
-//! (unique per key, as GCM requires).
+//! where the ciphertext covers `{ inner IP packet | padding | pad length |
+//! next header }` (RFC 4303 §2.4, same trailer for every cipher below).
+//!
+//! - **AEAD** (AES-GCM-16 128/192/256, ChaCha20-Poly1305): IV is 8 bytes
+//!   (explicit), ICV is the 16-byte AEAD tag folded in by the cipher itself.
+//!   The nonce is `salt(4) ‖ IV(8)`, salt from the CHILD-SA key material's
+//!   trailing 4 bytes; the AEAD associated data is `SPI | SeqNum`.
+//! - **Classic** (AES-CBC 128/192/256, 3DES-CBC, paired with a separate
+//!   [`crate::crypto::IntegAlgorithm`]): IV is the cipher's block size,
+//!   derived per-packet from the (secret) encryption key + SPI + sequence
+//!   number via SHA-256 (see [`cbc_packet_iv`]) rather than drawn from an
+//!   RNG — `EspSa::seal` has no entropy-source parameter, and a value that's
+//!   a keyed hash of already-unique-per-key inputs (SPI+seq never repeat
+//!   under one key) is exactly as unpredictable to an attacker without the
+//!   key as fresh randomness would be, which is what CBC's IV requirement
+//!   (unique + unpredictable) actually needs. The ICV is
+//!   `IntegAlgorithm::compute` over `SPI | SeqNum | IV | ciphertext`
+//!   (RFC 4303 §2.8: everything but the ICV field itself).
+//!
+//! Both cipher families reuse [`crate::ikev2::sk::SkCipher`] — the same
+//! ENCR(+INTEG) tag the `SK{}` payload uses — since the algorithm catalog
+//! (RFC 7296 §3.3.2 transform IDs) and the low-level AEAD/CBC primitives are
+//! identical; only the surrounding packet framing (ESP header vs. IKE
+//! header) differs.
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
-
-use crate::crypto::derive_child_keys;
+use crate::crypto::{derive_child_keys, derive_child_keys_pfs, ChildKeys, IntegAlgorithm};
 use crate::error::IkeError;
+use crate::ikev2::sk::{aead_nonce, aead_open_dispatch, aead_seal_dispatch, cbc_decrypt, cbc_encrypt, SkCipher};
 use crate::role::Role;
 
-const KEY_LEN: usize = 32;
 const SALT_LEN: usize = 4;
-const IV_LEN: usize = 8;
-const ICV_LEN: usize = 16;
+const IV_LEN: usize = 8; // AEAD explicit IV
 const ESP_HEADER_LEN: usize = 8; // SPI + SeqNum
 
 /// Next Header values for tunnel-mode inner packets.
@@ -32,43 +49,112 @@ pub mod next_header {
     pub const IPV6: u8 = 41;
 }
 
-/// One direction of an ESP security association: AES-256-GCM, tunnel mode,
-/// non-ESN. Holds the SPI to stamp on outbound packets, the key + salt, and the
-/// outbound sequence counter.
+/// Constant-time byte-slice equality — avoids a timing side channel verifying
+/// a classic cipher's HMAC ICV.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Per-packet CBC IV: `SHA-256(enc_key | SPI | seq | counter)`, truncated to
+/// `block` bytes. See the module doc for why this (rather than an RNG call)
+/// is the right source for a classic ESP cipher's IV here.
+fn cbc_packet_iv(enc_key: &[u8], spi: u32, seq: u32, block: usize) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut out = Vec::with_capacity(block + 32);
+    let mut counter: u8 = 0;
+    while out.len() < block {
+        let mut h = Sha256::new();
+        h.update(b"ryke-esp-cbc-iv");
+        h.update(enc_key);
+        h.update(spi.to_be_bytes());
+        h.update(seq.to_be_bytes());
+        h.update([counter]);
+        out.extend_from_slice(&h.finalize());
+        counter += 1;
+    }
+    out.truncate(block);
+    out
+}
+
+/// One direction of an ESP security association: tunnel mode, non-ESN, under
+/// a negotiated [`SkCipher`]. Holds the SPI to stamp on outbound packets, the
+/// key material, and the outbound sequence counter.
 pub struct EspSa {
     spi: u32,
-    key: [u8; KEY_LEN],
-    salt: [u8; SALT_LEN],
+    cipher: SkCipher,
+    /// Raw encryption key (no salt — kept separately below).
+    enc_key: Vec<u8>,
+    /// AEAD salt (4 bytes); empty for a classic cipher.
+    salt: Vec<u8>,
+    /// Classic-cipher integrity key; empty for AEAD.
+    integ_key: Vec<u8>,
     seq: u32,
 }
 
 impl EspSa {
     /// `key_material` is 36 bytes: a 32-byte AES-256 key + a 4-byte salt, as
-    /// produced by [`crate::derive_child_keys`] for AES-GCM.
+    /// produced by [`crate::crypto::derive_child_keys`] for the fixed
+    /// AES-256-GCM shape every caller of this constructor still uses today
+    /// (`ikev1::quick`, `examples/ike_client_eap_fortigate`). Prefer
+    /// [`Self::new_with_cipher`] for any other [`SkCipher`].
     pub fn new(spi: u32, key_material: &[u8]) -> Result<Self, IkeError> {
-        if key_material.len() != KEY_LEN + SALT_LEN {
-            return Err(IkeError::Crypto("ESP key material must be 36 bytes (32-byte key + 4-byte salt)"));
+        Self::new_with_cipher(spi, SkCipher::Aes256Gcm, key_material, &[])
+    }
+
+    /// Build one direction of an ESP SA under an arbitrary negotiated
+    /// `cipher`. `enc_material` is the encryption key, plus (for an AEAD
+    /// cipher) its trailing 4-byte salt — `cipher.key_len() +
+    /// cipher.salt_len()` bytes total. `integ_key` is the separate
+    /// integrity key a classic cipher needs (`cipher.integ_algorithm()`'s
+    /// `key_len()` bytes; ignored, and may be empty, for AEAD).
+    pub fn new_with_cipher(spi: u32, cipher: SkCipher, enc_material: &[u8], integ_key: &[u8]) -> Result<Self, IkeError> {
+        let want_enc = cipher.key_len() + cipher.salt_len();
+        if enc_material.len() != want_enc {
+            return Err(IkeError::Crypto("ESP encryption key material has the wrong length for this cipher"));
         }
-        let mut key = [0u8; KEY_LEN];
-        key.copy_from_slice(&key_material[..KEY_LEN]);
-        let mut salt = [0u8; SALT_LEN];
-        salt.copy_from_slice(&key_material[KEY_LEN..]);
-        Ok(EspSa { spi, key, salt, seq: 0 })
+        if let Some(integ) = cipher.integ_algorithm() {
+            if integ_key.len() != integ.key_len() {
+                return Err(IkeError::Crypto("ESP integrity key has the wrong length for this cipher"));
+            }
+        }
+        let (enc_key, salt) = enc_material.split_at(cipher.key_len());
+        Ok(EspSa {
+            spi,
+            cipher,
+            enc_key: enc_key.to_vec(),
+            salt: salt.to_vec(),
+            integ_key: integ_key.to_vec(),
+            seq: 0,
+        })
     }
 
     pub fn spi(&self) -> u32 {
         self.spi
     }
 
-    fn cipher(&self) -> Aes256Gcm {
-        Aes256Gcm::new_from_slice(&self.key).expect("32-byte AES key")
+    /// The raw key+salt material this SA was derived from (32-byte AES key +
+    /// 4-byte GCM salt, RFC 4106 layout) — for a consumer that hands packets
+    /// to the kernel via XFRM instead of this struct's own `seal`/`open`.
+    /// AES-256-GCM only; panics if this SA was built with a different cipher
+    /// (a caller using [`Self::new_with_cipher`] for a non-default cipher
+    /// already has its own key material and has no reason to call this).
+    pub fn key_material(&self) -> [u8; 32 + SALT_LEN] {
+        assert_eq!(self.cipher, SkCipher::Aes256Gcm, "key_material() is AES-256-GCM-only");
+        let mut out = [0u8; 32 + SALT_LEN];
+        out[..32].copy_from_slice(&self.enc_key);
+        out[32..].copy_from_slice(&self.salt);
+        out
     }
 
     fn nonce(&self, iv: &[u8; IV_LEN]) -> [u8; SALT_LEN + IV_LEN] {
-        let mut nonce = [0u8; SALT_LEN + IV_LEN];
-        nonce[..SALT_LEN].copy_from_slice(&self.salt);
-        nonce[SALT_LEN..].copy_from_slice(iv);
-        nonce
+        aead_nonce(&self.salt, iv)
     }
 
     /// Encrypt an inner IP packet into an ESP packet (tunnel mode). Advances the
@@ -79,12 +165,13 @@ impl EspSa {
             .checked_add(1)
             .ok_or(IkeError::Crypto("ESP sequence number exhausted; rekey required"))?;
         let seq = self.seq;
-        let iv = (seq as u64).to_be_bytes();
 
         // plaintext = inner | padding | pad_len | next_header, padded so that
-        // (inner + padding + 2) is a multiple of 4 (RFC 4303 §2.4).
+        // (inner + padding + 2) is a multiple of 4 (RFC 4303 §2.4) for AEAD,
+        // or a multiple of the cipher's block size for a classic cipher.
+        let align = if self.cipher.is_aead() { 4 } else { self.cipher.block_len() };
         let unpadded = inner.len() + 2;
-        let pad = (4 - (unpadded % 4)) % 4;
+        let pad = (align - (unpadded % align)) % align;
         let mut plaintext = Vec::with_capacity(inner.len() + pad + 2);
         plaintext.extend_from_slice(inner);
         for i in 0..pad {
@@ -97,14 +184,26 @@ impl EspSa {
         aad[..4].copy_from_slice(&self.spi.to_be_bytes());
         aad[4..].copy_from_slice(&seq.to_be_bytes());
 
-        let ct_and_tag = self
-            .cipher()
-            .encrypt(Nonce::from_slice(&self.nonce(&iv)), Payload { msg: &plaintext, aad: &aad })
-            .map_err(|_| IkeError::Crypto("ESP encryption failed"))?;
+        let (iv, ct_and_tag): (Vec<u8>, Vec<u8>) = if self.cipher.is_aead() {
+            let iv = (seq as u64).to_be_bytes();
+            let ct = aead_seal_dispatch(self.cipher, &self.enc_key, &self.nonce(&iv), &aad, &plaintext)?;
+            (iv.to_vec(), ct)
+        } else {
+            let iv = cbc_packet_iv(&self.enc_key, self.spi, seq, self.cipher.block_len());
+            let ct = cbc_encrypt(self.cipher, &self.enc_key, &iv, &plaintext)?;
+            let integ = self.cipher.integ_algorithm().expect("classic cipher has an integ algorithm");
+            let mut mac_input = Vec::with_capacity(aad.len() + iv.len() + ct.len());
+            mac_input.extend_from_slice(&aad);
+            mac_input.extend_from_slice(&iv);
+            mac_input.extend_from_slice(&ct);
+            let icv = integ.compute(&self.integ_key, &mac_input);
+            let mut ct_and_icv = ct;
+            ct_and_icv.extend_from_slice(&icv);
+            (iv, ct_and_icv)
+        };
 
-        let mut out = Vec::with_capacity(ESP_HEADER_LEN + IV_LEN + ct_and_tag.len());
-        out.extend_from_slice(&self.spi.to_be_bytes());
-        out.extend_from_slice(&seq.to_be_bytes());
+        let mut out = Vec::with_capacity(ESP_HEADER_LEN + iv.len() + ct_and_tag.len());
+        out.extend_from_slice(&aad);
         out.extend_from_slice(&iv);
         out.extend_from_slice(&ct_and_tag);
         Ok(out)
@@ -113,7 +212,9 @@ impl EspSa {
     /// Decrypt an ESP packet, returning the inner IP packet and its Next Header.
     /// The packet's SPI must match this SA.
     pub fn open(&self, packet: &[u8]) -> Result<(Vec<u8>, u8), IkeError> {
-        let min = ESP_HEADER_LEN + IV_LEN + ICV_LEN;
+        let iv_len = if self.cipher.is_aead() { IV_LEN } else { self.cipher.block_len() };
+        let icv_len = self.cipher.icv_len();
+        let min = ESP_HEADER_LEN + iv_len + icv_len;
         if packet.len() < min {
             return Err(IkeError::Truncated { need: min, have: packet.len() });
         }
@@ -121,16 +222,33 @@ impl EspSa {
         if spi != self.spi {
             return Err(IkeError::Crypto("ESP SPI does not match this SA"));
         }
-        let iv: [u8; IV_LEN] = packet[8..16].try_into().unwrap();
-        let ct_and_tag = &packet[16..];
+        let aad = &packet[0..ESP_HEADER_LEN]; // SPI | SeqNum
+        let iv = &packet[ESP_HEADER_LEN..ESP_HEADER_LEN + iv_len];
+        let ct_and_tag = &packet[ESP_HEADER_LEN + iv_len..];
 
-        let mut aad = [0u8; ESP_HEADER_LEN];
-        aad.copy_from_slice(&packet[0..ESP_HEADER_LEN]); // SPI | SeqNum
-
-        let plaintext = self
-            .cipher()
-            .decrypt(Nonce::from_slice(&self.nonce(&iv)), Payload { msg: ct_and_tag, aad: &aad })
-            .map_err(|_| IkeError::BadIntegrity)?;
+        let plaintext = if self.cipher.is_aead() {
+            let iv_arr: [u8; IV_LEN] = iv.try_into().unwrap();
+            aead_open_dispatch(self.cipher, &self.enc_key, &self.nonce(&iv_arr), aad, ct_and_tag)?
+        } else {
+            if ct_and_tag.len() < icv_len {
+                return Err(IkeError::Truncated { need: icv_len, have: ct_and_tag.len() });
+            }
+            let ct = &ct_and_tag[..ct_and_tag.len() - icv_len];
+            let icv = &ct_and_tag[ct_and_tag.len() - icv_len..];
+            if ct.is_empty() || ct.len() % self.cipher.block_len() != 0 {
+                return Err(IkeError::Crypto("ESP CBC ciphertext not block-aligned"));
+            }
+            let integ = self.cipher.integ_algorithm().expect("classic cipher has an integ algorithm");
+            let mut mac_input = Vec::with_capacity(aad.len() + iv.len() + ct.len());
+            mac_input.extend_from_slice(aad);
+            mac_input.extend_from_slice(iv);
+            mac_input.extend_from_slice(ct);
+            let expected_icv = integ.compute(&self.integ_key, &mac_input);
+            if !ct_eq(&expected_icv, icv) {
+                return Err(IkeError::BadIntegrity);
+            }
+            cbc_decrypt(self.cipher, &self.enc_key, iv, ct)?
+        };
 
         // Trailer: [ … | padding(pad_len) | pad_len | next_header ].
         if plaintext.len() < 2 {
@@ -146,7 +264,7 @@ impl EspSa {
     }
 }
 
-/// Both ESP directions for one endpoint of a CHILD SA (AES-GCM-256).
+/// Both ESP directions for one endpoint of a CHILD SA.
 pub struct ChildSa {
     /// SA we encrypt outbound traffic on (stamped with the peer's SPI).
     pub outbound: EspSa,
@@ -157,21 +275,81 @@ pub struct ChildSa {
 impl ChildSa {
     /// Derive both ESP SAs from the IKE SA's `SK_d`, the two nonces, our role,
     /// and the two ESP SPIs (`local_spi` is the SPI we chose in our SA payload;
-    /// `peer_spi` is the SPI the peer chose). RFC 7296 §2.17: `encr_i` is the
-    /// initiator's outbound key, `encr_r` the responder's; a packet carries the
-    /// SPI of the SA that *receives* it.
-    pub fn derive(sk_d: &[u8], ni: &[u8], nr: &[u8], role: Role, local_spi: u32, peer_spi: u32) -> ChildSa {
-        // AES-GCM-256: 36-byte key material per direction, no separate integ key.
-        let keys = derive_child_keys(sk_d, ni, nr, KEY_LEN + SALT_LEN, 0);
-        let esp = |spi: u32, material: &[u8]| EspSa::new(spi, material).expect("36-byte child key");
+    /// `peer_spi` is the SPI the peer chose), under the fixed AES-256-GCM
+    /// cipher every caller of this constructor still uses today. Prefer
+    /// [`Self::derive_with_cipher`] for any other [`SkCipher`]. RFC 7296
+    /// §2.17: `encr_i` is the initiator's outbound key, `encr_r` the
+    /// responder's; a packet carries the SPI of the SA that *receives* it.
+    pub fn derive(prf: crate::crypto::PrfAlgorithm, sk_d: &[u8], ni: &[u8], nr: &[u8], role: Role, local_spi: u32, peer_spi: u32) -> ChildSa {
+        Self::derive_with_cipher(prf, SkCipher::Aes256Gcm, sk_d, ni, nr, role, local_spi, peer_spi)
+    }
+
+    /// Like [`Self::derive`], but under an arbitrary negotiated ESP `cipher`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn derive_with_cipher(
+        prf: crate::crypto::PrfAlgorithm,
+        cipher: SkCipher,
+        sk_d: &[u8],
+        ni: &[u8],
+        nr: &[u8],
+        role: Role,
+        local_spi: u32,
+        peer_spi: u32,
+    ) -> ChildSa {
+        let integ_len = cipher.integ_algorithm().map(IntegAlgorithm::key_len).unwrap_or(0);
+        let keys = derive_child_keys(prf, sk_d, ni, nr, cipher.key_len() + cipher.salt_len(), integ_len);
+        Self::from_keys(cipher, keys, role, local_spi, peer_spi)
+    }
+
+    /// Like [`Self::derive`], but for a **PFS** CHILD SA rekey: folds the
+    /// fresh `shared_secret` from the rekey's own KE exchange into the seed
+    /// (see [`crate::crypto::derive_child_keys_pfs`]) instead of deriving
+    /// straight from `Ni | Nr`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn derive_pfs(
+        prf: crate::crypto::PrfAlgorithm,
+        shared_secret: &[u8],
+        sk_d: &[u8],
+        ni: &[u8],
+        nr: &[u8],
+        role: Role,
+        local_spi: u32,
+        peer_spi: u32,
+    ) -> ChildSa {
+        Self::derive_with_cipher_pfs(prf, SkCipher::Aes256Gcm, shared_secret, sk_d, ni, nr, role, local_spi, peer_spi)
+    }
+
+    /// Like [`Self::derive_with_cipher`], but for a **PFS** CHILD SA rekey --
+    /// see [`Self::derive_pfs`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn derive_with_cipher_pfs(
+        prf: crate::crypto::PrfAlgorithm,
+        cipher: SkCipher,
+        shared_secret: &[u8],
+        sk_d: &[u8],
+        ni: &[u8],
+        nr: &[u8],
+        role: Role,
+        local_spi: u32,
+        peer_spi: u32,
+    ) -> ChildSa {
+        let integ_len = cipher.integ_algorithm().map(IntegAlgorithm::key_len).unwrap_or(0);
+        let keys = derive_child_keys_pfs(prf, sk_d, shared_secret, ni, nr, cipher.key_len() + cipher.salt_len(), integ_len);
+        Self::from_keys(cipher, keys, role, local_spi, peer_spi)
+    }
+
+    fn from_keys(cipher: SkCipher, keys: ChildKeys, role: Role, local_spi: u32, peer_spi: u32) -> ChildSa {
+        let esp = |spi: u32, enc: &[u8], integ: &[u8]| {
+            EspSa::new_with_cipher(spi, cipher, enc, integ).expect("derive_child_keys produced correctly-sized material")
+        };
         match role {
             Role::Initiator => ChildSa {
-                outbound: esp(peer_spi, &keys.encr_i),
-                inbound: esp(local_spi, &keys.encr_r),
+                outbound: esp(peer_spi, &keys.encr_i, &keys.integ_i),
+                inbound: esp(local_spi, &keys.encr_r, &keys.integ_r),
             },
             Role::Responder => ChildSa {
-                outbound: esp(peer_spi, &keys.encr_r),
-                inbound: esp(local_spi, &keys.encr_i),
+                outbound: esp(peer_spi, &keys.encr_r, &keys.integ_r),
+                inbound: esp(local_spi, &keys.encr_i, &keys.integ_i),
             },
         }
     }
@@ -205,7 +383,7 @@ mod tests {
             let inner: Vec<u8> = (0..len as u8).collect();
             let packet = tx.seal(&inner, next_header::IPV6).unwrap();
             // ciphertext (after SPI|Seq|IV, before the 16-byte tag) is 4-aligned.
-            let ct_len = packet.len() - ESP_HEADER_LEN - IV_LEN - ICV_LEN;
+            let ct_len = packet.len() - ESP_HEADER_LEN - IV_LEN - 16;
             assert_eq!(ct_len % 4, 0, "len {len}");
             let (out, nh) = rx.open(&packet).unwrap();
             assert_eq!(out, inner);
@@ -243,5 +421,109 @@ mod tests {
         let rx2 = EspSa::new(5, &[8u8; 36]).unwrap();
         let good = tx2.seal(b"y", 4).unwrap();
         assert_eq!(rx2.open(&good).unwrap_err(), IkeError::BadIntegrity);
+    }
+
+    fn aead_ciphers() -> Vec<SkCipher> {
+        vec![SkCipher::Aes128Gcm, SkCipher::Aes192Gcm, SkCipher::Aes256Gcm, SkCipher::ChaCha20Poly1305]
+    }
+
+    fn cbc_ciphers() -> Vec<SkCipher> {
+        use IntegAlgorithm::*;
+        vec![
+            SkCipher::Aes128Cbc(HmacSha2_256_128),
+            SkCipher::Aes192Cbc(HmacSha1_96),
+            SkCipher::Aes256Cbc(HmacSha2_512_256),
+            SkCipher::TripleDesCbc(HmacMd5_96),
+        ]
+    }
+
+    #[test]
+    fn every_aead_cipher_roundtrips_various_lengths() {
+        for cipher in aead_ciphers() {
+            let enc = vec![0x24u8; cipher.key_len() + cipher.salt_len()];
+            for len in [0usize, 1, 15, 16, 17, 40] {
+                let mut tx = EspSa::new_with_cipher(1, cipher, &enc, &[]).unwrap();
+                let rx = EspSa::new_with_cipher(1, cipher, &enc, &[]).unwrap();
+                let inner: Vec<u8> = (0..len as u8).collect();
+                let packet = tx.seal(&inner, next_header::IPV4).unwrap();
+                let (out, nh) = rx.open(&packet).unwrap();
+                assert_eq!(out, inner, "{cipher:?} len={len}");
+                assert_eq!(nh, next_header::IPV4, "{cipher:?} len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_cbc_cipher_roundtrips_various_lengths() {
+        for cipher in cbc_ciphers() {
+            let integ = cipher.integ_algorithm().unwrap();
+            let enc = vec![0x31u8; cipher.key_len()];
+            let ik = vec![0x62u8; integ.key_len()];
+            for len in [0usize, 1, 15, 16, 17, 40] {
+                let mut tx = EspSa::new_with_cipher(1, cipher, &enc, &ik).unwrap();
+                let rx = EspSa::new_with_cipher(1, cipher, &enc, &ik).unwrap();
+                let inner: Vec<u8> = (0..len as u8).collect();
+                let packet = tx.seal(&inner, next_header::IPV6).unwrap();
+                let (out, nh) = rx.open(&packet).unwrap();
+                assert_eq!(out, inner, "{cipher:?} len={len}");
+                assert_eq!(nh, next_header::IPV6, "{cipher:?} len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn cbc_iv_differs_per_packet_and_ciphertext_is_block_aligned() {
+        for cipher in cbc_ciphers() {
+            let integ = cipher.integ_algorithm().unwrap();
+            let enc = vec![0x11u8; cipher.key_len()];
+            let ik = vec![0x22u8; integ.key_len()];
+            let mut tx = EspSa::new_with_cipher(7, cipher, &enc, &ik).unwrap();
+            let p1 = tx.seal(b"same plaintext", 4).unwrap();
+            let p2 = tx.seal(b"same plaintext", 4).unwrap();
+            let block = cipher.block_len();
+            let iv1 = &p1[ESP_HEADER_LEN..ESP_HEADER_LEN + block];
+            let iv2 = &p2[ESP_HEADER_LEN..ESP_HEADER_LEN + block];
+            assert_ne!(iv1, iv2, "{cipher:?}");
+            assert_ne!(p1, p2, "{cipher:?}");
+        }
+    }
+
+    #[test]
+    fn cbc_tampering_and_wrong_integ_key_are_rejected() {
+        for cipher in cbc_ciphers() {
+            let integ = cipher.integ_algorithm().unwrap();
+            let enc = vec![0x44u8; cipher.key_len()];
+            let ik = vec![0x55u8; integ.key_len()];
+            let mut tx = EspSa::new_with_cipher(5, cipher, &enc, &ik).unwrap();
+            let rx = EspSa::new_with_cipher(5, cipher, &enc, &ik).unwrap();
+            let mut packet = tx.seal(b"hello world", 4).unwrap();
+            let last = packet.len() - 1;
+            packet[last] ^= 1;
+            assert_eq!(rx.open(&packet).unwrap_err(), IkeError::BadIntegrity, "{cipher:?}");
+
+            let mut bad_ik = ik.clone();
+            bad_ik[0] ^= 0xff;
+            let mut tx2 = EspSa::new_with_cipher(5, cipher, &enc, &ik).unwrap();
+            let rx2 = EspSa::new_with_cipher(5, cipher, &enc, &bad_ik).unwrap();
+            let good = tx2.seal(b"y", 4).unwrap();
+            assert_eq!(rx2.open(&good).unwrap_err(), IkeError::BadIntegrity, "{cipher:?}");
+        }
+    }
+
+    #[test]
+    fn derive_with_cipher_matches_across_the_matrix() {
+        use crate::crypto::PrfAlgorithm;
+        for cipher in aead_ciphers().into_iter().chain(cbc_ciphers()) {
+            let sk_d = [0x77u8; 32];
+            let ni = [0x11u8; 32];
+            let nr = [0x22u8; 32];
+            let mut init = ChildSa::derive_with_cipher(PrfAlgorithm::Sha256, cipher, &sk_d, &ni, &nr, Role::Initiator, 100, 200);
+            let mut resp = ChildSa::derive_with_cipher(PrfAlgorithm::Sha256, cipher, &sk_d, &ni, &nr, Role::Responder, 200, 100);
+
+            let pkt = init.outbound.seal(b"init->resp", next_header::IPV4).unwrap();
+            assert_eq!(resp.inbound.open(&pkt).unwrap().0, b"init->resp", "{cipher:?}");
+            let pkt2 = resp.outbound.seal(b"resp->init", next_header::IPV4).unwrap();
+            assert_eq!(init.inbound.open(&pkt2).unwrap().0, b"resp->init", "{cipher:?}");
+        }
     }
 }

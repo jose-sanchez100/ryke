@@ -369,6 +369,7 @@ fn responder_respond_inner(
     let spi_i = header.initiator_spi;
     let spi_r = local.spi;
     let keys = crypto::derive_session_keys(
+        suite.prf_algorithm(),
         &shared,
         &payloads.nonce.data, // Ni
         &local.nonce,         // Nr
@@ -421,6 +422,7 @@ pub fn initiator_complete(local: &LocalSecret, request: &[u8], response: &[u8]) 
     let spi_i = local.spi;
     let spi_r = header.responder_spi;
     let keys = crypto::derive_session_keys(
+        suite.prf_algorithm(),
         &shared,
         &local.nonce,         // Ni
         &payloads.nonce.data, // Nr
@@ -600,10 +602,10 @@ mod tests {
 
     #[test]
     fn responder_rejects_unsupported_offer() {
-        // Offer only MODP-1536 (group 5) for DH, which ryke does not implement.
+        // Offer a DH group id that doesn't exist -- ryke can't implement it.
         let mut offer = default_offer();
         offer.proposals[0].transforms[2] =
-            Transform { transform_type: transform_type::DH, transform_id: 5, key_length: None };
+            Transform { transform_type: transform_type::DH, transform_id: 9999, key_length: None };
         let request = initiator_request(&init_secret(), &offer);
         let err = responder_respond(&request, &resp_secret()).unwrap_err();
         assert_eq!(err, IkeError::NoProposalChosen);

@@ -102,7 +102,8 @@ impl<E: Entropy> Server<E> {
                 let (response, peer_id, peer_child_spi) =
                     ike_auth::responder_process_auth(&sa, &data, &self.auth, child_spi, &iv, None)?;
                 self.transport.send_to(&response, from)?;
-                let child = ChildSa::derive(&sa.keys.sk_d, &sa.ni, &sa.nr, Role::Responder, child_spi, peer_child_spi);
+                let child =
+                    ChildSa::derive(sa.suite.prf_algorithm(), &sa.keys.sk_d, &sa.ni, &sa.nr, Role::Responder, child_spi, peer_child_spi);
                 self.children.insert(key, child);
                 Ok(ServerEvent::Established { spi_i: key.0, spi_r: key.1, peer_id })
             }

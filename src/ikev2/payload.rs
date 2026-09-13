@@ -21,17 +21,37 @@ pub mod transform_type {
 
 /// A selection of transform IDs we care about at M1.
 pub mod transform_id {
-    // ENCR
+    // ENCR (RFC 7296 §3.3.2, IANA "Transform Type 1 - Encryption Algorithm Transform IDs")
+    pub const DES_IV64: u16 = 1;
+    pub const DES: u16 = 2;
+    pub const TRIPLE_DES: u16 = 3;
     pub const AES_CBC: u16 = 12;
     pub const AES_GCM_16: u16 = 20;
+    pub const CHACHA20_POLY1305: u16 = 28;
     // PRF
+    pub const PRF_HMAC_MD5: u16 = 1;
+    pub const PRF_HMAC_SHA1: u16 = 2;
     pub const PRF_HMAC_SHA2_256: u16 = 5;
+    pub const PRF_HMAC_SHA2_384: u16 = 6;
+    pub const PRF_HMAC_SHA2_512: u16 = 7;
     // INTEG
+    pub const AUTH_HMAC_MD5_96: u16 = 1;
+    pub const AUTH_HMAC_SHA1_96: u16 = 2;
     pub const AUTH_HMAC_SHA2_256_128: u16 = 12;
+    pub const AUTH_HMAC_SHA2_384_192: u16 = 13;
+    pub const AUTH_HMAC_SHA2_512_256: u16 = 14;
     // DH
+    pub const MODP_768: u16 = 1;
     pub const MODP_1024: u16 = 2;
+    pub const MODP_1536: u16 = 5;
     pub const MODP_2048: u16 = 14;
+    pub const MODP_3072: u16 = 15;
+    pub const MODP_4096: u16 = 16;
+    pub const MODP_6144: u16 = 17;
+    pub const MODP_8192: u16 = 18;
     pub const ECP256: u16 = 19;
+    pub const ECP384: u16 = 20;
+    pub const ECP521: u16 = 21;
     pub const X25519: u16 = 31;
     // ESN
     pub const ESN_NONE: u16 = 0;

@@ -33,13 +33,14 @@ use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
 };
 use crate::ikev2::mschapv2;
+use crate::ikev2::negotiate::{self, ChosenEspSuite};
 use crate::ikev2::payload::{
-    auth_method, Authentication, Certificate, Configuration, Identification,
+    auth_method, Authentication, Certificate, Configuration, Identification, SecurityAssociation,
     TrafficSelector, TrafficSelectors,
 };
 use crate::role::Role;
 use crate::ikev2::sign::SigningKey;
-use crate::ikev2::sk::{build_encrypted_gcm, open_encrypted_gcm};
+use crate::ikev2::sk::{build_encrypted, open_encrypted};
 
 /// How the server (responder) authenticates *itself* in the EAP exchange
 /// (RFC 7296 §2.16 — its own AUTH, separate from the EAP/MSK exchange).
@@ -96,6 +97,18 @@ fn peer_sk_e(sa: &CompletedSaInit) -> &[u8] {
         Role::Responder => &sa.keys.sk_ei,
     }
 }
+fn our_sk_a(sa: &CompletedSaInit) -> &[u8] {
+    match sa.role {
+        Role::Initiator => &sa.keys.sk_ai,
+        Role::Responder => &sa.keys.sk_ar,
+    }
+}
+fn peer_sk_a(sa: &CompletedSaInit) -> &[u8] {
+    match sa.role {
+        Role::Initiator => &sa.keys.sk_ar,
+        Role::Responder => &sa.keys.sk_ai,
+    }
+}
 
 fn full_tunnel_ts() -> Vec<u8> {
     TrafficSelectors { selectors: vec![TrafficSelector::ipv4_any()] }.to_bytes()
@@ -116,13 +129,13 @@ fn build_sk(sa: &CompletedSaInit, msg_id: u32, is_response: bool, inner: &[(Payl
     };
     let first = first_payload_type(inner);
     let bytes = encode_payload_chain(inner);
-    build_encrypted_gcm(header, first, &bytes, our_sk_e(sa), iv)
+    build_encrypted(sa.suite.sk_cipher(), header, first, &bytes, our_sk_e(sa), our_sk_a(sa), iv)
 }
 
 /// Collect a decrypted message's payloads plus its Message ID.
 fn decrypt(sa: &CompletedSaInit, message: &[u8]) -> Result<(u32, Payloads), IkeError> {
     let msg_id = IkeHeader::parse(message)?.message_id;
-    let (first, inner) = open_encrypted_gcm(message, peer_sk_e(sa))?;
+    let (first, inner) = open_encrypted(sa.suite.sk_cipher(), message, peer_sk_e(sa), peer_sk_a(sa))?;
     let mut out = Vec::new();
     for p in payloads(first, &inner) {
         let p = p?;
@@ -148,6 +161,7 @@ pub struct EapInitiator {
     user: Vec<u8>,
     password: String,
     child_spi: u32,
+    esp_offer: SecurityAssociation,
     nt_response: [u8; 24],
     verify: ServerVerify,
     server_verified: bool,
@@ -156,6 +170,9 @@ pub struct EapInitiator {
     /// the SPI we must stamp on outbound ESP so the peer's inbound SA accepts
     /// it. `None` until [`EapEvent::Established`].
     peer_child_spi: Option<u32>,
+    /// The ESP cipher the responder named in SAr2, once known — set only
+    /// after [`EapEvent::Established`].
+    peer_esp_suite: Option<ChosenEspSuite>,
     /// The inner IPv4 the responder assigned us (CFG_REPLY), if any.
     assigned_ip4: Option<std::net::Ipv4Addr>,
     /// The responder's actual granted `TSr` from the final message, if any --
@@ -173,17 +190,35 @@ impl EapInitiator {
         child_spi: u32,
         verify: ServerVerify,
     ) -> Self {
+        Self::new_with_esp_offer(sa, id, user, password, child_spi, esp_offer(0), verify)
+    }
+
+    /// Like [`Self::new`], but with a caller-supplied CHILD SA proposal
+    /// template instead of the default AES-GCM-256 one — see
+    /// [`crate::ikev2::ike_auth::initiator_auth_request_with_cfg`]'s doc for
+    /// `esp_offer`'s contract (its own SPI field is ignored/overwritten).
+    pub fn new_with_esp_offer(
+        sa: CompletedSaInit,
+        id: Identification,
+        user: Vec<u8>,
+        password: String,
+        child_spi: u32,
+        esp_offer: SecurityAssociation,
+        verify: ServerVerify,
+    ) -> Self {
         EapInitiator {
             sa,
             id,
             user,
             password,
             child_spi,
+            esp_offer,
             nt_response: [0u8; 24],
             verify,
             server_verified: false,
             send_certreq: false,
             peer_child_spi: None,
+            peer_esp_suite: None,
             assigned_ip4: None,
             granted_ts: None,
         }
@@ -212,6 +247,12 @@ impl EapInitiator {
     /// [`EapEvent::Established`].
     pub fn peer_child_spi(&self) -> Option<u32> {
         self.peer_child_spi
+    }
+
+    /// The ESP cipher the responder named in SAr2, once known — set only
+    /// after [`EapEvent::Established`].
+    pub fn peer_esp_suite(&self) -> Option<ChosenEspSuite> {
+        self.peer_esp_suite
     }
 
     /// The inner IPv4 the responder assigned us via CFG_REPLY, if any.
@@ -252,7 +293,7 @@ impl EapInitiator {
         if auth.method != auth_method::DIGITAL_SIGNATURE {
             return false;
         }
-        let octets = responder_signed_octets(&self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, idr);
+        let octets = responder_signed_octets(self.sa.suite.prf_algorithm(), &self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, idr);
         // Path validation (chain + dates + CA) + SAN binding + signature.
         crate::ikev2::sign::verify_cert_auth(leaf, &certs[1..], cas, Some(expected_dns), now, &auth.data, &octets).is_ok()
     }
@@ -264,11 +305,12 @@ impl EapInitiator {
                 &self.sa,
                 &self.id,
                 self.child_spi,
+                &self.esp_offer,
                 vec![[0u8; 20]],
                 &iv(entropy),
             )
         } else {
-            initiator_eap_request(&self.sa, &self.id, self.child_spi, &iv(entropy))
+            initiator_eap_request(&self.sa, &self.id, self.child_spi, &self.esp_offer, &iv(entropy))
         }
     }
 
@@ -310,13 +352,12 @@ impl EapInitiator {
             };
             let idr = find(&ps, PayloadType::IdResponder).unwrap_or(&[]);
             let msk = mschapv2::derive_msk(&self.password, &self.nt_response);
-            let expect = psk_auth(
-                &msk,
-                &responder_signed_octets(&self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, idr),
-            );
+            let algo = self.sa.suite.prf_algorithm();
+            let expect = psk_auth(algo, &msk, &responder_signed_octets(algo, &self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, idr));
             let got = Authentication::parse(auth_bytes)?;
             if got.method == auth_method::SHARED_KEY && got.data == expect {
                 self.peer_child_spi = esp_spi_from_sa(sar2);
+                self.peer_esp_suite = SecurityAssociation::parse(sar2).ok().and_then(|sa| negotiate::select_esp(&sa));
                 if let Some(cp) = find(&ps, PayloadType::Configuration).and_then(|d| Configuration::parse(d).ok()) {
                     self.assigned_ip4 = cp.assigned_ipv4();
                 }
@@ -339,8 +380,9 @@ impl EapInitiator {
             // EAP done: send AUTH keyed by the MSK.
             let msk = mschapv2::derive_msk(&self.password, &self.nt_response);
             let idi = self.id.to_bytes();
-            let octets = initiator_signed_octets(&self.sa.init_message, &self.sa.nr, &self.sa.keys.sk_pi, &idi);
-            let auth = Authentication { method: auth_method::SHARED_KEY, data: psk_auth(&msk, &octets) };
+            let algo = self.sa.suite.prf_algorithm();
+            let octets = initiator_signed_octets(algo, &self.sa.init_message, &self.sa.nr, &self.sa.keys.sk_pi, &idi);
+            let auth = Authentication { method: auth_method::SHARED_KEY, data: psk_auth(algo, &msk, &octets) };
             let msg = build_sk(&self.sa, next_id, false, &[(PayloadType::Authentication, auth.to_bytes())], &iv(entropy))?;
             return Ok(EapEvent::Reply(msg));
         }
@@ -465,12 +507,13 @@ impl EapResponder {
             self.peer_child_spi = esp_spi_from_sa(sai2);
             self.peer_idi = find(&ps, PayloadType::IdInitiator).unwrap_or(&[]).to_vec();
             let idr = self.id.to_bytes();
-            let octets = responder_signed_octets(&self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, &idr);
+            let algo = self.sa.suite.prf_algorithm();
+            let octets = responder_signed_octets(algo, &self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, &idr);
 
             let mut inner: Vec<(PayloadType, Vec<u8>)> = vec![(PayloadType::IdResponder, idr)];
             match &self.auth {
                 ServerAuth::Psk(psk) => {
-                    let auth = Authentication { method: auth_method::SHARED_KEY, data: psk_auth(psk, &octets) };
+                    let auth = Authentication { method: auth_method::SHARED_KEY, data: psk_auth(algo, psk, &octets) };
                     inner.push((PayloadType::Authentication, auth.to_bytes()));
                 }
                 ServerAuth::Cert { key, chain } => {
@@ -500,7 +543,9 @@ impl EapResponder {
         if let Some(auth_bytes) = find(&ps, PayloadType::Authentication) {
             if find(&ps, PayloadType::Eap).is_none() {
                 let msk = mschapv2::derive_msk(&self.password, &self.nt_response);
-                let expect = psk_auth(&msk, &initiator_signed_octets(&self.sa.init_message, &self.sa.nr, &self.sa.keys.sk_pi, &self.peer_idi));
+                let algo = self.sa.suite.prf_algorithm();
+                let expect =
+                    psk_auth(algo, &msk, &initiator_signed_octets(algo, &self.sa.init_message, &self.sa.nr, &self.sa.keys.sk_pi, &self.peer_idi));
                 let got = crate::ikev2::payload::Authentication::parse(auth_bytes)?;
                 if got.data != expect {
                     return Ok(EapEvent::Failed);
@@ -509,7 +554,7 @@ impl EapResponder {
                 let idr = self.id.to_bytes();
                 let our_auth = Authentication {
                     method: auth_method::SHARED_KEY,
-                    data: psk_auth(&msk, &responder_signed_octets(&self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, &idr)),
+                    data: psk_auth(algo, &msk, &responder_signed_octets(algo, &self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, &idr)),
                 };
                 // Assign the client its inner IP via a Configuration Payload
                 // (CFG_REPLY) and narrow TSi to that /32, mirroring the PSK path,

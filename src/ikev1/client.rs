@@ -1,5 +1,6 @@
 //! A minimal blocking IKEv1 **initiator** (client) over UDP: Aggressive Mode
-//! (PSK) followed by Quick Mode, establishing an ESP CHILD SA. No XAUTH /
+//! (PSK) followed by Quick Mode (optionally with PFS, see
+//! `InitiatorConfig::pfs_group`), establishing an ESP CHILD SA. No XAUTH /
 //! Mode-Config yet — suitable for gateways configured for plain PSK (including
 //! ryke's own responder).
 
@@ -10,7 +11,7 @@ use std::time::Duration;
 use crate::entropy::Entropy;
 use crate::esp::ChildSa;
 use crate::ikev1::phase1::{initiate_aggressive, InitiatorConfig, Phase1State};
-use crate::ikev1::quick::initiate_quick;
+use crate::ikev1::quick::initiate_quick_with_pfs;
 use crate::transport::{DriverError, UdpTransport};
 
 /// What a completed IKEv1 handshake yields: the Phase-1 state (for rekey / info
@@ -55,8 +56,8 @@ impl<E: Entropy> Client<E> {
         // marked Phase 1 complete and drop it as "phase 1 incomplete".
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        // Phase 2: Quick Mode.
-        let (qm1, qi) = initiate_quick(&phase1, &mut self.entropy, cfg.ts_local, cfg.ts_remote)?;
+        // Phase 2: Quick Mode, optionally with PFS (see `InitiatorConfig::pfs_group`'s doc).
+        let (qm1, qi) = initiate_quick_with_pfs(&phase1, &mut self.entropy, cfg.ts_local, cfg.ts_remote, cfg.pfs_group)?;
         self.transport.send_to(&qm1, server)?;
         let (qm2, _from) = self.transport.recv_from()?;
         let (qm3, child) = qi.complete(&qm2)?;

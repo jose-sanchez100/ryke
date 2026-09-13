@@ -56,10 +56,10 @@ impl<E: Entropy> Client<E> {
     ) -> Result<(Identification, u32, Option<Ipv4Addr>), DriverError> {
         let mut iv = [0u8; 8];
         self.entropy.fill(&mut iv);
-        let request = ike_auth::initiator_auth_request(sa, cfg, child_spi, &iv)?;
+        let request = ike_auth::initiator_auth_request(sa, cfg, child_spi, &ike_auth::esp_offer(0), &iv)?;
         self.transport.send_to(&request, server)?;
         let (response, _from) = self.transport.recv_from()?;
-        let (id, spi, ip4, _tsr) = ike_auth::initiator_verify_auth(sa, &response, cfg)?;
+        let (id, spi, _esp_suite, ip4, _tsr) = ike_auth::initiator_verify_auth(sa, &response, cfg)?;
         Ok((id, spi, ip4))
     }
 
@@ -75,7 +75,8 @@ impl<E: Entropy> Client<E> {
     ) -> Result<(CompletedSaInit, Identification, ChildSa, Option<Ipv4Addr>), DriverError> {
         let sa = self.sa_init(server)?;
         let (peer, peer_child_spi, assigned_ip) = self.authenticate(server, &sa, cfg, child_spi)?;
-        let child = ChildSa::derive(&sa.keys.sk_d, &sa.ni, &sa.nr, Role::Initiator, child_spi, peer_child_spi);
+        let child =
+            ChildSa::derive(sa.suite.prf_algorithm(), &sa.keys.sk_d, &sa.ni, &sa.nr, Role::Initiator, child_spi, peer_child_spi);
         Ok((sa, peer, child, assigned_ip))
     }
 }

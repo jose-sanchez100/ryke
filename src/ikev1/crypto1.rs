@@ -121,23 +121,44 @@ pub fn derive_cipher_key(prf: Prf, skeyid_e: &[u8], key_len: usize) -> Vec<u8> {
     ka
 }
 
-/// Quick-Mode ESP keying material (RFC 2409 §5.5, no PFS):
-/// `KEYMAT = prf(SKEYID_d, protocol | SPI | Ni_b | Nr_b)`, expanded by feedback
-/// to `out_len` bytes.
-pub fn keymat(prf: Prf, skeyid_d: &[u8], protocol: u8, spi: &[u8], ni: &[u8], nr: &[u8], out_len: usize) -> Vec<u8> {
-    let seed = cat(&[&[protocol], spi, ni, nr]);
+fn keymat_inner(prf: Prf, skeyid_d: &[u8], seed: &[u8], out_len: usize) -> Vec<u8> {
     let mut out = Vec::new();
-    let mut prev = prf.mac(skeyid_d, &seed);
+    let mut prev = prf.mac(skeyid_d, seed);
     out.extend_from_slice(&prev);
     while out.len() < out_len {
-        // K(n) = prf(SKEYID_d, K(n-1) | protocol | SPI | Ni_b | Nr_b)
+        // K(n) = prf(SKEYID_d, K(n-1) | <seed>)
         let mut input = prev.clone();
-        input.extend_from_slice(&seed);
+        input.extend_from_slice(seed);
         prev = prf.mac(skeyid_d, &input);
         out.extend_from_slice(&prev);
     }
     out.truncate(out_len);
     out
+}
+
+/// Quick-Mode ESP keying material (RFC 2409 §5.5, no PFS):
+/// `KEYMAT = prf(SKEYID_d, protocol | SPI | Ni_b | Nr_b)`, expanded by feedback
+/// to `out_len` bytes.
+pub fn keymat(prf: Prf, skeyid_d: &[u8], protocol: u8, spi: &[u8], ni: &[u8], nr: &[u8], out_len: usize) -> Vec<u8> {
+    keymat_inner(prf, skeyid_d, &cat(&[&[protocol], spi, ni, nr]), out_len)
+}
+
+/// Like [`keymat`], but for the **PFS** variant of Quick Mode (RFC 2409
+/// §5.5): `KEYMAT = prf(SKEYID_d, g(qm)^xy | protocol | SPI | Ni_b | Nr_b)`,
+/// with the fresh Quick-Mode Diffie-Hellman `shared_secret` folded into every
+/// feedback block's seed alongside the fixed protocol/SPI/nonce inputs.
+#[allow(clippy::too_many_arguments)]
+pub fn keymat_pfs(
+    prf: Prf,
+    skeyid_d: &[u8],
+    shared_secret: &[u8],
+    protocol: u8,
+    spi: &[u8],
+    ni: &[u8],
+    nr: &[u8],
+    out_len: usize,
+) -> Vec<u8> {
+    keymat_inner(prf, skeyid_d, &cat(&[shared_secret, &[protocol], spi, ni, nr]), out_len)
 }
 
 /// The Phase-1 CBC IV seed: `HASH(g^xi | g^xr)`, truncated to the block size.

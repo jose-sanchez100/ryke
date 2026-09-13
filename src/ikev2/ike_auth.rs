@@ -30,7 +30,7 @@ use crate::ikev2::payload::{
 };
 use std::net::Ipv4Addr;
 use crate::ikev2::sign::SigningKey;
-use crate::ikev2::sk::{build_encrypted, open_encrypted};
+use crate::ikev2::sk::{build_encrypted, open_encrypted, SkCipher};
 
 /// How this side proves its own identity in `IKE_AUTH`.
 pub enum LocalAuth {
@@ -92,6 +92,36 @@ pub fn esp_offer(spi: u32) -> SecurityAssociation {
                 Transform { transform_type: transform_type::ESN, transform_id: transform_id::ESN_NONE, key_length: None },
             ],
         }],
+    }
+}
+
+/// An ESP CHILD SA offer for a specific already-negotiated `cipher`, with the
+/// given SPI -- used at CHILD SA rekey time (`crate::ikev2::rekey`) so the
+/// `CREATE_CHILD_SA` exchange preserves the tunnel's existing algorithm
+/// instead of [`esp_offer`]'s fixed AES-GCM-256 default. Rekey only ever adds
+/// PFS on top of what's already running, per `rekey`'s own module doc -- it
+/// never silently changes cipher out from under a profile that asked for
+/// something else (e.g. AES-CBC-256/SHA-512 for a compliance-driven gateway).
+pub fn esp_offer_for_cipher(spi: u32, cipher: SkCipher) -> SecurityAssociation {
+    let (encr_id, key_bits) = match cipher {
+        SkCipher::Aes128Gcm => (transform_id::AES_GCM_16, Some(128)),
+        SkCipher::Aes192Gcm => (transform_id::AES_GCM_16, Some(192)),
+        SkCipher::Aes256Gcm => (transform_id::AES_GCM_16, Some(256)),
+        // Both have exactly one key size, so IANA convention omits an
+        // explicit Key Length attribute (see `negotiate::fixed_key_bits`).
+        SkCipher::ChaCha20Poly1305 => (transform_id::CHACHA20_POLY1305, None),
+        SkCipher::TripleDesCbc(_) => (transform_id::TRIPLE_DES, None),
+        SkCipher::Aes128Cbc(_) => (transform_id::AES_CBC, Some(128)),
+        SkCipher::Aes192Cbc(_) => (transform_id::AES_CBC, Some(192)),
+        SkCipher::Aes256Cbc(_) => (transform_id::AES_CBC, Some(256)),
+    };
+    let mut transforms = vec![Transform { transform_type: transform_type::ENCR, transform_id: encr_id, key_length: key_bits }];
+    if let Some(integ) = cipher.integ_algorithm() {
+        transforms.push(Transform { transform_type: transform_type::INTEG, transform_id: integ.transform_id(), key_length: None });
+    }
+    transforms.push(Transform { transform_type: transform_type::ESN, transform_id: transform_id::ESN_NONE, key_length: None });
+    SecurityAssociation {
+        proposals: vec![Proposal { num: 1, protocol_id: protocol_id::ESP, spi: spi.to_be_bytes().to_vec(), transforms }],
     }
 }
 

@@ -144,6 +144,24 @@ impl EspSa {
         self.cipher
     }
 
+    /// The encryption key material in [`Self::new_with_cipher`]'s own input
+    /// shape: the raw key, plus (for an AEAD cipher) its trailing salt --
+    /// `cipher().key_len() + cipher().salt_len()` bytes. General-cipher
+    /// counterpart to [`Self::key_material`] (which is AES-256-GCM-only).
+    pub fn enc_material(&self) -> Vec<u8> {
+        let mut out = self.enc_key.clone();
+        out.extend_from_slice(&self.salt);
+        out
+    }
+
+    /// The separate integrity key for a classic (non-AEAD) cipher; empty for
+    /// AEAD, which has none. General-cipher counterpart to the integ half of
+    /// [`Self::key_material`]'s fixed AES-256-GCM shape (which has none at
+    /// all, since GCM is AEAD).
+    pub fn integ_key(&self) -> &[u8] {
+        &self.integ_key
+    }
+
     /// The raw key+salt material this SA was derived from (32-byte AES key +
     /// 4-byte GCM salt, RFC 4106 layout) — for a consumer that hands packets
     /// to the kernel via XFRM instead of this struct's own `seal`/`open`.

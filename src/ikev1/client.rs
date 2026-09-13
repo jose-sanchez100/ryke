@@ -12,8 +12,10 @@ use std::time::Duration;
 
 use crate::debug::ike_debug;
 use crate::entropy::Entropy;
+use crate::error::IkeError;
 use crate::esp::ChildSa;
 use crate::ikev1::cfg as modecfg;
+use crate::ikev1::informational;
 use crate::ikev1::phase1::{initiate_aggressive, initiate_main, Ikev1ExchangeMode, InitiatorConfig, Phase1State};
 use crate::ikev1::quick::initiate_quick_with_pfs;
 use crate::transport::{DriverError, UdpTransport};
@@ -40,6 +42,25 @@ pub struct Established {
     /// kernel "encapsulated" packets under (usage counters moved) but which
     /// could never actually leave the box as a valid IP packet.
     pub local_addr: SocketAddr,
+}
+
+impl Established {
+    /// Build the pair of graceful-disconnect Informational messages (one
+    /// Delete for the CHILD SA, one for the whole ISAKMP SA, sent as two
+    /// separate exchanges — see [`crate::ikev1::informational::build_delete`]'s
+    /// doc for why they're not combined into one message). Just builds the
+    /// bytes; the caller sends both, in order (typically well after
+    /// `connect()` returned and this `Established`'s own `Client`/socket is
+    /// long gone — a fresh caller-supplied socket is all that's needed,
+    /// since these are fire-and-forget datagrams with no reply to correlate
+    /// back to a session). Without ever sending these, the gateway has no
+    /// way to learn this side disconnected short of DPD or the SA's own
+    /// lifetime expiry — confirmed live against a real FortiGate: it kept
+    /// the dialup session (and its `0.0.0.0/0` reverse-route) up
+    /// indefinitely after this app exited.
+    pub fn close_message(&self, entropy: &mut impl Entropy) -> Result<(Vec<u8>, Vec<u8>), IkeError> {
+        informational::build_delete(&self.phase1, entropy, self.child.inbound.spi())
+    }
 }
 
 /// A UDP IKEv1 initiator driven by an [`Entropy`] source.

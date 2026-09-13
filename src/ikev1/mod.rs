@@ -11,6 +11,7 @@
 pub mod cfg;
 pub mod client;
 pub mod crypto1;
+pub mod informational;
 pub mod isakmp;
 pub mod modecfg;
 pub mod payloads;

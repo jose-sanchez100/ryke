@@ -579,6 +579,33 @@ impl Configuration {
             .find(|a| a.attr_type == config_attr::INTERNAL_IP4_ADDRESS && a.value.len() == 4)
             .map(|a| Ipv4Addr::new(a.value[0], a.value[1], a.value[2], a.value[3]))
     }
+
+    /// Every INTERNAL_IP4_DNS attribute value — a responder may hand back more
+    /// than one resolver. Empty if none were sent.
+    pub fn assigned_dns(&self) -> Vec<Ipv4Addr> {
+        self.attrs
+            .iter()
+            .filter(|a| a.attr_type == config_attr::INTERNAL_IP4_DNS && a.value.len() == 4)
+            .map(|a| Ipv4Addr::new(a.value[0], a.value[1], a.value[2], a.value[3]))
+            .collect()
+    }
+
+    /// Every INTERNAL_IP4_SUBNET attribute, as (network, prefix length) --
+    /// a responder may hand back more than one (e.g. one per split-tunnel
+    /// range), same as [`Self::assigned_dns`] for resolvers. Each value is
+    /// network address (4 bytes) + netmask (4 bytes) — the same convention
+    /// strongSwan uses.
+    pub fn assigned_subnets(&self) -> Vec<(Ipv4Addr, u8)> {
+        self.attrs
+            .iter()
+            .filter(|a| a.attr_type == config_attr::INTERNAL_IP4_SUBNET && a.value.len() == 8)
+            .map(|a| {
+                let net = Ipv4Addr::new(a.value[0], a.value[1], a.value[2], a.value[3]);
+                let mask = u32::from_be_bytes([a.value[4], a.value[5], a.value[6], a.value[7]]);
+                (net, mask.count_ones() as u8)
+            })
+            .collect()
+    }
 }
 
 /// Notify Message Types (RFC 7296 §3.10.1 and later). Types < 16384 are errors;

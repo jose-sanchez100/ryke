@@ -19,6 +19,7 @@ pub mod phase1;
 pub mod phase2;
 pub mod quick;
 pub mod server;
+pub mod xauth;
 
 pub use client::{Client, Established};
 pub use server::{Server, ServerEvent};

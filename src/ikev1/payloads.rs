@@ -44,6 +44,11 @@ pub mod auth {
     /// XAUTHInitPreShared — Android's "IPSec Xauth PSK" advertises this, and it
     /// signals that an Xauth exchange follows Phase 1.
     pub const XAUTH_INIT_PSK: u16 = 65001;
+    /// XAUTHInitRSA — the RSA-signature analog of `XAUTH_INIT_PSK`: certificate
+    /// auth for Phase 1, followed by an Xauth exchange. Private IANA range
+    /// value, confirmed against strongSwan's `IKEV1_AUTH_XAUTH_INIT_RSA`
+    /// (`proposal_substructure.c`).
+    pub const XAUTH_INIT_RSA: u16 = 65005;
 }
 
 /// Life-type values (attr `LIFE_TYPE`).
@@ -65,6 +70,29 @@ pub mod id_type {
     pub const USER_FQDN: u8 = 3;
     pub const IPV4_ADDR_SUBNET: u8 = 4;
     pub const KEY_ID: u8 = 11;
+    /// A certificate's own Subject DN, DER-encoded — see
+    /// [`crate::ikev2::sign::cert_subject_dn`], reused as-is here since the
+    /// DER encoding is identical to IKEv2's `ID_DER_ASN1_DN` (value 9 there
+    /// too).
+    pub const DER_ASN1_DN: u8 = 9;
+}
+
+/// CERT payload encoding values (RFC 2408 §3.9).
+pub mod cert_encoding {
+    /// X.509 Certificate — Signature. The only encoding this crate sends or
+    /// parses (matches the IKEv2 side's `cert_encoding::X509_SIGNATURE`).
+    pub const X509_SIGNATURE: u8 = 4;
+}
+
+/// Build a CERT payload body: a 1-byte encoding tag followed by the raw DER
+/// certificate (RFC 2408 §3.9). No typed struct — this crate's payload
+/// bodies stay raw byte blobs when the shape is this simple (see this file's
+/// header doc).
+pub fn cert_payload_body(der: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(1 + der.len());
+    body.push(cert_encoding::X509_SIGNATURE);
+    body.extend_from_slice(der);
+    body
 }
 
 /// A Transform attribute — either a 2-byte short (TV) or a variable long (TLV).

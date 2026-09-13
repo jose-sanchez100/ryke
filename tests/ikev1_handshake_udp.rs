@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use ryke::crypto::DhGroup;
 use ryke::ikev1::payloads::Id;
-use ryke::ikev1::phase1::{Ikev1ExchangeMode, InitiatorConfig, Phase1Config};
+use ryke::ikev1::phase1::{Ikev1ExchangeMode, Ikev1LocalAuth, InitiatorConfig, Phase1Config};
 use ryke::ikev1::{Client, Server, ServerEvent};
 use ryke::ikev2::sk::SkCipher;
 use ryke::SeedEntropy;
@@ -16,7 +16,12 @@ use ryke::SeedEntropy;
 fn ikev1_full_handshake_over_udp_loopback() {
     let psk = b"correct horse battery staple".to_vec();
 
-    let rcfg = Phase1Config { psk: psk.clone(), our_id: Id::ipv4([192, 168, 0, 1]) };
+    let rcfg = Phase1Config {
+        local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+        trusted_cas: Vec::new(),
+        now_unix: 0,
+        our_id: Id::ipv4([192, 168, 0, 1]),
+    };
     let mut server = Server::bind("127.0.0.1:0", SeedEntropy::new(0x2222), rcfg).unwrap();
     server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let server_addr = server.local_addr().unwrap();
@@ -32,10 +37,14 @@ fn ikev1_full_handshake_over_udp_loopback() {
     });
 
     let icfg = InitiatorConfig {
-        psk,
+        local_auth: Ikev1LocalAuth::Psk(psk),
+        trusted_cas: Vec::new(),
+        now_unix: 0,
+        key_len: 32,
         our_id: Id::ipv4([10, 1, 1, 1]),
         group: DhGroup::Modp1024,
         xauth: false,
+        xauth_creds: None,
         ts_local: ([10, 0, 99, 0], [255, 255, 255, 0]),
         ts_remote: ([10, 0, 99, 0], [255, 255, 255, 0]),
         esp_cipher: SkCipher::Aes256Gcm,
@@ -78,7 +87,12 @@ fn ikev1_full_handshake_over_udp_loopback() {
 fn ikev1_full_handshake_over_udp_loopback_with_pfs() {
     let psk = b"correct horse battery staple".to_vec();
 
-    let rcfg = Phase1Config { psk: psk.clone(), our_id: Id::ipv4([192, 168, 0, 1]) };
+    let rcfg = Phase1Config {
+        local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+        trusted_cas: Vec::new(),
+        now_unix: 0,
+        our_id: Id::ipv4([192, 168, 0, 1]),
+    };
     let mut server = Server::bind("127.0.0.1:0", SeedEntropy::new(0x4444), rcfg).unwrap();
     server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let server_addr = server.local_addr().unwrap();
@@ -92,10 +106,14 @@ fn ikev1_full_handshake_over_udp_loopback_with_pfs() {
     });
 
     let icfg = InitiatorConfig {
-        psk,
+        local_auth: Ikev1LocalAuth::Psk(psk),
+        trusted_cas: Vec::new(),
+        now_unix: 0,
+        key_len: 32,
         our_id: Id::ipv4([10, 1, 1, 1]),
         group: DhGroup::Modp1024,
         xauth: false,
+        xauth_creds: None,
         ts_local: ([10, 0, 99, 0], [255, 255, 255, 0]),
         ts_remote: ([10, 0, 99, 0], [255, 255, 255, 0]),
         esp_cipher: SkCipher::Aes256Gcm,
@@ -135,7 +153,12 @@ fn ikev1_full_handshake_over_udp_loopback_with_pfs() {
 fn ikev1_full_handshake_over_udp_loopback_main_mode() {
     let psk = b"correct horse battery staple".to_vec();
 
-    let rcfg = Phase1Config { psk: psk.clone(), our_id: Id::ipv4([192, 168, 0, 1]) };
+    let rcfg = Phase1Config {
+        local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+        trusted_cas: Vec::new(),
+        now_unix: 0,
+        our_id: Id::ipv4([192, 168, 0, 1]),
+    };
     let mut server = Server::bind("127.0.0.1:0", SeedEntropy::new(0x5555), rcfg).unwrap();
     server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let server_addr = server.local_addr().unwrap();
@@ -150,10 +173,14 @@ fn ikev1_full_handshake_over_udp_loopback_main_mode() {
     });
 
     let icfg = InitiatorConfig {
-        psk,
+        local_auth: Ikev1LocalAuth::Psk(psk),
+        trusted_cas: Vec::new(),
+        now_unix: 0,
+        key_len: 32,
         our_id: Id::ipv4([10, 1, 1, 1]),
         group: DhGroup::Modp1024,
         xauth: false,
+        xauth_creds: None,
         ts_local: ([10, 0, 99, 0], [255, 255, 255, 0]),
         ts_remote: ([10, 0, 99, 0], [255, 255, 255, 0]),
         esp_cipher: SkCipher::Aes256Gcm,

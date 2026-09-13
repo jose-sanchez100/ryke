@@ -170,16 +170,22 @@ mod tests {
     use crate::entropy::SeedEntropy;
     use crate::ikev1::isakmp::flags;
     use crate::ikev1::payloads::Id;
-    use crate::ikev1::phase1::{initiate_aggressive, respond_aggressive, Ikev1ExchangeMode, InitiatorConfig, Phase1Config};
+    use crate::ikev1::phase1::{
+        initiate_aggressive, respond_aggressive, Ikev1ExchangeMode, Ikev1LocalAuth, InitiatorConfig, Phase1Config,
+    };
     use crate::ikev2::sk::SkCipher;
 
     fn phase1_pair() -> (Phase1State, Phase1State) {
         let psk = b"correct horse battery staple".to_vec();
         let icfg = InitiatorConfig {
-            psk: psk.clone(),
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            key_len: 32,
             our_id: Id::ipv4([10, 1, 1, 1]),
             group: DhGroup::Modp1024,
             xauth: false,
+            xauth_creds: None,
             ts_local: ([0, 0, 0, 0], [0, 0, 0, 0]),
             ts_remote: ([0, 0, 0, 0], [0, 0, 0, 0]),
             esp_cipher: SkCipher::Aes256Gcm,
@@ -187,7 +193,12 @@ mod tests {
             mode_cfg: false,
             mode: Ikev1ExchangeMode::Aggressive,
         };
-        let rcfg = Phase1Config { psk, our_id: Id::ipv4([192, 168, 0, 1]) };
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(psk),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
         let mut ie = SeedEntropy::new(0xAAAA);
         let mut re = SeedEntropy::new(0xBBBB);
         let (msg1, ai) = initiate_aggressive(&icfg, &mut ie);

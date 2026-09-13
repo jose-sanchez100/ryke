@@ -496,15 +496,37 @@ mod tests {
     use crate::crypto::{DhGroup, IntegAlgorithm};
     use crate::entropy::SeedEntropy;
     use crate::ikev1::payloads::Id;
-    use crate::ikev1::phase1::{initiate_aggressive, respond_aggressive, Ikev1ExchangeMode, InitiatorConfig, Phase1Config};
+    use crate::ikev1::phase1::{
+        initiate_aggressive, respond_aggressive, Ikev1ExchangeMode, Ikev1LocalAuth, InitiatorConfig, Phase1Config,
+    };
     use crate::ikev2::sk::SkCipher;
 
     #[test]
     fn ikev1_initiator_and_responder_agree_and_esp_roundtrips() {
         let psk = b"correct horse battery staple".to_vec();
         let ts = ([10, 0, 99, 0], [255, 255, 255, 0]);
-        let icfg = InitiatorConfig { psk: psk.clone(), our_id: Id::ipv4([10, 1, 1, 1]), group: DhGroup::Modp1024, xauth: false, ts_local: ts, ts_remote: ts, esp_cipher: SkCipher::Aes256Gcm, pfs_group: None, mode_cfg: false, mode: Ikev1ExchangeMode::Aggressive };
-        let rcfg = Phase1Config { psk: psk.clone(), our_id: Id::ipv4([192, 168, 0, 1]) };
+        let icfg = InitiatorConfig {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            key_len: 32,
+            our_id: Id::ipv4([10, 1, 1, 1]),
+            group: DhGroup::Modp1024,
+            xauth: false,
+            xauth_creds: None,
+            ts_local: ts,
+            ts_remote: ts,
+            esp_cipher: SkCipher::Aes256Gcm,
+            pfs_group: None,
+            mode_cfg: false,
+            mode: Ikev1ExchangeMode::Aggressive,
+        };
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
         let mut ie = SeedEntropy::new(0x1111);
         let mut re = SeedEntropy::new(0x2222);
 
@@ -541,8 +563,28 @@ mod tests {
         let psk = b"correct horse battery staple".to_vec();
         let ts = ([10, 0, 99, 0], [255, 255, 255, 0]);
         let cipher = SkCipher::Aes256Cbc(IntegAlgorithm::HmacSha2_256_128);
-        let icfg = InitiatorConfig { psk: psk.clone(), our_id: Id::ipv4([10, 1, 1, 1]), group: DhGroup::Modp1024, xauth: false, ts_local: ts, ts_remote: ts, esp_cipher: cipher, pfs_group: None, mode_cfg: false, mode: Ikev1ExchangeMode::Aggressive };
-        let rcfg = Phase1Config { psk: psk.clone(), our_id: Id::ipv4([192, 168, 0, 1]) };
+        let icfg = InitiatorConfig {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            key_len: 32,
+            our_id: Id::ipv4([10, 1, 1, 1]),
+            group: DhGroup::Modp1024,
+            xauth: false,
+            xauth_creds: None,
+            ts_local: ts,
+            ts_remote: ts,
+            esp_cipher: cipher,
+            pfs_group: None,
+            mode_cfg: false,
+            mode: Ikev1ExchangeMode::Aggressive,
+        };
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
         let mut ie = SeedEntropy::new(0x7777);
         let mut re = SeedEntropy::new(0x8888);
 
@@ -573,8 +615,28 @@ mod tests {
     fn ikev1_quick_mode_pfs_agrees_and_esp_roundtrips() {
         let psk = b"correct horse battery staple".to_vec();
         let ts = ([10, 0, 99, 0], [255, 255, 255, 0]);
-        let icfg = InitiatorConfig { psk: psk.clone(), our_id: Id::ipv4([10, 1, 1, 1]), group: DhGroup::Modp1024, xauth: false, ts_local: ts, ts_remote: ts, esp_cipher: SkCipher::Aes256Gcm, pfs_group: None, mode_cfg: false, mode: Ikev1ExchangeMode::Aggressive };
-        let rcfg = Phase1Config { psk: psk.clone(), our_id: Id::ipv4([192, 168, 0, 1]) };
+        let icfg = InitiatorConfig {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            key_len: 32,
+            our_id: Id::ipv4([10, 1, 1, 1]),
+            group: DhGroup::Modp1024,
+            xauth: false,
+            xauth_creds: None,
+            ts_local: ts,
+            ts_remote: ts,
+            esp_cipher: SkCipher::Aes256Gcm,
+            pfs_group: None,
+            mode_cfg: false,
+            mode: Ikev1ExchangeMode::Aggressive,
+        };
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
         let mut ie = SeedEntropy::new(0x3333);
         let mut re = SeedEntropy::new(0x4444);
 
@@ -607,8 +669,28 @@ mod tests {
     fn pfs_quick_mode_derives_a_fresh_key_each_time() {
         let psk = b"correct horse battery staple".to_vec();
         let ts = ([10, 0, 99, 0], [255, 255, 255, 0]);
-        let icfg = InitiatorConfig { psk: psk.clone(), our_id: Id::ipv4([10, 1, 1, 1]), group: DhGroup::Modp1024, xauth: false, ts_local: ts, ts_remote: ts, esp_cipher: SkCipher::Aes256Gcm, pfs_group: None, mode_cfg: false, mode: Ikev1ExchangeMode::Aggressive };
-        let rcfg = Phase1Config { psk: psk.clone(), our_id: Id::ipv4([192, 168, 0, 1]) };
+        let icfg = InitiatorConfig {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            key_len: 32,
+            our_id: Id::ipv4([10, 1, 1, 1]),
+            group: DhGroup::Modp1024,
+            xauth: false,
+            xauth_creds: None,
+            ts_local: ts,
+            ts_remote: ts,
+            esp_cipher: SkCipher::Aes256Gcm,
+            pfs_group: None,
+            mode_cfg: false,
+            mode: Ikev1ExchangeMode::Aggressive,
+        };
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
         let mut ie = SeedEntropy::new(0x5555);
         let mut re = SeedEntropy::new(0x6666);
         let (msg1, ai) = initiate_aggressive(&icfg, &mut ie);
@@ -631,8 +713,28 @@ mod tests {
     #[test]
     fn wrong_psk_fails_phase1() {
         let ts = ([0, 0, 0, 0], [0, 0, 0, 0]);
-        let icfg = InitiatorConfig { psk: b"right".to_vec(), our_id: Id::ipv4([10, 1, 1, 1]), group: DhGroup::Modp1024, xauth: false, ts_local: ts, ts_remote: ts, esp_cipher: SkCipher::Aes256Gcm, pfs_group: None, mode_cfg: false, mode: Ikev1ExchangeMode::Aggressive };
-        let rcfg = Phase1Config { psk: b"wrong".to_vec(), our_id: Id::ipv4([192, 168, 0, 1]) };
+        let icfg = InitiatorConfig {
+            local_auth: Ikev1LocalAuth::Psk(b"right".to_vec()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            key_len: 32,
+            our_id: Id::ipv4([10, 1, 1, 1]),
+            group: DhGroup::Modp1024,
+            xauth: false,
+            xauth_creds: None,
+            ts_local: ts,
+            ts_remote: ts,
+            esp_cipher: SkCipher::Aes256Gcm,
+            pfs_group: None,
+            mode_cfg: false,
+            mode: Ikev1ExchangeMode::Aggressive,
+        };
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(b"wrong".to_vec()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
         let mut ie = SeedEntropy::new(1);
         let mut re = SeedEntropy::new(2);
         let (msg1, ai) = initiate_aggressive(&icfg, &mut ie);

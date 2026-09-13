@@ -14,13 +14,15 @@ use super::crypto1::{self, Prf, AES_BLOCK};
 use super::isakmp::{self, exchange, payload, IsakmpHeader};
 use super::phase2;
 use super::payloads::{
-    attr, auth, enc, hash, life, protocol, Attribute, Id, Proposal, SaPayload, Transform, IPSEC_DOI,
-    SIT_IDENTITY_ONLY,
+    attr, auth, cert_payload_body, enc, hash, id_type, life, protocol, Attribute, Id, Proposal, SaPayload,
+    Transform, IPSEC_DOI, SIT_IDENTITY_ONLY,
 };
 use crate::crypto::DhGroup;
 use crate::entropy::Entropy;
 use crate::error::IkeError;
+use crate::ikev2::sign::{cert_subject_dn, validate_chain, SigningKey, VerifyingKey};
 use crate::ikev2::sk::SkCipher;
+use std::sync::Arc;
 
 /// Well-known XAUTH capability Vendor ID (`09002689dfd6b712`, the de-facto marker
 /// from draft-beaulieu-ike-xauth). An XAUTH initiator refuses to authenticate a
@@ -43,10 +45,48 @@ fn is_xauth_auth(method: u16) -> bool {
     (65001..=65010).contains(&method)
 }
 
+/// How this side proves its own identity in Phase 1 (RFC 2409 §5.1/§5.4).
+#[derive(Clone)]
+pub enum Ikev1LocalAuth {
+    /// Pre-shared key (§5.4) — both sides use the same secret.
+    Psk(Vec<u8>),
+    /// RSA digital signature (§5.1, Main Mode only — see
+    /// [`Ikev1ExchangeMode`]): `chain[0]` is the leaf cert whose key signs
+    /// `HASH_I`/`HASH_R`, the rest are intermediates sent alongside it in the
+    /// CERT payloads. `Arc` because [`SigningKey`] isn't `Clone` and this
+    /// config gets cloned once per Phase-1 message-state transition, same as
+    /// `Psk`'s `Vec<u8>` was before it.
+    Sig { key: Arc<SigningKey>, chain: Vec<Vec<u8>> },
+}
+
+impl Ikev1LocalAuth {
+    /// The pre-shared key. Only ever reached from Aggressive-Mode code paths,
+    /// which are PSK-only in this crate (RSA-sig needs Main Mode's identity
+    /// protection) -- [`Client::connect`](super::client::Client::connect)
+    /// rejects a `Sig` config paired with [`Ikev1ExchangeMode::Aggressive`]
+    /// before this can be reached from that entry point.
+    fn expect_psk(&self) -> &[u8] {
+        match self {
+            Ikev1LocalAuth::Psk(p) => p,
+            Ikev1LocalAuth::Sig { .. } => {
+                panic!("Ikev1LocalAuth::Sig is not valid for Aggressive Mode (PSK only)")
+            }
+        }
+    }
+}
+
 /// The responder's Phase-1 configuration.
 pub struct Phase1Config {
-    pub psk: Vec<u8>,
-    /// The identity we assert in `IDr` (must be the one the peer's PSK maps to).
+    pub local_auth: Ikev1LocalAuth,
+    /// Trusted CA certificates to validate the peer's chain against — only
+    /// consulted when `local_auth` is `Sig`.
+    pub trusted_cas: Vec<Vec<u8>>,
+    /// Wall-clock time (Unix seconds) to check the peer's certificate
+    /// validity against — only consulted when `local_auth` is `Sig`.
+    pub now_unix: u64,
+    /// The identity we assert in `IDr`. Ignored (a DER-encoded cert subject
+    /// DN is asserted instead) when `local_auth` is `Sig` — must be the one
+    /// the peer's PSK maps to when `local_auth` is `Psk`.
     pub our_id: Id,
 }
 
@@ -76,15 +116,25 @@ pub struct Phase1State {
     pub peer_supports_dpd: bool,
 }
 
-/// Pick the first offered transform we support: AES-256-CBC, HASH SHA-256 (or
-/// SHA-1), DH group 2 (or 14), PSK or XAUTH-PSK auth. Returns the transform to
-/// echo plus the mapped primitives.
-fn select_transform(sa: &SaPayload) -> Option<(Transform, Prf, DhGroup, usize)> {
+/// Pick the first offered transform we support: AES-CBC (128/192/256-bit,
+/// per the offered `KEY_LENGTH` attribute), HASH SHA-256 (or SHA-1), DH
+/// group 2 (or 14), and -- matching our own configured `local_auth` --
+/// either PSK/XAUTH-PSK auth (`want_sig: false`) or RSA-SIG/XAUTH-RSA auth
+/// (`want_sig: true`); a real gateway policy only ever offers/accepts the
+/// one method it's configured for. Returns the transform to echo plus the
+/// mapped primitives (the `usize` is the AES key length in bytes).
+fn select_transform(sa: &SaPayload, want_sig: bool) -> Option<(Transform, Prf, DhGroup, usize)> {
     for prop in &sa.proposals {
         for t in &prop.transforms {
-            if t.attr(attr::ENCRYPTION) != Some(enc::AES_CBC) || t.attr(attr::KEY_LENGTH) != Some(256) {
+            if t.attr(attr::ENCRYPTION) != Some(enc::AES_CBC) {
                 continue;
             }
+            let key_len = match t.attr(attr::KEY_LENGTH) {
+                Some(128) => 16,
+                Some(192) => 24,
+                Some(256) => 32,
+                _ => continue,
+            };
             let prf = match t.attr(attr::HASH) {
                 Some(hash::SHA2_256) => Prf::Sha256,
                 Some(hash::SHA1) => Prf::Sha1,
@@ -95,11 +145,15 @@ fn select_transform(sa: &SaPayload) -> Option<(Transform, Prf, DhGroup, usize)> 
                 Some(14) => DhGroup::Modp2048,
                 _ => continue,
             };
-            match t.attr(attr::AUTH_METHOD) {
-                Some(auth::PSK) | Some(auth::XAUTH_INIT_PSK) => {}
-                _ => continue,
+            let auth_ok = if want_sig {
+                matches!(t.attr(attr::AUTH_METHOD), Some(auth::RSA_SIG) | Some(auth::XAUTH_INIT_RSA))
+            } else {
+                matches!(t.attr(attr::AUTH_METHOD), Some(auth::PSK) | Some(auth::XAUTH_INIT_PSK))
+            };
+            if !auth_ok {
+                continue;
             }
-            return Some((t.clone(), prf, group, 32));
+            return Some((t.clone(), prf, group, key_len));
         }
     }
     None
@@ -107,6 +161,21 @@ fn select_transform(sa: &SaPayload) -> Option<(Transform, Prf, DhGroup, usize)> 
 
 fn find(payloads: &[isakmp::Payload], t: u8) -> Option<&isakmp::Payload> {
     payloads.iter().find(|p| p.payload_type == t)
+}
+
+/// Collect every CERT payload's DER body (stripping the 1-byte encoding tag),
+/// leaf first — the chain order this crate always sends in. Errors if none
+/// are present.
+fn collect_certs(payloads: &[isakmp::Payload]) -> Result<Vec<Vec<u8>>, IkeError> {
+    let certs: Vec<Vec<u8>> = payloads
+        .iter()
+        .filter(|p| p.payload_type == payload::CERT)
+        .map(|p| p.data.get(1..).map(<[u8]>::to_vec).ok_or(IkeError::Crypto("empty CERT payload")))
+        .collect::<Result<_, _>>()?;
+    if certs.is_empty() {
+        return Err(IkeError::MissingPayload("CERT"));
+    }
+    Ok(certs)
 }
 
 /// Process Aggressive-Mode message 1 and build message 2. Returns the response
@@ -120,6 +189,14 @@ pub fn respond_aggressive(
     if hdr.exchange_type != exchange::AGGRESSIVE {
         return Err(IkeError::Crypto("not an Aggressive Mode message"));
     }
+    // Aggressive Mode is PSK-only in this crate -- RSA-sig needs Main Mode's
+    // identity protection (IDi/IDr must go out encrypted, which Aggressive
+    // Mode's single-round-trip shape can't give a CERT/SIG payload without
+    // leaking the certificate identity in the clear).
+    let Ikev1LocalAuth::Psk(psk) = &cfg.local_auth else {
+        return Err(IkeError::Crypto("Aggressive Mode requires PSK auth (RSA-sig needs Main Mode)"));
+    };
+
     let cky_i = hdr.init_cookie;
     let ps = isakmp::parse_payloads(hdr.next_payload, &msg1[IsakmpHeader::LEN..])?;
 
@@ -136,7 +213,7 @@ pub fn respond_aggressive(
 
     let sa = SaPayload::parse(&sa_p.data)?;
     let (chosen, prf, group, key_len) =
-        select_transform(&sa).ok_or(IkeError::NoProposalChosen)?;
+        select_transform(&sa, false).ok_or(IkeError::NoProposalChosen)?;
     if gxi.len() != group.public_len() {
         return Err(IkeError::BadKeyExchange { group: group.transform_id(), len: gxi.len() });
     }
@@ -152,7 +229,7 @@ pub fn respond_aggressive(
     let gxy = group.shared(&dh_private, &gxi)?;
 
     // Key schedule.
-    let skeyid = crypto1::skeyid_psk(prf, &cfg.psk, &ni, &nr);
+    let skeyid = crypto1::skeyid_psk(prf, psk, &ni, &nr);
     let skeyid_d = crypto1::skeyid_d(prf, &skeyid, &gxy, &cky_i, &cky_r);
     let skeyid_a = crypto1::skeyid_a(prf, &skeyid, &skeyid_d, &gxy, &cky_i, &cky_r);
     let skeyid_e = crypto1::skeyid_e(prf, &skeyid, &skeyid_a, &gxy, &cky_i, &cky_r);
@@ -273,7 +350,7 @@ impl Phase1State {
         let body = &msg3[IsakmpHeader::LEN..];
         let decrypted;
         let (first, payload_bytes) = if hdr.encrypted() {
-            decrypted = crypto1::aes256_cbc_decrypt(&self.enc_key, &self.phase1_iv, body)?;
+            decrypted = crypto1::aes_cbc_decrypt(&self.enc_key, &self.phase1_iv, body)?;
             (hdr.next_payload, decrypted.as_slice())
         } else {
             (hdr.next_payload, body)
@@ -300,19 +377,41 @@ impl Phase1State {
 
 /// The initiator's Phase-1 configuration.
 pub struct InitiatorConfig {
-    pub psk: Vec<u8>,
-    /// The identity we assert in `IDi`.
+    pub local_auth: Ikev1LocalAuth,
+    /// Trusted CA certificates to validate the peer's chain against — only
+    /// consulted when `local_auth` is `Sig`.
+    pub trusted_cas: Vec<Vec<u8>>,
+    /// Wall-clock time (Unix seconds) to check the peer's certificate
+    /// validity against — only consulted when `local_auth` is `Sig`.
+    pub now_unix: u64,
+    /// AES-CBC key length to offer for Phase 1, in bytes (16/24/32 for
+    /// AES-128/192/256 -- any other value is a caller bug, not a wire
+    /// error). HASH stays fixed at SHA-256 (see [`initiator_sa`]'s doc);
+    /// confirmed live against a real FortiGate IKEv1 gateway policy pinned
+    /// to AES-192-CBC that negotiation fails outright ("no SA proposal
+    /// chosen") when this app always offered AES-256 regardless of the
+    /// profile's own configured cipher.
+    pub key_len: usize,
+    /// The identity we assert in `IDi`. Ignored (a DER-encoded cert subject
+    /// DN is asserted instead) when `local_auth` is `Sig`.
     pub our_id: Id,
     /// DH group to offer (MODP-1024 or MODP-2048).
     pub group: DhGroup,
     /// Offer the XAUTH-PSK auth method — required by gateways that mandate XAUTH
     /// (e.g. Android's native client). With plain PSK, Quick Mode follows directly.
     pub xauth: bool,
+    /// `(user, password)` to answer the gateway's XAUTH challenge with, once
+    /// Phase 1 completes — see [`super::xauth`]. Only consulted when `xauth`
+    /// is set; `None` with `xauth: true` means "offer XAUTH-PSK but don't
+    /// actually answer a challenge" (only useful for testing the SA
+    /// negotiation itself, not a real connection).
+    pub xauth_creds: Option<(Vec<u8>, Vec<u8>)>,
     /// Quick-Mode traffic selectors offered as IDci/IDcr: `(address, netmask)`.
     pub ts_local: ([u8; 4], [u8; 4]),
     pub ts_remote: ([u8; 4], [u8; 4]),
     /// The ESP cipher to offer for the CHILD SA (Quick Mode's own SA
-    /// payload) -- unlike Phase 1 (still fixed AES-256-CBC/SHA-256, see
+    /// payload) -- unlike Phase 1 (AES-CBC only, key length pluggable via
+    /// [`InitiatorConfig::key_len`] but HASH still fixed at SHA-256, see
     /// [`initiator_sa`]'s doc), Phase 2 is fully algorithm-agile: any
     /// [`crate::ikev2::sk::SkCipher`] this crate implements works here,
     /// confirmed live against a real FortiGate that rejects a GCM offer
@@ -348,9 +447,16 @@ pub enum Ikev1ExchangeMode {
     Main,
 }
 
-/// The initiator's SA offer: AES-256-CBC / SHA-256 / `group` / PSK (or XAUTH-PSK).
-fn initiator_sa(group: DhGroup, xauth: bool) -> SaPayload {
-    let auth_method = if xauth { auth::XAUTH_INIT_PSK } else { auth::PSK };
+/// The initiator's SA offer: AES-CBC (`key_len` bytes) / SHA-256 / `group` /
+/// one of PSK, XAUTH-PSK, RSA-SIG, XAUTH-RSA (`want_sig` selects the RSA-SIG
+/// pair).
+fn initiator_sa(group: DhGroup, xauth: bool, want_sig: bool, key_len: usize) -> SaPayload {
+    let auth_method = match (want_sig, xauth) {
+        (false, false) => auth::PSK,
+        (false, true) => auth::XAUTH_INIT_PSK,
+        (true, false) => auth::RSA_SIG,
+        (true, true) => auth::XAUTH_INIT_RSA,
+    };
     SaPayload {
         doi: IPSEC_DOI,
         situation: SIT_IDENTITY_ONLY,
@@ -363,7 +469,7 @@ fn initiator_sa(group: DhGroup, xauth: bool) -> SaPayload {
                 transform_id: 1,
                 attributes: vec![
                     Attribute::short(attr::ENCRYPTION, enc::AES_CBC),
-                    Attribute::short(attr::KEY_LENGTH, 256),
+                    Attribute::short(attr::KEY_LENGTH, (key_len * 8) as u16),
                     Attribute::short(attr::HASH, hash::SHA2_256),
                     Attribute::short(attr::GROUP_DESC, group.transform_id()),
                     Attribute::short(attr::AUTH_METHOD, auth_method),
@@ -401,7 +507,7 @@ pub fn initiate_aggressive(cfg: &InitiatorConfig, entropy: &mut impl Entropy) ->
     let mut ni = vec![0u8; 16];
     entropy.fill(&mut ni);
 
-    let sa = initiator_sa(cfg.group, cfg.xauth);
+    let sa = initiator_sa(cfg.group, cfg.xauth, false, cfg.key_len);
     let sai_b = sa.to_bytes();
     let idi_b = cfg.our_id.to_bytes();
 
@@ -426,14 +532,14 @@ pub fn initiate_aggressive(cfg: &InitiatorConfig, entropy: &mut impl Entropy) ->
     let state = AggressiveInitiator {
         prf,
         group: cfg.group,
-        psk: cfg.psk.clone(),
+        psk: cfg.local_auth.expect_psk().to_vec(),
         cky_i,
         dh_private,
         gxi,
         ni,
         idi_b,
         sai_b,
-        key_len: 32,
+        key_len: cfg.key_len,
     };
     (msg1, state)
 }
@@ -549,7 +655,8 @@ impl AggressiveInitiator {
 pub fn initiate_main(cfg: &InitiatorConfig, entropy: &mut impl Entropy) -> (Vec<u8>, MainSaSent) {
     let mut cky_i = [0u8; 8];
     entropy.fill(&mut cky_i);
-    let sa = initiator_sa(cfg.group, cfg.xauth);
+    let want_sig = matches!(cfg.local_auth, Ikev1LocalAuth::Sig { .. });
+    let sa = initiator_sa(cfg.group, cfg.xauth, want_sig, cfg.key_len);
     let sai_b = sa.to_bytes();
 
     let hdr = IsakmpHeader {
@@ -564,14 +671,26 @@ pub fn initiate_main(cfg: &InitiatorConfig, entropy: &mut impl Entropy) -> (Vec<
     };
     let msg1 = isakmp::build_message(hdr, &[(payload::SA, sai_b.clone())]);
 
-    let state = MainSaSent { group: cfg.group, psk: cfg.psk.clone(), our_id: cfg.our_id.clone(), cky_i, sai_b };
+    let state = MainSaSent {
+        group: cfg.group,
+        key_len: cfg.key_len,
+        local_auth: cfg.local_auth.clone(),
+        trusted_cas: cfg.trusted_cas.clone(),
+        now_unix: cfg.now_unix,
+        our_id: cfg.our_id.clone(),
+        cky_i,
+        sai_b,
+    };
     (msg1, state)
 }
 
 /// Post-message-1 Main-Mode initiator state.
 pub struct MainSaSent {
     group: DhGroup,
-    psk: Vec<u8>,
+    key_len: usize,
+    local_auth: Ikev1LocalAuth,
+    trusted_cas: Vec<Vec<u8>>,
+    now_unix: u64,
     our_id: Id,
     cky_i: [u8; 8],
     sai_b: Vec<u8>,
@@ -611,7 +730,10 @@ impl MainSaSent {
 
         let state = MainKeSent {
             group: self.group,
-            psk: self.psk,
+            key_len: self.key_len,
+            local_auth: self.local_auth,
+            trusted_cas: self.trusted_cas,
+            now_unix: self.now_unix,
             our_id: self.our_id,
             cky_i: self.cky_i,
             cky_r,
@@ -627,7 +749,10 @@ impl MainSaSent {
 /// Post-message-3 Main-Mode initiator state.
 pub struct MainKeSent {
     group: DhGroup,
-    psk: Vec<u8>,
+    key_len: usize,
+    local_auth: Ikev1LocalAuth,
+    trusted_cas: Vec<Vec<u8>>,
+    now_unix: u64,
     our_id: Id,
     cky_i: [u8; 8],
     cky_r: [u8; 8],
@@ -655,14 +780,30 @@ impl MainKeSent {
         }
         let prf = Prf::Sha256;
         let gxy = self.group.shared(&self.dh_private, &gxr)?;
-        let skeyid = crypto1::skeyid_psk(prf, &self.psk, &self.ni, &nr);
+        let skeyid = match &self.local_auth {
+            Ikev1LocalAuth::Psk(psk) => crypto1::skeyid_psk(prf, psk, &self.ni, &nr),
+            Ikev1LocalAuth::Sig { .. } => crypto1::skeyid_sig(prf, &self.ni, &nr, &gxy),
+        };
         let skeyid_d = crypto1::skeyid_d(prf, &skeyid, &gxy, &self.cky_i, &self.cky_r);
         let skeyid_a = crypto1::skeyid_a(prf, &skeyid, &skeyid_d, &gxy, &self.cky_i, &self.cky_r);
         let skeyid_e = crypto1::skeyid_e(prf, &skeyid, &skeyid_a, &gxy, &self.cky_i, &self.cky_r);
-        let enc_key = crypto1::derive_cipher_key(prf, &skeyid_e, 32);
+        let enc_key = crypto1::derive_cipher_key(prf, &skeyid_e, self.key_len);
         let phase1_iv = crypto1::phase1_iv(prf, &self.gxi, &gxr, AES_BLOCK);
 
-        let idi_b = self.our_id.to_bytes();
+        // §5.1 (Sig): IDii is the DER-encoded subject DN of our own leaf cert,
+        // not the configured `our_id` -- matching isakmpd's
+        // `x509_cert_get_subjects` and the already-live-confirmed IKEv2 cert
+        // convention (`cert_subject_dn`).
+        let idi_b = match &self.local_auth {
+            Ikev1LocalAuth::Psk(_) => self.our_id.to_bytes(),
+            Ikev1LocalAuth::Sig { chain, .. } => Id {
+                id_type: id_type::DER_ASN1_DN,
+                protocol: 0,
+                port: 0,
+                data: cert_subject_dn(&chain[0])?,
+            }
+            .to_bytes(),
+        };
         let hash_i = crypto1::hash_i(prf, &skeyid, &self.gxi, &gxr, &self.cky_i, &self.cky_r, &self.sai_b, &idi_b);
 
         let hdr5 = IsakmpHeader {
@@ -675,12 +816,20 @@ impl MainKeSent {
             message_id: 0,
             length: 0,
         };
-        let (msg5, iv_after_msg5) = phase2::encrypt_payloads(
-            hdr5,
-            &enc_key,
-            &phase1_iv,
-            &[(payload::ID, idi_b.clone()), (payload::HASH, hash_i)],
-        )?;
+        // §5.1 (Sig): CERT (one per chain cert) + SIG (a raw PKCS#1 v1.5
+        // signature over `hash_i`, RFC 2409's SIG payload convention) instead
+        // of a HASH payload -- see `sign_classic_rsa_raw`'s doc.
+        let out_payloads: Vec<(u8, Vec<u8>)> = match &self.local_auth {
+            Ikev1LocalAuth::Psk(_) => vec![(payload::ID, idi_b.clone()), (payload::HASH, hash_i)],
+            Ikev1LocalAuth::Sig { key, chain } => {
+                let sig = key.sign_classic_rsa_raw(&hash_i)?;
+                let mut out = vec![(payload::ID, idi_b.clone())];
+                out.extend(chain.iter().map(|cert| (payload::CERT, cert_payload_body(cert))));
+                out.push((payload::SIG, sig));
+                out
+            }
+        };
+        let (msg5, iv_after_msg5) = phase2::encrypt_payloads(hdr5, &enc_key, &phase1_iv, &out_payloads)?;
 
         let state = MainIdSent {
             prf,
@@ -698,6 +847,9 @@ impl MainKeSent {
             nr,
             sai_b: self.sai_b,
             idi_b,
+            trusted_cas: self.trusted_cas,
+            now_unix: self.now_unix,
+            is_sig: matches!(self.local_auth, Ikev1LocalAuth::Sig { .. }),
             iv_after_msg5,
             peer_supports_dpd,
         };
@@ -706,7 +858,7 @@ impl MainKeSent {
 }
 
 /// Post-message-5 Main-Mode initiator state: the key schedule is derived and
-/// message 5 is already sent — only the responder's message 6 (`HASH_R`)
+/// message 5 is already sent — only the responder's message 6 (`HASH_R`/`SIG`)
 /// remains to be verified before Phase 1 can be trusted.
 pub struct MainIdSent {
     prf: Prf,
@@ -724,6 +876,9 @@ pub struct MainIdSent {
     nr: Vec<u8>,
     sai_b: Vec<u8>,
     idi_b: Vec<u8>,
+    trusted_cas: Vec<Vec<u8>>,
+    now_unix: u64,
+    is_sig: bool,
     /// Not the raw `HASH(g^xi|g^xr)` Phase-1 seed -- that's only needed to
     /// encrypt message 5 itself (already consumed by the time this struct
     /// exists). This is the IV chained forward past message 5's own
@@ -733,15 +888,23 @@ pub struct MainIdSent {
 }
 
 impl MainIdSent {
-    /// Process message 6 (`HDR*, IDr, HASH_R`, encrypted): verify the
-    /// responder's `HASH_R` and return the completed, authenticated [`Phase1State`].
+    /// Process message 6 (`HDR*, IDr, HASH_R` or `HDR*, IDr, CERT.., SIG`,
+    /// encrypted): verify the responder's authentication and return the
+    /// completed, authenticated [`Phase1State`].
     pub fn complete_id(self, msg6: &[u8]) -> Result<Phase1State, IkeError> {
         let (_hdr, ps, iv_after_msg6) = phase2::decrypt_payloads(msg6, &self.enc_key, &self.iv_after_msg5)?;
         let idr_b = find(&ps, payload::ID).ok_or(IkeError::MissingPayload("ID"))?.data.clone();
-        let hash_r_got = find(&ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
         let expect_hr = crypto1::hash_r(self.prf, &self.skeyid, &self.gxr, &self.gxi, &self.cky_r, &self.cky_i, &self.sai_b, &idr_b);
-        if hash_r_got != expect_hr {
-            return Err(IkeError::AuthFailed);
+        if self.is_sig {
+            let certs = collect_certs(&ps)?;
+            let sig = find(&ps, payload::SIG).ok_or(IkeError::MissingPayload("SIG"))?.data.clone();
+            validate_chain(&certs[0], &certs[1..], &self.trusted_cas, self.now_unix)?;
+            VerifyingKey::from_cert_der(&certs[0])?.verify_classic_rsa_raw(&sig, &expect_hr)?;
+        } else {
+            let hash_r_got = find(&ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
+            if hash_r_got != expect_hr {
+                return Err(IkeError::AuthFailed);
+            }
         }
         Ok(Phase1State {
             prf: self.prf,
@@ -792,7 +955,8 @@ pub fn respond_main(cfg: &Phase1Config, msg1: &[u8], entropy: &mut impl Entropy)
     let sa_p = find(&ps, payload::SA).ok_or(IkeError::MissingPayload("SA"))?;
     let sai_b = sa_p.data.clone();
     let sa = SaPayload::parse(&sai_b)?;
-    let (chosen, prf, group, key_len) = select_transform(&sa).ok_or(IkeError::NoProposalChosen)?;
+    let want_sig = matches!(cfg.local_auth, Ikev1LocalAuth::Sig { .. });
+    let (chosen, prf, group, key_len) = select_transform(&sa, want_sig).ok_or(IkeError::NoProposalChosen)?;
 
     let mut cky_r = [0u8; 8];
     entropy.fill(&mut cky_r);
@@ -814,7 +978,18 @@ pub fn respond_main(cfg: &Phase1Config, msg1: &[u8], entropy: &mut impl Entropy)
     };
     let msg2 = isakmp::build_message(hdr2, &[(payload::SA, sar.to_bytes())]);
 
-    let state = MainRespSaSent { prf, group, key_len, cky_i, cky_r, psk: cfg.psk.clone(), our_id: cfg.our_id.clone(), sai_b };
+    let state = MainRespSaSent {
+        prf,
+        group,
+        key_len,
+        cky_i,
+        cky_r,
+        local_auth: cfg.local_auth.clone(),
+        trusted_cas: cfg.trusted_cas.clone(),
+        now_unix: cfg.now_unix,
+        our_id: cfg.our_id.clone(),
+        sai_b,
+    };
     Ok((msg2, state))
 }
 
@@ -825,7 +1000,9 @@ pub struct MainRespSaSent {
     key_len: usize,
     cky_i: [u8; 8],
     cky_r: [u8; 8],
-    psk: Vec<u8>,
+    local_auth: Ikev1LocalAuth,
+    trusted_cas: Vec<Vec<u8>>,
+    now_unix: u64,
     our_id: Id,
     sai_b: Vec<u8>,
 }
@@ -873,7 +1050,9 @@ impl MainRespSaSent {
             key_len: self.key_len,
             cky_i: self.cky_i,
             cky_r: self.cky_r,
-            psk: self.psk,
+            local_auth: self.local_auth,
+            trusted_cas: self.trusted_cas,
+            now_unix: self.now_unix,
             our_id: self.our_id,
             sai_b: self.sai_b,
             gxi,
@@ -894,7 +1073,9 @@ pub struct MainRespKeSent {
     key_len: usize,
     cky_i: [u8; 8],
     cky_r: [u8; 8],
-    psk: Vec<u8>,
+    local_auth: Ikev1LocalAuth,
+    trusted_cas: Vec<Vec<u8>>,
+    now_unix: u64,
     our_id: Id,
     sai_b: Vec<u8>,
     gxi: Vec<u8>,
@@ -912,7 +1093,10 @@ impl MainRespKeSent {
     /// [`Phase1State`].
     pub fn complete_id(self, msg5: &[u8]) -> Result<(Vec<u8>, Phase1State), IkeError> {
         let gxy = self.group.shared(&self.dh_private, &self.gxi)?;
-        let skeyid = crypto1::skeyid_psk(self.prf, &self.psk, &self.ni, &self.nr);
+        let skeyid = match &self.local_auth {
+            Ikev1LocalAuth::Psk(psk) => crypto1::skeyid_psk(self.prf, psk, &self.ni, &self.nr),
+            Ikev1LocalAuth::Sig { .. } => crypto1::skeyid_sig(self.prf, &self.ni, &self.nr, &gxy),
+        };
         let skeyid_d = crypto1::skeyid_d(self.prf, &skeyid, &gxy, &self.cky_i, &self.cky_r);
         let skeyid_a = crypto1::skeyid_a(self.prf, &skeyid, &skeyid_d, &gxy, &self.cky_i, &self.cky_r);
         let skeyid_e = crypto1::skeyid_e(self.prf, &skeyid, &skeyid_a, &gxy, &self.cky_i, &self.cky_r);
@@ -921,13 +1105,31 @@ impl MainRespKeSent {
 
         let (_hdr, ps, iv_after_msg5) = phase2::decrypt_payloads(msg5, &enc_key, &phase1_iv)?;
         let idii_b = find(&ps, payload::ID).ok_or(IkeError::MissingPayload("ID"))?.data.clone();
-        let hash_i_got = find(&ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
         let expect_hi = crypto1::hash_i(self.prf, &skeyid, &self.gxi, &self.gxr, &self.cky_i, &self.cky_r, &self.sai_b, &idii_b);
-        if hash_i_got != expect_hi {
-            return Err(IkeError::AuthFailed);
+        if matches!(self.local_auth, Ikev1LocalAuth::Sig { .. }) {
+            let certs = collect_certs(&ps)?;
+            let sig = find(&ps, payload::SIG).ok_or(IkeError::MissingPayload("SIG"))?.data.clone();
+            validate_chain(&certs[0], &certs[1..], &self.trusted_cas, self.now_unix)?;
+            VerifyingKey::from_cert_der(&certs[0])?.verify_classic_rsa_raw(&sig, &expect_hi)?;
+        } else {
+            let hash_i_got = find(&ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
+            if hash_i_got != expect_hi {
+                return Err(IkeError::AuthFailed);
+            }
         }
 
-        let idir_b = self.our_id.to_bytes();
+        // §5.1 (Sig): IDir is our own leaf cert's subject DN, same convention
+        // as IDii above.
+        let idir_b = match &self.local_auth {
+            Ikev1LocalAuth::Psk(_) => self.our_id.to_bytes(),
+            Ikev1LocalAuth::Sig { chain, .. } => Id {
+                id_type: id_type::DER_ASN1_DN,
+                protocol: 0,
+                port: 0,
+                data: cert_subject_dn(&chain[0])?,
+            }
+            .to_bytes(),
+        };
         let hash_r = crypto1::hash_r(self.prf, &skeyid, &self.gxr, &self.gxi, &self.cky_r, &self.cky_i, &self.sai_b, &idir_b);
         let hdr6 = IsakmpHeader {
             init_cookie: self.cky_i,
@@ -939,7 +1141,17 @@ impl MainRespKeSent {
             message_id: 0,
             length: 0,
         };
-        let (msg6, iv_after_msg6) = phase2::encrypt_payloads(hdr6, &enc_key, &iv_after_msg5, &[(payload::ID, idir_b), (payload::HASH, hash_r)])?;
+        let out_payloads: Vec<(u8, Vec<u8>)> = match &self.local_auth {
+            Ikev1LocalAuth::Psk(_) => vec![(payload::ID, idir_b.clone()), (payload::HASH, hash_r)],
+            Ikev1LocalAuth::Sig { key, chain } => {
+                let sig = key.sign_classic_rsa_raw(&hash_r)?;
+                let mut out = vec![(payload::ID, idir_b.clone())];
+                out.extend(chain.iter().map(|cert| (payload::CERT, cert_payload_body(cert))));
+                out.push((payload::SIG, sig));
+                out
+            }
+        };
+        let (msg6, iv_after_msg6) = phase2::encrypt_payloads(hdr6, &enc_key, &iv_after_msg5, &out_payloads)?;
 
         let state = Phase1State {
             prf: self.prf,
@@ -1026,7 +1238,12 @@ mod tests {
     #[test]
     fn full_aggressive_phase1_against_an_in_process_initiator() {
         // Play both roles: an initiator drives group-2 DH + HASH_I, ryke responds.
-        let cfg = Phase1Config { psk: b"testpsk".to_vec(), our_id: Id::ipv4([192, 168, 3, 204]) };
+        let cfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(b"testpsk".to_vec()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 3, 204]),
+        };
         let cky_i = [0xAB; 8];
         let mut ie = SeedEntropy::new(7);
         let i_priv = ie.next_array32();
@@ -1075,7 +1292,12 @@ mod tests {
 
     #[test]
     fn wrong_psk_fails_hash_i() {
-        let cfg = Phase1Config { psk: b"right".to_vec(), our_id: Id::ipv4([10, 0, 0, 1]) };
+        let cfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(b"right".to_vec()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([10, 0, 0, 1]),
+        };
         let cky_i = [0x01; 8];
         let mut ie = SeedEntropy::new(3);
         let i_priv = ie.next_array32();
@@ -1103,11 +1325,16 @@ mod tests {
         // which hand-build msg1) -- `initiate_aggressive` offers
         // `DPD_VENDOR_ID`, `respond_aggressive` echoes it back, and each side
         // should come away with `peer_supports_dpd: true`.
+        let psk = b"correct horse battery staple".to_vec();
         let icfg = InitiatorConfig {
-            psk: b"correct horse battery staple".to_vec(),
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            key_len: 32,
             our_id: Id::ipv4([10, 1, 1, 1]),
             group: DhGroup::Modp1024,
             xauth: false,
+            xauth_creds: None,
             ts_local: ([0, 0, 0, 0], [0, 0, 0, 0]),
             ts_remote: ([0, 0, 0, 0], [0, 0, 0, 0]),
             esp_cipher: crate::ikev2::sk::SkCipher::Aes256Gcm,
@@ -1115,7 +1342,12 @@ mod tests {
             mode_cfg: false,
             mode: Ikev1ExchangeMode::Aggressive,
         };
-        let rcfg = Phase1Config { psk: icfg.psk.clone(), our_id: Id::ipv4([192, 168, 0, 1]) };
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(psk),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
         let mut ie = SeedEntropy::new(0x1111);
         let mut re = SeedEntropy::new(0x2222);
         let (msg1, ai) = initiate_aggressive(&icfg, &mut ie);
@@ -1129,10 +1361,14 @@ mod tests {
 
     fn main_mode_icfg(psk: Vec<u8>) -> InitiatorConfig {
         InitiatorConfig {
-            psk,
+            local_auth: Ikev1LocalAuth::Psk(psk),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            key_len: 32,
             our_id: Id::ipv4([10, 1, 1, 1]),
             group: DhGroup::Modp1024,
             xauth: false,
+            xauth_creds: None,
             ts_local: ([0, 0, 0, 0], [0, 0, 0, 0]),
             ts_remote: ([0, 0, 0, 0], [0, 0, 0, 0]),
             esp_cipher: crate::ikev2::sk::SkCipher::Aes256Gcm,
@@ -1144,8 +1380,14 @@ mod tests {
 
     #[test]
     fn full_main_phase1_against_an_in_process_responder() {
-        let icfg = main_mode_icfg(b"correct horse battery staple".to_vec());
-        let rcfg = Phase1Config { psk: icfg.psk.clone(), our_id: Id::ipv4([192, 168, 0, 1]) };
+        let psk = b"correct horse battery staple".to_vec();
+        let icfg = main_mode_icfg(psk.clone());
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(psk),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
         let mut ie = SeedEntropy::new(0x3333);
         let mut re = SeedEntropy::new(0x4444);
 
@@ -1179,6 +1421,44 @@ mod tests {
         assert_eq!(rstate.phase1_iv, last_block, "responder's phase1_iv must chain from message 6's ciphertext");
     }
 
+    /// A profile configured for AES-192 (`InitiatorConfig::key_len: 24`) must
+    /// actually offer AES-192 on the wire and complete the handshake with a
+    /// 24-byte `enc_key` on both sides -- confirmed live against a real
+    /// FortiGate IKEv1 gateway policy pinned to AES-192-CBC that this app
+    /// used to fail to negotiate at all ("no SA proposal chosen") because
+    /// `initiator_sa` unconditionally offered AES-256 regardless of what a
+    /// profile's own Phase-1 proposal configured.
+    #[test]
+    fn main_mode_offers_and_completes_with_aes_192() {
+        let psk = b"correct horse battery staple".to_vec();
+        let mut icfg = main_mode_icfg(psk.clone());
+        icfg.key_len = 24;
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(psk),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
+        let mut ie = SeedEntropy::new(0x9191);
+        let mut re = SeedEntropy::new(0x9292);
+
+        let (msg1, sa_sent) = initiate_main(&icfg, &mut ie);
+        let hdr1 = IsakmpHeader::parse(&msg1).unwrap();
+        let ps1 = isakmp::parse_payloads(hdr1.next_payload, &msg1[IsakmpHeader::LEN..]).unwrap();
+        let sa = SaPayload::parse(&find(&ps1, payload::SA).unwrap().data).unwrap();
+        assert_eq!(sa.proposals[0].transforms[0].attr(attr::KEY_LENGTH), Some(192), "message 1 must offer AES-192, not the old hardcoded AES-256");
+
+        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re).unwrap();
+        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie).unwrap();
+        let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
+        let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
+        let (msg6, rstate) = r2.complete_id(&msg5).unwrap();
+        let istate = id_sent.complete_id(&msg6).unwrap();
+
+        assert_eq!(istate.enc_key.len(), 24, "AES-192 key must be 24 bytes");
+        assert_eq!(istate.enc_key, rstate.enc_key, "both sides must derive the identical AES-192 key");
+    }
+
     #[test]
     fn wrong_psk_fails_main_mode_hash_i() {
         // Unlike Aggressive Mode's `wrong_psk_fails_hash_i` (whose msg3 can
@@ -1189,7 +1469,12 @@ mod tests {
         // Either way, the property under test is the same: a wrong PSK must
         // never yield an established Phase1State.
         let icfg = main_mode_icfg(b"right".to_vec());
-        let rcfg = Phase1Config { psk: b"wrong".to_vec(), our_id: Id::ipv4([192, 168, 0, 1]) };
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(b"wrong".to_vec()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
         let mut ie = SeedEntropy::new(0x5555);
         let mut re = SeedEntropy::new(0x6666);
 
@@ -1207,8 +1492,14 @@ mod tests {
         // this module's Main Mode doc comment) is that the initiator must
         // verify the responder's HASH_R itself -- a tampered message 6 must
         // never produce a `Phase1State`.
-        let icfg = main_mode_icfg(b"correct horse battery staple".to_vec());
-        let rcfg = Phase1Config { psk: icfg.psk.clone(), our_id: Id::ipv4([192, 168, 0, 1]) };
+        let psk = b"correct horse battery staple".to_vec();
+        let icfg = main_mode_icfg(psk.clone());
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(psk),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
         let mut ie = SeedEntropy::new(0x9999);
         let mut re = SeedEntropy::new(0xAAAA);
 
@@ -1220,5 +1511,153 @@ mod tests {
         let (mut msg6, _rstate) = r2.complete_id(&msg5).unwrap();
         *msg6.last_mut().unwrap() ^= 0xFF; // corrupt the tail of the encrypted HASH_R
         assert!(id_sent.complete_id(&msg6).is_err(), "a tampered HASH_R must never verify");
+    }
+
+    /// A self-signed RSA certificate built at test time from the crate's
+    /// shared RSA test key (`crate::test_certs::RSA_KEY_PK8`) -- trusted as
+    /// its own anchor, so `validate_chain(leaf, [], [leaf], now)` succeeds.
+    /// `serial` must be distinct across calls within the same test (it's the
+    /// only thing that varies): two certs built with the same key, subject
+    /// and serial within the same wall-clock second are byte-identical DER,
+    /// which silently defeats an "untrusted cert" test. Returns the cert DER
+    /// and the wall-clock time it's valid at.
+    fn self_signed_rsa_test_cert(serial: u32) -> (Vec<u8>, u64) {
+        use der::Encode;
+        use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey};
+        use sha2::Sha256;
+        use std::str::FromStr;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::spki::SubjectPublicKeyInfoOwned;
+        use x509_cert::time::Validity;
+
+        let priv_key = rsa::RsaPrivateKey::from_pkcs8_der(crate::test_certs::RSA_KEY_PK8).unwrap();
+        let pub_key_der = priv_key.to_public_key().to_public_key_der().unwrap();
+        let pub_key = SubjectPublicKeyInfoOwned::try_from(pub_key_der.as_bytes()).unwrap();
+        let subject = Name::from_str("CN=ryke-ikev1-sig-test").unwrap();
+        let signer = rsa::pkcs1v15::SigningKey::<Sha256>::new(priv_key);
+        let validity = Validity::from_now(Duration::new(300, 0)).unwrap();
+        let builder = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(serial),
+            validity,
+            subject,
+            pub_key,
+            &signer,
+        )
+        .unwrap();
+        let cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
+        let der = cert.to_der().unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        (der, now)
+    }
+
+    /// The RSA-signature analog of `full_main_phase1_against_an_in_process_responder`
+    /// -- both sides configured with `Ikev1LocalAuth::Sig` instead of `Psk`,
+    /// exercising the real CERT/SIG wire format both directions (§5.1) rather
+    /// than a hand-built fixture. This is the highest-value test for the whole
+    /// RSA-sig feature: it fails if the SKEYID formula, the CERT/SIG payload
+    /// shape, the DER_ASN1_DN identity, or the chain/signature verification
+    /// disagree between initiator and responder.
+    #[test]
+    fn full_main_phase1_sig_auth_against_an_in_process_responder() {
+        let (cert_der, now_unix) = self_signed_rsa_test_cert(1);
+        let ikey = Arc::new(SigningKey::rsa_from_pkcs8_der(crate::test_certs::RSA_KEY_PK8).unwrap());
+        let rkey = Arc::new(SigningKey::rsa_from_pkcs8_der(crate::test_certs::RSA_KEY_PK8).unwrap());
+
+        let icfg = InitiatorConfig {
+            local_auth: Ikev1LocalAuth::Sig { key: ikey, chain: vec![cert_der.clone()] },
+            trusted_cas: vec![cert_der.clone()],
+            now_unix,
+            key_len: 32,
+            our_id: Id::ipv4([10, 1, 1, 1]), // ignored -- IDi/IDr come from the cert's subject DN
+            group: DhGroup::Modp1024,
+            xauth: false,
+            xauth_creds: None,
+            ts_local: ([0, 0, 0, 0], [0, 0, 0, 0]),
+            ts_remote: ([0, 0, 0, 0], [0, 0, 0, 0]),
+            esp_cipher: crate::ikev2::sk::SkCipher::Aes256Gcm,
+            pfs_group: None,
+            mode_cfg: false,
+            mode: Ikev1ExchangeMode::Main,
+        };
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Sig { key: rkey, chain: vec![cert_der.clone()] },
+            trusted_cas: vec![cert_der],
+            now_unix,
+            our_id: Id::ipv4([192, 168, 0, 1]), // ignored, same reason
+        };
+        let mut ie = SeedEntropy::new(0xBEEF);
+        let mut re = SeedEntropy::new(0xCAFE);
+
+        let (msg1, sa_sent) = initiate_main(&icfg, &mut ie);
+        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re).unwrap();
+        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie).unwrap();
+        let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
+        let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
+        let (msg6, rstate) = r2.complete_id(&msg5).unwrap();
+        let istate = id_sent.complete_id(&msg6).unwrap();
+
+        assert_eq!(istate.skeyid_e, rstate.skeyid_e, "both sides must derive the same SKEYID_e");
+        assert_eq!(istate.enc_key, rstate.enc_key);
+    }
+
+    /// A wrong/untrusted certificate (self-signed, but not in `trusted_cas`)
+    /// must never let Main Mode complete -- the chain-validation branch of
+    /// `MainIdSent::complete_id`/`MainRespKeSent::complete_id` must actually
+    /// reject, not just skip straight to the signature check.
+    #[test]
+    fn main_mode_sig_auth_rejects_an_untrusted_responder_cert() {
+        let (good_cert, now_unix) = self_signed_rsa_test_cert(1);
+        // A valid but unrelated (EC, not RSA) cert -- distinct key pair from
+        // `good_cert_r`'s, so it can never validate as its anchor. A second
+        // *RSA* self-signed cert from the same shared test key would not
+        // work here: its public key would still verify `good_cert_r`'s
+        // self-signature, since both certs share the same underlying key
+        // pair (only the serial number would differ).
+        let bad_cert = crate::test_certs::LEAF_CERT_DER.to_vec();
+        let ikey = Arc::new(SigningKey::rsa_from_pkcs8_der(crate::test_certs::RSA_KEY_PK8).unwrap());
+        let rkey = Arc::new(SigningKey::rsa_from_pkcs8_der(crate::test_certs::RSA_KEY_PK8).unwrap());
+
+        let (good_cert_r, _) = self_signed_rsa_test_cert(3);
+        let icfg = InitiatorConfig {
+            local_auth: Ikev1LocalAuth::Sig { key: ikey, chain: vec![good_cert.clone()] },
+            // The initiator only trusts `bad_cert` -- the responder's actual
+            // (different, freshly self-signed) `good_cert_r` must not validate.
+            trusted_cas: vec![bad_cert],
+            now_unix,
+            key_len: 32,
+            our_id: Id::ipv4([10, 1, 1, 1]),
+            group: DhGroup::Modp1024,
+            xauth: false,
+            xauth_creds: None,
+            ts_local: ([0, 0, 0, 0], [0, 0, 0, 0]),
+            ts_remote: ([0, 0, 0, 0], [0, 0, 0, 0]),
+            esp_cipher: crate::ikev2::sk::SkCipher::Aes256Gcm,
+            pfs_group: None,
+            mode_cfg: false,
+            mode: Ikev1ExchangeMode::Main,
+        };
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Sig { key: rkey, chain: vec![good_cert_r] },
+            // The responder trusts the initiator's real cert, so msg5
+            // verifies fine on this side -- only the initiator's verification
+            // of msg6 (the thing under test) should fail.
+            trusted_cas: vec![good_cert],
+            now_unix,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
+        let mut ie = SeedEntropy::new(0x1234);
+        let mut re = SeedEntropy::new(0x5678);
+
+        let (msg1, sa_sent) = initiate_main(&icfg, &mut ie);
+        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re).unwrap();
+        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie).unwrap();
+        let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
+        let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
+        let (msg6, _rstate) = r2.complete_id(&msg5).unwrap();
+        assert!(id_sent.complete_id(&msg6).is_err(), "an untrusted responder cert must never verify");
     }
 }

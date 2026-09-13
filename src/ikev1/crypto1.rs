@@ -16,6 +16,10 @@ use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
+type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+type Aes192CbcEnc = cbc::Encryptor<aes::Aes192>;
+type Aes192CbcDec = cbc::Decryptor<aes::Aes192>;
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
@@ -74,6 +78,16 @@ fn cat(parts: &[&[u8]]) -> Vec<u8> {
 /// `SKEYID = prf(pre-shared-key, Ni_b | Nr_b)` for PSK authentication.
 pub fn skeyid_psk(prf: Prf, psk: &[u8], ni: &[u8], nr: &[u8]) -> Vec<u8> {
     prf.mac(psk, &cat(&[ni, nr]))
+}
+
+/// `SKEYID = prf(Ni_b | Nr_b, g^xy)` for RSA-signature authentication (RFC
+/// 2409 §5.1). Mirrors `skeyid_psk` with the key/data roles swapped: the
+/// nonces become the PRF key, and the DH shared secret is the data (there is
+/// no pre-shared key in this mode). Confirmed against isakmpd's
+/// `sig_gen_skeyid` (`ike_auth.c`), which both DSS and RSA signature
+/// authentication share.
+pub fn skeyid_sig(prf: Prf, ni: &[u8], nr: &[u8], gxy: &[u8]) -> Vec<u8> {
+    prf.mac(&cat(&[ni, nr]), gxy)
 }
 
 /// `SKEYID_d = prf(SKEYID, g^xy | CKY-I | CKY-R | 0)`.
@@ -188,24 +202,37 @@ pub fn pad_to_block(data: &[u8], block: usize) -> Vec<u8> {
 }
 
 /// AES-CBC encrypt (raw, no padding). `plaintext` must be block-aligned.
-pub fn aes256_cbc_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, IkeError> {
+/// `key` selects the variant: 16 bytes = AES-128, 24 = AES-192, 32 = AES-256
+/// (RFC 2409 negotiates the width via the SA's `KEY_LENGTH` attribute — see
+/// [`super::phase1::InitiatorConfig::key_len`]).
+pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, IkeError> {
     if plaintext.len() % AES_BLOCK != 0 {
         return Err(IkeError::Crypto("CBC plaintext not block-aligned"));
     }
-    let cipher = Aes256CbcEnc::new_from_slices(key, iv).map_err(|_| IkeError::Crypto("bad AES-CBC key/iv"))?;
-    Ok(cipher.encrypt_padded_vec_mut::<NoPadding>(plaintext))
+    let bad_key = || IkeError::Crypto("bad AES-CBC key/iv");
+    Ok(match key.len() {
+        16 => Aes128CbcEnc::new_from_slices(key, iv).map_err(|_| bad_key())?.encrypt_padded_vec_mut::<NoPadding>(plaintext),
+        24 => Aes192CbcEnc::new_from_slices(key, iv).map_err(|_| bad_key())?.encrypt_padded_vec_mut::<NoPadding>(plaintext),
+        32 => Aes256CbcEnc::new_from_slices(key, iv).map_err(|_| bad_key())?.encrypt_padded_vec_mut::<NoPadding>(plaintext),
+        _ => return Err(IkeError::Crypto("unsupported AES-CBC key length (need 16/24/32 bytes)")),
+    })
 }
 
 /// AES-CBC decrypt (raw, no padding). Returns the full padded plaintext; the
-/// caller uses ISAKMP length fields to find the real end.
-pub fn aes256_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, IkeError> {
+/// caller uses ISAKMP length fields to find the real end. See
+/// [`aes_cbc_encrypt`] for the key-length-selects-variant convention.
+pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, IkeError> {
     if ciphertext.is_empty() || ciphertext.len() % AES_BLOCK != 0 {
         return Err(IkeError::Crypto("CBC ciphertext not block-aligned"));
     }
-    let cipher = Aes256CbcDec::new_from_slices(key, iv).map_err(|_| IkeError::Crypto("bad AES-CBC key/iv"))?;
-    cipher
-        .decrypt_padded_vec_mut::<NoPadding>(ciphertext)
-        .map_err(|_| IkeError::Crypto("AES-CBC decrypt failed"))
+    let bad_key = || IkeError::Crypto("bad AES-CBC key/iv");
+    let bad_ct = || IkeError::Crypto("AES-CBC decrypt failed");
+    match key.len() {
+        16 => Aes128CbcDec::new_from_slices(key, iv).map_err(|_| bad_key())?.decrypt_padded_vec_mut::<NoPadding>(ciphertext).map_err(|_| bad_ct()),
+        24 => Aes192CbcDec::new_from_slices(key, iv).map_err(|_| bad_key())?.decrypt_padded_vec_mut::<NoPadding>(ciphertext).map_err(|_| bad_ct()),
+        32 => Aes256CbcDec::new_from_slices(key, iv).map_err(|_| bad_key())?.decrypt_padded_vec_mut::<NoPadding>(ciphertext).map_err(|_| bad_ct()),
+        _ => Err(IkeError::Crypto("unsupported AES-CBC key length (need 16/24/32 bytes)")),
+    }
 }
 
 /// The last ciphertext block — becomes the IV for the next message with the same
@@ -240,6 +267,20 @@ mod tests {
     }
 
     #[test]
+    fn skeyid_sig_matches_the_rfc_2409_formula_and_differs_from_skeyid_psk() {
+        for prf in [Prf::Sha1, Prf::Sha256] {
+            let (ni, nr, gxy) = (&[1u8; 16][..], &[2u8; 16][..], &[0xABu8; 128][..]);
+            // §5.1: nonces are the PRF key, g^xy is the data -- the opposite
+            // role assignment from §5.4's `skeyid_psk`.
+            let got = skeyid_sig(prf, ni, nr, gxy);
+            let expected = prf.mac(&cat(&[ni, nr]), gxy);
+            assert_eq!(got, expected);
+            assert_eq!(got.len(), prf.output_len());
+            assert_ne!(got, skeyid_psk(prf, b"not actually used as a psk here", ni, nr));
+        }
+    }
+
+    #[test]
     fn hash_i_and_hash_r_differ_by_argument_order() {
         let prf = Prf::Sha256;
         let skeyid = skeyid_psk(prf, b"psk", &[1; 16], &[2; 16]);
@@ -268,12 +309,40 @@ mod tests {
         let iv = phase1_iv(Prf::Sha256, &[0x01; 128], &[0x02; 128], AES_BLOCK);
         assert_eq!(iv.len(), AES_BLOCK);
         let plain = pad_to_block(b"an encrypted ISAKMP payload chain", AES_BLOCK);
-        let ct = aes256_cbc_encrypt(&key, &iv, &plain).unwrap();
+        let ct = aes_cbc_encrypt(&key, &iv, &plain).unwrap();
         assert_eq!(ct.len(), plain.len());
-        let pt = aes256_cbc_decrypt(&key, &iv, &ct).unwrap();
+        let pt = aes_cbc_decrypt(&key, &iv, &ct).unwrap();
         assert_eq!(pt, plain);
         // The next-message IV is the last ciphertext block.
         assert_eq!(next_iv(&ct, AES_BLOCK), ct[ct.len() - AES_BLOCK..]);
+    }
+
+    /// AES-128 and AES-192 must round-trip too (RFC 2409's `KEY_LENGTH`
+    /// attribute selects the width -- a gateway policy pinned to AES-192
+    /// (confirmed live against a real FortiGate) fails outright if this
+    /// crate can only ever speak AES-256) and must not cross-decrypt with a
+    /// different width, proving the dispatch in `aes_cbc_encrypt`/`_decrypt`
+    /// actually picks a different cipher rather than silently truncating a
+    /// 256-bit routine's key.
+    #[test]
+    fn aes_cbc_roundtrips_at_128_and_192_bits_and_widths_dont_cross_decrypt() {
+        let iv = phase1_iv(Prf::Sha256, &[0x01; 128], &[0x02; 128], AES_BLOCK);
+        let plain = pad_to_block(b"an encrypted ISAKMP payload chain", AES_BLOCK);
+        for key_len in [16usize, 24] {
+            let key = vec![0x42; key_len];
+            let ct = aes_cbc_encrypt(&key, &iv, &plain).unwrap();
+            assert_eq!(ct.len(), plain.len());
+            let pt = aes_cbc_decrypt(&key, &iv, &ct).unwrap();
+            assert_eq!(pt, plain);
+        }
+        let key128 = vec![0x42; 16];
+        let key256 = vec![0x42; 32];
+        let ct128 = aes_cbc_encrypt(&key128, &iv, &plain).unwrap();
+        assert_ne!(ct128, aes_cbc_encrypt(&key256, &iv, &plain).unwrap());
+        // Decrypting AES-128 ciphertext with an AES-256 key selects the
+        // wrong cipher width (NoPadding never errors) -- must not silently
+        // recover the right plaintext.
+        assert_ne!(aes_cbc_decrypt(&key256, &iv, &ct128).unwrap(), plain);
     }
 
     #[test]

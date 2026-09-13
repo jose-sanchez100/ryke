@@ -111,6 +111,15 @@ impl SigningKey {
         Ok(SigningKey::EcdsaP256(key))
     }
 
+    /// Load an RSA signing key from a PKCS#8 DER document
+    /// (`-----BEGIN PRIVATE KEY-----`, e.g. `openssl pkcs8 …` output).
+    pub fn rsa_from_pkcs8_der(der: &[u8]) -> Result<Self, IkeError> {
+        use rsa::pkcs8::DecodePrivateKey;
+        let key = rsa::RsaPrivateKey::from_pkcs8_der(der)
+            .map_err(|_| IkeError::Crypto("bad RSA PKCS#8 DER private key"))?;
+        Ok(SigningKey::RsaSha256(Box::new(key)))
+    }
+
     /// The DER `AlgorithmIdentifier` this key advertises in the AUTH payload.
     pub fn algorithm_id(&self) -> &'static [u8] {
         match self {
@@ -156,6 +165,24 @@ impl SigningKey {
             SigningKey::RsaSha256(_) => Err(IkeError::Crypto("method 9 needs an ECDSA P-256 key")),
         }
     }
+
+    /// Sign `data` directly with PKCS#1 v1.5 padding and no ASN.1
+    /// `DigestInfo` prefix (`rsa::Pkcs1v15Sign::new_unprefixed`) — the classic
+    /// IKEv1 SIG payload convention (RFC 2409 §5.1): `HASH_I`/`HASH_R` (an
+    /// HMAC/PRF output) is signed as-is, unlike IKEv2's methods 1/14 which
+    /// re-hash the signed octets with SHA-256/SHA-1 first (see
+    /// `verify_classic_rsa_auth_data` below). Confirmed against isakmpd's
+    /// `rsa_sig_encode_hash`, which calls OpenSSL's
+    /// `RSA_private_encrypt(..., RSA_PKCS1_PADDING)` directly over the raw
+    /// hash bytes.
+    pub fn sign_classic_rsa_raw(&self, data: &[u8]) -> Result<Vec<u8>, IkeError> {
+        match self {
+            SigningKey::RsaSha256(key) => key
+                .sign(rsa::Pkcs1v15Sign::new_unprefixed(), data)
+                .map_err(|_| IkeError::Crypto("RSA signing failed")),
+            SigningKey::EcdsaP256(_) => Err(IkeError::Crypto("IKEv1 SIG payload needs an RSA certificate key")),
+        }
+    }
 }
 
 /// A public key that verifies RFC 7427 Digital Signatures.
@@ -194,6 +221,19 @@ impl VerifyingKey {
             }
             _ => Err(IkeError::Crypto("unsupported certificate key algorithm")),
         }
+    }
+
+    /// Verify a classic IKEv1 SIG payload: `sig` is a raw PKCS#1 v1.5
+    /// signature over `data` directly, no `DigestInfo` prefix — the
+    /// counterpart to `SigningKey::sign_classic_rsa_raw`. `data` is normally
+    /// an already-computed `HASH_I`/`HASH_R` (see `crypto1::hash_i`/`hash_r`),
+    /// not a message to be hashed again.
+    pub fn verify_classic_rsa_raw(&self, sig: &[u8], data: &[u8]) -> Result<(), IkeError> {
+        let VerifyingKey::Rsa(pk) = self else {
+            return Err(IkeError::Crypto("IKEv1 SIG payload needs an RSA certificate key"));
+        };
+        pk.verify(rsa::Pkcs1v15Sign::new_unprefixed(), data, sig)
+            .map_err(|_| IkeError::AuthFailed)
     }
 
     /// Verify method-14 AUTH Data against the §2.15 `signed_octets`.
@@ -300,6 +340,18 @@ pub fn cert_is_ca(cert_der: &[u8]) -> Result<bool, IkeError> {
         }
     }
     Ok(false)
+}
+
+/// DER of a certificate's subject distinguished name — RFC 7296's
+/// `ID_DER_ASN1_DN` (value 9) IDi/IDr content for a certificate-authenticated
+/// peer whose identity a gateway policy matches against the cert's Subject
+/// DN rather than an arbitrary configured string (confirmed against a real
+/// FortiGate: it rejected `ID_KEY_ID` carrying an unrelated username with
+/// "gw validation failed" once a client certificate was in play). Also reused
+/// as-is by IKEv1 Main Mode RSA-sig auth (RFC 2409 §5.1's `ID_DER_ASN1_DN`),
+/// which encodes identically.
+pub fn cert_subject_dn(cert_der: &[u8]) -> Result<Vec<u8>, IkeError> {
+    subject_dn(cert_der)
 }
 
 /// DER of a certificate's subject / issuer distinguished name (for chaining).
@@ -461,6 +513,34 @@ mod tests {
         let auth = signer.sign_auth_data(octets).unwrap();
         verifier.verify_auth_data(&auth, octets).unwrap();
         assert!(verifier.verify_auth_data(&auth, b"tampered").is_err());
+    }
+
+    #[test]
+    fn classic_rsa_raw_sign_verify_roundtrips_and_rejects_tampering_and_prefixed_signatures() {
+        // The IKEv1 SIG-payload primitive (RFC 2409 §5.1): signs `data`
+        // directly (here, a stand-in for an already-computed HASH_I/HASH_R),
+        // with no re-hashing and no DigestInfo prefix -- distinct from
+        // `sign_auth_data`/`verify_classic_rsa_auth_data` above, which both
+        // re-hash the input first.
+        let (signer, verifier) = rsa_signer();
+        let hash_i = b"a stand-in for crypto1::hash_i's 32-byte SHA-256 output"; // arbitrary length is fine -- unprefixed
+        let sig = signer.sign_classic_rsa_raw(hash_i).unwrap();
+        verifier.verify_classic_rsa_raw(&sig, hash_i).unwrap();
+        assert!(verifier.verify_classic_rsa_raw(&sig, b"tampered").is_err());
+
+        // A signature made by the prefixed method-1 scheme must not verify
+        // under the raw/unprefixed verifier -- the two must not cross-accept
+        // each other's signatures.
+        use rsa::pkcs8::DecodePrivateKey;
+        let key = rsa::RsaPrivateKey::from_pkcs8_der(RSA_KEY_PK8).unwrap();
+        let via_method1 = key.sign(rsa::Pkcs1v15Sign::new::<Sha256>(), &Sha256::digest(hash_i)).unwrap();
+        assert!(verifier.verify_classic_rsa_raw(&via_method1, hash_i).is_err());
+
+        // Neither side of a classic RSA SIG payload works with an ECDSA key.
+        let ec_signer = SigningKey::EcdsaP256(p256::ecdsa::SigningKey::from_slice(LEAF_SCALAR).unwrap());
+        assert!(ec_signer.sign_classic_rsa_raw(hash_i).is_err());
+        let ec_vk = VerifyingKey::from_cert_der(LEAF_CERT_DER).unwrap();
+        assert!(ec_vk.verify_classic_rsa_raw(&sig, hash_i).is_err());
     }
 
     #[test]

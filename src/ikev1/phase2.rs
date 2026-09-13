@@ -49,7 +49,7 @@ pub fn build_encrypted_prefixed(
     let (first, plaintext) = isakmp::encode_payloads(&all);
 
     let padded = crypto1::pad_to_block(&plaintext, AES_BLOCK);
-    let ct = crypto1::aes256_cbc_encrypt(enc_key, iv, &padded)?;
+    let ct = crypto1::aes_cbc_encrypt(enc_key, iv, &padded)?;
     let next = crypto1::next_iv(&ct, AES_BLOCK);
 
     header.next_payload = first;
@@ -71,7 +71,7 @@ pub fn encrypt_payloads(
 ) -> Result<(Vec<u8>, Vec<u8>), IkeError> {
     let (first, plaintext) = isakmp::encode_payloads(payloads);
     let padded = crypto1::pad_to_block(&plaintext, AES_BLOCK);
-    let ct = crypto1::aes256_cbc_encrypt(enc_key, iv, &padded)?;
+    let ct = crypto1::aes_cbc_encrypt(enc_key, iv, &padded)?;
     let next = crypto1::next_iv(&ct, AES_BLOCK);
     header.next_payload = first;
     header.flags |= flags::ENCRYPTION;
@@ -92,7 +92,7 @@ pub fn decrypt_payloads(
 ) -> Result<(IsakmpHeader, Vec<Payload>, Vec<u8>), IkeError> {
     let header = IsakmpHeader::parse(data)?;
     let ct = &data[IsakmpHeader::LEN..];
-    let plaintext = crypto1::aes256_cbc_decrypt(enc_key, iv, ct)?;
+    let plaintext = crypto1::aes_cbc_decrypt(enc_key, iv, ct)?;
     let next = crypto1::next_iv(ct, AES_BLOCK);
     let payloads = isakmp::parse_payloads(header.next_payload, &plaintext)?;
     Ok((header, payloads, next))
@@ -109,7 +109,7 @@ pub fn parse_encrypted(
 ) -> Result<(IsakmpHeader, Vec<Payload>, Vec<u8>), IkeError> {
     let header = IsakmpHeader::parse(data)?;
     let ct = &data[IsakmpHeader::LEN..];
-    let plaintext = crypto1::aes256_cbc_decrypt(enc_key, iv, ct)?;
+    let plaintext = crypto1::aes_cbc_decrypt(enc_key, iv, ct)?;
     let next = crypto1::next_iv(ct, AES_BLOCK);
     let payloads = isakmp::parse_payloads(header.next_payload, &plaintext)?;
 

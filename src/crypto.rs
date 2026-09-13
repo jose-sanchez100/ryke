@@ -1,14 +1,13 @@
-//! Cryptographic core for `IKE_SA_INIT` (M1): X25519 Diffie-Hellman, the
-//! HMAC-SHA256 PRF, `prf+` (RFC 7296 §2.13), and the SKEYSEED / SK_* key
-//! schedule (§2.14).
+//! Cryptographic core for `IKE_SA_INIT`: Diffie-Hellman (X25519, ECP-256,
+//! MODP-1024/2048), the HMAC-SHA256 PRF, `prf+` (RFC 7296 §2.13), and the
+//! SKEYSEED / SK_* key schedule (§2.14).
 //!
 //! Verified against published test vectors where they exist — RFC 7748 for
 //! X25519, RFC 4231 for HMAC-SHA256. End-to-end key-schedule correctness is
-//! confirmed at the M1 interop checkpoint against an independent IKEv2 responder.
-//!
-//! At M1 we support exactly one suite's primitives: X25519 (DH group 31) and
-//! PRF_HMAC_SHA2_256 (transform 5). More groups/PRFs slot in behind the same
-//! functions later.
+//! confirmed against an independent IKEv2 responder (in-process). ECP256 was
+//! added after a real FortiGate's phase1-proposal turned out to require it
+//! (offering neither X25519 nor the MODP groups this crate started with);
+//! that live interop check is still pending as of this commit.
 
 use crate::error::IkeError;
 use hmac::{Hmac, Mac};
@@ -20,8 +19,9 @@ type HmacSha256 = Hmac<Sha256>;
 /// Diffie-Hellman primitives: X25519 (RFC 7748, group 31) and the finite-field
 /// MODP groups 2 (1024-bit) and 14 (2048-bit) from RFC 2409 / RFC 3526.
 pub mod dh {
-    use super::{PublicKey, StaticSecret};
+    use super::{IkeError, PublicKey, StaticSecret};
     use num_bigint_dig::BigUint;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
 
     /// Public key for a 32-byte private scalar.
     pub fn x25519_public(private: &[u8; 32]) -> [u8; 32] {
@@ -95,6 +95,41 @@ pub mod dh {
         let one = BigUint::from(1u32);
         y > one && y < &p - &one
     }
+
+    /// P-256 (ECP-256, DH group 19, RFC 5903). Added after a real FortiGate's
+    /// phase1-proposal turned out to require group 19 specifically -- neither
+    /// X25519 nor the MODP groups above satisfied it. The KE payload carries
+    /// the raw X||Y coordinates (no SEC1 0x04 prefix); the shared secret is
+    /// the X coordinate only.
+    pub fn p256_public(private: &[u8; 32]) -> [u8; 64] {
+        let secret = p256_secret(private);
+        let encoded = secret.public_key().to_encoded_point(false);
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&encoded.as_bytes()[1..65]);
+        out
+    }
+
+    pub fn p256_shared(private: &[u8; 32], peer_xy: &[u8; 64]) -> Result<[u8; 32], IkeError> {
+        let secret = p256_secret(private);
+        let mut sec1 = [0u8; 65];
+        sec1[0] = 0x04;
+        sec1[1..].copy_from_slice(peer_xy);
+        let peer_public = p256::PublicKey::from_sec1_bytes(&sec1)
+            .map_err(|_| IkeError::BadKeyExchange { group: 19, len: peer_xy.len() })?;
+        let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer_public.as_affine());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(shared.raw_secret_bytes());
+        Ok(out)
+    }
+
+    fn p256_secret(private: &[u8; 32]) -> p256::SecretKey {
+        // A uniformly random 32-byte scalar is invalid only if it's zero or
+        // >= the curve order -- probability ~2^-128 either way, on par with
+        // "the CSPRNG produced all-zero output". Matches the risk this module
+        // already accepts for X25519/MODP (also unchecked for degenerate
+        // private-key values).
+        p256::SecretKey::from_slice(private).expect("32 bytes of CSPRNG output is a valid P-256 scalar")
+    }
 }
 
 /// A negotiated Diffie-Hellman group. `private` is a byte string of entropy:
@@ -104,15 +139,20 @@ pub enum DhGroup {
     X25519,
     Modp1024,
     Modp2048,
+    /// ECP-256 (group 19, RFC 5903) -- required by at least one real FortiGate
+    /// phase1-proposal encountered in interop testing, which offered neither
+    /// X25519 nor the MODP groups.
+    EcpP256,
 }
 
 impl DhGroup {
-    /// Map an IKE DH transform ID (31 / 2 / 14) to a group.
+    /// Map an IKE DH transform ID (31 / 2 / 14 / 19) to a group.
     pub fn from_transform_id(id: u16) -> Option<DhGroup> {
         match id {
             31 => Some(DhGroup::X25519),
             2 => Some(DhGroup::Modp1024),
             14 => Some(DhGroup::Modp2048),
+            19 => Some(DhGroup::EcpP256),
             _ => None,
         }
     }
@@ -123,6 +163,7 @@ impl DhGroup {
             DhGroup::X25519 => 31,
             DhGroup::Modp1024 => 2,
             DhGroup::Modp2048 => 14,
+            DhGroup::EcpP256 => 19,
         }
     }
 
@@ -132,6 +173,7 @@ impl DhGroup {
             DhGroup::X25519 => 32,
             DhGroup::Modp1024 => 128,
             DhGroup::Modp2048 => 256,
+            DhGroup::EcpP256 => 64, // X || Y, RFC 5903 -- no SEC1 0x04 prefix
         }
     }
 
@@ -145,6 +187,11 @@ impl DhGroup {
             }
             DhGroup::Modp1024 => dh::modp_public(private, &dh::MODP_1024_PRIME),
             DhGroup::Modp2048 => dh::modp_public(private, &dh::MODP_2048_PRIME),
+            DhGroup::EcpP256 => {
+                let mut s = [0u8; 32];
+                s.copy_from_slice(&private[..32]);
+                dh::p256_public(&s).to_vec()
+            }
         }
     }
 
@@ -173,6 +220,13 @@ impl DhGroup {
                     return Err(IkeError::BadKeyExchange { group: 14, len: peer.len() });
                 }
                 dh::modp_shared(private, peer, &dh::MODP_2048_PRIME)
+            }
+            DhGroup::EcpP256 => {
+                let mut s = [0u8; 32];
+                s.copy_from_slice(&private[..32]);
+                let mut p = [0u8; 64];
+                p.copy_from_slice(peer);
+                dh::p256_shared(&s, &p)?.to_vec()
             }
         })
     }
@@ -416,6 +470,40 @@ mod tests {
     }
 
     #[test]
+    fn p256_agrees_both_directions() {
+        // Mirrors modp_groups_agree_and_encode_full_width for ECP256: two
+        // parties with distinct scalars derive the same shared secret.
+        let a_priv = [0x11u8; 32];
+        let b_priv = [0x22u8; 32];
+        let a_pub = DhGroup::EcpP256.public(&a_priv);
+        let b_pub = DhGroup::EcpP256.public(&b_priv);
+        assert_eq!(a_pub.len(), 64);
+        assert_eq!(b_pub.len(), 64);
+        assert_ne!(a_pub, b_pub);
+        let a_shared = DhGroup::EcpP256.shared(&a_priv, &b_pub).unwrap();
+        let b_shared = DhGroup::EcpP256.shared(&b_priv, &a_pub).unwrap();
+        assert_eq!(a_shared, b_shared, "both sides must derive the same ECDH secret");
+        assert_eq!(a_shared.len(), 32);
+        // A distinct scalar yields a distinct secret.
+        let c_shared = DhGroup::EcpP256.shared(&[0x33u8; 32], &a_pub).unwrap();
+        assert_ne!(c_shared, a_shared);
+    }
+
+    #[test]
+    fn p256_rejects_wrong_length_peer_value() {
+        let priv_ = [0x44u8; 32];
+        assert!(DhGroup::EcpP256.shared(&priv_, &[0u8; 63]).is_err());
+        assert!(DhGroup::EcpP256.shared(&priv_, &[0u8; 65]).is_err());
+    }
+
+    #[test]
+    fn p256_rejects_a_point_not_on_the_curve() {
+        // 64 bytes of the right length, but not a valid X||Y coordinate pair.
+        let priv_ = [0x44u8; 32];
+        assert!(DhGroup::EcpP256.shared(&priv_, &[0xAAu8; 64]).is_err());
+    }
+
+    #[test]
     fn modp_2_pow_1_is_2_left_padded() {
         // g^1 mod p = 2, which must be left-zero-padded to the full width.
         let mut one = [0u8; 32];
@@ -443,7 +531,12 @@ mod tests {
 
     #[test]
     fn transform_id_roundtrips() {
-        for (g, id) in [(DhGroup::X25519, 31), (DhGroup::Modp1024, 2), (DhGroup::Modp2048, 14)] {
+        for (g, id) in [
+            (DhGroup::X25519, 31),
+            (DhGroup::Modp1024, 2),
+            (DhGroup::Modp2048, 14),
+            (DhGroup::EcpP256, 19),
+        ] {
             assert_eq!(g.transform_id(), id);
             assert_eq!(DhGroup::from_transform_id(id), Some(g));
         }

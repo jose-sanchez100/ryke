@@ -1,9 +1,10 @@
 //! Suite negotiation for `IKE_SA_INIT`.
 //!
 //! From the initiator's Security Association, pick a proposal we support and
-//! describe the chosen suite (transforms + key lengths for the schedule). M1
-//! supports X25519 (DH group 31) + PRF-HMAC-SHA256, with AES-GCM-16-256 (AEAD)
-//! preferred and AES-CBC-256 + HMAC-SHA2-256-128 as a fallback.
+//! describe the chosen suite (transforms + key lengths for the schedule).
+//! Supports X25519 (DH group 31), ECP256 (group 19), and MODP-2048/1024
+//! (groups 14/2) + PRF-HMAC-SHA256, with AES-GCM-16-256 (AEAD) preferred and
+//! AES-CBC-256 + HMAC-SHA2-256-128 as a fallback.
 //!
 //! Note: an **IKE** proposal carries ENCR, PRF, (INTEG for non-AEAD), and D-H —
 //! but *not* ESN. ESN is only valid for ESP/AH (CHILD SA) proposals
@@ -63,12 +64,14 @@ fn select_from_proposal(proposal: &Proposal) -> Option<ChosenSuite> {
     if proposal.protocol_id != protocol_id::IKE {
         return None;
     }
-    // Required PRF; then a DH group we support, preferring X25519, then the MODP
-    // groups (which native Android IKEv2 and IKEv1 use).
+    // Required PRF; then a DH group we support, preferring X25519, then ECP256
+    // (required by at least one real FortiGate phase1-proposal that offered
+    // neither X25519 nor MODP), then the MODP groups (native Android IKEv2 and
+    // IKEv1 use these).
     if !has(proposal, transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, None) {
         return None;
     }
-    let dh_id = [transform_id::X25519, transform_id::MODP_2048, transform_id::MODP_1024]
+    let dh_id = [transform_id::X25519, transform_id::ECP256, transform_id::MODP_2048, transform_id::MODP_1024]
         .into_iter()
         .find(|&g| has(proposal, transform_type::DH, g, None))?;
 

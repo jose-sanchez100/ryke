@@ -31,6 +31,7 @@ pub mod transform_id {
     // DH
     pub const MODP_1024: u16 = 2;
     pub const MODP_2048: u16 = 14;
+    pub const ECP256: u16 = 19;
     pub const X25519: u16 = 31;
     // ESN
     pub const ESN_NONE: u16 = 0;
@@ -756,6 +757,20 @@ impl Notify {
         out.extend_from_slice(&self.spi);
         out.extend_from_slice(&self.data);
         out
+    }
+}
+
+/// Best-effort human name for the notify types most likely to show up while
+/// debugging interop against a real gateway. Not exhaustive.
+pub fn notify_type_name(t: u16) -> &'static str {
+    match t {
+        1 => "UNSUPPORTED_CRITICAL_PAYLOAD",
+        7 => "INVALID_SYNTAX",
+        notify_type::INVALID_KE_PAYLOAD => "INVALID_KE_PAYLOAD",
+        notify_type::NO_PROPOSAL_CHOSEN => "NO_PROPOSAL_CHOSEN",
+        notify_type::AUTHENTICATION_FAILED => "AUTHENTICATION_FAILED",
+        notify_type::TS_UNACCEPTABLE => "TS_UNACCEPTABLE",
+        _ => "UNKNOWN",
     }
 }
 

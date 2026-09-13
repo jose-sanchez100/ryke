@@ -133,6 +133,16 @@ fn parse_sa_init(header: &IkeHeader, body: &[u8]) -> Result<SaInitPayloads, IkeE
             PayloadType::Nonce => nonce = Some(Nonce::parse(payload.data)),
             PayloadType::Notify => {
                 if let Ok(n) = Notify::parse(payload.data) {
+                    if n.is_error() {
+                        // A rejection response carries only this Notify --
+                        // no SA/KE/Nonce ever follow -- so surface it now
+                        // rather than falling through to a confusing
+                        // "missing SA payload" once those checks run below.
+                        return Err(IkeError::PeerRejected {
+                            notify_type: n.notify_type,
+                            name: crate::ikev2::payload::notify_type_name(n.notify_type),
+                        });
+                    }
                     if n.notify_type == notify_type::SIGNATURE_HASH_ALGORITHMS {
                         signature_hashes = parse_signature_hashes(&n.data);
                     } else if n.notify_type == notify_type::COOKIE {

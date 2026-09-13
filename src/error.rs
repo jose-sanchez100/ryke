@@ -26,6 +26,14 @@ pub enum IkeError {
     #[error("no supported proposal in the offered SA")]
     NoProposalChosen,
 
+    /// The peer rejected the exchange via an error Notify (RFC 7296 §3.10.1,
+    /// type < 16384) instead of continuing it -- e.g. NO_PROPOSAL_CHOSEN when
+    /// our offer doesn't match its policy. Previously this surfaced as a
+    /// confusing `MissingPayload("SA")` once the parser fell through looking
+    /// for payloads that a rejection response never carries.
+    #[error("peer rejected the exchange: {name} (notify type {notify_type})")]
+    PeerRejected { notify_type: u16, name: &'static str },
+
     /// The peer's Key Exchange used a DH group other than the negotiated one.
     #[error("DH group mismatch: expected {expected}, got {got}")]
     DhGroupMismatch { expected: u16, got: u16 },

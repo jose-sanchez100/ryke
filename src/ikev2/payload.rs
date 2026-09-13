@@ -538,12 +538,21 @@ impl Configuration {
         Configuration { cfg_type: cfg_type::REPLY, attrs }
     }
 
-    /// A CFG_REQUEST asking the responder to assign an inner IPv4 (an empty
-    /// INTERNAL_IP4_ADDRESS attribute), as a native client sends.
+    /// A CFG_REQUEST asking the responder to assign an inner IPv4 and, if it
+    /// hands out split-tunnel routes, to include them: an empty
+    /// INTERNAL_IP4_ADDRESS attribute (the virtual-IP request) plus an empty
+    /// INTERNAL_IP4_SUBNET attribute (a responder that has split-tunnel
+    /// subnets to offer replies with one INTERNAL_IP4_SUBNET per range, read
+    /// back with [`Self::assigned_subnets`]; one that doesn't simply omits
+    /// it, per RFC 7296 §3.15.1 — requesting it costs nothing and is a no-op
+    /// against a responder that doesn't support it).
     pub fn request_ipv4() -> Self {
         Configuration {
             cfg_type: cfg_type::REQUEST,
-            attrs: vec![ConfigAttr { attr_type: config_attr::INTERNAL_IP4_ADDRESS, value: Vec::new() }],
+            attrs: vec![
+                ConfigAttr { attr_type: config_attr::INTERNAL_IP4_ADDRESS, value: Vec::new() },
+                ConfigAttr { attr_type: config_attr::INTERNAL_IP4_SUBNET, value: Vec::new() },
+            ],
         }
     }
 

@@ -1,0 +1,175 @@
+//! IKEv1 Mode-Config (draft-dukes-ike-mode-cfg) address assignment — an
+//! ISAKMP Transaction exchange (RFC 2408 exchange type 6, same framing as
+//! [`super::xauth`]) run after XAUTH (if any) and before Quick Mode, when the
+//! caller wants an assigned inner IPv4. Unlike XAUTH, the **client** drives
+//! this exchange:
+//!
+//! ```text
+//! I (client)   →  HDR*, ATTR(REQUEST, [INTERNAL_IP4_ADDRESS, ...])
+//! R (gateway)  →  HDR*, ATTR(REPLY, [INTERNAL_IP4_ADDRESS=addr, ...])
+//! ```
+//!
+//! REQUEST and REPLY share one message-id, the same IV-chaining convention
+//! [`super::xauth`]'s own REQUEST/REPLY pair uses (the paired SET/ACK is a
+//! separate, later Transaction with its own fresh message-id — this
+//! exchange has no such second round).
+//!
+//! Confirmed live against a real FortiGate: an IKEv1 dialup policy that
+//! requires this round rejects the following Quick Mode proposal outright
+//! ("peer has not completed Configuration Method") if it's skipped.
+
+use super::crypto1::{self, AES_BLOCK};
+use super::isakmp::{exchange, payload, IsakmpHeader, Payload};
+use super::modecfg::{cfg, ConfigPayload};
+use super::phase1::Phase1State;
+use super::phase2;
+use crate::error::IkeError;
+
+fn cfg_header(cky_i: [u8; 8], cky_r: [u8; 8], msgid: u32) -> IsakmpHeader {
+    IsakmpHeader {
+        init_cookie: cky_i,
+        resp_cookie: cky_r,
+        next_payload: payload::NONE,
+        version: IsakmpHeader::VERSION_1_0,
+        exchange_type: exchange::TRANSACTION,
+        flags: 0,
+        message_id: msgid,
+        length: 0,
+    }
+}
+
+fn attribute_payload(ps: &[Payload]) -> Result<&Payload, IkeError> {
+    ps.iter().find(|p| p.payload_type == payload::ATTRIBUTE).ok_or(IkeError::MissingPayload("ATTRIBUTE"))
+}
+
+/// Build a fresh CFG_REQUEST for `msgid` (caller-chosen, must be non-zero and
+/// distinct from any other in-flight exchange's message-id on this Phase 1 —
+/// same convention as [`super::quick::initiate_quick`]'s own SPI/msgid).
+/// Returns the request bytes and the IV the paired CFG_REPLY (same
+/// message-id) chains from — pass it to [`parse_cfg_reply`].
+pub fn build_cfg_request(st: &Phase1State, msgid: u32) -> Result<(Vec<u8>, Vec<u8>), IkeError> {
+    let req = ConfigPayload::request_ipv4(msgid as u16);
+    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
+    let hdr = cfg_header(st.cky_i, st.cky_r, msgid);
+    let (msg, next_iv) = phase2::build_encrypted(hdr, st.prf, &st.skeyid_a, &st.enc_key, &iv0, &[(payload::ATTRIBUTE, req.to_bytes())])?;
+    Ok((msg, next_iv))
+}
+
+/// Decrypt and parse the gateway's CFG_REPLY, chained from `req_next_iv`
+/// (returned by [`build_cfg_request`]).
+pub fn parse_cfg_reply(st: &Phase1State, reply: &[u8], req_next_iv: &[u8]) -> Result<ConfigPayload, IkeError> {
+    let hdr = IsakmpHeader::parse(reply)?;
+    if hdr.exchange_type != exchange::TRANSACTION {
+        return Err(IkeError::Crypto("expected a Transaction (Mode-Config) message"));
+    }
+    let (_h, ps, _next) = phase2::parse_encrypted(reply, st.prf, &st.skeyid_a, &st.enc_key, req_next_iv)?;
+    let got = ConfigPayload::parse(&attribute_payload(&ps)?.data)?;
+    if got.cfg_type != cfg::REPLY {
+        return Err(IkeError::Crypto("expected a Mode-Config REPLY"));
+    }
+    Ok(got)
+}
+
+/// Gateway-side test double (not a real responder implementation — mirrors
+/// [`super::xauth::test_gateway`]'s role: this exists only so the
+/// client-side logic above can be round-trip tested without a real gateway).
+#[cfg(test)]
+pub(crate) mod test_gateway {
+    use super::*;
+    use crate::ikev1::modecfg::cfg_attr;
+    use crate::ikev1::payloads::Attribute;
+    use std::net::Ipv4Addr;
+
+    /// Decrypt the client's REQUEST (using `iv0` computed the same way
+    /// [`build_cfg_request`] did) and build a REPLY granting `addr` (plus a
+    /// fixed /24 netmask and one DNS server) on the same message-id.
+    pub fn handle_request(st: &Phase1State, request: &[u8], msgid: u32, addr: Ipv4Addr) -> Vec<u8> {
+        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
+        let (_h, ps, iv1) = phase2::parse_encrypted(request, st.prf, &st.skeyid_a, &st.enc_key, &iv0).unwrap();
+        let got = ConfigPayload::parse(&attribute_payload(&ps).unwrap().data).unwrap();
+        assert_eq!(got.cfg_type, cfg::REQUEST);
+
+        let reply = ConfigPayload::new(
+            cfg::REPLY,
+            got.identifier,
+            vec![
+                Attribute::long_bytes(cfg_attr::INTERNAL_IP4_ADDRESS, addr.octets().to_vec()),
+                Attribute::long_bytes(cfg_attr::INTERNAL_IP4_NETMASK, [255, 255, 255, 0]),
+                Attribute::long_bytes(cfg_attr::INTERNAL_IP4_DNS, [8, 8, 8, 8]),
+            ],
+        );
+        let hdr = cfg_header(st.cky_i, st.cky_r, msgid);
+        let (msg, _next) = phase2::build_encrypted(hdr, st.prf, &st.skeyid_a, &st.enc_key, &iv1, &[(payload::ATTRIBUTE, reply.to_bytes())]).unwrap();
+        msg
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::DhGroup;
+    use crate::entropy::SeedEntropy;
+    use crate::ikev1::payloads::Id;
+    use crate::ikev1::phase1::{initiate_aggressive, respond_aggressive, Ikev1ExchangeMode, InitiatorConfig, Phase1Config};
+    use crate::ikev2::sk::SkCipher;
+    use std::net::Ipv4Addr;
+
+    fn phase1_pair() -> (Phase1State, Phase1State) {
+        let psk = b"correct horse battery staple".to_vec();
+        let icfg = InitiatorConfig {
+            psk: psk.clone(),
+            our_id: Id::ipv4([10, 1, 1, 1]),
+            group: DhGroup::Modp1024,
+            xauth: false,
+            ts_local: ([0, 0, 0, 0], [0, 0, 0, 0]),
+            ts_remote: ([0, 0, 0, 0], [0, 0, 0, 0]),
+            esp_cipher: SkCipher::Aes256Gcm,
+            pfs_group: None,
+            mode_cfg: false,
+            mode: Ikev1ExchangeMode::Aggressive,
+        };
+        let rcfg = Phase1Config { psk, our_id: Id::ipv4([192, 168, 0, 1]) };
+        let mut ie = SeedEntropy::new(0xCCCC);
+        let mut re = SeedEntropy::new(0xDDDD);
+        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie);
+        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re).unwrap();
+        let (msg3, istate) = ai.complete(&msg2).unwrap();
+        rstate.verify_hash_i(&msg3).unwrap();
+        (istate, rstate)
+    }
+
+    #[test]
+    fn cfg_round_trip_yields_the_gateways_assigned_address() {
+        let (client_st, gw_st) = phase1_pair();
+        let msgid = 0x5000_0001;
+        let (request, next_iv) = build_cfg_request(&client_st, msgid).unwrap();
+        let reply = test_gateway::handle_request(&gw_st, &request, msgid, Ipv4Addr::new(10, 212, 134, 202));
+        let got = parse_cfg_reply(&client_st, &reply, &next_iv).unwrap();
+        assert_eq!(got.assigned_ipv4(), Some(Ipv4Addr::new(10, 212, 134, 202)));
+        assert_eq!(got.assigned_netmask(), Some(Ipv4Addr::new(255, 255, 255, 0)));
+        assert_eq!(got.assigned_dns(), vec![Ipv4Addr::new(8, 8, 8, 8)]);
+    }
+
+    #[test]
+    fn cfg_request_carries_the_expected_empty_attrs() {
+        let (client_st, _gw_st) = phase1_pair();
+        let (_request, _next_iv) = build_cfg_request(&client_st, 0x6000_0001).unwrap();
+        let req = ConfigPayload::request_ipv4(0x1234);
+        assert!(req.attr(crate::ikev1::modecfg::cfg_attr::INTERNAL_IP4_ADDRESS).is_some());
+        assert!(req.attr(crate::ikev1::modecfg::cfg_attr::INTERNAL_IP4_NETMASK).is_some());
+        assert!(req.attr(crate::ikev1::modecfg::cfg_attr::INTERNAL_IP4_DNS).is_some());
+        assert!(req.attr(crate::ikev1::modecfg::cfg_attr::INTERNAL_IP4_SUBNET).is_some());
+    }
+
+    #[test]
+    fn parse_cfg_reply_rejects_a_non_transaction_message() {
+        let (client_st, _gw_st) = phase1_pair();
+        let (request, next_iv) = build_cfg_request(&client_st, 0x7000_0001).unwrap();
+        // Feeding the REQUEST back in as if it were the REPLY: still a
+        // Transaction message, so this exercises the cfg_type check instead
+        // -- use a clearly-wrong exchange type to hit the exchange check.
+        let mut bad = request.clone();
+        bad[18] = 0xFF; // exchange type byte
+        assert!(parse_cfg_reply(&client_st, &bad, &next_iv).is_err());
+    }
+}

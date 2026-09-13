@@ -8,6 +8,7 @@
 //! `prf+`), its CBC-with-IV-chaining encryption, and its Aggressive-Mode key
 //! schedule are all structurally different from IKEv2.
 
+pub mod cfg;
 pub mod client;
 pub mod crypto1;
 pub mod isakmp;

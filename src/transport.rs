@@ -5,7 +5,7 @@
 //! marker) and IKE fragmentation arrive at M3.
 
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -25,6 +25,29 @@ pub enum DriverError {
     Ike(#[from] IkeError),
 }
 
+/// The local IP our packets actually carry as their source when reaching
+/// `peer`, resolved via the OS routing table: a throwaway UDP `connect`
+/// picks the route without sending anything. Needed because the real IKE
+/// socket always binds the literal wildcard address (`0.0.0.0`, so it can
+/// answer on whichever local interface a peer happens to reach it through)
+/// and `getsockname()` on a socket that was never itself `connect()`-ed
+/// reports that same `0.0.0.0` back, not the concrete interface address the
+/// OS actually picks per-destination at send time -- confirmed the hard way
+/// on the IKEv1 side: a caller that used the wildcard-bound socket's own
+/// `local_addr()` directly ended up installing a kernel XFRM SA with `src
+/// 0.0.0.0` as the outer tunnel address, which the kernel dutifully
+/// "encapsulated" packets under (SA usage counters moved) but which can never
+/// actually leave the box as a valid IP packet -- traffic vanished silently
+/// with no error anywhere. IKEv2's `Ikev2Session` already solved this with an
+/// identical probe (`ikev2::session::local_ip_for`); this is the shared,
+/// public home for the same trick so [`UdpTransport::local_addr_for`] (and
+/// therefore [`crate::ikev1::client::Client`]) gets it too.
+pub fn local_ip_for(peer: SocketAddr) -> io::Result<IpAddr> {
+    let probe = UdpSocket::bind(("0.0.0.0", 0))?;
+    probe.connect(peer)?;
+    probe.local_addr().map(|a| a.ip())
+}
+
 /// A blocking UDP transport for IKE messages.
 pub struct UdpTransport {
     socket: UdpSocket,
@@ -35,8 +58,22 @@ impl UdpTransport {
         Ok(Self { socket: UdpSocket::bind(addr)? })
     }
 
+    /// This socket's own bound local address -- **not** meaningful as "the
+    /// address our packets actually leave from" when bound to the wildcard
+    /// address (the common case for a long-lived IKE socket); use
+    /// [`Self::local_addr_for`] for that.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    /// The concrete local `(IP, port)` our packets actually carry when
+    /// reaching `peer`: this socket's own bound port (a real IKE socket
+    /// always binds a literal well-known port, so that part is already
+    /// meaningful) combined with [`local_ip_for`]'s routing-table-resolved IP
+    /// (which isn't, when the socket is wildcard-bound).
+    pub fn local_addr_for(&self, peer: SocketAddr) -> io::Result<SocketAddr> {
+        let port = self.socket.local_addr()?.port();
+        Ok(SocketAddr::new(local_ip_for(peer)?, port))
     }
 
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
@@ -55,5 +92,28 @@ impl UdpTransport {
     pub fn send_to(&self, data: &[u8], to: SocketAddr) -> io::Result<usize> {
         crate::debug::dump(">>>", to, data);
         self.socket.send_to(data, to)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A wildcard-bound transport's own `local_addr()` reports `0.0.0.0` (the
+    /// bug this module exists to work around); `local_addr_for(peer)` must
+    /// instead resolve the concrete loopback IP the OS would actually use
+    /// reaching `peer`, keeping the transport's own bound port.
+    #[test]
+    fn local_addr_for_resolves_the_concrete_ip_not_the_wildcard() {
+        let peer_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = peer_sock.local_addr().unwrap();
+
+        let transport = UdpTransport::bind("0.0.0.0:0").unwrap();
+        let wildcard = transport.local_addr().unwrap();
+        assert_eq!(wildcard.ip(), std::net::Ipv4Addr::UNSPECIFIED);
+
+        let resolved = transport.local_addr_for(peer).unwrap();
+        assert_eq!(resolved.ip(), std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(resolved.port(), wildcard.port());
     }
 }

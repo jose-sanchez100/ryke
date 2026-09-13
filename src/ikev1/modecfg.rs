@@ -6,6 +6,7 @@
 
 use super::payloads::{self, Attribute};
 use crate::error::IkeError;
+use std::net::Ipv4Addr;
 
 /// Configuration exchange types (the `cfg-type` octet).
 pub mod cfg {
@@ -89,6 +90,72 @@ impl ConfigPayload {
     /// Find the first attribute of a given type.
     pub fn attr(&self, attr_type: u16) -> Option<&Attribute> {
         self.attributes.iter().find(|a| a.attr_type == attr_type)
+    }
+
+    /// A CFG_REQUEST asking the responder to assign an inner IPv4 (address,
+    /// netmask, DNS, split-tunnel subnet) -- the IKEv1 Mode-Config
+    /// counterpart to `crate::ikev2::payload::Configuration::request_ipv4`.
+    /// All value-less (empty), a classic dialup client's request. Confirmed
+    /// live against a real FortiGate: an IKEv1 dialup policy that requires
+    /// this round rejects the following Quick Mode proposal outright ("peer
+    /// has not completed Configuration Method") if it's skipped.
+    pub fn request_ipv4(identifier: u16) -> Self {
+        ConfigPayload::new(
+            cfg::REQUEST,
+            identifier,
+            vec![
+                Attribute::long_bytes(cfg_attr::INTERNAL_IP4_ADDRESS, Vec::new()),
+                Attribute::long_bytes(cfg_attr::INTERNAL_IP4_NETMASK, Vec::new()),
+                Attribute::long_bytes(cfg_attr::INTERNAL_IP4_DNS, Vec::new()),
+                Attribute::long_bytes(cfg_attr::INTERNAL_IP4_SUBNET, Vec::new()),
+            ],
+        )
+    }
+
+    /// The first INTERNAL_IP4_ADDRESS attribute value, if present and well-formed.
+    pub fn assigned_ipv4(&self) -> Option<Ipv4Addr> {
+        self.attr(cfg_attr::INTERNAL_IP4_ADDRESS)
+            .map(Attribute::bytes)
+            .filter(|b| b.len() == 4)
+            .map(|b| Ipv4Addr::new(b[0], b[1], b[2], b[3]))
+    }
+
+    /// The first INTERNAL_IP4_NETMASK attribute value, if present and well-formed.
+    pub fn assigned_netmask(&self) -> Option<Ipv4Addr> {
+        self.attr(cfg_attr::INTERNAL_IP4_NETMASK)
+            .map(Attribute::bytes)
+            .filter(|b| b.len() == 4)
+            .map(|b| Ipv4Addr::new(b[0], b[1], b[2], b[3]))
+    }
+
+    /// Every INTERNAL_IP4_DNS attribute value -- a responder may hand back
+    /// more than one resolver. Empty if none were sent.
+    pub fn assigned_dns(&self) -> Vec<Ipv4Addr> {
+        self.attributes
+            .iter()
+            .filter(|a| a.attr_type == cfg_attr::INTERNAL_IP4_DNS)
+            .map(Attribute::bytes)
+            .filter(|b| b.len() == 4)
+            .map(|b| Ipv4Addr::new(b[0], b[1], b[2], b[3]))
+            .collect()
+    }
+
+    /// Every INTERNAL_IP4_SUBNET attribute, as (network, prefix length) -- a
+    /// responder may hand back more than one (e.g. one per split-tunnel
+    /// range). Each value is network address (4 bytes) + netmask (4 bytes),
+    /// the same convention as the IKEv2 CFG_REPLY attribute of the same name.
+    pub fn assigned_subnets(&self) -> Vec<(Ipv4Addr, u8)> {
+        self.attributes
+            .iter()
+            .filter(|a| a.attr_type == cfg_attr::INTERNAL_IP4_SUBNET)
+            .map(Attribute::bytes)
+            .filter(|b| b.len() == 8)
+            .map(|b| {
+                let net = Ipv4Addr::new(b[0], b[1], b[2], b[3]);
+                let mask = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+                (net, mask.count_ones() as u8)
+            })
+            .collect()
     }
 }
 

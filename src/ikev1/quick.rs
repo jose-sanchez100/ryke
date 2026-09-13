@@ -15,13 +15,16 @@
 //! `HASH(2) = prf(SKEYID_a, M-ID | Ni_b | SA | Nr [| KE])`,
 //! `HASH(3) = prf(SKEYID_a, 0 | M-ID | Ni_b | Nr_b)`.
 //!
-//! The ESP keys are AES-256-GCM (RFC 4106): a 36-byte KEYMAT (32-byte key +
-//! 4-byte salt) per SPI, derived from `SKEYID_d` and the Quick-Mode nonces
-//! (no PFS) or additionally the Quick-Mode DH shared secret (PFS, RFC 2409
-//! §5.5's `g(qm)^xy` variant -- see [`crypto1::keymat_pfs`]). Unlike IKEv2
-//! (where PFS only ever applies at a later `CREATE_CHILD_SA` rekey -- see
-//! [`crate::ikev2::rekey`]), IKEv1 Quick Mode negotiates PFS on the *initial*
-//! Phase-2 exchange, so it's testable at connect time.
+//! The ESP cipher is algorithm-agile (any [`SkCipher`] the caller picks --
+//! AEAD or classic-CBC-with-separate-HMAC), the same cipher catalog
+//! [`crate::esp::EspSa`] implements for IKEv2. KEYMAT is a single
+//! `enc_key_len + salt_len + integ_key_len`-byte blob per SPI, derived from
+//! `SKEYID_d` and the Quick-Mode nonces (no PFS) or additionally the
+//! Quick-Mode DH shared secret (PFS, RFC 2409 §5.5's `g(qm)^xy` variant --
+//! see [`crypto1::keymat_pfs`]). Unlike IKEv2 (where PFS only ever applies at
+//! a later `CREATE_CHILD_SA` rekey -- see [`crate::ikev2::rekey`]), IKEv1
+//! Quick Mode negotiates PFS on the *initial* Phase-2 exchange, so it's
+//! testable at connect time.
 
 use super::crypto1::{self, Prf, AES_BLOCK};
 use super::isakmp::{self, exchange, payload, IsakmpHeader, Payload};
@@ -30,16 +33,12 @@ use super::payloads::{
 };
 use super::phase1::Phase1State;
 use super::phase2;
-use crate::crypto::DhGroup;
+use crate::crypto::{DhGroup, IntegAlgorithm};
 use crate::entropy::Entropy;
 use crate::error::IkeError;
 use crate::esp::{ChildSa, EspSa};
-
-/// AES-256-GCM ESP key material: 32-byte key + 4-byte salt (RFC 4106).
-const ESP_KEYMAT_LEN: usize = 36;
-/// ESP transform id for AES-GCM with a 16-octet ICV (IANA ESP transform 20,
-/// RFC 4106) — the algorithm ryke actually keys (36-byte KEYMAT = 32 key + 4 salt).
-const ESP_AES_GCM_16: u8 = 20;
+use crate::ikev2::payload::transform_id;
+use crate::ikev2::sk::SkCipher;
 
 /// IPsec ESP SA attribute types (RFC 2407 §4.5) — a *different* registry from the
 /// Phase-1 IKE attributes: here KEY_LENGTH is 6, not 14.
@@ -54,9 +53,52 @@ mod esp_attr {
     pub const GROUP_DESC: u16 = 3;
     pub const ENCAP_MODE: u16 = 4;
     pub const KEY_LENGTH: u16 = 6;
+    /// Separate integrity algorithm for a classic (non-AEAD) cipher (RFC 2407
+    /// §4.5) -- absent for an AEAD cipher, which needs no separate check.
+    pub const AUTH_ALGORITHM: u16 = 5;
 }
 const ENCAP_TUNNEL: u16 = 1;
 const LIFE_SECONDS: u16 = 1;
+
+/// This registry (RFC 2407 §4.5's ESP `AUTH_ALGORITHM` attribute values) is
+/// numbered independently of IKEv2's own INTEG transform IDs
+/// ([`crate::ikev2::payload::transform_id::AUTH_HMAC_SHA2_256_128`] etc.) --
+/// e.g. HMAC-SHA2-256 is value 5 here but transform ID 12 there. Confirmed
+/// against a real FortiGate's own IKE debug log (`type = AUTH_ALG,
+/// val=SHA2_256`, ESP_AES_CBC proposal).
+fn esp_auth_algorithm(integ: IntegAlgorithm) -> u16 {
+    match integ {
+        IntegAlgorithm::HmacMd5_96 => 1,
+        IntegAlgorithm::HmacSha1_96 => 2,
+        IntegAlgorithm::HmacSha2_256_128 => 5,
+        IntegAlgorithm::HmacSha2_384_192 => 6,
+        IntegAlgorithm::HmacSha2_512_256 => 7,
+    }
+}
+
+fn integ_from_esp_auth_algorithm(v: u16) -> Option<IntegAlgorithm> {
+    match v {
+        1 => Some(IntegAlgorithm::HmacMd5_96),
+        2 => Some(IntegAlgorithm::HmacSha1_96),
+        5 => Some(IntegAlgorithm::HmacSha2_256_128),
+        6 => Some(IntegAlgorithm::HmacSha2_384_192),
+        7 => Some(IntegAlgorithm::HmacSha2_512_256),
+        _ => None,
+    }
+}
+
+/// The ESP transform ID for `cipher` -- the same unified IANA "Transform Type
+/// 1" numbering [`transform_id`] already uses for IKEv2 (RFC 4835/8221
+/// unified the IKEv1 ESP and IKEv2 registries for every algorithm `ryke`
+/// implements), just narrowed to `u8` for IKEv1's `Transform::transform_id` field.
+fn esp_transform_id(cipher: SkCipher) -> u8 {
+    (match cipher {
+        SkCipher::Aes128Gcm | SkCipher::Aes192Gcm | SkCipher::Aes256Gcm => transform_id::AES_GCM_16,
+        SkCipher::ChaCha20Poly1305 => transform_id::CHACHA20_POLY1305,
+        SkCipher::Aes128Cbc(_) | SkCipher::Aes192Cbc(_) | SkCipher::Aes256Cbc(_) => transform_id::AES_CBC,
+        SkCipher::TripleDesCbc(_) => transform_id::TRIPLE_DES,
+    }) as u8
+}
 
 fn find(ps: &[Payload], t: u8) -> Option<&Payload> {
     ps.iter().find(|p| p.payload_type == t)
@@ -75,18 +117,28 @@ fn qm_header(cky_i: [u8; 8], cky_r: [u8; 8], msgid: u32) -> IsakmpHeader {
     }
 }
 
-/// An ESP SA proposal carrying our inbound SPI: AES-GCM-16-256, tunnel mode —
-/// a well-formed proposal a peer like strongSwan will select. When
-/// `pfs_group` is `Some`, also carries a GROUP DESCRIPTION attribute naming
-/// the DH group PFS will use -- the signal the peer keys its own PFS
-/// participation off of.
-fn esp_sa(spi: u32, pfs_group: Option<DhGroup>) -> SaPayload {
+/// An ESP SA proposal carrying our inbound SPI under `cipher`, tunnel mode --
+/// a well-formed proposal a peer like strongSwan (or a real gateway, e.g. a
+/// FortiGate demanding ESP_AES_CBC/HMAC-SHA2-256 rather than the AES-GCM this
+/// module used to hardcode) will select, given the right `cipher`. Carries a
+/// KEY_LENGTH attribute for every cipher except 3DES (fixed-size, no
+/// KEY_LENGTH by convention) and, for a classic (non-AEAD) cipher, a separate
+/// AUTH_ALGORITHM attribute (an AEAD cipher needs no separate integrity
+/// check, so gets none). When `pfs_group` is `Some`, also carries a GROUP
+/// DESCRIPTION attribute naming the DH group PFS will use -- the signal the
+/// peer keys its own PFS participation off of.
+fn esp_sa(spi: u32, cipher: SkCipher, pfs_group: Option<DhGroup>) -> SaPayload {
     let mut attributes = vec![
         Attribute::short(esp_attr::ENCAP_MODE, ENCAP_TUNNEL),
         Attribute::short(esp_attr::LIFE_TYPE, LIFE_SECONDS),
         Attribute::long_u32(esp_attr::LIFE_DURATION, 3600),
-        Attribute::short(esp_attr::KEY_LENGTH, 256),
     ];
+    if !matches!(cipher, SkCipher::TripleDesCbc(_)) {
+        attributes.push(Attribute::short(esp_attr::KEY_LENGTH, (cipher.key_len() * 8) as u16));
+    }
+    if let Some(integ) = cipher.integ_algorithm() {
+        attributes.push(Attribute::short(esp_attr::AUTH_ALGORITHM, esp_auth_algorithm(integ)));
+    }
     if let Some(group) = pfs_group {
         attributes.push(Attribute::short(esp_attr::GROUP_DESC, group.transform_id()));
     }
@@ -97,7 +149,7 @@ fn esp_sa(spi: u32, pfs_group: Option<DhGroup>) -> SaPayload {
             num: 1,
             protocol_id: protocol::ESP,
             spi: spi.to_be_bytes().to_vec(),
-            transforms: vec![Transform { num: 1, transform_id: ESP_AES_GCM_16, attributes }],
+            transforms: vec![Transform { num: 1, transform_id: esp_transform_id(cipher), attributes }],
         }],
     }
 }
@@ -130,6 +182,24 @@ fn peer_pfs_group(ps: &[Payload]) -> Result<Option<DhGroup>, IkeError> {
     Ok(transform.attr(esp_attr::GROUP_DESC).and_then(DhGroup::from_transform_id))
 }
 
+/// The `SkCipher` named on the SA payload's ESP transform -- the responder's
+/// counterpart to knowing what to key its own side with, mirroring
+/// `peer_pfs_group`'s auto-detect pattern rather than assuming a fixed
+/// cipher. `key_len` falls back to a sensible default (192 bits for 3DES,
+/// 256 otherwise) when the peer omitted KEY_LENGTH (a fixed-key cipher, or a
+/// lenient peer relying on the transform ID alone).
+fn peer_esp_cipher(ps: &[Payload]) -> Result<SkCipher, IkeError> {
+    let sa_p = find(ps, payload::SA).ok_or(IkeError::MissingPayload("SA"))?;
+    let sa = SaPayload::parse(&sa_p.data)?;
+    let prop = sa.proposals.first().ok_or(IkeError::NoProposalChosen)?;
+    let transform = prop.transforms.first().ok_or(IkeError::NoProposalChosen)?;
+    let encr_id = transform.transform_id as u16;
+    let default_bits = if encr_id == transform_id::TRIPLE_DES { 192 } else { 256 };
+    let key_bits = transform.attr(esp_attr::KEY_LENGTH).unwrap_or(default_bits);
+    let integ_id = transform.attr(esp_attr::AUTH_ALGORITHM).and_then(integ_from_esp_auth_algorithm).map(IntegAlgorithm::transform_id);
+    SkCipher::from_encr_integ(encr_id, key_bits, integ_id).ok_or(IkeError::NoProposalChosen)
+}
+
 /// `HASH(3) = prf(SKEYID_a, 0 | M-ID | Ni_b | Nr_b)`.
 fn hash3(prf: Prf, skeyid_a: &[u8], msgid: u32, ni: &[u8], nr: &[u8]) -> Vec<u8> {
     let mut h = vec![0u8];
@@ -139,34 +209,55 @@ fn hash3(prf: Prf, skeyid_a: &[u8], msgid: u32, ni: &[u8], nr: &[u8]) -> Vec<u8>
     prf.mac(skeyid_a, &h)
 }
 
-/// Derive the ESP CHILD SA. KEYMAT depends only on `SKEYID_d`, the Quick-Mode
-/// nonces and the SPI of the *receiving* SA, so the derivation is symmetric: each
-/// side stamps outbound packets with the peer's SPI and expects its own inbound.
-fn derive_child(prf: Prf, skeyid_d: &[u8], ni: &[u8], nr: &[u8], local_spi: u32, peer_spi: u32) -> Result<ChildSa, IkeError> {
-    let km_local = crypto1::keymat(prf, skeyid_d, protocol::ESP, &local_spi.to_be_bytes(), ni, nr, ESP_KEYMAT_LEN);
-    let km_peer = crypto1::keymat(prf, skeyid_d, protocol::ESP, &peer_spi.to_be_bytes(), ni, nr, ESP_KEYMAT_LEN);
+/// The `(enc_material, integ_key)` split of a KEYMAT blob for `cipher` --
+/// `enc_material` is `cipher.key_len() + cipher.salt_len()` bytes (the shape
+/// [`EspSa::new_with_cipher`] wants), `integ_key` the trailing
+/// `cipher.integ_algorithm()`'s key length (empty for AEAD).
+fn split_esp_keymat(cipher: SkCipher, km: &[u8]) -> (&[u8], &[u8]) {
+    km.split_at(cipher.key_len() + cipher.salt_len())
+}
+
+fn esp_keymat_len(cipher: SkCipher) -> usize {
+    cipher.key_len() + cipher.salt_len() + cipher.integ_algorithm().map(IntegAlgorithm::key_len).unwrap_or(0)
+}
+
+/// Derive the ESP CHILD SA under `cipher`. KEYMAT depends only on
+/// `SKEYID_d`, the Quick-Mode nonces and the SPI of the *receiving* SA, so
+/// the derivation is symmetric: each side stamps outbound packets with the
+/// peer's SPI and expects its own inbound.
+fn derive_child(prf: Prf, skeyid_d: &[u8], cipher: SkCipher, ni: &[u8], nr: &[u8], local_spi: u32, peer_spi: u32) -> Result<ChildSa, IkeError> {
+    let out_len = esp_keymat_len(cipher);
+    let km_local = crypto1::keymat(prf, skeyid_d, protocol::ESP, &local_spi.to_be_bytes(), ni, nr, out_len);
+    let km_peer = crypto1::keymat(prf, skeyid_d, protocol::ESP, &peer_spi.to_be_bytes(), ni, nr, out_len);
+    let (enc_local, integ_local) = split_esp_keymat(cipher, &km_local);
+    let (enc_peer, integ_peer) = split_esp_keymat(cipher, &km_peer);
     Ok(ChildSa {
-        outbound: EspSa::new(peer_spi, &km_peer)?,
-        inbound: EspSa::new(local_spi, &km_local)?,
+        outbound: EspSa::new_with_cipher(peer_spi, cipher, enc_peer, integ_peer)?,
+        inbound: EspSa::new_with_cipher(local_spi, cipher, enc_local, integ_local)?,
     })
 }
 
 /// Like [`derive_child`], but folding a PFS `shared_secret` into the KEYMAT
 /// (see [`crypto1::keymat_pfs`]).
+#[allow(clippy::too_many_arguments)]
 fn derive_child_pfs(
     prf: Prf,
     skeyid_d: &[u8],
+    cipher: SkCipher,
     shared_secret: &[u8],
     ni: &[u8],
     nr: &[u8],
     local_spi: u32,
     peer_spi: u32,
 ) -> Result<ChildSa, IkeError> {
-    let km_local = crypto1::keymat_pfs(prf, skeyid_d, shared_secret, protocol::ESP, &local_spi.to_be_bytes(), ni, nr, ESP_KEYMAT_LEN);
-    let km_peer = crypto1::keymat_pfs(prf, skeyid_d, shared_secret, protocol::ESP, &peer_spi.to_be_bytes(), ni, nr, ESP_KEYMAT_LEN);
+    let out_len = esp_keymat_len(cipher);
+    let km_local = crypto1::keymat_pfs(prf, skeyid_d, shared_secret, protocol::ESP, &local_spi.to_be_bytes(), ni, nr, out_len);
+    let km_peer = crypto1::keymat_pfs(prf, skeyid_d, shared_secret, protocol::ESP, &peer_spi.to_be_bytes(), ni, nr, out_len);
+    let (enc_local, integ_local) = split_esp_keymat(cipher, &km_local);
+    let (enc_peer, integ_peer) = split_esp_keymat(cipher, &km_peer);
     Ok(ChildSa {
-        outbound: EspSa::new(peer_spi, &km_peer)?,
-        inbound: EspSa::new(local_spi, &km_local)?,
+        outbound: EspSa::new_with_cipher(peer_spi, cipher, enc_peer, integ_peer)?,
+        inbound: EspSa::new_with_cipher(local_spi, cipher, enc_local, integ_local)?,
     })
 }
 
@@ -184,22 +275,28 @@ pub struct QuickInitiator {
     local_spi: u32,
     ni: Vec<u8>,
     iv1: Vec<u8>,
+    /// The ESP cipher we offered -- see `esp_sa`'s doc. A successful
+    /// `complete()` implies the peer accepted this exact (sole) proposal, so
+    /// this is trusted directly rather than re-parsed from the response, the
+    /// same precedent `pfs` below already follows.
+    cipher: SkCipher,
     /// Our ephemeral PFS share, if PFS was requested: the DH group plus our
     /// private key, needed once the response's KE payload arrives.
     pfs: Option<(DhGroup, [u8; 32])>,
 }
 
 /// Build Quick-Mode message 1 (`HASH(1), SA, Ni, IDci, IDcr`) as the initiator,
-/// choosing a fresh message-id and inbound ESP SPI. `ts_local`/`ts_remote` are
-/// the `(address, netmask)` traffic selectors offered as IDci/IDcr. No PFS --
-/// see [`initiate_quick_with_pfs`].
+/// choosing a fresh message-id and inbound ESP SPI, offering `cipher` for the
+/// ESP CHILD SA. `ts_local`/`ts_remote` are the `(address, netmask)` traffic
+/// selectors offered as IDci/IDcr. No PFS -- see [`initiate_quick_with_pfs`].
 pub fn initiate_quick(
     st: &Phase1State,
     entropy: &mut impl Entropy,
+    cipher: SkCipher,
     ts_local: ([u8; 4], [u8; 4]),
     ts_remote: ([u8; 4], [u8; 4]),
 ) -> Result<(Vec<u8>, QuickInitiator), IkeError> {
-    initiate_quick_with_pfs(st, entropy, ts_local, ts_remote, None)
+    initiate_quick_with_pfs(st, entropy, cipher, ts_local, ts_remote, None)
 }
 
 /// Like [`initiate_quick`], but when `pfs_group` is `Some`, also generates an
@@ -207,9 +304,11 @@ pub fn initiate_quick(
 /// attribute on the ESP proposal, and adds a `KE` payload -- Perfect Forward
 /// Secrecy for this CHILD SA (RFC 2409 §5.5's PFS variant). `None` reproduces
 /// [`initiate_quick`]'s exact behavior.
+#[allow(clippy::too_many_arguments)]
 pub fn initiate_quick_with_pfs(
     st: &Phase1State,
     entropy: &mut impl Entropy,
+    cipher: SkCipher,
     ts_local: ([u8; 4], [u8; 4]),
     ts_remote: ([u8; 4], [u8; 4]),
     pfs_group: Option<DhGroup>,
@@ -227,7 +326,7 @@ pub fn initiate_quick_with_pfs(
 
     let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
     let mut after = vec![
-        (payload::SA, esp_sa(local_spi, pfs_group).to_bytes()),
+        (payload::SA, esp_sa(local_spi, cipher, pfs_group).to_bytes()),
         (payload::NONCE, ni.clone()),
     ];
     if let Some((group, dh_private)) = &pfs {
@@ -247,6 +346,7 @@ pub fn initiate_quick_with_pfs(
         local_spi,
         ni,
         iv1,
+        cipher,
         pfs,
     }))
 }
@@ -280,9 +380,9 @@ impl QuickInitiator {
             Some((group, dh_private)) => {
                 let gxr = find(&ps, payload::KE).ok_or(IkeError::MissingPayload("KE"))?.data.clone();
                 let shared = group.shared(dh_private, &gxr)?;
-                derive_child_pfs(self.prf, &self.skeyid_d, &shared, &self.ni, &nr, self.local_spi, peer_spi)?
+                derive_child_pfs(self.prf, &self.skeyid_d, self.cipher, &shared, &self.ni, &nr, self.local_spi, peer_spi)?
             }
-            None => derive_child(self.prf, &self.skeyid_d, &self.ni, &nr, self.local_spi, peer_spi)?,
+            None => derive_child(self.prf, &self.skeyid_d, self.cipher, &self.ni, &nr, self.local_spi, peer_spi)?,
         };
         Ok((msg3, child))
     }
@@ -302,6 +402,12 @@ pub struct QuickResponder {
     ni: Vec<u8>,
     nr: Vec<u8>,
     iv2: Vec<u8>,
+    /// The cipher named on the initiator's ESP proposal (see
+    /// [`peer_esp_cipher`]) -- echoed straight back in message 2 rather than
+    /// assuming a fixed cipher, so this responder (used only as `ryke`'s own
+    /// client-testing double, see `ikev1::server::Server`) can interoperate
+    /// with an initiator offering any cipher this module supports.
+    cipher: SkCipher,
     /// The PFS shared secret, if the initiator's proposal asked for PFS (see
     /// [`peer_pfs_group`]) -- computed here so [`Self::complete`] only needs
     /// to fold it into the KEYMAT once `HASH(3)` is verified.
@@ -326,6 +432,7 @@ pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) 
     let ni = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
     let peer_spi = peer_esp_spi(&ps)?;
     let pfs_group = peer_pfs_group(&ps)?;
+    let cipher = peer_esp_cipher(&ps)?;
 
     let mut spi_b = [0u8; 4];
     entropy.fill(&mut spi_b);
@@ -334,7 +441,7 @@ pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) 
     entropy.fill(&mut nr);
 
     let mut after: Vec<(u8, Vec<u8>)> = vec![
-        (payload::SA, esp_sa(local_spi, pfs_group).to_bytes()),
+        (payload::SA, esp_sa(local_spi, cipher, pfs_group).to_bytes()),
         (payload::NONCE, nr.clone()),
     ];
     let pfs_shared = match pfs_group {
@@ -362,6 +469,7 @@ pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) 
         ni,
         nr,
         iv2,
+        cipher,
         pfs_shared,
     }))
 }
@@ -376,8 +484,8 @@ impl QuickResponder {
             return Err(IkeError::AuthFailed);
         }
         match &self.pfs_shared {
-            Some(shared) => derive_child_pfs(self.prf, &self.skeyid_d, shared, &self.ni, &self.nr, self.local_spi, self.peer_spi),
-            None => derive_child(self.prf, &self.skeyid_d, &self.ni, &self.nr, self.local_spi, self.peer_spi),
+            Some(shared) => derive_child_pfs(self.prf, &self.skeyid_d, self.cipher, shared, &self.ni, &self.nr, self.local_spi, self.peer_spi),
+            None => derive_child(self.prf, &self.skeyid_d, self.cipher, &self.ni, &self.nr, self.local_spi, self.peer_spi),
         }
     }
 }
@@ -385,16 +493,18 @@ impl QuickResponder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::DhGroup;
+    use crate::crypto::{DhGroup, IntegAlgorithm};
     use crate::entropy::SeedEntropy;
     use crate::ikev1::payloads::Id;
-    use crate::ikev1::phase1::{initiate_aggressive, respond_aggressive, InitiatorConfig, Phase1Config};
+    use crate::ikev1::phase1::{initiate_aggressive, respond_aggressive, Ikev1ExchangeMode, InitiatorConfig, Phase1Config};
+    use crate::ikev2::sk::SkCipher;
 
     #[test]
     fn ikev1_initiator_and_responder_agree_and_esp_roundtrips() {
         let psk = b"correct horse battery staple".to_vec();
         let ts = ([10, 0, 99, 0], [255, 255, 255, 0]);
-        let icfg = InitiatorConfig { psk: psk.clone(), our_id: Id::ipv4([10, 1, 1, 1]), group: DhGroup::Modp1024, xauth: false, ts_local: ts, ts_remote: ts, pfs_group: None };        let rcfg = Phase1Config { psk: psk.clone(), our_id: Id::ipv4([192, 168, 0, 1]) };
+        let icfg = InitiatorConfig { psk: psk.clone(), our_id: Id::ipv4([10, 1, 1, 1]), group: DhGroup::Modp1024, xauth: false, ts_local: ts, ts_remote: ts, esp_cipher: SkCipher::Aes256Gcm, pfs_group: None, mode_cfg: false, mode: Ikev1ExchangeMode::Aggressive };
+        let rcfg = Phase1Config { psk: psk.clone(), our_id: Id::ipv4([192, 168, 0, 1]) };
         let mut ie = SeedEntropy::new(0x1111);
         let mut re = SeedEntropy::new(0x2222);
 
@@ -405,7 +515,7 @@ mod tests {
         rstate.verify_hash_i(&msg3).unwrap();
 
         // Phase 2: Quick Mode.
-        let (qm1, qi) = initiate_quick(&istate, &mut ie, ts, ts).unwrap();
+        let (qm1, qi) = initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, ts, ts).unwrap();
         let (qm2, qr) = respond_quick(&rstate, &qm1, &mut re).unwrap();
         let (qm3, mut ichild) = qi.complete(&qm2).unwrap();
         let mut rchild = qr.complete(&qm3).unwrap();
@@ -421,11 +531,49 @@ mod tests {
         assert_eq!(got_r, pkt);
     }
 
+    /// The specific cipher a real FortiGate demanded live (see this crate's
+    /// project memory): ESP_AES_CBC/256 + a separate HMAC-SHA2-256 ICV, not
+    /// this module's old hardcoded AES-GCM. Confirms the classic (non-AEAD)
+    /// path end to end -- `esp_sa`'s AUTH_ALGORITHM attribute, KEYMAT split,
+    /// and `EspSa::seal`/`open`'s CBC+HMAC framing all agree.
+    #[test]
+    fn ikev1_quick_mode_with_classic_cbc_hmac_cipher_agrees_and_esp_roundtrips() {
+        let psk = b"correct horse battery staple".to_vec();
+        let ts = ([10, 0, 99, 0], [255, 255, 255, 0]);
+        let cipher = SkCipher::Aes256Cbc(IntegAlgorithm::HmacSha2_256_128);
+        let icfg = InitiatorConfig { psk: psk.clone(), our_id: Id::ipv4([10, 1, 1, 1]), group: DhGroup::Modp1024, xauth: false, ts_local: ts, ts_remote: ts, esp_cipher: cipher, pfs_group: None, mode_cfg: false, mode: Ikev1ExchangeMode::Aggressive };
+        let rcfg = Phase1Config { psk: psk.clone(), our_id: Id::ipv4([192, 168, 0, 1]) };
+        let mut ie = SeedEntropy::new(0x7777);
+        let mut re = SeedEntropy::new(0x8888);
+
+        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie);
+        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re).unwrap();
+        let (msg3, istate) = ai.complete(&msg2).unwrap();
+        rstate.verify_hash_i(&msg3).unwrap();
+
+        let (qm1, qi) = initiate_quick(&istate, &mut ie, cipher, ts, ts).unwrap();
+        let (qm2, qr) = respond_quick(&rstate, &qm1, &mut re).unwrap();
+        let (qm3, mut ichild) = qi.complete(&qm2).unwrap();
+        let mut rchild = qr.complete(&qm3).unwrap();
+
+        assert_eq!(ichild.outbound.cipher(), cipher);
+        assert_eq!(rchild.outbound.cipher(), cipher);
+
+        let pkt: Vec<u8> = (0..40u8).collect();
+        let sealed = ichild.outbound.seal(&pkt, 4).unwrap();
+        let (got, nh) = rchild.inbound.open(&sealed).unwrap();
+        assert_eq!(got, pkt);
+        assert_eq!(nh, 4);
+        let sealed_r = rchild.outbound.seal(&pkt, 4).unwrap();
+        let (got_r, _) = ichild.inbound.open(&sealed_r).unwrap();
+        assert_eq!(got_r, pkt);
+    }
+
     #[test]
     fn ikev1_quick_mode_pfs_agrees_and_esp_roundtrips() {
         let psk = b"correct horse battery staple".to_vec();
         let ts = ([10, 0, 99, 0], [255, 255, 255, 0]);
-        let icfg = InitiatorConfig { psk: psk.clone(), our_id: Id::ipv4([10, 1, 1, 1]), group: DhGroup::Modp1024, xauth: false, ts_local: ts, ts_remote: ts, pfs_group: None };
+        let icfg = InitiatorConfig { psk: psk.clone(), our_id: Id::ipv4([10, 1, 1, 1]), group: DhGroup::Modp1024, xauth: false, ts_local: ts, ts_remote: ts, esp_cipher: SkCipher::Aes256Gcm, pfs_group: None, mode_cfg: false, mode: Ikev1ExchangeMode::Aggressive };
         let rcfg = Phase1Config { psk: psk.clone(), our_id: Id::ipv4([192, 168, 0, 1]) };
         let mut ie = SeedEntropy::new(0x3333);
         let mut re = SeedEntropy::new(0x4444);
@@ -436,7 +584,7 @@ mod tests {
         rstate.verify_hash_i(&msg3).unwrap();
 
         // Quick Mode, this time with PFS (a fresh DH group of its own).
-        let (qm1, qi) = initiate_quick_with_pfs(&istate, &mut ie, ts, ts, Some(DhGroup::Modp2048)).unwrap();
+        let (qm1, qi) = initiate_quick_with_pfs(&istate, &mut ie, SkCipher::Aes256Gcm, ts, ts, Some(DhGroup::Modp2048)).unwrap();
         let (qm2, qr) = respond_quick(&rstate, &qm1, &mut re).unwrap();
         let (qm3, mut ichild) = qi.complete(&qm2).unwrap();
         let mut rchild = qr.complete(&qm3).unwrap();
@@ -459,7 +607,7 @@ mod tests {
     fn pfs_quick_mode_derives_a_fresh_key_each_time() {
         let psk = b"correct horse battery staple".to_vec();
         let ts = ([10, 0, 99, 0], [255, 255, 255, 0]);
-        let icfg = InitiatorConfig { psk: psk.clone(), our_id: Id::ipv4([10, 1, 1, 1]), group: DhGroup::Modp1024, xauth: false, ts_local: ts, ts_remote: ts, pfs_group: None };
+        let icfg = InitiatorConfig { psk: psk.clone(), our_id: Id::ipv4([10, 1, 1, 1]), group: DhGroup::Modp1024, xauth: false, ts_local: ts, ts_remote: ts, esp_cipher: SkCipher::Aes256Gcm, pfs_group: None, mode_cfg: false, mode: Ikev1ExchangeMode::Aggressive };
         let rcfg = Phase1Config { psk: psk.clone(), our_id: Id::ipv4([192, 168, 0, 1]) };
         let mut ie = SeedEntropy::new(0x5555);
         let mut re = SeedEntropy::new(0x6666);
@@ -469,7 +617,7 @@ mod tests {
         rstate.verify_hash_i(&msg3).unwrap();
 
         let run = |ie: &mut SeedEntropy, re: &mut SeedEntropy| {
-            let (qm1, qi) = initiate_quick_with_pfs(&istate, ie, ts, ts, Some(DhGroup::Modp2048)).unwrap();
+            let (qm1, qi) = initiate_quick_with_pfs(&istate, ie, SkCipher::Aes256Gcm, ts, ts, Some(DhGroup::Modp2048)).unwrap();
             let (qm2, qr) = respond_quick(&rstate, &qm1, re).unwrap();
             let (qm3, ichild) = qi.complete(&qm2).unwrap();
             let _ = qr.complete(&qm3).unwrap();
@@ -483,7 +631,8 @@ mod tests {
     #[test]
     fn wrong_psk_fails_phase1() {
         let ts = ([0, 0, 0, 0], [0, 0, 0, 0]);
-        let icfg = InitiatorConfig { psk: b"right".to_vec(), our_id: Id::ipv4([10, 1, 1, 1]), group: DhGroup::Modp1024, xauth: false, ts_local: ts, ts_remote: ts, pfs_group: None };        let rcfg = Phase1Config { psk: b"wrong".to_vec(), our_id: Id::ipv4([192, 168, 0, 1]) };
+        let icfg = InitiatorConfig { psk: b"right".to_vec(), our_id: Id::ipv4([10, 1, 1, 1]), group: DhGroup::Modp1024, xauth: false, ts_local: ts, ts_remote: ts, esp_cipher: SkCipher::Aes256Gcm, pfs_group: None, mode_cfg: false, mode: Ikev1ExchangeMode::Aggressive };
+        let rcfg = Phase1Config { psk: b"wrong".to_vec(), our_id: Id::ipv4([192, 168, 0, 1]) };
         let mut ie = SeedEntropy::new(1);
         let mut re = SeedEntropy::new(2);
         let (msg1, ai) = initiate_aggressive(&icfg, &mut ie);

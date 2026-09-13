@@ -139,6 +139,11 @@ impl EspSa {
         self.spi
     }
 
+    /// The cipher this SA was negotiated with.
+    pub fn cipher(&self) -> SkCipher {
+        self.cipher
+    }
+
     /// The raw key+salt material this SA was derived from (32-byte AES key +
     /// 4-byte GCM salt, RFC 4106 layout) — for a consumer that hands packets
     /// to the kernel via XFRM instead of this struct's own `seal`/`open`.

@@ -30,6 +30,7 @@
 
 // Shared crypto core (used by both IKEv1 and IKEv2).
 pub mod crypto;
+pub mod debug;
 pub mod entropy;
 pub mod error;
 pub mod esp;

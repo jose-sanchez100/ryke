@@ -48,10 +48,12 @@ impl UdpTransport {
         let mut buf = vec![0u8; MAX_DATAGRAM];
         let (n, from) = self.socket.recv_from(&mut buf)?;
         buf.truncate(n);
+        crate::debug::dump("<<<", from, &buf);
         Ok((buf, from))
     }
 
     pub fn send_to(&self, data: &[u8], to: SocketAddr) -> io::Result<usize> {
+        crate::debug::dump(">>>", to, data);
         self.socket.send_to(data, to)
     }
 }

@@ -8,6 +8,7 @@ use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
+use crate::debug::ike_debug;
 use crate::entropy::Entropy;
 use crate::esp::ChildSa;
 use crate::ikev1::phase1::{initiate_aggressive, InitiatorConfig, Phase1State};
@@ -45,6 +46,7 @@ impl<E: Entropy> Client<E> {
     /// (msg1/msg2/msg3) — against `server`, returning the established SA.
     pub fn connect(&mut self, server: SocketAddr, cfg: &InitiatorConfig) -> Result<Established, DriverError> {
         // Phase 1: Aggressive Mode.
+        ike_debug!("Aggressive Mode: sending msg1 to {server}");
         let (msg1, ai) = initiate_aggressive(cfg, &mut self.entropy);
         self.transport.send_to(&msg1, server)?;
         let (msg2, _from) = self.transport.recv_from()?;
@@ -62,6 +64,7 @@ impl<E: Entropy> Client<E> {
         let (qm2, _from) = self.transport.recv_from()?;
         let (qm3, child) = qi.complete(&qm2)?;
         self.transport.send_to(&qm3, server)?;
+        ike_debug!("Quick Mode: complete -- CHILD SA established");
 
         Ok(Established { phase1, child })
     }

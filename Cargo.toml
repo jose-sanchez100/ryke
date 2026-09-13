@@ -48,6 +48,8 @@ aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 # Raw UDP_ENCAP sockopt wiring for RFC 3947/3948 NAT-T (transport.rs).
 libc = "0.2"
+# Zeroize rekeyed CHILD SA key material on drop (ikev1::quick::ChildKeyMaterial).
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 # Only tests build throwaway certificates; the builder never ships in the library.

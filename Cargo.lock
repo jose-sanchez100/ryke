@@ -679,6 +679,7 @@ dependencies = [
  "thiserror",
  "x25519-dalek",
  "x509-cert",
+ "zeroize",
 ]
 
 [[package]]

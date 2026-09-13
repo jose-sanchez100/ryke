@@ -39,6 +39,41 @@ use crate::error::IkeError;
 use crate::esp::{ChildSa, EspSa};
 use crate::ikev2::payload::transform_id;
 use crate::ikev2::sk::SkCipher;
+use zeroize::Zeroize;
+
+/// One direction's derived ESP key material -- cipher-tagged so the caller
+/// (e.g. a kernel XFRM installer) knows how to interpret `enc`/`integ`
+/// without re-deriving or re-negotiating anything. Zeroized on drop; `Debug`
+/// never prints the raw bytes.
+#[derive(Clone, PartialEq, Eq, Zeroize)]
+pub struct ChildKeyMaterial {
+    #[zeroize(skip)]
+    pub cipher: SkCipher,
+    pub enc: Vec<u8>,
+    pub integ: Vec<u8>,
+}
+
+impl std::fmt::Debug for ChildKeyMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildKeyMaterial")
+            .field("cipher", &self.cipher)
+            .field("enc", &format_args!("[{} bytes REDACTED]", self.enc.len()))
+            .field("integ", &format_args!("[{} bytes REDACTED]", self.integ.len()))
+            .finish()
+    }
+}
+
+/// The result of a completed CHILD SA rekey: the new SPIs plus both
+/// directions' fresh key material, ready for a caller to install as the
+/// data plane's new SAs (this crate never installs kernel state itself --
+/// see [`crate::esp::EspSa`]'s own doc for why).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RekeyedChild {
+    pub local_spi: u32,
+    pub peer_spi: u32,
+    pub key_out: ChildKeyMaterial,
+    pub key_in: ChildKeyMaterial,
+}
 
 /// IPsec ESP SA attribute types (RFC 2407 §4.5) — a *different* registry from the
 /// Phase-1 IKE attributes: here KEY_LENGTH is 6, not 14.

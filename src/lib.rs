@@ -54,8 +54,9 @@ pub use entropy::{Entropy, SeedEntropy};
 pub use error::IkeError;
 pub use esp::{ChildSa, EspSa};
 pub use ikev2::exchange::{
-    default_offer, ike_cookie, initiator_complete, initiator_request, responder_respond,
-    responder_respond_natt, CompletedSaInit, CookiePolicy, LocalSecret, SaInitResult,
+    default_offer, ike_cookie, initiator_complete, initiator_complete_natt, initiator_request,
+    initiator_request_natt, responder_respond, responder_respond_natt, CompletedSaInit,
+    CookiePolicy, LocalSecret, NatStatus, SaInitResult,
 };
 pub use ikev2::natt::{
     is_ike_on_4500, unwrap_ike_4500, wrap_ike_4500, NON_ESP_MARKER,

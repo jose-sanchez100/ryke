@@ -111,6 +111,10 @@ struct SaInitPayloads {
     signature_hashes: Vec<u16>,
     /// A COOKIE notify the initiator echoed back (RFC 7296 §2.6), if any.
     cookie: Option<Vec<u8>>,
+    /// The peer's `NAT_DETECTION_DESTINATION_IP` notify data, if it sent one.
+    nat_dest: Option<Vec<u8>>,
+    /// The peer's `NAT_DETECTION_SOURCE_IP` notify data, if it sent one.
+    nat_source: Option<Vec<u8>>,
 }
 
 /// Decode a `SIGNATURE_HASH_ALGORITHMS` notify's data — a bare list of 16-bit
@@ -125,6 +129,8 @@ fn parse_sa_init(header: &IkeHeader, body: &[u8]) -> Result<SaInitPayloads, IkeE
     let mut nonce = None;
     let mut signature_hashes = Vec::new();
     let mut cookie = None;
+    let mut nat_dest = None;
+    let mut nat_source = None;
     for payload in payloads(header.next_payload, body) {
         let payload = payload?;
         match payload.payload_type {
@@ -147,6 +153,10 @@ fn parse_sa_init(header: &IkeHeader, body: &[u8]) -> Result<SaInitPayloads, IkeE
                         signature_hashes = parse_signature_hashes(&n.data);
                     } else if n.notify_type == notify_type::COOKIE {
                         cookie = Some(n.data);
+                    } else if n.notify_type == notify_type::NAT_DETECTION_DESTINATION_IP {
+                        nat_dest = Some(n.data);
+                    } else if n.notify_type == notify_type::NAT_DETECTION_SOURCE_IP {
+                        nat_source = Some(n.data);
                     }
                 }
             }
@@ -160,6 +170,8 @@ fn parse_sa_init(header: &IkeHeader, body: &[u8]) -> Result<SaInitPayloads, IkeE
         nonce: nonce.ok_or(IkeError::MissingPayload("Nonce"))?,
         signature_hashes,
         cookie,
+        nat_dest,
+        nat_source,
     })
 }
 
@@ -227,6 +239,36 @@ pub fn initiator_request(local: &LocalSecret, offer: &SecurityAssociation) -> Ve
     let public = group.public(&local.dh_private);
     let header = base_header(local.spi, 0, Flags { initiator: true, version: false, response: false });
     build_sa_init(header, offer, group.transform_id(), &public, &local.nonce, &[])
+}
+
+/// Initiator step 1, **NAT-detecting** variant (RFC 7296 §2.23): also emits
+/// `NAT_DETECTION_SOURCE_IP`/`NAT_DETECTION_DESTINATION_IP` notifies so we can
+/// tell, from the response, whether either end sits behind a NAT and the
+/// exchange (and later ESP) needs to float to UDP 4500. `our_addr` is the local
+/// address our packets will actually carry as their source (the specific
+/// interface IP the OS routes through to reach `peer_addr` — not `0.0.0.0`: a
+/// wildcard-bound socket must resolve this via its outbound route first, e.g. by
+/// connecting a throwaway socket to `peer_addr` and reading its local address).
+/// `peer_addr` is where we're sending, i.e. the gateway's `IKE_SA_INIT` address.
+pub fn initiator_request_natt(
+    local: &LocalSecret,
+    offer: &SecurityAssociation,
+    our_addr: std::net::SocketAddr,
+    peer_addr: std::net::SocketAddr,
+) -> Vec<u8> {
+    let group = offer_dh_group(offer);
+    let public = group.public(&local.dh_private);
+    let header = base_header(local.spi, 0, Flags { initiator: true, version: false, response: false });
+    // SPIr is unknown at this point -- the wire header carries 0, and the
+    // responder reconstructs the same hash input from that same 0 (see
+    // `responder_respond_inner`, which hashes with its own real spi_r once it
+    // has one -- symmetric only once we re-hash with the real spi_r to check
+    // *its* response, done in `initiator_complete_natt`).
+    let extra_notifies = [
+        natt::source_ip_notify(local.spi, 0, our_addr.ip(), our_addr.port()),
+        natt::destination_ip_notify(local.spi, 0, peer_addr.ip(), peer_addr.port()),
+    ];
+    build_sa_init(header, offer, group.transform_id(), &public, &local.nonce, &extra_notifies)
 }
 
 /// A COOKIE challenge policy (RFC 7296 §2.6) — return-routability against
@@ -445,6 +487,71 @@ pub fn initiator_complete(local: &LocalSecret, request: &[u8], response: &[u8]) 
     })
 }
 
+/// What [`initiator_complete_natt`] found out about NAT on the path (RFC 7296
+/// §2.23). Split into its parts (rather than a single bool) so a caller can
+/// tell "the responder never sent a NAT_DETECTION notify at all" apart from
+/// "it sent one and the addresses genuinely matched" -- both look like "no
+/// float needed" from `float_to_4500()` alone, but they mean very different
+/// things when a client behind a NAT expects to have to float and doesn't.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NatStatus {
+    /// The response carried a `NAT_DETECTION_DESTINATION_IP` notify (the
+    /// responder's guess of *our* address) we could actually compare.
+    pub dest_notify_present: bool,
+    /// The response carried a `NAT_DETECTION_SOURCE_IP` notify (the
+    /// responder's own claimed address) we could actually compare.
+    pub source_notify_present: bool,
+    /// Our claimed address disagreed with what the responder observed --
+    /// meaningless if `dest_notify_present` is false.
+    pub we_are_natted: bool,
+    /// The responder's claimed address disagreed with what we observed the
+    /// response arrive from -- meaningless if `source_notify_present` is false.
+    pub peer_is_natted: bool,
+}
+
+impl NatStatus {
+    /// Whether the exchange should float to UDP 4500 (RFC 7296 §2.23): either
+    /// end being NAT'd is enough.
+    pub fn float_to_4500(&self) -> bool {
+        self.we_are_natted || self.peer_is_natted
+    }
+}
+
+/// Initiator step 2, **NAT-detecting** variant: like [`initiator_complete`], but
+/// also reads the responder's `NAT_DETECTION_*` notifies (present only if
+/// [`initiator_request_natt`] built the request) and returns a [`NatStatus`]
+/// telling the caller whether (and why) to float to UDP 4500. `our_addr`/
+/// `peer_addr` must be the exact same addresses passed to
+/// `initiator_request_natt` for this exchange.
+pub fn initiator_complete_natt(
+    local: &LocalSecret,
+    request: &[u8],
+    response: &[u8],
+    our_addr: std::net::SocketAddr,
+    peer_addr: std::net::SocketAddr,
+) -> Result<(CompletedSaInit, NatStatus), IkeError> {
+    let header = IkeHeader::parse(response)?;
+    let payloads = parse_sa_init(&header, &response[IkeHeader::LEN..])?;
+    let spi_i = local.spi;
+    let spi_r = header.responder_spi;
+
+    let status = NatStatus {
+        dest_notify_present: payloads.nat_dest.is_some(),
+        source_notify_present: payloads.nat_source.is_some(),
+        we_are_natted: payloads
+            .nat_dest
+            .as_deref()
+            .is_some_and(|d| natt::we_are_behind_nat(d, spi_i, spi_r, our_addr.ip(), our_addr.port())),
+        peer_is_natted: payloads
+            .nat_source
+            .as_deref()
+            .is_some_and(|d| natt::peer_is_behind_nat(d, spi_i, spi_r, peer_addr.ip(), peer_addr.port())),
+    };
+
+    let sa = initiator_complete(local, request, response)?;
+    Ok((sa, status))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +561,45 @@ mod tests {
     }
     fn resp_secret() -> LocalSecret {
         LocalSecret { dh_private: [9u8; 32], nonce: vec![0x22; 32], spi: 0xBBBB_BBBB_3333_4444 }
+    }
+    #[test]
+    fn initiator_natt_detects_when_we_are_translated() {
+        // The initiator claims a private address; the responder observes a
+        // different (translated) one -- exactly what a home-router NAT does. The
+        // responder itself is reachable directly (no NAT on its side).
+        let claimed: std::net::SocketAddr = "10.0.0.167:55000".parse().unwrap();
+        let responder_addr: std::net::SocketAddr = "198.51.100.7:500".parse().unwrap();
+        let observed: std::net::SocketAddr = "203.0.113.50:55000".parse().unwrap(); // post-NAT
+
+        let request = initiator_request_natt(&init_secret(), &default_offer(), claimed, responder_addr);
+        let response = match responder_respond_natt(&request, &resp_secret(), responder_addr, observed, None).unwrap() {
+            SaInitResult::Established { response, .. } => response,
+            other => panic!("expected Established, got {other:?}", other = std::mem::discriminant(&other)),
+        };
+
+        let (sa, status) = initiator_complete_natt(&init_secret(), &request, &response, claimed, responder_addr).unwrap();
+        assert_eq!(sa.role, Role::Initiator);
+        assert!(status.dest_notify_present);
+        assert!(status.we_are_natted, "our claimed address disagrees with what the responder observed");
+        assert!(!status.peer_is_natted);
+        assert!(status.float_to_4500());
+    }
+
+    #[test]
+    fn initiator_natt_no_float_when_addresses_agree() {
+        // Both sides see exactly the addresses they claim -- no NAT anywhere.
+        let our: std::net::SocketAddr = "203.0.113.9:500".parse().unwrap();
+        let responder_addr: std::net::SocketAddr = "198.51.100.7:500".parse().unwrap();
+
+        let request = initiator_request_natt(&init_secret(), &default_offer(), our, responder_addr);
+        let response = match responder_respond_natt(&request, &resp_secret(), responder_addr, our, None).unwrap() {
+            SaInitResult::Established { response, .. } => response,
+            other => panic!("expected Established, got {other:?}", other = std::mem::discriminant(&other)),
+        };
+
+        let (_, status) = initiator_complete_natt(&init_secret(), &request, &response, our, responder_addr).unwrap();
+        assert!(status.dest_notify_present && status.source_notify_present);
+        assert!(!status.float_to_4500(), "matching addresses on both sides -- no NAT to detect");
     }
 
     #[test]

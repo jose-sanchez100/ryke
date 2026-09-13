@@ -28,6 +28,15 @@ use crate::ikev2::sk::SkCipher;
 /// in Aggressive-Mode message 2 whenever an XAUTH auth method was negotiated.
 pub const XAUTH_VENDOR_ID: [u8; 8] = [0x09, 0x00, 0x26, 0x89, 0xdf, 0xd6, 0xb7, 0x12];
 
+/// RFC 3706 Dead Peer Detection capability marker
+/// (`AFCAD71368A1F1C96B8696FC77570100` — MD5("draft-ietf-ipsec-dpd-00.txt")).
+/// Advertised unconditionally by both sides (it costs nothing to offer); a
+/// peer that echoes it back is DPD-capable, recorded on
+/// [`Phase1State::peer_supports_dpd`].
+pub const DPD_VENDOR_ID: [u8; 16] = [
+    0xAF, 0xCA, 0xD7, 0x13, 0x68, 0xA1, 0xF1, 0xC9, 0x6B, 0x86, 0x96, 0xFC, 0x77, 0x57, 0x01, 0x00,
+];
+
 /// The XAUTH auth methods occupy the private range 65001..=65010
 /// (XAUTHInit/Resp × PreShared/DSS/RSA/…).
 fn is_xauth_auth(method: u16) -> bool {
@@ -63,6 +72,8 @@ pub struct Phase1State {
     /// The initiator's SA-payload body and ID body — needed to verify `HASH_I`.
     sai_b: Vec<u8>,
     idii_b: Vec<u8>,
+    /// Whether the peer's own Phase-1 message echoed [`DPD_VENDOR_ID`].
+    pub peer_supports_dpd: bool,
 }
 
 /// Pick the first offered transform we support: AES-256-CBC, HASH SHA-256 (or
@@ -121,6 +132,7 @@ pub fn respond_aggressive(
     let idii_b = id_p.data.clone(); // signed as IDii_b
     let gxi = ke_p.data.clone();
     let ni = nonce_p.data.clone();
+    let peer_supports_dpd = ps.iter().any(|p| p.payload_type == payload::VENDOR_ID && p.data == DPD_VENDOR_ID);
 
     let sa = SaPayload::parse(&sa_p.data)?;
     let (chosen, prf, group, key_len) =
@@ -177,6 +189,9 @@ pub fn respond_aggressive(
     if is_xauth_auth(chosen_auth) {
         out_payloads.push((payload::VENDOR_ID, XAUTH_VENDOR_ID.to_vec()));
     }
+    // Advertise our own DPD support unconditionally, independent of whether
+    // the initiator advertised theirs -- see `DPD_VENDOR_ID`'s doc.
+    out_payloads.push((payload::VENDOR_ID, DPD_VENDOR_ID.to_vec()));
     let out_header = IsakmpHeader {
         init_cookie: cky_i,
         resp_cookie: cky_r,
@@ -206,6 +221,7 @@ pub fn respond_aggressive(
         nr,
         sai_b,
         idii_b,
+        peer_supports_dpd,
     };
     Ok((msg2, state))
 }
@@ -245,6 +261,7 @@ impl Phase1State {
             nr: Vec::new(),
             sai_b: Vec::new(),
             idii_b: Vec::new(),
+            peer_supports_dpd: false,
         }
     }
 
@@ -403,6 +420,7 @@ pub fn initiate_aggressive(cfg: &InitiatorConfig, entropy: &mut impl Entropy) ->
         (payload::KE, gxi.clone()),
         (payload::NONCE, ni.clone()),
         (payload::ID, idi_b.clone()),
+        (payload::VENDOR_ID, DPD_VENDOR_ID.to_vec()),
     ]);
 
     let state = AggressiveInitiator {
@@ -435,6 +453,7 @@ impl AggressiveInitiator {
         let nr = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
         let hash_r_got = find(&ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
         let idr_b = find(&ps, payload::ID).ok_or(IkeError::MissingPayload("ID"))?.data.clone();
+        let peer_supports_dpd = ps.iter().any(|p| p.payload_type == payload::VENDOR_ID && p.data == DPD_VENDOR_ID);
 
         if gxr.len() != self.group.public_len() {
             return Err(IkeError::BadKeyExchange { group: self.group.transform_id(), len: gxr.len() });
@@ -485,6 +504,7 @@ impl AggressiveInitiator {
             nr,
             sai_b: self.sai_b,
             idii_b: self.idi_b,
+            peer_supports_dpd,
         };
         Ok((msg3, state))
     }

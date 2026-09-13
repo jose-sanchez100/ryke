@@ -1,5 +1,6 @@
 //! A minimal blocking IKEv1 **initiator** (client) over UDP: Aggressive Mode
-//! (PSK), an optional Mode-Config round (see [`crate::ikev1::cfg`],
+//! or Main Mode (see [`InitiatorConfig::mode`]) for Phase 1 (PSK), an
+//! optional Mode-Config round (see [`crate::ikev1::cfg`],
 //! `InitiatorConfig::mode_cfg`) for an assigned inner IPv4, then Quick Mode
 //! (optionally with PFS, see `InitiatorConfig::pfs_group`), establishing an
 //! ESP CHILD SA. No XAUTH yet — suitable for gateways configured for plain
@@ -13,7 +14,7 @@ use crate::debug::ike_debug;
 use crate::entropy::Entropy;
 use crate::esp::ChildSa;
 use crate::ikev1::cfg as modecfg;
-use crate::ikev1::phase1::{initiate_aggressive, InitiatorConfig, Phase1State};
+use crate::ikev1::phase1::{initiate_aggressive, initiate_main, Ikev1ExchangeMode, InitiatorConfig, Phase1State};
 use crate::ikev1::quick::initiate_quick_with_pfs;
 use crate::transport::{DriverError, UdpTransport};
 
@@ -61,21 +62,46 @@ impl<E: Entropy> Client<E> {
         self.transport.set_read_timeout(dur)
     }
 
-    /// Run the full handshake — Aggressive Mode (msg1/msg2/msg3) then Quick Mode
-    /// (msg1/msg2/msg3) — against `server`, returning the established SA.
+    /// Run the full handshake — Phase 1 (Aggressive or Main Mode, see
+    /// [`InitiatorConfig::mode`]) then Quick Mode (msg1/msg2/msg3) — against
+    /// `server`, returning the established SA.
     pub fn connect(&mut self, server: SocketAddr, cfg: &InitiatorConfig) -> Result<Established, DriverError> {
-        // Phase 1: Aggressive Mode.
-        ike_debug!("Aggressive Mode: sending msg1 to {server}");
-        let (msg1, ai) = initiate_aggressive(cfg, &mut self.entropy);
-        self.transport.send_to(&msg1, server)?;
-        let (msg2, _from) = self.transport.recv_from()?;
-        let (msg3, phase1) = ai.complete(&msg2)?;
-        self.transport.send_to(&msg3, server)?;
+        let phase1 = match cfg.mode {
+            Ikev1ExchangeMode::Aggressive => {
+                ike_debug!("Aggressive Mode: sending msg1 to {server}");
+                let (msg1, ai) = initiate_aggressive(cfg, &mut self.entropy);
+                self.transport.send_to(&msg1, server)?;
+                let (msg2, _from) = self.transport.recv_from()?;
+                let (msg3, phase1) = ai.complete(&msg2)?;
+                self.transport.send_to(&msg3, server)?;
 
-        // Aggressive Mode has no acknowledgement for msg3, so pause briefly before
-        // the next round — otherwise a fast responder can receive it before it
-        // has marked Phase 1 complete and drop it as "phase 1 incomplete".
-        std::thread::sleep(std::time::Duration::from_millis(200));
+                // Aggressive Mode has no acknowledgement for msg3, so pause briefly
+                // before the next round — otherwise a fast responder can receive it
+                // before it has marked Phase 1 complete and drop it as "phase 1
+                // incomplete".
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                phase1
+            }
+            Ikev1ExchangeMode::Main => {
+                ike_debug!("Main Mode: sending msg1 to {server}");
+                let (msg1, sa_sent) = initiate_main(cfg, &mut self.entropy);
+                self.transport.send_to(&msg1, server)?;
+                let (msg2, _from) = self.transport.recv_from()?;
+                let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut self.entropy)?;
+                self.transport.send_to(&msg3, server)?;
+                let (msg4, _from) = self.transport.recv_from()?;
+                let (msg5, id_sent) = ke_sent.complete_ke(&msg4)?;
+                self.transport.send_to(&msg5, server)?;
+                let (msg6, _from) = self.transport.recv_from()?;
+                let phase1 = id_sent.complete_id(&msg6)?;
+                // Unlike Aggressive Mode, message 6 is a real reply the
+                // initiator already waited for above, so Phase 1 is known
+                // complete on both sides here -- no artificial pause needed
+                // before Quick Mode.
+                ike_debug!("Main Mode: complete");
+                phase1
+            }
+        };
 
         // Mode-Config: request an assigned inner IPv4 (+ netmask/DNS/subnet)
         // -- see `crate::ikev1::cfg`'s doc. Some gateways reject the following

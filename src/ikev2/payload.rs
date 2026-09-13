@@ -6,7 +6,7 @@
 //! payload header. Chaining payloads into a full message (adding those generic
 //! headers) is the message-builder's job.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::error::IkeError;
 
@@ -474,12 +474,15 @@ pub mod cfg_type {
 }
 
 /// Configuration Attribute types (RFC 7296 §3.15.1 + IANA registry). Only the
-/// IPv4 attributes a client needs to bring up a tunnel interface are named.
+/// attributes a client needs to bring up a tunnel interface are named.
 pub mod config_attr {
     pub const INTERNAL_IP4_ADDRESS: u16 = 1;
     pub const INTERNAL_IP4_NETMASK: u16 = 2;
     pub const INTERNAL_IP4_DNS: u16 = 3;
     pub const INTERNAL_IP4_SUBNET: u16 = 13;
+    pub const INTERNAL_IP6_ADDRESS: u16 = 8;
+    pub const INTERNAL_IP6_DNS: u16 = 10;
+    pub const INTERNAL_IP6_SUBNET: u16 = 15;
 }
 
 /// One IKEv2 Configuration Attribute (RFC 7296 §3.15.1): a 15-bit type (the top
@@ -538,20 +541,25 @@ impl Configuration {
         Configuration { cfg_type: cfg_type::REPLY, attrs }
     }
 
-    /// A CFG_REQUEST asking the responder to assign an inner IPv4 and, if it
-    /// hands out split-tunnel routes, to include them: an empty
-    /// INTERNAL_IP4_ADDRESS attribute (the virtual-IP request) plus an empty
-    /// INTERNAL_IP4_SUBNET attribute (a responder that has split-tunnel
-    /// subnets to offer replies with one INTERNAL_IP4_SUBNET per range, read
-    /// back with [`Self::assigned_subnets`]; one that doesn't simply omits
-    /// it, per RFC 7296 §3.15.1 — requesting it costs nothing and is a no-op
-    /// against a responder that doesn't support it).
+    /// A CFG_REQUEST asking the responder to assign an inner IPv4/IPv6
+    /// address and, if it hands out split-tunnel routes, to include them:
+    /// empty INTERNAL_IP4_ADDRESS/INTERNAL_IP6_ADDRESS attributes (the
+    /// virtual-IP requests) plus empty INTERNAL_IP4_SUBNET/INTERNAL_IP6_SUBNET
+    /// attributes (a responder that has split-tunnel subnets to offer
+    /// replies with one per range, read back with [`Self::assigned_subnets`]
+    /// / [`Self::assigned_ipv6_subnets`]). Per RFC 7296 §3.15.1, an attribute
+    /// a responder doesn't support or have a value for is simply omitted
+    /// from CFG_REPLY, so requesting IPv6 here is a no-op against an
+    /// IPv4-only responder — an initiator that never asks for
+    /// INTERNAL_IP6_ADDRESS never gets one back either way.
     pub fn request_ipv4() -> Self {
         Configuration {
             cfg_type: cfg_type::REQUEST,
             attrs: vec![
                 ConfigAttr { attr_type: config_attr::INTERNAL_IP4_ADDRESS, value: Vec::new() },
                 ConfigAttr { attr_type: config_attr::INTERNAL_IP4_SUBNET, value: Vec::new() },
+                ConfigAttr { attr_type: config_attr::INTERNAL_IP6_ADDRESS, value: Vec::new() },
+                ConfigAttr { attr_type: config_attr::INTERNAL_IP6_SUBNET, value: Vec::new() },
             ],
         }
     }
@@ -612,6 +620,51 @@ impl Configuration {
                 let net = Ipv4Addr::new(a.value[0], a.value[1], a.value[2], a.value[3]);
                 let mask = u32::from_be_bytes([a.value[4], a.value[5], a.value[6], a.value[7]]);
                 (net, mask.count_ones() as u8)
+            })
+            .collect()
+    }
+
+    /// The first INTERNAL_IP6_ADDRESS attribute, as (address, prefix length).
+    /// The value is 17 octets -- a 16-byte address plus a 1-byte prefix
+    /// length, per RFC 7296 §3.15.1 (unlike the IPv4 attribute, the prefix
+    /// length travels with the address itself, not as a separate NETMASK
+    /// attribute).
+    pub fn assigned_ipv6(&self) -> Option<(Ipv6Addr, u8)> {
+        self.attrs
+            .iter()
+            .find(|a| a.attr_type == config_attr::INTERNAL_IP6_ADDRESS && a.value.len() == 17)
+            .map(|a| {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&a.value[..16]);
+                (Ipv6Addr::from(octets), a.value[16])
+            })
+    }
+
+    /// Every INTERNAL_IP6_DNS attribute value (16-byte address, no prefix
+    /// length) -- same multi-resolver allowance as [`Self::assigned_dns`].
+    pub fn assigned_ipv6_dns(&self) -> Vec<Ipv6Addr> {
+        self.attrs
+            .iter()
+            .filter(|a| a.attr_type == config_attr::INTERNAL_IP6_DNS && a.value.len() == 16)
+            .map(|a| {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&a.value);
+                Ipv6Addr::from(octets)
+            })
+            .collect()
+    }
+
+    /// Every INTERNAL_IP6_SUBNET attribute, as (network, prefix length) --
+    /// same split-tunnel allowance as [`Self::assigned_subnets`]. Each value
+    /// is 17 octets: a 16-byte prefix plus a 1-byte prefix length.
+    pub fn assigned_ipv6_subnets(&self) -> Vec<(Ipv6Addr, u8)> {
+        self.attrs
+            .iter()
+            .filter(|a| a.attr_type == config_attr::INTERNAL_IP6_SUBNET && a.value.len() == 17)
+            .map(|a| {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&a.value[..16]);
+                (Ipv6Addr::from(octets), a.value[16])
             })
             .collect()
     }
@@ -964,6 +1017,48 @@ mod tests {
             end_addr: vec![0xFF; 16],
         };
         assert_eq!(ipv6.to_ipv4_cidr(), None);
+    }
+
+    #[test]
+    fn request_ipv4_asks_for_both_families_address_and_subnet() {
+        let req = Configuration::request_ipv4();
+        assert_eq!(req.cfg_type, cfg_type::REQUEST);
+        let types: Vec<u16> = req.attrs.iter().map(|a| a.attr_type).collect();
+        assert!(types.contains(&config_attr::INTERNAL_IP4_ADDRESS));
+        assert!(types.contains(&config_attr::INTERNAL_IP4_SUBNET));
+        assert!(types.contains(&config_attr::INTERNAL_IP6_ADDRESS));
+        assert!(types.contains(&config_attr::INTERNAL_IP6_SUBNET));
+        assert!(req.attrs.iter().all(|a| a.value.is_empty()), "a CFG_REQUEST asks with empty attribute values");
+    }
+
+    #[test]
+    fn configuration_reads_back_assigned_ipv6_address_dns_and_subnets() {
+        let addr = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1);
+        let mut addr_value = addr.octets().to_vec();
+        addr_value.push(64); // prefix length
+
+        let dns = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+
+        let subnet = Ipv6Addr::new(0xfd00, 0, 0, 0x10, 0, 0, 0, 0);
+        let mut subnet_value = subnet.octets().to_vec();
+        subnet_value.push(60);
+
+        let cfg = Configuration {
+            cfg_type: cfg_type::REPLY,
+            attrs: vec![
+                ConfigAttr { attr_type: config_attr::INTERNAL_IP6_ADDRESS, value: addr_value },
+                ConfigAttr { attr_type: config_attr::INTERNAL_IP6_DNS, value: dns.octets().to_vec() },
+                ConfigAttr { attr_type: config_attr::INTERNAL_IP6_SUBNET, value: subnet_value },
+            ],
+        };
+
+        assert_eq!(cfg.assigned_ipv6(), Some((addr, 64)));
+        assert_eq!(cfg.assigned_ipv6_dns(), vec![dns]);
+        assert_eq!(cfg.assigned_ipv6_subnets(), vec![(subnet, 60)]);
+
+        // Round-trips through wire encoding too.
+        let parsed = Configuration::parse(&cfg.to_bytes()).unwrap();
+        assert_eq!(parsed.assigned_ipv6(), Some((addr, 64)));
     }
 
     #[test]

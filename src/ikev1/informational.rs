@@ -116,6 +116,16 @@ fn parse_notify(body: &[u8]) -> Option<(u16, &[u8])> {
     Some((msg_type, data))
 }
 
+/// The inverse of [`delete_body`]: pull `(protocol_id, spi)` back out of a
+/// parsed Delete payload's body. `None` on anything too short to be
+/// well-formed.
+pub(crate) fn parse_delete(body: &[u8]) -> Option<(u8, &[u8])> {
+    let protocol_id = *body.get(4)?;
+    let spi_size = *body.get(5)? as usize;
+    let spi = body.get(8..8 + spi_size)?;
+    Some((protocol_id, spi))
+}
+
 /// RFC 3706 §2 Notify Message Types.
 mod notify_type {
     pub const R_U_THERE: u16 = 36136;
@@ -196,8 +206,13 @@ pub enum Liveness {
     /// "silence is alive" stance when it sent nothing itself.
     Alive,
     /// The peer sent an unsolicited Informational carrying a Delete payload
-    /// — it tore the tunnel down on its own initiative (e.g. an admin
-    /// disconnected the dialup session on the gateway).
+    /// that actually tears this tunnel down — either a Delete for the whole
+    /// ISAKMP SA (e.g. an admin disconnected the dialup session on the
+    /// gateway), or an ESP Delete naming the CHILD SA's SPI *currently* in
+    /// use (`current_peer_spi`, as passed to [`peek`]/[`probe`]). A Delete
+    /// for some other ESP SPI — most commonly the just-superseded SPI from a
+    /// CHILD SA rekey the peer initiated — does not tear anything down and
+    /// is silently ignored; see [`watch`]'s doc.
     PeerTornDown,
     /// [`probe`] only: no R-U-THERE-ACK arrived within the timeout. Could be
     /// transient packet loss rather than a dead peer — callers should
@@ -222,20 +237,32 @@ enum Seen {
 /// (`expect_ack_seq: None`) and [`probe`] (`Some(seq)` for the sequence
 /// number it just sent), mirroring
 /// [`crate::ikev2::session::LivenessSession::recv_and_classify`]'s shape.
-/// Three-way classification: a Delete ends the wait immediately as
-/// [`Seen::PeerTornDown`]; an incoming R-U-THERE from the peer is always
-/// auto-ack'd via [`build_r_u_there_ack`] (RFC 3706 requires answering one
-/// whenever seen, regardless of whether this call is a passive `peek` or an
-/// active `probe`) and the wait continues; an R-U-THERE-ACK matching
-/// `expect_ack_seq` ends the wait as [`Seen::AckMatched`]; anything else
-/// (garbage, a message for a different exchange/SA, a decrypt/HASH failure,
-/// a stale/mismatched ack, a failed auto-ack send) is silently skipped
-/// rather than surfaced as an error, same best-effort stance this module
-/// has always taken for Delete detection. A UDP datagram the peer already
-/// sent sits in the kernel's receive buffer regardless of how long ago it
-/// arrived, so even a short `timeout` reliably catches anything already
-/// pending.
-fn watch(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, timeout: Duration, expect_ack_seq: Option<u32>) -> std::io::Result<Seen> {
+/// Three-way classification: a Delete for the whole ISAKMP SA, or an ESP
+/// Delete naming `current_peer_spi` (the CHILD SA currently in use), ends
+/// the wait immediately as [`Seen::PeerTornDown`] — but an ESP Delete naming
+/// any other SPI (most commonly one just superseded by a CHILD SA rekey the
+/// peer initiated) does *not* tear anything down and the wait continues,
+/// same as an unrelated message; an incoming R-U-THERE from the peer is
+/// always auto-ack'd via [`build_r_u_there_ack`] (RFC 3706 requires
+/// answering one whenever seen, regardless of whether this call is a
+/// passive `peek` or an active `probe`) and the wait continues; an
+/// R-U-THERE-ACK matching `expect_ack_seq` ends the wait as
+/// [`Seen::AckMatched`]; anything else (garbage, a message for a different
+/// exchange/SA, a decrypt/HASH failure, a stale/mismatched ack, a failed
+/// auto-ack send) is silently skipped rather than surfaced as an error, same
+/// best-effort stance this module has always taken for Delete detection. A
+/// UDP datagram the peer already sent sits in the kernel's receive buffer
+/// regardless of how long ago it arrived, so even a short `timeout`
+/// reliably catches anything already pending.
+fn watch(
+    sock: &UdpSocket,
+    st: &Phase1State,
+    entropy: &mut impl Entropy,
+    peer: SocketAddr,
+    timeout: Duration,
+    expect_ack_seq: Option<u32>,
+    current_peer_spi: u32,
+) -> std::io::Result<Seen> {
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 8192];
     loop {
@@ -259,8 +286,18 @@ fn watch(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: S
         let Ok((_h, payloads, _next)) = phase2::parse_encrypted(&buf[..n], st.prf, &st.skeyid_a, &st.enc_key, &iv0) else {
             continue;
         };
-        if payloads.iter().any(|p| p.payload_type == payload::DELETE) {
-            return Ok(Seen::PeerTornDown);
+        if let Some(del) = payloads.iter().find(|p| p.payload_type == payload::DELETE) {
+            let tears_down = match parse_delete(&del.data) {
+                Some((proto, _spi)) if proto == protocol::ISAKMP => true,
+                Some((proto, spi)) if proto == protocol::ESP => {
+                    matches!(<[u8; 4]>::try_from(spi), Ok(b) if u32::from_be_bytes(b) == current_peer_spi)
+                }
+                _ => false,
+            };
+            if tears_down {
+                return Ok(Seen::PeerTornDown);
+            }
+            continue;
         }
         let Some(notify) = payloads.iter().find(|p| p.payload_type == payload::NOTIFY) else { continue };
         let Some((msg_type, data)) = parse_notify(&notify.data) else { continue };
@@ -289,8 +326,11 @@ fn watch(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: S
 /// call on every routine status poll instead of [`probe`]'s full round trip
 /// — see [`watch`]'s doc for the shared classification and
 /// [`Liveness::Alive`]'s doc for why silence here means alive, not unknown.
-pub fn peek(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, timeout: Duration) -> Result<Liveness, DriverError> {
-    match watch(sock, st, entropy, peer, timeout, None)? {
+/// `current_peer_spi` is our CHILD SA's currently-in-use inbound SPI — an
+/// ESP Delete naming any other SPI (e.g. one just superseded by a rekey) is
+/// ignored rather than misread as a full teardown.
+pub fn peek(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, timeout: Duration, current_peer_spi: u32) -> Result<Liveness, DriverError> {
+    match watch(sock, st, entropy, peer, timeout, None, current_peer_spi)? {
         Seen::Nothing | Seen::AckMatched => Ok(Liveness::Alive),
         Seen::PeerTornDown => Ok(Liveness::PeerTornDown),
     }
@@ -301,10 +341,12 @@ pub fn peek(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer
 /// [`Phase1State::peer_supports_dpd`] is `true` — RFC 3706 requires the peer
 /// to have advertised support first; a caller that never confirmed that
 /// should keep using [`peek`] only, exactly as before this function existed.
-pub fn probe(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, seq: u32, timeout: Duration) -> Result<Liveness, DriverError> {
+/// `current_peer_spi` is our CHILD SA's currently-in-use inbound SPI — see
+/// [`peek`]'s doc.
+pub fn probe(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, seq: u32, timeout: Duration, current_peer_spi: u32) -> Result<Liveness, DriverError> {
     let msg = build_r_u_there(st, entropy, seq)?;
     sock.send_to(&msg, peer)?;
-    match watch(sock, st, entropy, peer, timeout, Some(seq))? {
+    match watch(sock, st, entropy, peer, timeout, Some(seq), current_peer_spi)? {
         Seen::Nothing => Ok(Liveness::NoReply),
         Seen::PeerTornDown => Ok(Liveness::PeerTornDown),
         Seen::AckMatched => Ok(Liveness::Alive),
@@ -340,6 +382,8 @@ mod tests {
             pfs_group: None,
             mode_cfg: false,
             mode: Ikev1ExchangeMode::Aggressive,
+            p1_lifetime_secs: 28800,
+            p2_lifetime_secs: 3600,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(psk),
@@ -410,7 +454,7 @@ mod tests {
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let peer: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
         let mut e = SeedEntropy::new(0x1);
-        let got = peek(&sock, &client_st, &mut e, peer, std::time::Duration::from_millis(20)).unwrap();
+        let got = peek(&sock, &client_st, &mut e, peer, std::time::Duration::from_millis(20), 0).unwrap();
         assert_eq!(got, Liveness::Alive);
     }
 
@@ -426,7 +470,7 @@ mod tests {
         let (esp_msg, _isakmp_msg) = build_delete(&gw_st, &mut e, 0xAAAA_BBBB).unwrap();
         gw_sock.send_to(&esp_msg, client_addr).unwrap();
 
-        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(200)).unwrap();
+        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(200), 0xAAAA_BBBB).unwrap();
         assert_eq!(got, Liveness::PeerTornDown);
     }
 
@@ -454,7 +498,7 @@ mod tests {
         gw_sock.send_to(&msg, client_addr).unwrap();
 
         let mut e = SeedEntropy::new(0x2);
-        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(100)).unwrap();
+        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(100), 0).unwrap();
         assert_eq!(got, Liveness::Alive);
     }
 
@@ -473,7 +517,7 @@ mod tests {
         gw_sock.send_to(&probe_msg, client_addr).unwrap();
 
         let mut ce = SeedEntropy::new(0x4);
-        let got = peek(&client_sock, &client_st, &mut ce, gw_addr, std::time::Duration::from_millis(200)).unwrap();
+        let got = peek(&client_sock, &client_st, &mut ce, gw_addr, std::time::Duration::from_millis(200), 0).unwrap();
         assert_eq!(got, Liveness::Alive);
 
         // The gateway should now have our ACK sitting on its own socket.
@@ -517,7 +561,7 @@ mod tests {
         });
 
         let mut ce = SeedEntropy::new(0x6);
-        let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 42, std::time::Duration::from_secs(2)).unwrap();
+        let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 42, std::time::Duration::from_secs(2), 0).unwrap();
         assert_eq!(got, Liveness::Alive);
         responder.join().unwrap();
     }
@@ -528,7 +572,7 @@ mod tests {
         let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let dead_peer: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
         let mut e = SeedEntropy::new(0x7);
-        let got = probe(&client_sock, &client_st, &mut e, dead_peer, 1, std::time::Duration::from_millis(50)).unwrap();
+        let got = probe(&client_sock, &client_st, &mut e, dead_peer, 1, std::time::Duration::from_millis(50), 0).unwrap();
         assert_eq!(got, Liveness::NoReply);
     }
 
@@ -550,8 +594,60 @@ mod tests {
         });
 
         let mut ce = SeedEntropy::new(0x9);
-        let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 99, std::time::Duration::from_secs(2)).unwrap();
+        let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 99, std::time::Duration::from_secs(2), 0x1234).unwrap();
         assert_eq!(got, Liveness::PeerTornDown);
+        responder.join().unwrap();
+    }
+
+    /// Regression test for the misclassification bug this module used to
+    /// have: any Delete at all -- even an ESP Delete naming a CHILD SA SPI
+    /// that isn't the one currently in use, e.g. because the peer just
+    /// rekeyed it -- used to be read as a full tunnel teardown. It must now
+    /// be silently ignored, since it doesn't affect the CHILD SA `peek`'s
+    /// caller actually cares about.
+    #[test]
+    fn peek_ignores_an_esp_delete_for_a_superseded_child_sa() {
+        let (client_st, gw_st) = phase1_pair();
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        let gw_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gw_addr = gw_sock.local_addr().unwrap();
+
+        // The peer deletes the *old* SPI (0x1111_1111) after rekeying, but
+        // our currently-in-use SPI is 0x2222_2222 -- this must not tear down.
+        let mut e = SeedEntropy::new(0xFEED2);
+        let (esp_msg, _isakmp_msg) = build_delete(&gw_st, &mut e, 0x1111_1111).unwrap();
+        gw_sock.send_to(&esp_msg, client_addr).unwrap();
+
+        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(100), 0x2222_2222).unwrap();
+        assert_eq!(got, Liveness::Alive);
+    }
+
+    /// Same non-teardown expectation as
+    /// [`peek_ignores_an_esp_delete_for_a_superseded_child_sa`], but via
+    /// [`probe`]: the stray ESP Delete for a superseded SPI must not be
+    /// mistaken for the R-U-THERE-ACK reply, so `probe` should simply time
+    /// out to [`Liveness::NoReply`].
+    #[test]
+    fn probe_ignores_an_esp_delete_for_a_superseded_child_sa_and_times_out() {
+        let (client_st, gw_st) = phase1_pair();
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        let gw_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gw_addr = gw_sock.local_addr().unwrap();
+
+        let responder = std::thread::spawn(move || {
+            gw_sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let mut buf = [0u8; 8192];
+            let _n = gw_sock.recv(&mut buf).unwrap(); // the R-U-THERE itself
+            let mut ge = SeedEntropy::new(0xA);
+            let (esp_msg, _isakmp_msg) = build_delete(&gw_st, &mut ge, 0x1111_1111).unwrap();
+            gw_sock.send_to(&esp_msg, client_addr).unwrap();
+        });
+
+        let mut ce = SeedEntropy::new(0xB);
+        let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 100, std::time::Duration::from_millis(200), 0x2222_2222).unwrap();
+        assert_eq!(got, Liveness::NoReply);
         responder.join().unwrap();
     }
 }

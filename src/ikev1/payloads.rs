@@ -175,6 +175,19 @@ impl Attribute {
             _ => None,
         }
     }
+
+    /// The value as a u32 -- the shape `LIFE_DURATION` (always sent via
+    /// [`Attribute::long_u32`]) comes back as, needed to read a peer's
+    /// possibly-shortened SA lifetime back out of its own response (RFC 2407
+    /// §4.5: the responder isn't bound to the proposer's offered duration and
+    /// may unilaterally pick a shorter one for its own copy of the SA).
+    pub fn as_u32(&self) -> Option<u32> {
+        match &self.value {
+            AttrValue::Short(v) => Some(*v as u32),
+            AttrValue::Long(d) if d.len() == 4 => Some(u32::from_be_bytes([d[0], d[1], d[2], d[3]])),
+            _ => None,
+        }
+    }
 }
 
 pub fn parse_attributes(mut b: &[u8]) -> Result<Vec<Attribute>, IkeError> {
@@ -220,6 +233,11 @@ impl Transform {
     /// Look up a transform attribute's u16 value.
     pub fn attr(&self, attr_type: u16) -> Option<u16> {
         self.attributes.iter().find(|a| a.attr_type == attr_type).and_then(|a| a.as_u16())
+    }
+
+    /// Look up a transform attribute's u32 value -- see [`Attribute::as_u32`].
+    pub fn attr_u32(&self, attr_type: u16) -> Option<u32> {
+        self.attributes.iter().find(|a| a.attr_type == attr_type).and_then(|a| a.as_u32())
     }
 }
 

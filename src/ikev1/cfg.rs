@@ -133,6 +133,8 @@ mod tests {
             pfs_group: None,
             mode_cfg: false,
             mode: Ikev1ExchangeMode::Aggressive,
+            p1_lifetime_secs: 28800,
+            p2_lifetime_secs: 3600,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(psk),

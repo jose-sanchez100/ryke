@@ -49,6 +49,20 @@ pub struct Established {
     pub netmask: Option<Ipv4Addr>,
     pub dns: Vec<Ipv4Addr>,
     pub subnets: Vec<(Ipv4Addr, u8)>,
+    /// The CHILD SA's negotiated ESP lifetime, in seconds (RFC 2407 §4.5 --
+    /// the responder's own chosen value if it echoed one, else whatever we
+    /// offered; see `quick::negotiated_p2_lifetime`) -- a caller scheduling a
+    /// [`crate::ikev1::quick::rekey_child`] call ahead of expiry reads this
+    /// rather than assuming `InitiatorConfig::p2_lifetime_secs` was actually
+    /// honored.
+    pub p2_lifetime_secs: u32,
+    /// The traffic selectors this CHILD SA was actually established with --
+    /// `ts_local` may differ from `InitiatorConfig::ts_local` when
+    /// Mode-Config narrowed it to the assigned address (see `connect`'s own
+    /// doc on that). A future `rekey_child` call must re-offer these same
+    /// selectors, not `cfg.ts_local`/`cfg.ts_remote` verbatim.
+    pub ts_local: ([u8; 4], [u8; 4]),
+    pub ts_remote: ([u8; 4], [u8; 4]),
     /// Our real local `(IP, port)` as seen reaching the peer -- resolved via
     /// [`crate::transport::UdpTransport::local_addr_for`], **not**
     /// [`Client::local_addr`] (which reports the wildcard-bound socket's own
@@ -387,10 +401,11 @@ impl<E: Entropy> Client<E> {
             "Quick Mode: starting{}",
             if cfg.pfs_group.is_some() { " with PFS" } else { "" }
         );
-        let (qm1, qi) = initiate_quick_with_pfs(&phase1, &mut self.entropy, cfg.esp_cipher, ts_local, cfg.ts_remote, cfg.pfs_group)?;
+        let (qm1, qi) =
+            initiate_quick_with_pfs(&phase1, &mut self.entropy, cfg.esp_cipher, ts_local, cfg.ts_remote, cfg.pfs_group, cfg.p2_lifetime_secs)?;
         self.send_step(&qm1, server, phase1.floated)?;
         let qm2 = self.recv_matching(phase1.cky_i, Some(phase1.cky_r), exchange::QUICK, phase1.floated)?;
-        let (qm3, child) = qi.complete(&qm2)?;
+        let (qm3, child, p2_lifetime_secs) = qi.complete(&qm2)?;
         self.send_step(&qm3, server, phase1.floated)?;
         ike_debug!("Quick Mode: complete -- CHILD SA established");
 
@@ -403,7 +418,7 @@ impl<E: Entropy> Client<E> {
         // an IKEv2 NAT-T path would use too.
         let local_addr =
             if phase1.floated { SocketAddr::new(our_addr.ip(), crate::natt_port()) } else { self.transport.local_addr_for(server)? };
-        Ok(Established { phase1, child, assigned_ip4, netmask, dns, subnets, local_addr })
+        Ok(Established { phase1, child, assigned_ip4, netmask, dns, subnets, local_addr, p2_lifetime_secs, ts_local, ts_remote: cfg.ts_remote })
     }
 }
 

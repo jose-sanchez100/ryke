@@ -26,7 +26,11 @@
 //! Quick Mode negotiates PFS on the *initial* Phase-2 exchange, so it's
 //! testable at connect time.
 
+use std::net::{SocketAddr, UdpSocket};
+use std::time::{Duration, Instant};
+
 use super::crypto1::{self, Prf, AES_BLOCK};
+use super::informational;
 use super::isakmp::{self, exchange, payload, IsakmpHeader, Payload};
 use super::payloads::{
     id_type, protocol, Attribute, Id, Proposal, SaPayload, Transform, IPSEC_DOI, SIT_IDENTITY_ONLY,
@@ -37,8 +41,10 @@ use crate::crypto::{DhGroup, IntegAlgorithm};
 use crate::entropy::Entropy;
 use crate::error::IkeError;
 use crate::esp::{ChildSa, EspSa};
+use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
 use crate::ikev2::payload::transform_id;
 use crate::ikev2::sk::SkCipher;
+use crate::transport::DriverError;
 use zeroize::Zeroize;
 
 /// One direction's derived ESP key material -- cipher-tagged so the caller
@@ -147,6 +153,21 @@ fn find(ps: &[Payload], t: u8) -> Option<&Payload> {
     ps.iter().find(|p| p.payload_type == t)
 }
 
+/// RFC 2407 §4.5: the responder isn't bound to the initiator's offered ESP
+/// SA lifetime and may unilaterally pick a shorter one -- read whatever the
+/// responder actually put on the SA payload's ESP transform (`ps`), falling
+/// back to `offered` (what we ourselves proposed) when the responder didn't
+/// carry a LIFE_DURATION attribute at all. Mirrors
+/// `phase1::negotiated_p1_lifetime`'s exact same RFC rationale, just against
+/// the ESP DOI's attribute registry instead of the IKE DOI's.
+fn negotiated_p2_lifetime(ps: &[Payload], offered: u32) -> u32 {
+    let Some(sa_p) = find(ps, payload::SA) else { return offered };
+    let Ok(sa) = SaPayload::parse(&sa_p.data) else { return offered };
+    let Some(prop) = sa.proposals.first() else { return offered };
+    let Some(transform) = prop.transforms.first() else { return offered };
+    transform.attr_u32(esp_attr::LIFE_DURATION).unwrap_or(offered)
+}
+
 fn qm_header(cky_i: [u8; 8], cky_r: [u8; 8], msgid: u32) -> IsakmpHeader {
     IsakmpHeader {
         init_cookie: cky_i,
@@ -175,12 +196,12 @@ fn qm_header(cky_i: [u8; 8], cky_r: [u8; 8], msgid: u32) -> IsakmpHeader {
 /// declaration on the wire; the actual UDP-in-ESP framing is entirely a
 /// kernel XFRM matter on the `free-vpn-v2` side (`daemon::xfrm::apply_natt`),
 /// unaffected by this attribute's value either way.
-fn esp_sa(spi: u32, cipher: SkCipher, pfs_group: Option<DhGroup>, floated: bool) -> SaPayload {
+fn esp_sa(spi: u32, cipher: SkCipher, pfs_group: Option<DhGroup>, floated: bool, life_duration: u32) -> SaPayload {
     let encap_mode = if floated { UDP_ENCAP_TUNNEL } else { ENCAP_TUNNEL };
     let mut attributes = vec![
         Attribute::short(esp_attr::ENCAP_MODE, encap_mode),
         Attribute::short(esp_attr::LIFE_TYPE, LIFE_SECONDS),
-        Attribute::long_u32(esp_attr::LIFE_DURATION, 3600),
+        Attribute::long_u32(esp_attr::LIFE_DURATION, life_duration),
     ];
     if !matches!(cipher, SkCipher::TripleDesCbc(_)) {
         attributes.push(Attribute::short(esp_attr::KEY_LENGTH, (cipher.key_len() * 8) as u16));
@@ -332,6 +353,10 @@ pub struct QuickInitiator {
     /// Our ephemeral PFS share, if PFS was requested: the DH group plus our
     /// private key, needed once the response's KE payload arrives.
     pfs: Option<(DhGroup, [u8; 32])>,
+    /// The ESP SA lifetime we offered -- needed by [`QuickInitiator::complete`]
+    /// to read back what the responder actually negotiated (RFC 2407 §4.5;
+    /// see `negotiated_p2_lifetime`'s doc).
+    life_duration: u32,
 }
 
 /// Build Quick-Mode message 1 (`HASH(1), SA, Ni, IDci, IDcr`) as the initiator,
@@ -344,8 +369,9 @@ pub fn initiate_quick(
     cipher: SkCipher,
     ts_local: ([u8; 4], [u8; 4]),
     ts_remote: ([u8; 4], [u8; 4]),
+    life_duration: u32,
 ) -> Result<(Vec<u8>, QuickInitiator), IkeError> {
-    initiate_quick_with_pfs(st, entropy, cipher, ts_local, ts_remote, None)
+    initiate_quick_with_pfs(st, entropy, cipher, ts_local, ts_remote, None, life_duration)
 }
 
 /// Like [`initiate_quick`], but when `pfs_group` is `Some`, also generates an
@@ -361,6 +387,7 @@ pub fn initiate_quick_with_pfs(
     ts_local: ([u8; 4], [u8; 4]),
     ts_remote: ([u8; 4], [u8; 4]),
     pfs_group: Option<DhGroup>,
+    life_duration: u32,
 ) -> Result<(Vec<u8>, QuickInitiator), IkeError> {
     let mut spi_b = [0u8; 4];
     entropy.fill(&mut spi_b);
@@ -375,7 +402,7 @@ pub fn initiate_quick_with_pfs(
 
     let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
     let mut after = vec![
-        (payload::SA, esp_sa(local_spi, cipher, pfs_group, st.floated).to_bytes()),
+        (payload::SA, esp_sa(local_spi, cipher, pfs_group, st.floated, life_duration).to_bytes()),
         (payload::NONCE, ni.clone()),
     ];
     if let Some((group, dh_private)) = &pfs {
@@ -397,13 +424,16 @@ pub fn initiate_quick_with_pfs(
         iv1,
         cipher,
         pfs,
+        life_duration,
     }))
 }
 
 impl QuickInitiator {
     /// Process message 2 (`HASH(2), SA, Nr, [KE]`): verify `HASH(2)`, and
-    /// return message 3 (`HASH(3)`) plus the established ESP CHILD SA.
-    pub fn complete(self, msg2: &[u8]) -> Result<(Vec<u8>, ChildSa), IkeError> {
+    /// return message 3 (`HASH(3)`), the established ESP CHILD SA, and the
+    /// actually-negotiated lifetime (RFC 2407 §4.5 -- see
+    /// `negotiated_p2_lifetime`'s doc).
+    pub fn complete(self, msg2: &[u8]) -> Result<(Vec<u8>, ChildSa, u32), IkeError> {
         let (_hdr, ps, iv2) = phase2::decrypt_payloads(msg2, &self.enc_key, &self.iv1)?;
         let nr = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
         isakmp::check_nonce_len(&nr)?;
@@ -434,7 +464,8 @@ impl QuickInitiator {
             }
             None => derive_child(self.prf, &self.skeyid_d, self.cipher, &self.ni, &nr, self.local_spi, peer_spi)?,
         };
-        Ok((msg3, child))
+        let negotiated_lifetime = negotiated_p2_lifetime(&ps, self.life_duration);
+        Ok((msg3, child, negotiated_lifetime))
     }
 }
 
@@ -487,6 +518,7 @@ pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) 
     let peer_spi = peer_esp_spi(&ps)?;
     let pfs_group = peer_pfs_group(&ps)?;
     let cipher = peer_esp_cipher(&ps)?;
+    let life_duration = negotiated_p2_lifetime(&ps, 3600);
 
     let mut spi_b = [0u8; 4];
     entropy.fill(&mut spi_b);
@@ -495,7 +527,7 @@ pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) 
     entropy.fill(&mut nr);
 
     let mut after: Vec<(u8, Vec<u8>)> = vec![
-        (payload::SA, esp_sa(local_spi, cipher, pfs_group, st.floated).to_bytes()),
+        (payload::SA, esp_sa(local_spi, cipher, pfs_group, st.floated, life_duration).to_bytes()),
         (payload::NONCE, nr.clone()),
     ];
     let pfs_shared = match pfs_group {
@@ -544,6 +576,101 @@ impl QuickResponder {
     }
 }
 
+// ---- rekey ----
+
+/// Rekey the CHILD SA identified by `old_local_spi` via a fresh Quick Mode
+/// exchange (RFC 2409 §5.5) run at any point while the Phase-1 SA (`st`)
+/// stays live -- IKEv1's equivalent of IKEv2's CREATE_CHILD_SA rekey (RFC
+/// 7296 §2.18). Drives the full three-message exchange over `sock` itself
+/// (NAT-T floated per `st.floated`, mirroring
+/// `ikev1::client::Client::send_step`/`recv_matching`'s own floating logic),
+/// then best-effort sends an explicit Delete (RFC 7296 §3.10 / RFC 2408) for
+/// `old_local_spi` -- the SA just superseded -- naming our own inbound SPI,
+/// same as `Established::close_message` does at full teardown. A failure to
+/// send (or to get any reply to) that closing Delete never fails the rekey
+/// itself: the new CHILD SA is already live by that point, and the old one
+/// will eventually be reaped by its own lifetime expiry either way.
+#[allow(clippy::too_many_arguments)]
+pub fn rekey_child(
+    sock: &UdpSocket,
+    st: &Phase1State,
+    entropy: &mut impl Entropy,
+    peer: SocketAddr,
+    cipher: SkCipher,
+    pfs_group: Option<DhGroup>,
+    ts_local: ([u8; 4], [u8; 4]),
+    ts_remote: ([u8; 4], [u8; 4]),
+    life_duration: u32,
+    timeout: Duration,
+    old_local_spi: u32,
+) -> Result<(RekeyedChild, u32), DriverError> {
+    let send = |msg: &[u8]| -> std::io::Result<()> {
+        if st.floated {
+            sock.send_to(&wrap_ike_4500(msg), SocketAddr::new(peer.ip(), crate::natt_port()))?;
+        } else {
+            sock.send_to(msg, peer)?;
+        }
+        Ok(())
+    };
+
+    let (msg1, qi) = initiate_quick_with_pfs(st, entropy, cipher, ts_local, ts_remote, pfs_group, life_duration)?;
+    let msgid = IsakmpHeader::parse(&msg1)?.message_id;
+    send(&msg1)?;
+
+    let deadline = Instant::now() + timeout;
+    let mut buf = [0u8; 8192];
+    let msg2 = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(IkeError::Crypto("rekey_child: timed out waiting for the Quick Mode reply").into());
+        }
+        sock.set_read_timeout(Some(remaining))?;
+        let n = match sock.recv(&mut buf) {
+            Ok(n) => n,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                return Err(IkeError::Crypto("rekey_child: timed out waiting for the Quick Mode reply").into());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let raw = &buf[..n];
+        let msg = if st.floated {
+            match unwrap_ike_4500(raw) {
+                Some(m) => m.to_vec(),
+                None => continue,
+            }
+        } else {
+            raw.to_vec()
+        };
+        let Ok(hdr) = IsakmpHeader::parse(&msg) else { continue };
+        if hdr.init_cookie != st.cky_i || hdr.resp_cookie != st.cky_r || hdr.exchange_type != exchange::QUICK || hdr.message_id != msgid {
+            continue;
+        }
+        break msg;
+    };
+
+    let (msg3, child, negotiated_lifetime) = qi.complete(&msg2)?;
+    send(&msg3)?;
+
+    let key_out = ChildKeyMaterial {
+        cipher: child.outbound.cipher(),
+        enc: child.outbound.enc_material(),
+        integ: child.outbound.integ_key().to_vec(),
+    };
+    let key_in = ChildKeyMaterial {
+        cipher: child.inbound.cipher(),
+        enc: child.inbound.enc_material(),
+        integ: child.inbound.integ_key().to_vec(),
+    };
+    let rekeyed = RekeyedChild { local_spi: child.inbound.spi(), peer_spi: child.outbound.spi(), key_out, key_in };
+
+    // Best-effort: never fails the rekey itself (see doc above).
+    if let Ok((delete_msg, _next_iv)) = informational::build_delete(st, entropy, old_local_spi) {
+        let _ = send(&delete_msg);
+    }
+
+    Ok((rekeyed, negotiated_lifetime))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,6 +701,8 @@ mod tests {
             pfs_group: None,
             mode_cfg: false,
             mode: Ikev1ExchangeMode::Aggressive,
+            p1_lifetime_secs: 28800,
+            p2_lifetime_secs: 3600,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(psk.clone()),
@@ -591,9 +720,9 @@ mod tests {
         rstate.verify_hash_i(&msg3).unwrap();
 
         // Phase 2: Quick Mode.
-        let (qm1, qi) = initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, ts, ts).unwrap();
+        let (qm1, qi) = initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, ts, ts, 3600).unwrap();
         let (qm2, qr) = respond_quick(&rstate, &qm1, &mut re).unwrap();
-        let (qm3, mut ichild) = qi.complete(&qm2).unwrap();
+        let (qm3, mut ichild, _lifetime) = qi.complete(&qm2).unwrap();
         let mut rchild = qr.complete(&qm3).unwrap();
 
         // The two CHILD SAs must interoperate: what one seals, the other opens.
@@ -626,6 +755,8 @@ mod tests {
             pfs_group: None,
             mode_cfg: false,
             mode: Ikev1ExchangeMode::Aggressive,
+            p1_lifetime_secs: 28800,
+            p2_lifetime_secs: 3600,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(psk.clone()),
@@ -641,7 +772,7 @@ mod tests {
         let (msg3, istate) = ai.complete(&msg2, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
         rstate.verify_hash_i(&msg3).unwrap();
 
-        let (qm1, _qi) = initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, ts, ts).unwrap();
+        let (qm1, _qi) = initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, ts, ts, 3600).unwrap();
 
         // RFC 2408 §3.1: every Phase 2 (Quick Mode) message must carry a
         // nonzero Message-ID -- tamper it down to 0 (the Phase-1 sentinel)
@@ -683,6 +814,8 @@ mod tests {
             pfs_group: None,
             mode_cfg: false,
             mode: Ikev1ExchangeMode::Aggressive,
+            p1_lifetime_secs: 28800,
+            p2_lifetime_secs: 3600,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(psk.clone()),
@@ -698,9 +831,9 @@ mod tests {
         let (msg3, istate) = ai.complete(&msg2, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
         rstate.verify_hash_i(&msg3).unwrap();
 
-        let (qm1, qi) = initiate_quick(&istate, &mut ie, cipher, ts, ts).unwrap();
+        let (qm1, qi) = initiate_quick(&istate, &mut ie, cipher, ts, ts, 3600).unwrap();
         let (qm2, qr) = respond_quick(&rstate, &qm1, &mut re).unwrap();
-        let (qm3, mut ichild) = qi.complete(&qm2).unwrap();
+        let (qm3, mut ichild, _lifetime) = qi.complete(&qm2).unwrap();
         let mut rchild = qr.complete(&qm3).unwrap();
 
         assert_eq!(ichild.outbound.cipher(), cipher);
@@ -735,6 +868,8 @@ mod tests {
             pfs_group: None,
             mode_cfg: false,
             mode: Ikev1ExchangeMode::Aggressive,
+            p1_lifetime_secs: 28800,
+            p2_lifetime_secs: 3600,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(psk.clone()),
@@ -751,9 +886,9 @@ mod tests {
         rstate.verify_hash_i(&msg3).unwrap();
 
         // Quick Mode, this time with PFS (a fresh DH group of its own).
-        let (qm1, qi) = initiate_quick_with_pfs(&istate, &mut ie, SkCipher::Aes256Gcm, ts, ts, Some(DhGroup::Modp2048)).unwrap();
+        let (qm1, qi) = initiate_quick_with_pfs(&istate, &mut ie, SkCipher::Aes256Gcm, ts, ts, Some(DhGroup::Modp2048), 3600).unwrap();
         let (qm2, qr) = respond_quick(&rstate, &qm1, &mut re).unwrap();
-        let (qm3, mut ichild) = qi.complete(&qm2).unwrap();
+        let (qm3, mut ichild, _lifetime) = qi.complete(&qm2).unwrap();
         let mut rchild = qr.complete(&qm3).unwrap();
 
         let pkt: Vec<u8> = (0..40u8).collect();
@@ -789,6 +924,8 @@ mod tests {
             pfs_group: None,
             mode_cfg: false,
             mode: Ikev1ExchangeMode::Aggressive,
+            p1_lifetime_secs: 28800,
+            p2_lifetime_secs: 3600,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(psk.clone()),
@@ -804,9 +941,9 @@ mod tests {
         rstate.verify_hash_i(&msg3).unwrap();
 
         let run = |ie: &mut SeedEntropy, re: &mut SeedEntropy| {
-            let (qm1, qi) = initiate_quick_with_pfs(&istate, ie, SkCipher::Aes256Gcm, ts, ts, Some(DhGroup::Modp2048)).unwrap();
+            let (qm1, qi) = initiate_quick_with_pfs(&istate, ie, SkCipher::Aes256Gcm, ts, ts, Some(DhGroup::Modp2048), 3600).unwrap();
             let (qm2, qr) = respond_quick(&rstate, &qm1, re).unwrap();
-            let (qm3, ichild) = qi.complete(&qm2).unwrap();
+            let (qm3, ichild, _lifetime) = qi.complete(&qm2).unwrap();
             let _ = qr.complete(&qm3).unwrap();
             ichild.outbound.key_material()
         };
@@ -833,6 +970,8 @@ mod tests {
             pfs_group: None,
             mode_cfg: false,
             mode: Ikev1ExchangeMode::Aggressive,
+            p1_lifetime_secs: 28800,
+            p2_lifetime_secs: 3600,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(b"wrong".to_vec()),
@@ -845,5 +984,162 @@ mod tests {
         let (msg1, ai) = initiate_aggressive(&icfg, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
         let (msg2, _rstate) = respond_aggressive(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
         assert!(matches!(ai.complete(&msg2, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()), Err(IkeError::AuthFailed)));
+    }
+
+    /// Regression test for the same bug class as `phase1`'s own
+    /// `initiator_sa_carries_the_configured_lifetime_not_a_hardcoded_one`,
+    /// but for the ESP SA lifetime: `esp_sa` must carry whatever
+    /// `life_duration` it's given, not this module's old hardcoded `3600`.
+    #[test]
+    fn esp_sa_carries_the_configured_lifetime_not_a_hardcoded_one() {
+        let sa = esp_sa(0x1234, SkCipher::Aes256Gcm, None, false, 900);
+        let life = sa.proposals[0].transforms[0].attr_u32(esp_attr::LIFE_DURATION);
+        assert_eq!(life, Some(900), "must carry the configured lifetime, not the old hardcoded 3600");
+    }
+
+    /// [`negotiated_p2_lifetime`] must prefer the responder's own chosen
+    /// value (RFC 2407 §4.5: the responder may unilaterally shorten the
+    /// initiator's offer) and fall back to `offered` only when the
+    /// responder's ESP SA payload carries no `LIFE_DURATION` attribute at
+    /// all -- the ESP-DOI counterpart to `phase1`'s
+    /// `negotiated_p1_lifetime_prefers_the_responders_value_and_falls_back_when_absent`.
+    #[test]
+    fn negotiated_p2_lifetime_prefers_the_responders_value_and_falls_back_when_absent() {
+        let sa_with_lifetime = esp_sa(0x1234, SkCipher::Aes256Gcm, None, false, 900);
+        let ps_with = vec![isakmp::Payload { payload_type: payload::SA, data: sa_with_lifetime.to_bytes() }];
+        assert_eq!(negotiated_p2_lifetime(&ps_with, 3600), 900, "must prefer the responder's own chosen value");
+
+        let sa_without_lifetime = SaPayload {
+            doi: IPSEC_DOI,
+            situation: SIT_IDENTITY_ONLY,
+            proposals: vec![Proposal {
+                num: 1,
+                protocol_id: protocol::ESP,
+                spi: 0x1234u32.to_be_bytes().to_vec(),
+                transforms: vec![Transform { num: 1, transform_id: esp_transform_id(SkCipher::Aes256Gcm), attributes: vec![] }],
+            }],
+        };
+        let ps_without = vec![isakmp::Payload { payload_type: payload::SA, data: sa_without_lifetime.to_bytes() }];
+        assert_eq!(negotiated_p2_lifetime(&ps_without, 3600), 3600, "must fall back to the offered value when absent");
+
+        assert_eq!(negotiated_p2_lifetime(&[], 3600), 3600, "must fall back to the offered value when there's no SA payload at all");
+    }
+
+    /// End-to-end confirmation that `rekey_child` -- the IKEv1 counterpart to
+    /// IKEv2's CREATE_CHILD_SA rekey (RFC 7296 §2.18 / RFC 2409 §5.5's second
+    /// Quick Mode exchange) -- interoperates over real loopback sockets with
+    /// a live responder: it negotiates a fresh ESP CHILD SA under the
+    /// already-established Phase-1 SA, the negotiated lifetime comes back
+    /// correctly, the rekeyed key material actually interoperates, and its
+    /// trailing best-effort step (an explicit ESP Delete naming the
+    /// just-superseded CHILD SA's local SPI -- RFC 7296 §3.10 / RFC 2408)
+    /// actually reaches the peer.
+    #[test]
+    fn rekey_child_over_loopback_interoperates_with_a_live_responder() {
+        let psk = b"correct horse battery staple".to_vec();
+        let ts = ([10, 0, 99, 0], [255, 255, 255, 0]);
+        let icfg = InitiatorConfig {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            key_len: 32,
+            our_id: Id::ipv4([10, 1, 1, 1]),
+            group: DhGroup::Modp1024,
+            xauth: false,
+            xauth_creds: None,
+            ts_local: ts,
+            ts_remote: ts,
+            esp_cipher: SkCipher::Aes256Gcm,
+            pfs_group: None,
+            mode_cfg: false,
+            mode: Ikev1ExchangeMode::Aggressive,
+            p1_lifetime_secs: 28800,
+            p2_lifetime_secs: 3600,
+        };
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
+        let mut ie = SeedEntropy::new(0xAAAA);
+        let mut re = SeedEntropy::new(0xBBBB);
+
+        let initiator_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let responder_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        initiator_sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        responder_sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let initiator_addr = initiator_sock.local_addr().unwrap();
+        let responder_addr = responder_sock.local_addr().unwrap();
+
+        // Phase 1, plus an initial Quick Mode exchange to get an existing
+        // CHILD SA to rekey away from -- both in-process, same as this
+        // module's other tests. `rekey_child`'s own job only starts below.
+        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie, initiator_addr, responder_addr);
+        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re, responder_addr, initiator_addr).unwrap();
+        let (msg3, istate) = ai.complete(&msg2, initiator_addr, responder_addr).unwrap();
+        rstate.verify_hash_i(&msg3).unwrap();
+
+        let (qm1, qi) = initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, ts, ts, 3600).unwrap();
+        let (qm2, qr) = respond_quick(&rstate, &qm1, &mut re).unwrap();
+        let (qm3, old_ichild, _lifetime) = qi.complete(&qm2).unwrap();
+        let _old_rchild = qr.complete(&qm3).unwrap();
+        let old_local_spi = old_ichild.inbound.spi();
+
+        // A live responder loop for the rekey itself: answer the new Quick
+        // Mode exchange, then read the trailing Delete for the
+        // just-superseded SPI.
+        let rstate2 = rstate.clone();
+        let responder = std::thread::spawn(move || {
+            let mut re = re;
+            let mut buf = [0u8; 8192];
+            let n = responder_sock.recv(&mut buf).unwrap();
+            let (msg2, qr) = respond_quick(&rstate2, &buf[..n], &mut re).unwrap();
+            responder_sock.send_to(&msg2, initiator_addr).unwrap();
+            let n = responder_sock.recv(&mut buf).unwrap();
+            let new_rchild = qr.complete(&buf[..n]).unwrap();
+            let n = responder_sock.recv(&mut buf).unwrap();
+            (new_rchild, buf[..n].to_vec(), rstate2)
+        });
+
+        let (rekeyed, negotiated_lifetime) = rekey_child(
+            &initiator_sock,
+            &istate,
+            &mut ie,
+            responder_addr,
+            SkCipher::Aes256Gcm,
+            None,
+            ts,
+            ts,
+            1800,
+            Duration::from_secs(5),
+            old_local_spi,
+        )
+        .unwrap();
+        assert_eq!(negotiated_lifetime, 1800, "both sides offer 1800, so nothing gets shortened");
+
+        let (mut new_rchild, delete_bytes, rstate2) = responder.join().unwrap();
+
+        // The rekeyed key material must actually interoperate: rebuild our
+        // own inbound SA from exactly what `rekey_child` handed back (the
+        // same shape a caller installing kernel XFRM state would use), and
+        // confirm it opens what the responder's freshly rekeyed outbound SA
+        // seals.
+        let new_ichild_in =
+            EspSa::new_with_cipher(rekeyed.local_spi, rekeyed.key_in.cipher, &rekeyed.key_in.enc, &rekeyed.key_in.integ).unwrap();
+        let pkt: Vec<u8> = (0..40u8).collect();
+        let sealed = new_rchild.outbound.seal(&pkt, 4).unwrap();
+        let (got, nh) = new_ichild_in.open(&sealed).unwrap();
+        assert_eq!(got, pkt);
+        assert_eq!(nh, 4);
+
+        // The trailing Delete must name the just-superseded local SPI.
+        let hdr = IsakmpHeader::parse(&delete_bytes).unwrap();
+        let iv0 = crypto1::phase2_iv(rstate2.prf, &rstate2.phase1_iv, hdr.message_id, AES_BLOCK);
+        let (_h, ps, _iv) = phase2::parse_encrypted(&delete_bytes, rstate2.prf, &rstate2.skeyid_a, &rstate2.enc_key, &iv0).unwrap();
+        let del = ps.iter().find(|p| p.payload_type == payload::DELETE).unwrap();
+        let (proto, spi) = informational::parse_delete(&del.data).unwrap();
+        assert_eq!(proto, protocol::ESP);
+        assert_eq!(spi, old_local_spi.to_be_bytes());
     }
 }

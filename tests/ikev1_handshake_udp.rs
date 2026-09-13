@@ -51,6 +51,8 @@ fn ikev1_full_handshake_over_udp_loopback() {
         pfs_group: None,
         mode_cfg: false,
         mode: Ikev1ExchangeMode::Aggressive,
+        p1_lifetime_secs: 28800,
+        p2_lifetime_secs: 3600,
     };
     let mut client = Client::bind("127.0.0.1:0", SeedEntropy::new(0x1111)).unwrap();
     client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -120,6 +122,8 @@ fn ikev1_full_handshake_over_udp_loopback_with_pfs() {
         pfs_group: Some(DhGroup::Modp2048),
         mode_cfg: false,
         mode: Ikev1ExchangeMode::Aggressive,
+        p1_lifetime_secs: 28800,
+        p2_lifetime_secs: 3600,
     };
     let mut client = Client::bind("127.0.0.1:0", SeedEntropy::new(0x3333)).unwrap();
     client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -187,6 +191,8 @@ fn ikev1_full_handshake_over_udp_loopback_main_mode() {
         pfs_group: None,
         mode_cfg: false,
         mode: Ikev1ExchangeMode::Main,
+        p1_lifetime_secs: 28800,
+        p2_lifetime_secs: 3600,
     };
     let mut client = Client::bind("127.0.0.1:0", SeedEntropy::new(0x6666)).unwrap();
     client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();

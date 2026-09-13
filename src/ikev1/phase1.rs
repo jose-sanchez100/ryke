@@ -223,6 +223,13 @@ pub struct Phase1State {
     /// floated session resumed this way would need its caller to already
     /// know to keep using the port-4500 socket regardless.
     pub floated: bool,
+    /// The Phase-1 SA lifetime actually in force, in seconds -- the
+    /// responder's own value if it echoed one (RFC 2407 §4.5: the responder
+    /// is never bound to the initiator's offered lifetime and may
+    /// unilaterally choose a shorter one), falling back to whatever this
+    /// side itself offered if the responder's chosen transform carried no
+    /// `LIFE_DURATION` attribute at all. See [`negotiated_p1_lifetime`].
+    pub negotiated_lifetime_secs: u32,
 }
 
 /// Pick the first offered transform we support: AES-CBC (128/192/256-bit,
@@ -270,6 +277,17 @@ fn select_transform(sa: &SaPayload, want_sig: bool) -> Option<(Transform, Prf, D
 
 fn find(payloads: &[isakmp::Payload], t: u8) -> Option<&isakmp::Payload> {
     payloads.iter().find(|p| p.payload_type == t)
+}
+
+/// Pull the responder's actually-chosen Phase-1 SA lifetime back out of its
+/// SA payload (RFC 2407 §4.5: the responder may unilaterally shorten the
+/// initiator's offered lifetime), falling back to `offered` if the chosen
+/// transform carried no `LIFE_DURATION` attribute at all.
+fn negotiated_p1_lifetime(ps: &[isakmp::Payload], offered: u32) -> u32 {
+    find(ps, payload::SA)
+        .and_then(|p| SaPayload::parse(&p.data).ok())
+        .and_then(|sa| sa.proposals.first().and_then(|prop| prop.transforms.first().and_then(|t| t.attr_u32(attr::LIFE_DURATION))))
+        .unwrap_or(offered)
 }
 
 /// Collect every CERT payload's DER body (stripping the 1-byte encoding tag),
@@ -357,6 +375,7 @@ pub fn respond_aggressive(
 
     // Response SA: echo just the chosen transform.
     let chosen_auth = chosen.attr(attr::AUTH_METHOD).unwrap_or(0);
+    let initiator_offered_lifetime = chosen.attr_u32(attr::LIFE_DURATION).unwrap_or(0);
     let sar = SaPayload {
         doi: sa.doi,
         situation: sa.situation,
@@ -428,6 +447,7 @@ pub fn respond_aggressive(
         idii_b,
         peer_supports_dpd,
         floated,
+        negotiated_lifetime_secs: initiator_offered_lifetime,
     };
     Ok((msg2, state))
 }
@@ -469,6 +489,7 @@ impl Phase1State {
             idii_b: Vec::new(),
             peer_supports_dpd: false,
             floated: false,
+            negotiated_lifetime_secs: 0,
         }
     }
 
@@ -562,6 +583,14 @@ pub struct InitiatorConfig {
     pub mode_cfg: bool,
     /// Which Phase-1 exchange to run -- see [`Ikev1ExchangeMode`].
     pub mode: Ikev1ExchangeMode,
+    /// Phase-1 SA lifetime to offer, in seconds (RFC 2407 §4.5 `LIFE_DURATION`,
+    /// `LIFE_TYPE` fixed at seconds) -- the responder may echo back a shorter
+    /// value; [`Phase1State::negotiated_lifetime_secs`] carries the value
+    /// actually in force, not this offered one.
+    pub p1_lifetime_secs: u32,
+    /// CHILD SA (Quick Mode) lifetime to offer, in seconds -- same
+    /// responder-may-shorten caveat, see [`crate::ikev1::quick::negotiated_p2_lifetime`].
+    pub p2_lifetime_secs: u32,
 }
 
 /// Which IKEv1 Phase-1 exchange the initiator runs: [`initiate_aggressive`]
@@ -580,7 +609,7 @@ pub enum Ikev1ExchangeMode {
 /// The initiator's SA offer: AES-CBC (`key_len` bytes) / SHA-256 / `group` /
 /// one of PSK, XAUTH-PSK, RSA-SIG, XAUTH-RSA (`want_sig` selects the RSA-SIG
 /// pair).
-fn initiator_sa(group: DhGroup, xauth: bool, want_sig: bool, key_len: usize) -> SaPayload {
+fn initiator_sa(group: DhGroup, xauth: bool, want_sig: bool, key_len: usize, life_duration: u32) -> SaPayload {
     let auth_method = match (want_sig, xauth) {
         (false, false) => auth::PSK,
         (false, true) => auth::XAUTH_INIT_PSK,
@@ -604,7 +633,7 @@ fn initiator_sa(group: DhGroup, xauth: bool, want_sig: bool, key_len: usize) -> 
                     Attribute::short(attr::GROUP_DESC, group.transform_id()),
                     Attribute::short(attr::AUTH_METHOD, auth_method),
                     Attribute::short(attr::LIFE_TYPE, life::SECONDS),
-                    Attribute::long_u32(attr::LIFE_DURATION, 28800),
+                    Attribute::long_u32(attr::LIFE_DURATION, life_duration),
                 ],
             }],
         }],
@@ -624,6 +653,7 @@ pub struct AggressiveInitiator {
     idi_b: Vec<u8>,
     sai_b: Vec<u8>,
     key_len: usize,
+    offered_p1_lifetime: u32,
 }
 
 /// Build Aggressive-Mode message 1 (`HDR, SA, KE, Ni, IDi`) as the initiator.
@@ -643,7 +673,7 @@ pub fn initiate_aggressive(cfg: &InitiatorConfig, entropy: &mut impl Entropy, ou
     let mut ni = vec![0u8; 16];
     entropy.fill(&mut ni);
 
-    let sa = initiator_sa(cfg.group, cfg.xauth, false, cfg.key_len);
+    let sa = initiator_sa(cfg.group, cfg.xauth, false, cfg.key_len, cfg.p1_lifetime_secs);
     let sai_b = sa.to_bytes();
     let idi_b = cfg.our_id.to_bytes();
 
@@ -679,6 +709,7 @@ pub fn initiate_aggressive(cfg: &InitiatorConfig, entropy: &mut impl Entropy, ou
         idi_b,
         sai_b,
         key_len: cfg.key_len,
+        offered_p1_lifetime: cfg.p1_lifetime_secs,
     };
     (msg1, state)
 }
@@ -707,6 +738,7 @@ impl AggressiveInitiator {
         let hash_r_got = find(&ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
         let idr_b = find(&ps, payload::ID).ok_or(IkeError::MissingPayload("ID"))?.data.clone();
         let peer_supports_dpd = ps.iter().any(|p| p.payload_type == payload::VENDOR_ID && p.data == DPD_VENDOR_ID);
+        let negotiated_lifetime_secs = negotiated_p1_lifetime(&ps, self.offered_p1_lifetime);
         // By message 2, both cookies are genuinely known, so this uses the
         // real `cky_r` (unlike message 1's own NAT-D, necessarily hashed
         // with CKY-R all-zero -- see `initiate_aggressive`'s doc).
@@ -763,6 +795,7 @@ impl AggressiveInitiator {
             idii_b: self.idi_b,
             peer_supports_dpd,
             floated,
+            negotiated_lifetime_secs,
         };
         Ok((msg3, state))
     }
@@ -808,7 +841,7 @@ pub fn initiate_main(cfg: &InitiatorConfig, entropy: &mut impl Entropy) -> (Vec<
     let mut cky_i = [0u8; 8];
     entropy.fill(&mut cky_i);
     let want_sig = matches!(cfg.local_auth, Ikev1LocalAuth::Sig { .. });
-    let sa = initiator_sa(cfg.group, cfg.xauth, want_sig, cfg.key_len);
+    let sa = initiator_sa(cfg.group, cfg.xauth, want_sig, cfg.key_len, cfg.p1_lifetime_secs);
     let sai_b = sa.to_bytes();
 
     let hdr = IsakmpHeader {
@@ -840,6 +873,7 @@ pub fn initiate_main(cfg: &InitiatorConfig, entropy: &mut impl Entropy) -> (Vec<
         our_id: cfg.our_id.clone(),
         cky_i,
         sai_b,
+        offered_p1_lifetime: cfg.p1_lifetime_secs,
     };
     (msg1, state)
 }
@@ -854,6 +888,7 @@ pub struct MainSaSent {
     our_id: Id,
     cky_i: [u8; 8],
     sai_b: Vec<u8>,
+    offered_p1_lifetime: u32,
 }
 
 impl MainSaSent {
@@ -874,6 +909,7 @@ impl MainSaSent {
         let ps = isakmp::parse_payloads(hdr.next_payload, &msg2[IsakmpHeader::LEN..])?;
         find(&ps, payload::SA).ok_or(IkeError::MissingPayload("SA"))?;
         let peer_supports_natt = peer_offers_natt(&ps);
+        let negotiated_p1_lifetime_secs = negotiated_p1_lifetime(&ps, self.offered_p1_lifetime);
 
         let dh_private = entropy.next_array32();
         let gxi = self.group.public(&dh_private);
@@ -916,6 +952,7 @@ impl MainSaSent {
             peer_supports_natt,
             our_addr,
             peer_addr,
+            negotiated_p1_lifetime_secs,
         };
         Ok((msg3, state))
     }
@@ -943,6 +980,7 @@ pub struct MainKeSent {
     peer_supports_natt: bool,
     our_addr: SocketAddr,
     peer_addr: SocketAddr,
+    negotiated_p1_lifetime_secs: u32,
 }
 
 impl MainKeSent {
@@ -1044,6 +1082,7 @@ impl MainKeSent {
             iv_after_msg5,
             peer_supports_dpd,
             floated,
+            negotiated_p1_lifetime_secs: self.negotiated_p1_lifetime_secs,
         };
         Ok((msg5, state))
     }
@@ -1083,6 +1122,7 @@ pub struct MainIdSent {
     /// which this struct is returned alongside, same reasoning as
     /// [`Phase1State::floated`]'s own doc.
     pub floated: bool,
+    negotiated_p1_lifetime_secs: u32,
 }
 
 impl MainIdSent {
@@ -1136,6 +1176,7 @@ impl MainIdSent {
             idii_b: self.idi_b,
             peer_supports_dpd: self.peer_supports_dpd,
             floated: self.floated,
+            negotiated_lifetime_secs: self.negotiated_p1_lifetime_secs,
         })
     }
 }
@@ -1163,6 +1204,7 @@ pub fn respond_main(cfg: &Phase1Config, msg1: &[u8], entropy: &mut impl Entropy,
     let sa = SaPayload::parse(&sai_b)?;
     let want_sig = matches!(cfg.local_auth, Ikev1LocalAuth::Sig { .. });
     let (chosen, prf, group, key_len) = select_transform(&sa, want_sig).ok_or(IkeError::NoProposalChosen)?;
+    let initiator_offered_lifetime = chosen.attr_u32(attr::LIFE_DURATION).unwrap_or(0);
     let peer_supports_natt = peer_offers_natt(&ps);
 
     let mut cky_r = [0u8; 8];
@@ -1202,6 +1244,7 @@ pub fn respond_main(cfg: &Phase1Config, msg1: &[u8], entropy: &mut impl Entropy,
         peer_supports_natt,
         our_addr,
         peer_addr,
+        initiator_offered_lifetime,
     };
     Ok((msg2, state))
 }
@@ -1221,6 +1264,7 @@ pub struct MainRespSaSent {
     peer_supports_natt: bool,
     our_addr: SocketAddr,
     peer_addr: SocketAddr,
+    initiator_offered_lifetime: u32,
 }
 
 impl MainRespSaSent {
@@ -1284,6 +1328,7 @@ impl MainRespSaSent {
             nr,
             peer_supports_dpd,
             floated,
+            initiator_offered_lifetime: self.initiator_offered_lifetime,
         };
         Ok((msg4, state))
     }
@@ -1308,6 +1353,7 @@ pub struct MainRespKeSent {
     nr: Vec<u8>,
     peer_supports_dpd: bool,
     floated: bool,
+    initiator_offered_lifetime: u32,
 }
 
 impl MainRespKeSent {
@@ -1401,6 +1447,7 @@ impl MainRespKeSent {
             idii_b,
             peer_supports_dpd: self.peer_supports_dpd,
             floated: self.floated,
+            negotiated_lifetime_secs: self.initiator_offered_lifetime,
         };
         Ok((msg6, state))
     }
@@ -1603,6 +1650,8 @@ mod tests {
             pfs_group: None,
             mode_cfg: false,
             mode: Ikev1ExchangeMode::Aggressive,
+            p1_lifetime_secs: 28800,
+            p2_lifetime_secs: 3600,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(psk),
@@ -1637,6 +1686,8 @@ mod tests {
             pfs_group: None,
             mode_cfg: false,
             mode: Ikev1ExchangeMode::Main,
+            p1_lifetime_secs: 28800,
+            p2_lifetime_secs: 3600,
         }
     }
 
@@ -1787,7 +1838,7 @@ mod tests {
         // Quick Mode's own SA proposal must declare the UDP-encap
         // encapsulation mode once floated (`quick::esp_sa`'s doc).
         let ts = ([0, 0, 0, 0], [0, 0, 0, 0]);
-        let (qm1, _qi) = crate::ikev1::quick::initiate_quick(&istate, &mut ie, crate::ikev2::sk::SkCipher::Aes256Gcm, ts, ts).unwrap();
+        let (qm1, _qi) = crate::ikev1::quick::initiate_quick(&istate, &mut ie, crate::ikev2::sk::SkCipher::Aes256Gcm, ts, ts, 3600).unwrap();
         let iv0 = crypto1::phase2_iv(istate.prf, &istate.phase1_iv, {
             let hdr = IsakmpHeader::parse(&qm1).unwrap();
             hdr.message_id
@@ -1821,6 +1872,8 @@ mod tests {
             pfs_group: None,
             mode_cfg: false,
             mode: Ikev1ExchangeMode::Aggressive,
+            p1_lifetime_secs: 28800,
+            p2_lifetime_secs: 3600,
         };
         let rcfg = Phase1Config { local_auth: Ikev1LocalAuth::Psk(psk), trusted_cas: Vec::new(), now_unix: 0, our_id: Id::ipv4([192, 168, 0, 1]) };
         let mut ie = SeedEntropy::new(0xC7C7);
@@ -1999,6 +2052,8 @@ mod tests {
             pfs_group: None,
             mode_cfg: false,
             mode: Ikev1ExchangeMode::Main,
+            p1_lifetime_secs: 28800,
+            p2_lifetime_secs: 3600,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Sig { key: rkey, chain: vec![cert_der.clone()] },
@@ -2056,6 +2111,8 @@ mod tests {
             pfs_group: None,
             mode_cfg: false,
             mode: Ikev1ExchangeMode::Main,
+            p1_lifetime_secs: 28800,
+            p2_lifetime_secs: 3600,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Sig { key: rkey, chain: vec![good_cert_r] },
@@ -2138,5 +2195,114 @@ mod tests {
         let peer: SocketAddr = "203.0.113.1:500".parse().unwrap();
         let ps = natd_msg(true, &[]);
         assert!(!natd_float_needed(&ps, true, Prf::Sha256, cky_i, cky_r, ours, peer));
+    }
+
+    /// Regression test for the same bug class `main_mode_offers_and_completes_with_aes_192`
+    /// guards against, but for the Phase-1 SA lifetime instead of the cipher:
+    /// `initiator_sa` must offer whatever `InitiatorConfig::p1_lifetime_secs`
+    /// configures, not a hardcoded `28800`.
+    #[test]
+    fn initiator_sa_carries_the_configured_lifetime_not_a_hardcoded_one() {
+        let sa = initiator_sa(DhGroup::Modp1024, false, false, 32, 1234);
+        let life = sa.proposals[0].transforms[0].attr_u32(attr::LIFE_DURATION);
+        assert_eq!(life, Some(1234), "must carry the configured lifetime, not the old hardcoded 28800");
+    }
+
+    /// [`negotiated_p1_lifetime`] must prefer the responder's own chosen
+    /// value (RFC 2407 §4.5: the responder may unilaterally shorten the
+    /// initiator's offer) and fall back to `offered` only when the
+    /// responder's SA payload carries no `LIFE_DURATION` attribute at all.
+    #[test]
+    fn negotiated_p1_lifetime_prefers_the_responders_value_and_falls_back_when_absent() {
+        let sa_with_lifetime = SaPayload {
+            doi: IPSEC_DOI,
+            situation: SIT_IDENTITY_ONLY,
+            proposals: vec![Proposal {
+                num: 1,
+                protocol_id: protocol::ISAKMP,
+                spi: Vec::new(),
+                transforms: vec![Transform {
+                    num: 1,
+                    transform_id: 1,
+                    attributes: vec![
+                        Attribute::short(attr::LIFE_TYPE, life::SECONDS),
+                        Attribute::long_u32(attr::LIFE_DURATION, 900),
+                    ],
+                }],
+            }],
+        };
+        let ps_with = vec![isakmp::Payload { payload_type: payload::SA, data: sa_with_lifetime.to_bytes() }];
+        assert_eq!(negotiated_p1_lifetime(&ps_with, 28800), 900, "must prefer the responder's own chosen value");
+
+        let sa_without_lifetime = SaPayload {
+            doi: IPSEC_DOI,
+            situation: SIT_IDENTITY_ONLY,
+            proposals: vec![Proposal {
+                num: 1,
+                protocol_id: protocol::ISAKMP,
+                spi: Vec::new(),
+                transforms: vec![Transform { num: 1, transform_id: 1, attributes: vec![] }],
+            }],
+        };
+        let ps_without = vec![isakmp::Payload { payload_type: payload::SA, data: sa_without_lifetime.to_bytes() }];
+        assert_eq!(negotiated_p1_lifetime(&ps_without, 28800), 28800, "must fall back to the offered value when absent");
+
+        assert_eq!(negotiated_p1_lifetime(&[], 28800), 28800, "must fall back to the offered value when there's no SA payload at all");
+    }
+
+    /// End-to-end confirmation that a non-default `InitiatorConfig::p1_lifetime_secs`
+    /// actually reaches `Phase1State::negotiated_lifetime_secs` on both sides,
+    /// in both Aggressive and Main Mode -- not just that the wire attribute
+    /// carries the right value (already covered above).
+    #[test]
+    fn configured_p1_lifetime_reaches_negotiated_lifetime_secs_in_both_modes() {
+        let psk = b"correct horse battery staple".to_vec();
+        let mut icfg = InitiatorConfig {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            key_len: 32,
+            our_id: Id::ipv4([10, 1, 1, 1]),
+            group: DhGroup::Modp1024,
+            xauth: false,
+            xauth_creds: None,
+            ts_local: ([0, 0, 0, 0], [0, 0, 0, 0]),
+            ts_remote: ([0, 0, 0, 0], [0, 0, 0, 0]),
+            esp_cipher: crate::ikev2::sk::SkCipher::Aes256Gcm,
+            pfs_group: None,
+            mode_cfg: false,
+            mode: Ikev1ExchangeMode::Aggressive,
+            p1_lifetime_secs: 1200,
+            p2_lifetime_secs: 3600,
+        };
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
+
+        // Aggressive Mode.
+        let mut ie = SeedEntropy::new(0xE1E1);
+        let mut re = SeedEntropy::new(0xE2E2);
+        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+        let (_msg3, istate) = ai.complete(&msg2, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
+        assert_eq!(istate.negotiated_lifetime_secs, 1200);
+        assert_eq!(rstate.negotiated_lifetime_secs, 1200);
+
+        // Main Mode -- same configured lifetime, different exchange.
+        icfg.mode = Ikev1ExchangeMode::Main;
+        let mut ie = SeedEntropy::new(0xE3E3);
+        let mut re = SeedEntropy::new(0xE4E4);
+        let (msg1, sa_sent) = initiate_main(&icfg, &mut ie);
+        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
+        let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
+        let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
+        let (msg6, rstate) = r2.complete_id(&msg5).unwrap();
+        let istate = id_sent.complete_id(&msg6).unwrap();
+        assert_eq!(istate.negotiated_lifetime_secs, 1200);
+        assert_eq!(rstate.negotiated_lifetime_secs, 1200);
     }
 }

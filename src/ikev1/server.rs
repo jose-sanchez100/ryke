@@ -99,7 +99,8 @@ impl<E: Entropy> Server<E> {
                 let has = |t: u8| ps.iter().any(|p| p.payload_type == t);
                 if has(payload::SA) {
                     // Message 1 → message 2.
-                    let (msg2, st) = respond_aggressive(&self.cfg, &data, &mut self.entropy)?;
+                    let our_addr = self.transport.local_addr_for(from)?;
+                    let (msg2, st) = respond_aggressive(&self.cfg, &data, &mut self.entropy, our_addr, from)?;
                     self.transport.send_to(&msg2, from)?;
                     self.sessions.insert(cky_i, Session { phase1: Some(st), main: None, quick: None });
                     Ok(ServerEvent::Phase1SaInit)
@@ -137,7 +138,8 @@ impl<E: Entropy> Server<E> {
                 let has = |t: u8| ps.iter().any(|p| p.payload_type == t);
                 if has(payload::SA) {
                     // Message 1 → message 2.
-                    let (msg2, st) = respond_main(&self.cfg, &data, &mut self.entropy)?;
+                    let our_addr = self.transport.local_addr_for(from)?;
+                    let (msg2, st) = respond_main(&self.cfg, &data, &mut self.entropy, our_addr, from)?;
                     self.transport.send_to(&msg2, from)?;
                     self.sessions.insert(cky_i, Session { phase1: None, main: Some(MainPhase::SaSent(st)), quick: None });
                     Ok(ServerEvent::Phase1SaInit)

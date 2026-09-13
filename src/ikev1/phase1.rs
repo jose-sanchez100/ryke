@@ -22,6 +22,7 @@ use crate::entropy::Entropy;
 use crate::error::IkeError;
 use crate::ikev2::sign::{cert_subject_dn, validate_chain, SigningKey, VerifyingKey};
 use crate::ikev2::sk::SkCipher;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// Well-known XAUTH capability Vendor ID (`09002689dfd6b712`, the de-facto marker
@@ -38,6 +39,102 @@ pub const XAUTH_VENDOR_ID: [u8; 8] = [0x09, 0x00, 0x26, 0x89, 0xdf, 0xd6, 0xb7, 
 pub const DPD_VENDOR_ID: [u8; 16] = [
     0xAF, 0xCA, 0xD7, 0x13, 0x68, 0xA1, 0xF1, 0xC9, 0x6B, 0x86, 0x96, 0xFC, 0x77, 0x57, 0x01, 0x00,
 ];
+
+/// RFC 3947 NAT-Traversal capability marker (`MD5("RFC 3947")`, computed
+/// directly rather than recalled from memory, to avoid a transcription
+/// error). Confirmed against isakmpd's own `VID_RFC3947`
+/// (`nat_traversal.c`): sent unconditionally alongside the SA payload in
+/// Main-Mode messages 1/2 (both directions), independent of whether a
+/// transform has been chosen yet -- the same "offer unconditionally, record
+/// whether the peer echoed it" shape [`DPD_VENDOR_ID`] already uses, just at
+/// a different point in the exchange (see [`Phase1State::floated`]'s doc for
+/// why the placement here specifically has to match msg1/2, not msg3/4 like
+/// DPD: a peer that gates its own NAT-D response in msg2 on having already
+/// seen this VID in msg1 would never send one back otherwise). Only the
+/// final RFC value is sent -- not the historical
+/// draft-ietf-ipsec-nat-t-ike-02/03 VIDs isakmpd also advertises for legacy
+/// interop, since this crate's real-world target (a modern FortiGate) is
+/// RFC-compliant.
+pub const NATT_RFC_VENDOR_ID: [u8; 16] = [
+    0x4a, 0x13, 0x1c, 0x81, 0x07, 0x03, 0x58, 0x45, 0x5c, 0x57, 0x28, 0xf2, 0x0e, 0x95, 0x45, 0x2f,
+];
+
+/// `HASH(CKY-I | CKY-R | IP | Port)` (RFC 3947 §4.2) -- the NAT-D payload's
+/// content, one for the sender's own claimed address, one for the address it
+/// believes the peer is at. Uses the *negotiated Phase-1 PRF's plain hash*
+/// (not HMAC-keyed, unlike every other `crypto1` formula in this file) --
+/// confirmed against isakmpd's `nat_t_generate_nat_d_hash`, which hashes with
+/// whatever `ie->hash->type` Phase 1 negotiated rather than a
+/// fixed algorithm. This crate's own initiator always offers SHA-256 for
+/// Phase 1 (see `initiator_sa`'s doc), so `prf` here is normally
+/// [`Prf::Sha256`] in practice, not SHA-1 like RFC 3947's original
+/// (SHA-1-only-IKE-era) examples -- if a live gateway turns out to expect
+/// SHA-1 specifically for this payload regardless of the negotiated Phase-1
+/// hash, that's the first thing to check via `--debug-all` (see this crate's
+/// project memory for the established verify-live-then-fix loop).
+fn natd_hash(prf: Prf, cky_i: [u8; 8], cky_r: [u8; 8], addr: SocketAddr) -> Vec<u8> {
+    let mut data = Vec::with_capacity(16 + 4 + 2);
+    data.extend_from_slice(&cky_i);
+    data.extend_from_slice(&cky_r);
+    match addr.ip() {
+        std::net::IpAddr::V4(a) => data.extend_from_slice(&a.octets()),
+        std::net::IpAddr::V6(a) => data.extend_from_slice(&a.octets()),
+    }
+    data.extend_from_slice(&addr.port().to_be_bytes());
+    prf.hash(&data)
+}
+
+/// The two NAT-D payloads one side sends: the address it believes the
+/// *recipient* (`dst`) is at first, then its own (`src`) address second --
+/// matching isakmpd's `nat_t_exchange_add_nat_d` order exactly
+/// (destination-then-source), confirmed by reading `nat_traversal.c`.
+/// [`natd_float_needed`]'s own comparison is order-agnostic on receive, but
+/// matching a real implementation's send order is the safer interop choice.
+fn natd_payloads(prf: Prf, cky_i: [u8; 8], cky_r: [u8; 8], dst: SocketAddr, src: SocketAddr) -> Vec<(u8, Vec<u8>)> {
+    vec![
+        (payload::NAT_D, natd_hash(prf, cky_i, cky_r, dst)),
+        (payload::NAT_D, natd_hash(prf, cky_i, cky_r, src)),
+    ]
+}
+
+fn peer_offers_natt(ps: &[isakmp::Payload]) -> bool {
+    ps.iter().any(|p| p.payload_type == payload::VENDOR_ID && p.data == NATT_RFC_VENDOR_ID)
+}
+
+/// Whether this exchange should float to UDP 4500 (RFC 3947 §5), given the
+/// NAT-D payloads seen in `ps` and whether the peer advertised
+/// [`NATT_RFC_VENDOR_ID`] at all (`peer_offers_natt` -- a separate parameter,
+/// not re-derived from `ps`, because Main Mode carries the VID in messages
+/// 1/2 but the NAT-D pair itself in messages 3/4: the gate and the payloads
+/// being gated don't always live in the same message, unlike Aggressive
+/// Mode's msg1/2 where both do). `false` outright if `peer_offers_natt` is
+/// `false` (NAT-D would be meaningless without that) -- also `false` if the
+/// peer *did* advertise support but sent no NAT-D payloads in `ps` at all,
+/// matching isakmpd's own `nat_t_match_nat_d_payload` fallback ("no payloads
+/// present" is treated as "matched", i.e. assume no NAT, rather than as a
+/// hard failure). Otherwise: float unless *both* of our own
+/// locally-recomputed candidate hashes (our own claimed `our_addr`, the
+/// peer's `peer_addr`) appear somewhere among the peer's NAT-D payloads --
+/// order-agnostic (checks membership, not position), which is more lenient
+/// than strictly required but matches isakmpd's own receive-side behavior
+/// and costs nothing. This is a single float-or-not boolean, not a
+/// which-side-is-natted attribution -- mirrors
+/// `ikev2::exchange::NatStatus::float_to_4500`'s
+/// `we_are_natted || peer_is_natted` simplification.
+fn natd_float_needed(ps: &[isakmp::Payload], peer_offers_natt: bool, prf: Prf, cky_i: [u8; 8], cky_r: [u8; 8], our_addr: SocketAddr, peer_addr: SocketAddr) -> bool {
+    if !peer_offers_natt {
+        return false;
+    }
+    let received: Vec<&[u8]> = ps.iter().filter(|p| p.payload_type == payload::NAT_D).map(|p| p.data.as_slice()).collect();
+    if received.is_empty() {
+        return false;
+    }
+    let expect_ours = natd_hash(prf, cky_i, cky_r, our_addr);
+    let expect_peer = natd_hash(prf, cky_i, cky_r, peer_addr);
+    let ours_seen = received.contains(&expect_ours.as_slice());
+    let peer_seen = received.contains(&expect_peer.as_slice());
+    !(ours_seen && peer_seen)
+}
 
 /// The XAUTH auth methods occupy the private range 65001..=65010
 /// (XAUTHInit/Resp × PreShared/DSS/RSA/…).
@@ -114,6 +211,18 @@ pub struct Phase1State {
     idii_b: Vec<u8>,
     /// Whether the peer's own Phase-1 message echoed [`DPD_VENDOR_ID`].
     pub peer_supports_dpd: bool,
+    /// Whether RFC 3947 NAT detection (see [`natd_float_needed`]) decided
+    /// this exchange must float to UDP 4500 for everything after the point
+    /// it was decided (Main Mode: message 5 onward; Aggressive Mode: message
+    /// 3 onward) -- XAUTH, Mode-Config, Quick Mode, and the Informational
+    /// exchange (DPD/graceful-disconnect Delete) all have to keep using this
+    /// same decision for the life of the SA, since the peer only ever
+    /// listens on whichever port it also decided to float to. `false` after
+    /// [`Phase1State::resume`] like `peer_supports_dpd` -- see that field's
+    /// doc for why (no VID/NAT-D info survives a restart); a genuinely
+    /// floated session resumed this way would need its caller to already
+    /// know to keep using the port-4500 socket regardless.
+    pub floated: bool,
 }
 
 /// Pick the first offered transform we support: AES-CBC (128/192/256-bit,
@@ -184,6 +293,8 @@ pub fn respond_aggressive(
     cfg: &Phase1Config,
     msg1: &[u8],
     entropy: &mut impl Entropy,
+    our_addr: SocketAddr,
+    peer_addr: SocketAddr,
 ) -> Result<(Vec<u8>, Phase1State), IkeError> {
     let hdr = IsakmpHeader::parse(msg1)?;
     if hdr.exchange_type != exchange::AGGRESSIVE {
@@ -269,6 +380,19 @@ pub fn respond_aggressive(
     // Advertise our own DPD support unconditionally, independent of whether
     // the initiator advertised theirs -- see `DPD_VENDOR_ID`'s doc.
     out_payloads.push((payload::VENDOR_ID, DPD_VENDOR_ID.to_vec()));
+    // RFC 3947 NAT-T: message 1's NAT-D (if any) was necessarily computed by
+    // the initiator with CKY-R still all-zero (it doesn't exist yet at that
+    // point) -- `hdr.resp_cookie` as parsed from msg1 is exactly that zero
+    // value, not our own freshly-chosen `cky_r`, so verification here must
+    // use it too. Message 2's own NAT-D pair (added below, dst=initiator
+    // first per isakmpd's order) uses the real `cky_r` instead, since both
+    // cookies are genuinely known by the time this side sends it.
+    let peer_offers_natt_here = peer_offers_natt(&ps);
+    let floated = natd_float_needed(&ps, peer_offers_natt_here, prf, cky_i, hdr.resp_cookie, our_addr, peer_addr);
+    if peer_offers_natt_here {
+        out_payloads.push((payload::VENDOR_ID, NATT_RFC_VENDOR_ID.to_vec()));
+        out_payloads.extend(natd_payloads(prf, cky_i, cky_r, peer_addr, our_addr));
+    }
     let out_header = IsakmpHeader {
         init_cookie: cky_i,
         resp_cookie: cky_r,
@@ -299,6 +423,7 @@ pub fn respond_aggressive(
         sai_b,
         idii_b,
         peer_supports_dpd,
+        floated,
     };
     Ok((msg2, state))
 }
@@ -339,6 +464,7 @@ impl Phase1State {
             sai_b: Vec::new(),
             idii_b: Vec::new(),
             peer_supports_dpd: false,
+            floated: false,
         }
     }
 
@@ -498,7 +624,13 @@ pub struct AggressiveInitiator {
 
 /// Build Aggressive-Mode message 1 (`HDR, SA, KE, Ni, IDi`) as the initiator.
 /// Returns the wire bytes and the state that completes the exchange.
-pub fn initiate_aggressive(cfg: &InitiatorConfig, entropy: &mut impl Entropy) -> (Vec<u8>, AggressiveInitiator) {
+/// `our_addr`/`peer_addr` are only used for RFC 3947 NAT-D (see
+/// [`natd_payloads`]'s doc): the cookies aren't both known yet at this point
+/// (`CKY-R` doesn't exist until the responder picks one), so the pair added
+/// here necessarily hashes with `CKY-R` all-zero -- exactly what this
+/// message's own header carries at this point, so a responder recomputing
+/// the same hash from the raw wire bytes agrees.
+pub fn initiate_aggressive(cfg: &InitiatorConfig, entropy: &mut impl Entropy, our_addr: SocketAddr, peer_addr: SocketAddr) -> (Vec<u8>, AggressiveInitiator) {
     let prf = Prf::Sha256;
     let mut cky_i = [0u8; 8];
     entropy.fill(&mut cky_i);
@@ -521,13 +653,16 @@ pub fn initiate_aggressive(cfg: &InitiatorConfig, entropy: &mut impl Entropy) ->
         message_id: 0,
         length: 0,
     };
-    let msg1 = isakmp::build_message(hdr, &[
+    let mut payloads = vec![
         (payload::SA, sai_b.clone()),
         (payload::KE, gxi.clone()),
         (payload::NONCE, ni.clone()),
         (payload::ID, idi_b.clone()),
         (payload::VENDOR_ID, DPD_VENDOR_ID.to_vec()),
-    ]);
+        (payload::VENDOR_ID, NATT_RFC_VENDOR_ID.to_vec()),
+    ];
+    payloads.extend(natd_payloads(prf, cky_i, [0; 8], peer_addr, our_addr));
+    let msg1 = isakmp::build_message(hdr, &payloads);
 
     let state = AggressiveInitiator {
         prf,
@@ -547,8 +682,12 @@ pub fn initiate_aggressive(cfg: &InitiatorConfig, entropy: &mut impl Entropy) ->
 impl AggressiveInitiator {
     /// Process message 2 (`HDR, SA, KE, Nr, IDr, HASH_R`): verify the responder's
     /// `HASH_R`, and return message 3 (`HDR, HASH_I`) plus the completed Phase-1
-    /// state ready to drive Quick Mode.
-    pub fn complete(self, msg2: &[u8]) -> Result<(Vec<u8>, Phase1State), IkeError> {
+    /// state ready to drive Quick Mode. `our_addr`/`peer_addr` are this
+    /// side's own view of both endpoints (RFC 3947 NAT-D, see
+    /// [`natd_float_needed`]) -- the resulting [`Phase1State::floated`]
+    /// decides whether message 3 (and everything after it) needs to go out
+    /// on UDP 4500 instead of 500.
+    pub fn complete(self, msg2: &[u8], our_addr: SocketAddr, peer_addr: SocketAddr) -> Result<(Vec<u8>, Phase1State), IkeError> {
         let hdr = IsakmpHeader::parse(msg2)?;
         if hdr.exchange_type != exchange::AGGRESSIVE {
             return Err(IkeError::Crypto("not an Aggressive Mode message"));
@@ -560,6 +699,10 @@ impl AggressiveInitiator {
         let hash_r_got = find(&ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
         let idr_b = find(&ps, payload::ID).ok_or(IkeError::MissingPayload("ID"))?.data.clone();
         let peer_supports_dpd = ps.iter().any(|p| p.payload_type == payload::VENDOR_ID && p.data == DPD_VENDOR_ID);
+        // By message 2, both cookies are genuinely known, so this uses the
+        // real `cky_r` (unlike message 1's own NAT-D, necessarily hashed
+        // with CKY-R all-zero -- see `initiate_aggressive`'s doc).
+        let floated = natd_float_needed(&ps, peer_offers_natt(&ps), self.prf, self.cky_i, cky_r, our_addr, peer_addr);
 
         if gxr.len() != self.group.public_len() {
             return Err(IkeError::BadKeyExchange { group: self.group.transform_id(), len: gxr.len() });
@@ -611,6 +754,7 @@ impl AggressiveInitiator {
             sai_b: self.sai_b,
             idii_b: self.idi_b,
             peer_supports_dpd,
+            floated,
         };
         Ok((msg3, state))
     }
@@ -669,7 +813,15 @@ pub fn initiate_main(cfg: &InitiatorConfig, entropy: &mut impl Entropy) -> (Vec<
         message_id: 0,
         length: 0,
     };
-    let msg1 = isakmp::build_message(hdr, &[(payload::SA, sai_b.clone())]);
+    let msg1 = isakmp::build_message(hdr, &[
+        (payload::SA, sai_b.clone()),
+        // RFC 3947 NAT-T VID: sent alongside SA in messages 1/2, not 3/4
+        // like `DPD_VENDOR_ID` -- matching isakmpd's own placement
+        // (`ike_phase_1_initiator_send_SA`) exactly, since a responder that
+        // gates its own NAT-D (msg3/4) on having already seen this VID here
+        // would otherwise never send one back.
+        (payload::VENDOR_ID, NATT_RFC_VENDOR_ID.to_vec()),
+    ]);
 
     let state = MainSaSent {
         group: cfg.group,
@@ -697,8 +849,12 @@ pub struct MainSaSent {
 }
 
 impl MainSaSent {
-    /// Process message 2 (`HDR, SA`) and build message 3 (`HDR, KE, Ni, VID(DPD)`).
-    pub fn complete_sa(self, msg2: &[u8], entropy: &mut impl Entropy) -> Result<(Vec<u8>, MainKeSent), IkeError> {
+    /// Process message 2 (`HDR, SA, [VID(RFC 3947)]`) and build message 3
+    /// (`HDR, KE, Ni, VID(DPD), [NAT-D, NAT-D]`). `our_addr`/`peer_addr` are
+    /// this side's own view of both endpoints, only used to compute the
+    /// NAT-D pair added when the responder's message 2 advertised NAT-T
+    /// support.
+    pub fn complete_sa(self, msg2: &[u8], entropy: &mut impl Entropy, our_addr: SocketAddr, peer_addr: SocketAddr) -> Result<(Vec<u8>, MainKeSent), IkeError> {
         let hdr = IsakmpHeader::parse(msg2)?;
         if hdr.exchange_type != exchange::MAIN {
             return Err(IkeError::Crypto("not a Main Mode message"));
@@ -706,6 +862,7 @@ impl MainSaSent {
         let cky_r = hdr.resp_cookie;
         let ps = isakmp::parse_payloads(hdr.next_payload, &msg2[IsakmpHeader::LEN..])?;
         find(&ps, payload::SA).ok_or(IkeError::MissingPayload("SA"))?;
+        let peer_supports_natt = peer_offers_natt(&ps);
 
         let dh_private = entropy.next_array32();
         let gxi = self.group.public(&dh_private);
@@ -722,11 +879,15 @@ impl MainSaSent {
             message_id: 0,
             length: 0,
         };
-        let msg3 = isakmp::build_message(hdr3, &[
+        let mut payloads3 = vec![
             (payload::KE, gxi.clone()),
             (payload::NONCE, ni.clone()),
             (payload::VENDOR_ID, DPD_VENDOR_ID.to_vec()),
-        ]);
+        ];
+        if peer_supports_natt {
+            payloads3.extend(natd_payloads(Prf::Sha256, self.cky_i, cky_r, peer_addr, our_addr));
+        }
+        let msg3 = isakmp::build_message(hdr3, &payloads3);
 
         let state = MainKeSent {
             group: self.group,
@@ -741,6 +902,9 @@ impl MainSaSent {
             dh_private,
             gxi,
             ni,
+            peer_supports_natt,
+            our_addr,
+            peer_addr,
         };
         Ok((msg3, state))
     }
@@ -760,11 +924,22 @@ pub struct MainKeSent {
     dh_private: [u8; 32],
     gxi: Vec<u8>,
     ni: Vec<u8>,
+    /// Whether the responder's message 2 advertised RFC 3947 support --
+    /// decided back in `complete_sa` (message 2, where the VID lives), since
+    /// message 4 (processed here) never repeats it -- see
+    /// `natd_float_needed`'s doc on why this is threaded through explicitly
+    /// rather than re-derived per message.
+    peer_supports_natt: bool,
+    our_addr: SocketAddr,
+    peer_addr: SocketAddr,
 }
 
 impl MainKeSent {
-    /// Process message 4 (`HDR, KE, Nr, [VID(DPD)]`), derive the Phase-1 key
-    /// schedule, and build message 5 (`HDR*, IDi, HASH_I`, encrypted).
+    /// Process message 4 (`HDR, KE, Nr, [VID(DPD)], [NAT-D, NAT-D]`), derive
+    /// the Phase-1 key schedule, and build message 5 (`HDR*, IDi, HASH_I`,
+    /// encrypted). Whether message 5 (and everything after it) needs to go
+    /// out floated on UDP 4500 is decided here -- see
+    /// [`MainIdSent::floated`]/[`Phase1State::floated`]'s doc.
     pub fn complete_ke(self, msg4: &[u8]) -> Result<(Vec<u8>, MainIdSent), IkeError> {
         let hdr = IsakmpHeader::parse(msg4)?;
         if hdr.exchange_type != exchange::MAIN {
@@ -774,6 +949,7 @@ impl MainKeSent {
         let gxr = find(&ps, payload::KE).ok_or(IkeError::MissingPayload("KE"))?.data.clone();
         let nr = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
         let peer_supports_dpd = ps.iter().any(|p| p.payload_type == payload::VENDOR_ID && p.data == DPD_VENDOR_ID);
+        let floated = natd_float_needed(&ps, self.peer_supports_natt, Prf::Sha256, self.cky_i, self.cky_r, self.our_addr, self.peer_addr);
 
         if gxr.len() != self.group.public_len() {
             return Err(IkeError::BadKeyExchange { group: self.group.transform_id(), len: gxr.len() });
@@ -852,6 +1028,7 @@ impl MainKeSent {
             is_sig: matches!(self.local_auth, Ikev1LocalAuth::Sig { .. }),
             iv_after_msg5,
             peer_supports_dpd,
+            floated,
         };
         Ok((msg5, state))
     }
@@ -885,6 +1062,12 @@ pub struct MainIdSent {
     /// ciphertext, needed to decrypt message 6.
     iv_after_msg5: Vec<u8>,
     peer_supports_dpd: bool,
+    /// Whether NAT-D (message 3/4) decided this exchange must float to UDP
+    /// 4500 -- `pub` (unlike this struct's other fields) because the caller
+    /// (`Client::connect`) needs to check it *before* sending message 5,
+    /// which this struct is returned alongside, same reasoning as
+    /// [`Phase1State::floated`]'s own doc.
+    pub floated: bool,
 }
 
 impl MainIdSent {
@@ -937,15 +1120,20 @@ impl MainIdSent {
             sai_b: self.sai_b,
             idii_b: self.idi_b,
             peer_supports_dpd: self.peer_supports_dpd,
+            floated: self.floated,
         })
     }
 }
 
 // ---- Main Mode responder (for self-testing against `ikev1::Client`) ----
 
-/// Process Main-Mode message 1 (`HDR, SA`) and build message 2 (`HDR, SA`),
-/// choosing a fresh responder cookie and echoing the selected transform.
-pub fn respond_main(cfg: &Phase1Config, msg1: &[u8], entropy: &mut impl Entropy) -> Result<(Vec<u8>, MainRespSaSent), IkeError> {
+/// Process Main-Mode message 1 (`HDR, SA, [VID(RFC 3947)]`) and build
+/// message 2 (`HDR, SA, VID(RFC 3947)`), choosing a fresh responder cookie
+/// and echoing the selected transform. The RFC 3947 VID is sent
+/// unconditionally, independent of whether the initiator advertised
+/// support (matching isakmpd's own `ike_phase_1_responder_send_SA` and this
+/// crate's existing `DPD_VENDOR_ID` "advertise unconditionally" precedent).
+pub fn respond_main(cfg: &Phase1Config, msg1: &[u8], entropy: &mut impl Entropy, our_addr: SocketAddr, peer_addr: SocketAddr) -> Result<(Vec<u8>, MainRespSaSent), IkeError> {
     let hdr = IsakmpHeader::parse(msg1)?;
     if hdr.exchange_type != exchange::MAIN {
         return Err(IkeError::Crypto("not a Main Mode message"));
@@ -957,6 +1145,7 @@ pub fn respond_main(cfg: &Phase1Config, msg1: &[u8], entropy: &mut impl Entropy)
     let sa = SaPayload::parse(&sai_b)?;
     let want_sig = matches!(cfg.local_auth, Ikev1LocalAuth::Sig { .. });
     let (chosen, prf, group, key_len) = select_transform(&sa, want_sig).ok_or(IkeError::NoProposalChosen)?;
+    let peer_supports_natt = peer_offers_natt(&ps);
 
     let mut cky_r = [0u8; 8];
     entropy.fill(&mut cky_r);
@@ -976,7 +1165,10 @@ pub fn respond_main(cfg: &Phase1Config, msg1: &[u8], entropy: &mut impl Entropy)
         message_id: 0,
         length: 0,
     };
-    let msg2 = isakmp::build_message(hdr2, &[(payload::SA, sar.to_bytes())]);
+    let msg2 = isakmp::build_message(hdr2, &[
+        (payload::SA, sar.to_bytes()),
+        (payload::VENDOR_ID, NATT_RFC_VENDOR_ID.to_vec()),
+    ]);
 
     let state = MainRespSaSent {
         prf,
@@ -989,6 +1181,9 @@ pub fn respond_main(cfg: &Phase1Config, msg1: &[u8], entropy: &mut impl Entropy)
         now_unix: cfg.now_unix,
         our_id: cfg.our_id.clone(),
         sai_b,
+        peer_supports_natt,
+        our_addr,
+        peer_addr,
     };
     Ok((msg2, state))
 }
@@ -1005,11 +1200,14 @@ pub struct MainRespSaSent {
     now_unix: u64,
     our_id: Id,
     sai_b: Vec<u8>,
+    peer_supports_natt: bool,
+    our_addr: SocketAddr,
+    peer_addr: SocketAddr,
 }
 
 impl MainRespSaSent {
-    /// Process message 3 (`HDR, KE, Ni, [VID(DPD)]`) and build message 4
-    /// (`HDR, KE, Nr, VID(DPD)`).
+    /// Process message 3 (`HDR, KE, Ni, [VID(DPD)], [NAT-D, NAT-D]`) and
+    /// build message 4 (`HDR, KE, Nr, VID(DPD), [NAT-D, NAT-D]`).
     pub fn complete_ke(self, msg3: &[u8], entropy: &mut impl Entropy) -> Result<(Vec<u8>, MainRespKeSent), IkeError> {
         let hdr = IsakmpHeader::parse(msg3)?;
         if hdr.exchange_type != exchange::MAIN {
@@ -1019,6 +1217,7 @@ impl MainRespSaSent {
         let gxi = find(&ps, payload::KE).ok_or(IkeError::MissingPayload("KE"))?.data.clone();
         let ni = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
         let peer_supports_dpd = ps.iter().any(|p| p.payload_type == payload::VENDOR_ID && p.data == DPD_VENDOR_ID);
+        let floated = natd_float_needed(&ps, self.peer_supports_natt, self.prf, self.cky_i, self.cky_r, self.our_addr, self.peer_addr);
 
         if gxi.len() != self.group.public_len() {
             return Err(IkeError::BadKeyExchange { group: self.group.transform_id(), len: gxi.len() });
@@ -1038,11 +1237,15 @@ impl MainRespSaSent {
             message_id: 0,
             length: 0,
         };
-        let msg4 = isakmp::build_message(hdr4, &[
+        let mut payloads4 = vec![
             (payload::KE, gxr.clone()),
             (payload::NONCE, nr.clone()),
             (payload::VENDOR_ID, DPD_VENDOR_ID.to_vec()),
-        ]);
+        ];
+        if self.peer_supports_natt {
+            payloads4.extend(natd_payloads(self.prf, self.cky_i, self.cky_r, self.peer_addr, self.our_addr));
+        }
+        let msg4 = isakmp::build_message(hdr4, &payloads4);
 
         let state = MainRespKeSent {
             prf: self.prf,
@@ -1061,6 +1264,7 @@ impl MainRespSaSent {
             ni,
             nr,
             peer_supports_dpd,
+            floated,
         };
         Ok((msg4, state))
     }
@@ -1084,6 +1288,7 @@ pub struct MainRespKeSent {
     ni: Vec<u8>,
     nr: Vec<u8>,
     peer_supports_dpd: bool,
+    floated: bool,
 }
 
 impl MainRespKeSent {
@@ -1176,6 +1381,7 @@ impl MainRespKeSent {
             sai_b: self.sai_b,
             idii_b,
             peer_supports_dpd: self.peer_supports_dpd,
+            floated: self.floated,
         };
         Ok((msg6, state))
     }
@@ -1252,7 +1458,7 @@ mod tests {
         let idi = Id { id_type: id_type::KEY_ID, protocol: 0, port: 0, data: b"grp".to_vec() };
 
         let msg1 = client_msg1(cky_i, &gxi, &ni, &idi);
-        let (msg2, st) = respond_aggressive(&cfg, &msg1, &mut SeedEntropy::new(9)).unwrap();
+        let (msg2, st) = respond_aggressive(&cfg, &msg1, &mut SeedEntropy::new(9), "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
         assert_eq!(st.group, DhGroup::Modp1024);
         assert_eq!(st.prf, Prf::Sha256); // picked AES256/SHA256, skipped SHA384
 
@@ -1304,7 +1510,7 @@ mod tests {
         let gxi = DhGroup::Modp1024.public(&i_priv);
         let idi = Id { id_type: id_type::KEY_ID, protocol: 0, port: 0, data: b"g".to_vec() };
         let msg1 = client_msg1(cky_i, &gxi, &[0x22; 16], &idi);
-        let (msg2, st) = respond_aggressive(&cfg, &msg1, &mut SeedEntropy::new(4)).unwrap();
+        let (msg2, st) = respond_aggressive(&cfg, &msg1, &mut SeedEntropy::new(4), "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
         let h2 = IsakmpHeader::parse(&msg2).unwrap();
         let p2 = isakmp::parse_payloads(h2.next_payload, &msg2[IsakmpHeader::LEN..]).unwrap();
         let nr = find(&p2, payload::NONCE).unwrap().data.clone();
@@ -1350,9 +1556,9 @@ mod tests {
         };
         let mut ie = SeedEntropy::new(0x1111);
         let mut re = SeedEntropy::new(0x2222);
-        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie);
-        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re).unwrap();
-        let (msg3, istate) = ai.complete(&msg2).unwrap();
+        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+        let (msg3, istate) = ai.complete(&msg2, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
         rstate.verify_hash_i(&msg3).unwrap();
 
         assert!(istate.peer_supports_dpd, "initiator should recognize the responder's echoed DPD VID");
@@ -1392,8 +1598,8 @@ mod tests {
         let mut re = SeedEntropy::new(0x4444);
 
         let (msg1, sa_sent) = initiate_main(&icfg, &mut ie);
-        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re).unwrap();
-        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie).unwrap();
+        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
         let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
         let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
         let (msg6, rstate) = r2.complete_id(&msg5).unwrap();
@@ -1403,6 +1609,11 @@ mod tests {
         assert_eq!(istate.enc_key, rstate.enc_key);
         assert!(istate.peer_supports_dpd, "initiator should recognize the responder's echoed DPD VID (msg4)");
         assert!(rstate.peer_supports_dpd, "responder should recognize the initiator's offered DPD VID (msg3)");
+        // Both sides claimed and observed the same addresses -- no NAT on
+        // the path, so neither should float. Regression guard: this is the
+        // common case and must keep working exactly as before NAT-T existed.
+        assert!(!istate.floated, "matching addresses on both sides -- no NAT to detect");
+        assert!(!rstate.floated);
 
         // The returned Phase1State must seed post-Phase-1 IVs (xauth.rs,
         // quick.rs, cfg.rs, informational.rs all read `phase1_iv` for this)
@@ -1419,6 +1630,100 @@ mod tests {
         let last_block = &msg6[msg6.len() - AES_BLOCK..];
         assert_eq!(istate.phase1_iv, last_block, "initiator's phase1_iv must chain from message 6's ciphertext");
         assert_eq!(rstate.phase1_iv, last_block, "responder's phase1_iv must chain from message 6's ciphertext");
+    }
+
+    /// The gateway is reachable at a fixed public address both sides agree
+    /// on, but the responder *observes* the initiator arriving from a
+    /// different address than the initiator itself claims -- simulating a
+    /// NAT translating the initiator's outbound traffic (the common case
+    /// this feature exists for). Both sides must independently conclude
+    /// `floated: true` from RFC 3947 NAT-D alone (each only ever sees its
+    /// own recomputed hashes against what the peer sent -- there is no
+    /// shared "ground truth" object in a real deployment), and the
+    /// handshake must still complete and agree on keys. Also checks that
+    /// Quick Mode's ESP proposal declares `UDP_ENCAP_TUNNEL` instead of
+    /// plain `ENCAP_TUNNEL` once floated (`quick::esp_sa`'s doc).
+    #[test]
+    fn full_main_phase1_floats_to_natt_when_a_nat_is_detected() {
+        let psk = b"correct horse battery staple".to_vec();
+        let icfg = main_mode_icfg(psk.clone());
+        let rcfg = Phase1Config { local_auth: Ikev1LocalAuth::Psk(psk), trusted_cas: Vec::new(), now_unix: 0, our_id: Id::ipv4([192, 168, 0, 1]) };
+        let mut ie = SeedEntropy::new(0xA5A5);
+        let mut re = SeedEntropy::new(0xB6B6);
+
+        let gateway_addr: SocketAddr = "203.0.113.9:500".parse().unwrap();
+        // What the initiator itself believes its own address is (e.g. its
+        // private LAN address).
+        let initiator_claimed_addr: SocketAddr = "10.0.0.5:500".parse().unwrap();
+        // What the responder actually observes the initiator's traffic
+        // arriving from (post-NAT, translated by the box in between).
+        let observed_initiator_addr: SocketAddr = "198.51.100.7:500".parse().unwrap();
+
+        let (msg1, sa_sent) = initiate_main(&icfg, &mut ie);
+        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re, gateway_addr, observed_initiator_addr).unwrap();
+        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie, initiator_claimed_addr, gateway_addr).unwrap();
+        let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
+        let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
+        assert!(id_sent.floated, "initiator must detect the NAT from message 4's NAT-D");
+        let (msg6, rstate) = r2.complete_id(&msg5).unwrap();
+        let istate = id_sent.complete_id(&msg6).unwrap();
+
+        assert!(istate.floated, "initiator's completed Phase1State must carry the float decision forward");
+        assert!(rstate.floated, "responder must independently detect the same NAT from message 3's NAT-D");
+        assert_eq!(istate.skeyid_e, rstate.skeyid_e, "NAT-T floating must not affect the key schedule");
+
+        // Quick Mode's own SA proposal must declare the UDP-encap
+        // encapsulation mode once floated (`quick::esp_sa`'s doc).
+        let ts = ([0, 0, 0, 0], [0, 0, 0, 0]);
+        let (qm1, _qi) = crate::ikev1::quick::initiate_quick(&istate, &mut ie, crate::ikev2::sk::SkCipher::Aes256Gcm, ts, ts).unwrap();
+        let iv0 = crypto1::phase2_iv(istate.prf, &istate.phase1_iv, {
+            let hdr = IsakmpHeader::parse(&qm1).unwrap();
+            hdr.message_id
+        }, AES_BLOCK);
+        let (_h, ps, _next) = phase2::parse_encrypted(&qm1, istate.prf, &istate.skeyid_a, &istate.enc_key, &iv0).unwrap();
+        let sa = SaPayload::parse(&find(&ps, payload::SA).unwrap().data).unwrap();
+        let encap_mode = sa.proposals[0].transforms[0].attr(4 /* esp_attr::ENCAP_MODE */).unwrap();
+        assert_eq!(encap_mode, 3, "floated Quick Mode must declare UDP_ENCAP_TUNNEL (3), not plain tunnel mode (1)");
+    }
+
+    /// The Aggressive Mode analog of the Main Mode NAT-detection test above
+    /// -- message 1's own NAT-D necessarily hashes with `CKY-R` still
+    /// all-zero (see `initiate_aggressive`'s doc), so this specifically
+    /// exercises that path, which the Main-Mode test above cannot.
+    #[test]
+    fn full_aggressive_phase1_floats_to_natt_when_a_nat_is_detected() {
+        let psk = b"correct horse battery staple".to_vec();
+        let ts = ([10, 0, 99, 0], [255, 255, 255, 0]);
+        let icfg = InitiatorConfig {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            key_len: 32,
+            our_id: Id::ipv4([10, 1, 1, 1]),
+            group: DhGroup::Modp1024,
+            xauth: false,
+            xauth_creds: None,
+            ts_local: ts,
+            ts_remote: ts,
+            esp_cipher: crate::ikev2::sk::SkCipher::Aes256Gcm,
+            pfs_group: None,
+            mode_cfg: false,
+            mode: Ikev1ExchangeMode::Aggressive,
+        };
+        let rcfg = Phase1Config { local_auth: Ikev1LocalAuth::Psk(psk), trusted_cas: Vec::new(), now_unix: 0, our_id: Id::ipv4([192, 168, 0, 1]) };
+        let mut ie = SeedEntropy::new(0xC7C7);
+        let mut re = SeedEntropy::new(0xD8D8);
+
+        let gateway_addr: SocketAddr = "203.0.113.9:500".parse().unwrap();
+        let initiator_claimed_addr: SocketAddr = "10.0.0.5:500".parse().unwrap();
+        let observed_initiator_addr: SocketAddr = "198.51.100.7:500".parse().unwrap();
+
+        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie, initiator_claimed_addr, gateway_addr);
+        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re, gateway_addr, observed_initiator_addr).unwrap();
+        assert!(rstate.floated, "responder must detect the NAT from message 1's NAT-D (hashed with CKY-R all-zero)");
+        let (_msg3, istate) = ai.complete(&msg2, initiator_claimed_addr, gateway_addr).unwrap();
+        assert!(istate.floated, "initiator must detect the same NAT from message 2's NAT-D (real CKY-R now)");
+        assert_eq!(istate.skeyid_e, rstate.skeyid_e);
     }
 
     /// A profile configured for AES-192 (`InitiatorConfig::key_len: 24`) must
@@ -1448,8 +1753,8 @@ mod tests {
         let sa = SaPayload::parse(&find(&ps1, payload::SA).unwrap().data).unwrap();
         assert_eq!(sa.proposals[0].transforms[0].attr(attr::KEY_LENGTH), Some(192), "message 1 must offer AES-192, not the old hardcoded AES-256");
 
-        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re).unwrap();
-        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie).unwrap();
+        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
         let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
         let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
         let (msg6, rstate) = r2.complete_id(&msg5).unwrap();
@@ -1479,8 +1784,8 @@ mod tests {
         let mut re = SeedEntropy::new(0x6666);
 
         let (msg1, sa_sent) = initiate_main(&icfg, &mut ie);
-        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re).unwrap();
-        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie).unwrap();
+        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
         let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
         let (msg5, _id_sent) = ke_sent.complete_ke(&msg4).unwrap();
         assert!(r2.complete_id(&msg5).is_err(), "a wrong PSK must never let Main Mode complete");
@@ -1504,8 +1809,8 @@ mod tests {
         let mut re = SeedEntropy::new(0xAAAA);
 
         let (msg1, sa_sent) = initiate_main(&icfg, &mut ie);
-        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re).unwrap();
-        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie).unwrap();
+        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
         let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
         let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
         let (mut msg6, _rstate) = r2.complete_id(&msg5).unwrap();
@@ -1593,8 +1898,8 @@ mod tests {
         let mut re = SeedEntropy::new(0xCAFE);
 
         let (msg1, sa_sent) = initiate_main(&icfg, &mut ie);
-        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re).unwrap();
-        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie).unwrap();
+        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
         let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
         let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
         let (msg6, rstate) = r2.complete_id(&msg5).unwrap();
@@ -1653,11 +1958,73 @@ mod tests {
         let mut re = SeedEntropy::new(0x5678);
 
         let (msg1, sa_sent) = initiate_main(&icfg, &mut ie);
-        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re).unwrap();
-        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie).unwrap();
+        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
         let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
         let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
         let (msg6, _rstate) = r2.complete_id(&msg5).unwrap();
         assert!(id_sent.complete_id(&msg6).is_err(), "an untrusted responder cert must never verify");
+    }
+
+    fn natd_msg(vid: bool, natd: &[(u8, Vec<u8>)]) -> Vec<isakmp::Payload> {
+        let mut ps = Vec::new();
+        if vid {
+            ps.push(isakmp::Payload { payload_type: payload::VENDOR_ID, data: NATT_RFC_VENDOR_ID.to_vec() });
+        }
+        for (t, d) in natd {
+            ps.push(isakmp::Payload { payload_type: *t, data: d.clone() });
+        }
+        ps
+    }
+
+    #[test]
+    fn natd_float_needed_agrees_on_matching_addresses() {
+        let cky_i = [0x11; 8];
+        let cky_r = [0x22; 8];
+        let ours: SocketAddr = "10.0.0.1:500".parse().unwrap();
+        let peer: SocketAddr = "203.0.113.1:500".parse().unwrap();
+        let payloads = natd_payloads(Prf::Sha256, cky_i, cky_r, peer, ours);
+        let ps = natd_msg(true, &payloads);
+        assert!(!natd_float_needed(&ps, true, Prf::Sha256, cky_i, cky_r, ours, peer), "identical addresses on both sides -- no NAT");
+    }
+
+    #[test]
+    fn natd_float_needed_detects_a_mismatched_address() {
+        let cky_i = [0x11; 8];
+        let cky_r = [0x22; 8];
+        let claimed: SocketAddr = "10.0.0.1:500".parse().unwrap();
+        let observed: SocketAddr = "198.51.100.1:500".parse().unwrap();
+        let peer: SocketAddr = "203.0.113.1:500".parse().unwrap();
+        // The peer computed its NAT-D pair using what it actually observed
+        // (`observed`), not what the sender itself would claim (`claimed`).
+        let payloads = natd_payloads(Prf::Sha256, cky_i, cky_r, peer, observed);
+        let ps = natd_msg(true, &payloads);
+        assert!(natd_float_needed(&ps, true, Prf::Sha256, cky_i, cky_r, claimed, peer), "our own recomputed hash (from `claimed`) can't be found -- must float");
+    }
+
+    #[test]
+    fn natd_float_needed_is_false_without_the_vendor_id() {
+        let cky_i = [0x11; 8];
+        let cky_r = [0x22; 8];
+        let ours: SocketAddr = "10.0.0.1:500".parse().unwrap();
+        let peer: SocketAddr = "203.0.113.1:500".parse().unwrap();
+        // Even with NAT-D payloads present, no float without the peer
+        // having advertised RFC 3947 support first.
+        let payloads = natd_payloads(Prf::Sha256, cky_i, cky_r, peer, ours);
+        let ps = natd_msg(false, &payloads);
+        assert!(!natd_float_needed(&ps, false, Prf::Sha256, cky_i, cky_r, ours, peer));
+    }
+
+    /// Matches isakmpd's own `nat_t_match_nat_d_payload` fallback: a peer
+    /// that advertised NAT-T support but sent no NAT-D payloads at all is
+    /// treated as "no NAT", not as a reason to float.
+    #[test]
+    fn natd_float_needed_is_false_when_no_natd_payloads_are_present() {
+        let cky_i = [0x11; 8];
+        let cky_r = [0x22; 8];
+        let ours: SocketAddr = "10.0.0.1:500".parse().unwrap();
+        let peer: SocketAddr = "203.0.113.1:500".parse().unwrap();
+        let ps = natd_msg(true, &[]);
+        assert!(!natd_float_needed(&ps, true, Prf::Sha256, cky_i, cky_r, ours, peer));
     }
 }

@@ -58,6 +58,14 @@ mod esp_attr {
     pub const AUTH_ALGORITHM: u16 = 5;
 }
 const ENCAP_TUNNEL: u16 = 1;
+/// UDP-encapsulated tunnel mode (RFC 3947 §4.3.1's final IANA value, as
+/// opposed to the legacy private-range 61443 some pre-RFC drafts used) --
+/// used instead of `ENCAP_TUNNEL` whenever `Phase1State::floated` is `true`,
+/// mirroring isakmpd's own `ike_quick_mode.c` switch (confirmed by reading
+/// it: it selects the RFC-final value there too, never the draft one, since
+/// this crate only advertises the RFC 3947 Vendor ID -- see
+/// `phase1::NATT_RFC_VENDOR_ID`'s doc).
+const UDP_ENCAP_TUNNEL: u16 = 3;
 const LIFE_SECONDS: u16 = 1;
 
 /// This registry (RFC 2407 §4.5's ESP `AUTH_ALGORITHM` attribute values) is
@@ -126,10 +134,16 @@ fn qm_header(cky_i: [u8; 8], cky_r: [u8; 8], msgid: u32) -> IsakmpHeader {
 /// AUTH_ALGORITHM attribute (an AEAD cipher needs no separate integrity
 /// check, so gets none). When `pfs_group` is `Some`, also carries a GROUP
 /// DESCRIPTION attribute naming the DH group PFS will use -- the signal the
-/// peer keys its own PFS participation off of.
-fn esp_sa(spi: u32, cipher: SkCipher, pfs_group: Option<DhGroup>) -> SaPayload {
+/// peer keys its own PFS participation off of. `floated` (RFC 3947, see
+/// `phase1::Phase1State::floated`'s doc) switches the ENCAP_MODE attribute to
+/// [`UDP_ENCAP_TUNNEL`] instead of [`ENCAP_TUNNEL`] -- this is purely a
+/// declaration on the wire; the actual UDP-in-ESP framing is entirely a
+/// kernel XFRM matter on the `free-vpn-v2` side (`daemon::xfrm::apply_natt`),
+/// unaffected by this attribute's value either way.
+fn esp_sa(spi: u32, cipher: SkCipher, pfs_group: Option<DhGroup>, floated: bool) -> SaPayload {
+    let encap_mode = if floated { UDP_ENCAP_TUNNEL } else { ENCAP_TUNNEL };
     let mut attributes = vec![
-        Attribute::short(esp_attr::ENCAP_MODE, ENCAP_TUNNEL),
+        Attribute::short(esp_attr::ENCAP_MODE, encap_mode),
         Attribute::short(esp_attr::LIFE_TYPE, LIFE_SECONDS),
         Attribute::long_u32(esp_attr::LIFE_DURATION, 3600),
     ];
@@ -326,7 +340,7 @@ pub fn initiate_quick_with_pfs(
 
     let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
     let mut after = vec![
-        (payload::SA, esp_sa(local_spi, cipher, pfs_group).to_bytes()),
+        (payload::SA, esp_sa(local_spi, cipher, pfs_group, st.floated).to_bytes()),
         (payload::NONCE, ni.clone()),
     ];
     if let Some((group, dh_private)) = &pfs {
@@ -441,7 +455,7 @@ pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) 
     entropy.fill(&mut nr);
 
     let mut after: Vec<(u8, Vec<u8>)> = vec![
-        (payload::SA, esp_sa(local_spi, cipher, pfs_group).to_bytes()),
+        (payload::SA, esp_sa(local_spi, cipher, pfs_group, st.floated).to_bytes()),
         (payload::NONCE, nr.clone()),
     ];
     let pfs_shared = match pfs_group {
@@ -531,9 +545,9 @@ mod tests {
         let mut re = SeedEntropy::new(0x2222);
 
         // Phase 1: Aggressive Mode.
-        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie);
-        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re).unwrap();
-        let (msg3, istate) = ai.complete(&msg2).unwrap();
+        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+        let (msg3, istate) = ai.complete(&msg2, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
         rstate.verify_hash_i(&msg3).unwrap();
 
         // Phase 2: Quick Mode.
@@ -588,9 +602,9 @@ mod tests {
         let mut ie = SeedEntropy::new(0x7777);
         let mut re = SeedEntropy::new(0x8888);
 
-        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie);
-        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re).unwrap();
-        let (msg3, istate) = ai.complete(&msg2).unwrap();
+        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+        let (msg3, istate) = ai.complete(&msg2, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
         rstate.verify_hash_i(&msg3).unwrap();
 
         let (qm1, qi) = initiate_quick(&istate, &mut ie, cipher, ts, ts).unwrap();
@@ -640,9 +654,9 @@ mod tests {
         let mut ie = SeedEntropy::new(0x3333);
         let mut re = SeedEntropy::new(0x4444);
 
-        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie);
-        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re).unwrap();
-        let (msg3, istate) = ai.complete(&msg2).unwrap();
+        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+        let (msg3, istate) = ai.complete(&msg2, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
         rstate.verify_hash_i(&msg3).unwrap();
 
         // Quick Mode, this time with PFS (a fresh DH group of its own).
@@ -693,9 +707,9 @@ mod tests {
         };
         let mut ie = SeedEntropy::new(0x5555);
         let mut re = SeedEntropy::new(0x6666);
-        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie);
-        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re).unwrap();
-        let (msg3, istate) = ai.complete(&msg2).unwrap();
+        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+        let (msg3, istate) = ai.complete(&msg2, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
         rstate.verify_hash_i(&msg3).unwrap();
 
         let run = |ie: &mut SeedEntropy, re: &mut SeedEntropy| {
@@ -737,8 +751,8 @@ mod tests {
         };
         let mut ie = SeedEntropy::new(1);
         let mut re = SeedEntropy::new(2);
-        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie);
-        let (msg2, _rstate) = respond_aggressive(&rcfg, &msg1, &mut re).unwrap();
-        assert!(matches!(ai.complete(&msg2), Err(IkeError::AuthFailed)));
+        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let (msg2, _rstate) = respond_aggressive(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+        assert!(matches!(ai.complete(&msg2, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()), Err(IkeError::AuthFailed)));
     }
 }

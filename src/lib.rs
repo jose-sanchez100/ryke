@@ -45,6 +45,13 @@ pub mod ikev2;
 #[cfg(test)]
 pub(crate) mod test_certs;
 
+/// The well-known NAT-T port (RFC 3947 §1 / RFC 3948 §1): once a NAT is
+/// detected between peers, the whole exchange -- Phase 1, Quick Mode/CREATE_CHILD_SA,
+/// and the ESP-in-UDP data plane -- floats here from port 500.
+pub const fn natt_port() -> u16 {
+    4500
+}
+
 pub use ikev2::client::Client;
 pub use crypto::{
     derive_child_keys, derive_session_keys, prf, prf_plus, ChildKeys, DhGroup, KeyLengths,

@@ -206,9 +206,9 @@ mod tests {
         };
         let mut ie = SeedEntropy::new(0xAAAA);
         let mut re = SeedEntropy::new(0xBBBB);
-        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie);
-        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re).unwrap();
-        let (msg3, istate) = ai.complete(&msg2).unwrap();
+        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+        let (msg3, istate) = ai.complete(&msg2, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()).unwrap();
         rstate.verify_hash_i(&msg3).unwrap();
         (istate, rstate)
     }

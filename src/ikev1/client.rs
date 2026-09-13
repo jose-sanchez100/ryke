@@ -6,9 +6,20 @@
 //! `InitiatorConfig::mode_cfg`) for an assigned inner IPv4, then Quick Mode
 //! (optionally with PFS, see `InitiatorConfig::pfs_group`), establishing an
 //! ESP CHILD SA.
+//!
+//! RFC 3947 NAT-T: [`Client::from_sockets`] hands in both the well-known
+//! port-500 socket and a port-4500 one up front (mirroring
+//! `ikev2::session::Ikev2Session::sa_init_with_sockets`'s own pre-bind-both
+//! approach), and `connect()` switches to the latter -- wrapping every
+//! message with the non-ESP marker (`ikev2::natt::wrap_ike_4500`, reused
+//! as-is: the marker and the underlying NAT-D hash shape are IKE-version-
+//! agnostic) -- the moment [`crate::ikev1::phase1::Phase1State::floated`] (or
+//! its precursors on the intermediate per-message states) says NAT was
+//! detected. See `phase1.rs`'s own NAT-T doc comments for the detection
+//! details; this module only owns the transport-switching side of it.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
 use crate::debug::ike_debug;
@@ -23,6 +34,7 @@ use crate::ikev1::phase1::{
 };
 use crate::ikev1::quick::initiate_quick_with_pfs;
 use crate::ikev1::xauth;
+use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
 use crate::transport::{DriverError, UdpTransport};
 
 /// What a completed IKEv1 handshake yields: the Phase-1 state (for rekey /
@@ -71,13 +83,44 @@ impl Established {
 /// A UDP IKEv1 initiator driven by an [`Entropy`] source.
 pub struct Client<E> {
     transport: UdpTransport,
+    /// Present only via [`Self::from_sockets`] -- a caller that never hands
+    /// one in (`bind`/`from_socket`, both pre-dating NAT-T) simply can't
+    /// float; [`Self::send_step`]/[`Self::recv_matching`] error out rather
+    /// than silently staying on port 500 if `phase1.rs`'s NAT-D logic ever
+    /// decides floating is needed without one configured.
+    natt_transport: Option<UdpTransport>,
     entropy: E,
 }
 
 impl<E: Entropy> Client<E> {
-    /// Bind a local socket (`"0.0.0.0:0"` for an ephemeral source port).
+    /// Bind a local socket (`"0.0.0.0:0"` for an ephemeral source port). No
+    /// NAT-T -- see [`Self::from_sockets`] for that.
     pub fn bind(addr: impl ToSocketAddrs, entropy: E) -> io::Result<Self> {
-        Ok(Self { transport: UdpTransport::bind(addr)?, entropy })
+        Ok(Self { transport: UdpTransport::bind(addr)?, natt_transport: None, entropy })
+    }
+
+    /// Like [`Self::bind`], but wrapping an already-bound socket instead of
+    /// binding a fresh one (see [`crate::transport::UdpTransport::from_socket`]) --
+    /// for a caller holding a persistent well-known-port socket across multiple
+    /// connects (e.g. a worker process that binds port 500 once at startup,
+    /// the way a real IKE daemon does) hands in a `try_clone`'d handle here
+    /// per attempt rather than this crate binding its own. No NAT-T -- see
+    /// [`Self::from_sockets`] for that.
+    pub fn from_socket(socket: UdpSocket, entropy: E) -> Self {
+        Self { transport: UdpTransport::from_socket(socket), natt_transport: None, entropy }
+    }
+
+    /// Like [`Self::from_socket`], but also wrapping a persistent port-4500
+    /// socket for RFC 3947 NAT-T floating -- the entry point a caller that
+    /// already binds both well-known ports once at startup (e.g. alongside
+    /// an IKEv2 path) should use instead of `from_socket`, so a connection
+    /// that turns out to need floating actually can.
+    pub fn from_sockets(socket500: UdpSocket, socket4500: UdpSocket, entropy: E) -> Self {
+        Self {
+            transport: UdpTransport::from_socket(socket500),
+            natt_transport: Some(UdpTransport::from_socket(socket4500)),
+            entropy,
+        }
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -85,7 +128,53 @@ impl<E: Entropy> Client<E> {
     }
 
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
-        self.transport.set_read_timeout(dur)
+        self.transport.set_read_timeout(dur)?;
+        if let Some(natt) = &self.natt_transport {
+            natt.set_read_timeout(dur)?;
+        }
+        Ok(())
+    }
+
+    /// Marks the port-4500 socket for kernel ESP-in-UDP decapsulation
+    /// (`crate::transport::enable_udp_encap`) the moment floating is first
+    /// confirmed -- a no-op when `floated` is `false`. Without this, the
+    /// handshake itself completes fine over port 4500 (it's all marked IKE
+    /// traffic, which this socket receives as plain datagrams either way),
+    /// but the ESP-in-UDP data plane that follows never does: incoming
+    /// ESP-in-UDP packets have no non-ESP marker (RFC 3948 §2.2) to
+    /// distinguish them from IKE control traffic, so without this sockopt
+    /// the kernel has no way to tell they're meant for XFRM instead of this
+    /// socket's own `recv()` -- they'd just sit there unread while `ping`
+    /// through the tunnel gets no reply, exactly as confirmed live: a
+    /// fully-succeeding NAT-T handshake with a dead data plane. Mirrors
+    /// `ikev2::session::Ikev2Session::sa_init_with_sockets`'s own call site,
+    /// just on the `Established` (`Client::connect`) end instead of `IKE_SA_INIT`.
+    fn enable_natt_encap(&self, floated: bool) -> Result<(), DriverError> {
+        if floated {
+            let natt = self.natt_transport.as_ref().ok_or(IkeError::Crypto(
+                "NAT-T floating required but this Client has no port-4500 socket (use Client::from_sockets)",
+            ))?;
+            natt.enable_udp_encap()?;
+        }
+        Ok(())
+    }
+
+    /// Send `msg` to `server`, floated (wrapped with the non-ESP marker, to
+    /// `server`'s IP on UDP 4500 instead of its own port) whenever `floated`
+    /// is `true`. Errors if `floated` is requested but this `Client` was
+    /// never given a port-4500 socket (see [`Self::from_sockets`]) -- rather
+    /// than silently sending unfloated, which the peer (now itself expecting
+    /// port 4500) would never see.
+    fn send_step(&self, msg: &[u8], server: SocketAddr, floated: bool) -> Result<(), DriverError> {
+        if floated {
+            let natt = self.natt_transport.as_ref().ok_or(IkeError::Crypto(
+                "NAT-T floating required but this Client has no port-4500 socket (use Client::from_sockets)",
+            ))?;
+            natt.send_to(&wrap_ike_4500(msg), SocketAddr::new(server.ip(), crate::natt_port()))?;
+        } else {
+            self.transport.send_to(msg, server)?;
+        }
+        Ok(())
     }
 
     /// Read datagrams until one carries this session's own ISAKMP cookies
@@ -108,8 +197,9 @@ impl<E: Entropy> Client<E> {
     /// failure confirmed live on the very next attempt after cookie
     /// filtering alone: this same peer, same SA, can legitimately have more
     /// than one message in flight for it -- e.g. a large cert-heavy Main
-    /// Mode message 6 lost to fragmentation (no NAT-T here, see
-    /// [`crate::ikev1`]'s known gap) while the gateway's very next message,
+    /// Mode message 6 lost to IP-level fragmentation (this crate has no IKE
+    /// fragmentation support, a separate, still-open gap from NAT-T) while
+    /// the gateway's very next message,
     /// its XAUTH request (a real, correctly-cookied datagram for the same
     /// SA, just for a *different* sub-exchange -- `exchange::TRANSACTION`,
     /// message-id nonzero, not `exchange::MAIN`'s message-id 0), arrives
@@ -119,9 +209,34 @@ impl<E: Entropy> Client<E> {
     /// "declared length exceeds available bytes" garbage cookie-filtering
     /// alone was meant to fix -- a different bogus value each retry, since
     /// each retransmission's ciphertext differs.
-    fn recv_matching(&self, cky_i: [u8; 8], cky_r: Option<[u8; 8]>, exchange_type: u8) -> Result<Vec<u8>, DriverError> {
+    ///
+    /// `floated`: once NAT-T (`phase1.rs`'s NAT-D detection) decides this
+    /// exchange must float, every message after that point -- both directions
+    /// -- moves to the port-4500 transport and carries the non-ESP marker
+    /// (RFC 3948 §2.2); a datagram received here without that marker while
+    /// `floated` is `true` is dropped as unparseable-for-this-step, same as
+    /// any other stray/foreign datagram.
+    fn recv_matching(&self, cky_i: [u8; 8], cky_r: Option<[u8; 8]>, exchange_type: u8, floated: bool) -> Result<Vec<u8>, DriverError> {
+        let transport = if floated {
+            self.natt_transport.as_ref().ok_or(IkeError::Crypto(
+                "NAT-T floating required but this Client has no port-4500 socket (use Client::from_sockets)",
+            ))?
+        } else {
+            &self.transport
+        };
         loop {
-            let (msg, from) = self.transport.recv_from()?;
+            let (raw, from) = transport.recv_from()?;
+            let msg = if floated {
+                match unwrap_ike_4500(&raw) {
+                    Some(m) => m.to_vec(),
+                    None => {
+                        ike_debug!("dropping datagram from {from} on the floated transport with no non-ESP marker ({} bytes)", raw.len());
+                        continue;
+                    }
+                }
+            } else {
+                raw
+            };
             let hdr = match IsakmpHeader::parse(&msg) {
                 Ok(h) => h,
                 Err(_) => {
@@ -152,16 +267,23 @@ impl<E: Entropy> Client<E> {
         if cfg.mode == Ikev1ExchangeMode::Aggressive && matches!(cfg.local_auth, Ikev1LocalAuth::Sig { .. }) {
             return Err(IkeError::Crypto("Aggressive Mode requires PSK auth (RSA-sig needs Main Mode)").into());
         }
+        // Resolved once, up front -- every NAT-D hash computed for this
+        // exchange (Main or Aggressive) uses this same fixed pair, exactly
+        // like `ikev2::session`'s own NAT-T does (it hashes against the
+        // *configured* peer address, not each reply's observed source --
+        // confirmed by reading `sa_init_with_sockets`).
+        let our_addr = self.transport.local_addr_for(server)?;
         let phase1 = match cfg.mode {
             Ikev1ExchangeMode::Aggressive => {
                 ike_debug!("Aggressive Mode: sending msg1 to {server}");
-                let (msg1, ai) = initiate_aggressive(cfg, &mut self.entropy);
+                let (msg1, ai) = initiate_aggressive(cfg, &mut self.entropy, our_addr, server);
                 let cky_i: [u8; 8] = msg1[..8].try_into().unwrap();
                 self.transport.send_to(&msg1, server)?;
-                let msg2 = self.recv_matching(cky_i, None, exchange::AGGRESSIVE)?;
-                let (msg3, phase1) = ai.complete(&msg2)?;
-                ike_debug!("Aggressive Mode: complete, sending msg3");
-                self.transport.send_to(&msg3, server)?;
+                let msg2 = self.recv_matching(cky_i, None, exchange::AGGRESSIVE, false)?;
+                let (msg3, phase1) = ai.complete(&msg2, our_addr, server)?;
+                ike_debug!("Aggressive Mode: complete, sending msg3 (floated={})", phase1.floated);
+                self.enable_natt_encap(phase1.floated)?;
+                self.send_step(&msg3, server, phase1.floated)?;
 
                 // Aggressive Mode has no acknowledgement for msg3, so pause briefly
                 // before the next round — otherwise a fast responder can receive it
@@ -175,14 +297,18 @@ impl<E: Entropy> Client<E> {
                 let (msg1, sa_sent) = initiate_main(cfg, &mut self.entropy);
                 let cky_i: [u8; 8] = msg1[..8].try_into().unwrap();
                 self.transport.send_to(&msg1, server)?;
-                let msg2 = self.recv_matching(cky_i, None, exchange::MAIN)?;
+                let msg2 = self.recv_matching(cky_i, None, exchange::MAIN, false)?;
                 let cky_r: [u8; 8] = msg2[8..16].try_into().unwrap();
-                let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut self.entropy)?;
+                let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut self.entropy, our_addr, server)?;
+                // Still unfloated: NAT-D isn't verified until message 4
+                // arrives (below), so whether to float is still unknown.
                 self.transport.send_to(&msg3, server)?;
-                let msg4 = self.recv_matching(cky_i, Some(cky_r), exchange::MAIN)?;
+                let msg4 = self.recv_matching(cky_i, Some(cky_r), exchange::MAIN, false)?;
                 let (msg5, id_sent) = ke_sent.complete_ke(&msg4)?;
-                self.transport.send_to(&msg5, server)?;
-                let msg6 = self.recv_matching(cky_i, Some(cky_r), exchange::MAIN)?;
+                ike_debug!("Main Mode: NAT-T floated={}", id_sent.floated);
+                self.enable_natt_encap(id_sent.floated)?;
+                self.send_step(&msg5, server, id_sent.floated)?;
+                let msg6 = self.recv_matching(cky_i, Some(cky_r), exchange::MAIN, id_sent.floated)?;
                 let msg6_len = msg6.len();
                 let phase1 = id_sent.complete_id(&msg6)?;
                 // Unlike Aggressive Mode, message 6 is a real reply the
@@ -200,15 +326,20 @@ impl<E: Entropy> Client<E> {
         // XAUTH: the gateway (not us) sends the first message here — see
         // crate::ikev1::xauth's doc comment. Only run when the caller actually
         // has credentials to answer with; `xauth: true, xauth_creds: None`
-        // (SA negotiation only, no real gateway) skips this.
+        // (SA negotiation only, no real gateway) skips this. Everything from
+        // here on (XAUTH, Mode-Config, Quick Mode) uses `phase1.floated`,
+        // decided above -- once floated, every later exchange on this same
+        // SA stays floated (the peer only ever listens on the port it also
+        // decided to float to).
         if let Some((user, password)) = &cfg.xauth_creds {
             ike_debug!("XAUTH: waiting for the gateway's request");
-            let request = self.recv_matching(phase1.cky_i, Some(phase1.cky_r), exchange::TRANSACTION)?;
+            let request = self.recv_matching(phase1.cky_i, Some(phase1.cky_r), exchange::TRANSACTION, phase1.floated)?;
             let reply = xauth::build_xauth_reply(&phase1, &request, user, password)?;
-            self.transport.send_to(&reply, server)?;
-            let set_msg = self.recv_matching(phase1.cky_i, Some(phase1.cky_r), exchange::TRANSACTION)?;
+            self.send_step(&reply, server, phase1.floated)?;
+            let set_msg = self.recv_matching(phase1.cky_i, Some(phase1.cky_r), exchange::TRANSACTION, phase1.floated)?;
             let (ack, ok) = xauth::build_xauth_ack(&phase1, &set_msg)?;
-            self.transport.send_to(&ack, server)?;
+            self.send_step(&ack, server, phase1.floated)?;
+            ike_debug!("XAUTH: {}", if ok { "succeeded" } else { "failed" });
             if !ok {
                 return Err(IkeError::AuthFailed.into());
             }
@@ -225,8 +356,8 @@ impl<E: Entropy> Client<E> {
             self.entropy.fill(&mut mid_b);
             let msgid = u32::from_be_bytes(mid_b) | 1; // non-zero
             let (request, next_iv) = modecfg::build_cfg_request(&phase1, msgid)?;
-            self.transport.send_to(&request, server)?;
-            let reply = self.recv_matching(phase1.cky_i, Some(phase1.cky_r), exchange::TRANSACTION)?;
+            self.send_step(&request, server, phase1.floated)?;
+            let reply = self.recv_matching(phase1.cky_i, Some(phase1.cky_r), exchange::TRANSACTION, phase1.floated)?;
             let got = modecfg::parse_cfg_reply(&phase1, &reply, &next_iv)?;
             assigned_ip4 = got.assigned_ipv4();
             netmask = got.assigned_netmask();
@@ -257,13 +388,21 @@ impl<E: Entropy> Client<E> {
             if cfg.pfs_group.is_some() { " with PFS" } else { "" }
         );
         let (qm1, qi) = initiate_quick_with_pfs(&phase1, &mut self.entropy, cfg.esp_cipher, ts_local, cfg.ts_remote, cfg.pfs_group)?;
-        self.transport.send_to(&qm1, server)?;
-        let qm2 = self.recv_matching(phase1.cky_i, Some(phase1.cky_r), exchange::QUICK)?;
+        self.send_step(&qm1, server, phase1.floated)?;
+        let qm2 = self.recv_matching(phase1.cky_i, Some(phase1.cky_r), exchange::QUICK, phase1.floated)?;
         let (qm3, child) = qi.complete(&qm2)?;
-        self.transport.send_to(&qm3, server)?;
+        self.send_step(&qm3, server, phase1.floated)?;
         ike_debug!("Quick Mode: complete -- CHILD SA established");
 
-        let local_addr = self.transport.local_addr_for(server)?;
+        // Post-float, our own reported address's port must be 4500 too, not
+        // just the peer's -- a caller deciding whether to install a
+        // UDP-encap kernel XFRM SA reads `phase1.floated` directly (see
+        // `Phase1State::floated`'s doc) and pairs it with this `local_addr`
+        // and its own already-known `server` address (bumped to port 4500
+        // the same way) -- the same IKE-version-agnostic, port-based signal
+        // an IKEv2 NAT-T path would use too.
+        let local_addr =
+            if phase1.floated { SocketAddr::new(our_addr.ip(), crate::natt_port()) } else { self.transport.local_addr_for(server)? };
         Ok(Established { phase1, child, assigned_ip4, netmask, dns, subnets, local_addr })
     }
 }
@@ -282,7 +421,7 @@ mod tests {
     /// against a real FortiGate before this fix landed.
     #[test]
     fn recv_matching_skips_a_stray_datagram_with_the_wrong_cookies() {
-        let client = Client { transport: UdpTransport::bind("127.0.0.1:0").unwrap(), entropy: SeedEntropy::new(1) };
+        let client = Client { transport: UdpTransport::bind("127.0.0.1:0").unwrap(), natt_transport: None, entropy: SeedEntropy::new(1) };
         let client_addr = client.local_addr().unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
 
@@ -304,7 +443,7 @@ mod tests {
         sender.send_to(&real, client_addr).unwrap();
 
         client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let got = client.recv_matching(cky_i, Some(cky_r), exchange::MAIN).unwrap();
+        let got = client.recv_matching(cky_i, Some(cky_r), exchange::MAIN, false).unwrap();
         assert_eq!(got, real, "must skip the stray datagram and return the one with matching cookies");
     }
 
@@ -313,7 +452,7 @@ mod tests {
     /// message 1) can be checked at that point.
     #[test]
     fn recv_matching_accepts_any_resp_cookie_when_not_yet_known() {
-        let client = Client { transport: UdpTransport::bind("127.0.0.1:0").unwrap(), entropy: SeedEntropy::new(1) };
+        let client = Client { transport: UdpTransport::bind("127.0.0.1:0").unwrap(), natt_transport: None, entropy: SeedEntropy::new(1) };
         let client_addr = client.local_addr().unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
 
@@ -325,7 +464,7 @@ mod tests {
         sender.send_to(&real, client_addr).unwrap();
 
         client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let got = client.recv_matching(cky_i, None, exchange::MAIN).unwrap();
+        let got = client.recv_matching(cky_i, None, exchange::MAIN, false).unwrap();
         assert_eq!(got, real);
     }
 
@@ -338,7 +477,7 @@ mod tests {
     /// exceeds available bytes" a few bytes into the resulting garbage.
     #[test]
     fn recv_matching_skips_a_same_session_datagram_from_the_wrong_sub_exchange() {
-        let client = Client { transport: UdpTransport::bind("127.0.0.1:0").unwrap(), entropy: SeedEntropy::new(1) };
+        let client = Client { transport: UdpTransport::bind("127.0.0.1:0").unwrap(), natt_transport: None, entropy: SeedEntropy::new(1) };
         let client_addr = client.local_addr().unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
 
@@ -360,7 +499,7 @@ mod tests {
         sender.send_to(&real, client_addr).unwrap();
 
         client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let got = client.recv_matching(cky_i, Some(cky_r), exchange::MAIN).unwrap();
+        let got = client.recv_matching(cky_i, Some(cky_r), exchange::MAIN, false).unwrap();
         assert_eq!(got, real, "must skip the Transaction-exchange datagram and return the Main-Mode one");
     }
 }

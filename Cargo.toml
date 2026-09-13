@@ -46,6 +46,8 @@ num-bigint-dig = { version = "0.8", default-features = false }
 # IKEv1 uses AES-CBC with explicit IV chaining (not the AEAD IKEv2 uses).
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
+# Raw UDP_ENCAP sockopt wiring for RFC 3947/3948 NAT-T (transport.rs).
+libc = "0.2"
 
 [dev-dependencies]
 # Only tests build throwaway certificates; the builder never ships in the library.

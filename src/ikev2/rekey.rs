@@ -454,7 +454,7 @@ mod tests {
         let cipher = SkCipher::Aes256Cbc(crate::crypto::IntegAlgorithm::HmacSha2_512_256);
 
         let req = build_rekey_request_with_pfs(&init_sa, 2, 0xDEAD_BEEF, 0x1111_1111, &ni, cipher, None, &[1u8; 8]).unwrap();
-        let (resp, resp_child) =
+        let (resp, mut resp_child) =
             responder_process_rekey_with_pfs(&resp_sa, &req, 0x2222_2222, &nr, cipher, None, &[2u8; 8], None).unwrap();
         let mut init_child = initiator_complete_rekey_with_pfs(&init_sa, &ni, 0x1111_1111, cipher, None, &resp).unwrap();
 

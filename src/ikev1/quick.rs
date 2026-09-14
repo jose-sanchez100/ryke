@@ -1125,7 +1125,7 @@ mod tests {
         // same shape a caller installing kernel XFRM state would use), and
         // confirm it opens what the responder's freshly rekeyed outbound SA
         // seals.
-        let new_ichild_in =
+        let mut new_ichild_in =
             EspSa::new_with_cipher(rekeyed.local_spi, rekeyed.key_in.cipher, &rekeyed.key_in.enc, &rekeyed.key_in.integ).unwrap();
         let pkt: Vec<u8> = (0..40u8).collect();
         let sealed = new_rchild.outbound.seal(&pkt, 4).unwrap();

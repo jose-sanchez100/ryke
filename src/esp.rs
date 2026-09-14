@@ -96,6 +96,12 @@ pub struct EspSa {
     /// Classic-cipher integrity key; empty for AEAD.
     integ_key: Vec<u8>,
     seq: u32,
+    /// Anti-replay state (RFC 4303 §3.4.3), inbound side only: highest
+    /// sequence number accepted so far, plus a 64-wide bitmap of the
+    /// `replay_highest - 63 ..= replay_highest` window (bit 0 = highest).
+    /// Outbound `EspSa`s never consult this -- only `open()` does.
+    replay_highest: u32,
+    replay_window: u64,
 }
 
 impl EspSa {
@@ -132,6 +138,8 @@ impl EspSa {
             salt: salt.to_vec(),
             integ_key: integ_key.to_vec(),
             seq: 0,
+            replay_highest: 0,
+            replay_window: 0,
         })
     }
 
@@ -232,9 +240,48 @@ impl EspSa {
         Ok(out)
     }
 
+    /// RFC 4303 §3.4.3 sliding-replay-window check, against `seq` alone (no
+    /// state mutation) -- called *before* decrypting, so a forged packet
+    /// with a stale/reused sequence number is rejected without spending a
+    /// crypto verification on it.
+    fn replay_check(&self, seq: u32) -> Result<(), IkeError> {
+        if seq == 0 {
+            return Err(IkeError::Crypto("ESP replay detected"));
+        }
+        if seq > self.replay_highest {
+            return Ok(());
+        }
+        let diff = self.replay_highest - seq;
+        if diff >= 64 {
+            return Err(IkeError::Crypto("ESP replay detected"));
+        }
+        if self.replay_window & (1 << diff) != 0 {
+            return Err(IkeError::Crypto("ESP replay detected"));
+        }
+        Ok(())
+    }
+
+    /// Records `seq` as accepted -- only called *after* the packet's
+    /// ICV/AEAD tag has verified, so an attacker can't burn valid sequence
+    /// numbers with forged packets.
+    fn replay_advance(&mut self, seq: u32) {
+        if seq > self.replay_highest {
+            let shift = seq - self.replay_highest;
+            self.replay_window = if shift >= 64 { 0 } else { self.replay_window << shift };
+            self.replay_window |= 1;
+            self.replay_highest = seq;
+        } else {
+            let diff = self.replay_highest - seq;
+            self.replay_window |= 1 << diff;
+        }
+    }
+
     /// Decrypt an ESP packet, returning the inner IP packet and its Next Header.
-    /// The packet's SPI must match this SA.
-    pub fn open(&self, packet: &[u8]) -> Result<(Vec<u8>, u8), IkeError> {
+    /// The packet's SPI must match this SA. Enforces the RFC 4303 §3.4.3
+    /// anti-replay window; call this only on the inbound `EspSa` of a live
+    /// session (a fresh one built for a one-off decrypt, e.g. in a test, has
+    /// an empty window and so accepts any single packet once).
+    pub fn open(&mut self, packet: &[u8]) -> Result<(Vec<u8>, u8), IkeError> {
         let iv_len = if self.cipher.is_aead() { IV_LEN } else { self.cipher.block_len() };
         let icv_len = self.cipher.icv_len();
         let min = ESP_HEADER_LEN + iv_len + icv_len;
@@ -245,6 +292,8 @@ impl EspSa {
         if spi != self.spi {
             return Err(IkeError::Crypto("ESP SPI does not match this SA"));
         }
+        let seq = u32::from_be_bytes(packet[4..8].try_into().unwrap());
+        self.replay_check(seq)?;
         let aad = &packet[0..ESP_HEADER_LEN]; // SPI | SeqNum
         let iv = &packet[ESP_HEADER_LEN..ESP_HEADER_LEN + iv_len];
         let ct_and_tag = &packet[ESP_HEADER_LEN + iv_len..];
@@ -292,6 +341,7 @@ impl EspSa {
             }
         }
         let inner = plaintext[..pad_start].to_vec();
+        self.replay_advance(seq);
         Ok((inner, next_header))
     }
 }
@@ -395,7 +445,7 @@ mod tests {
     fn seal_open_roundtrip() {
         let km = [0x42u8; 36];
         let mut tx = EspSa::new(0xCAFE_BABE, &km).unwrap();
-        let rx = EspSa::new(0xCAFE_BABE, &km).unwrap();
+        let mut rx = EspSa::new(0xCAFE_BABE, &km).unwrap();
 
         let inner = b"a pretend inner IP packet with some length".to_vec();
         let packet = tx.seal(&inner, next_header::IPV4).unwrap();
@@ -411,7 +461,7 @@ mod tests {
         let km = [9u8; 36];
         for len in 0..40 {
             let mut tx = EspSa::new(1, &km).unwrap();
-            let rx = EspSa::new(1, &km).unwrap();
+            let mut rx = EspSa::new(1, &km).unwrap();
             let inner: Vec<u8> = (0..len as u8).collect();
             let packet = tx.seal(&inner, next_header::IPV6).unwrap();
             // ciphertext (after SPI|Seq|IV, before the 16-byte tag) is 4-aligned.
@@ -435,7 +485,7 @@ mod tests {
     #[test]
     fn wrong_spi_is_rejected() {
         let mut tx = EspSa::new(10, &[2u8; 36]).unwrap();
-        let rx = EspSa::new(11, &[2u8; 36]).unwrap();
+        let mut rx = EspSa::new(11, &[2u8; 36]).unwrap();
         let packet = tx.seal(b"hello", 4).unwrap();
         assert!(matches!(rx.open(&packet), Err(IkeError::Crypto(_))));
     }
@@ -443,14 +493,14 @@ mod tests {
     #[test]
     fn tampering_and_wrong_key_are_rejected() {
         let mut tx = EspSa::new(5, &[3u8; 36]).unwrap();
-        let rx = EspSa::new(5, &[3u8; 36]).unwrap();
+        let mut rx = EspSa::new(5, &[3u8; 36]).unwrap();
         let mut packet = tx.seal(b"hello world", 4).unwrap();
         let last = packet.len() - 1;
         packet[last] ^= 1;
         assert_eq!(rx.open(&packet).unwrap_err(), IkeError::BadIntegrity);
 
         let mut tx2 = EspSa::new(5, &[7u8; 36]).unwrap();
-        let rx2 = EspSa::new(5, &[8u8; 36]).unwrap();
+        let mut rx2 = EspSa::new(5, &[8u8; 36]).unwrap();
         let good = tx2.seal(b"y", 4).unwrap();
         assert_eq!(rx2.open(&good).unwrap_err(), IkeError::BadIntegrity);
     }
@@ -462,7 +512,7 @@ mod tests {
         // 1,2,3,... pattern -- exercises the new padding check independently
         // of the (already-covered) tag-tamper path.
         let tx = EspSa::new(1, &[4u8; 36]).unwrap();
-        let rx = EspSa::new(1, &[4u8; 36]).unwrap();
+        let mut rx = EspSa::new(1, &[4u8; 36]).unwrap();
 
         let inner = b"hello".to_vec();
         let pad_len = 3u8;
@@ -487,6 +537,44 @@ mod tests {
         assert_eq!(rx.open(&packet).unwrap_err(), IkeError::Crypto("ESP padding bytes malformed"));
     }
 
+    #[test]
+    fn replayed_packet_is_rejected_but_out_of_order_within_window_is_accepted() {
+        let km = [7u8; 36];
+        let mut tx = EspSa::new(1, &km).unwrap();
+        let mut rx = EspSa::new(1, &km).unwrap();
+
+        let p1 = tx.seal(b"one", next_header::IPV4).unwrap();
+        let p2 = tx.seal(b"two", next_header::IPV4).unwrap();
+        let p3 = tx.seal(b"three", next_header::IPV4).unwrap();
+
+        // In-order delivery of the first packet succeeds.
+        assert_eq!(rx.open(&p1).unwrap().0, b"one");
+        // Replaying the same packet must be rejected.
+        assert_eq!(rx.open(&p1).unwrap_err(), IkeError::Crypto("ESP replay detected"));
+
+        // Out-of-order but not-yet-seen packets within the window are accepted...
+        assert_eq!(rx.open(&p3).unwrap().0, b"three");
+        assert_eq!(rx.open(&p2).unwrap().0, b"two");
+        // ...but replaying either of them afterward is rejected.
+        assert_eq!(rx.open(&p2).unwrap_err(), IkeError::Crypto("ESP replay detected"));
+        assert_eq!(rx.open(&p3).unwrap_err(), IkeError::Crypto("ESP replay detected"));
+    }
+
+    #[test]
+    fn packet_older_than_the_replay_window_is_rejected() {
+        let km = [8u8; 36];
+        let mut tx = EspSa::new(1, &km).unwrap();
+        let mut rx = EspSa::new(1, &km).unwrap();
+
+        let old = tx.seal(b"old", next_header::IPV4).unwrap();
+        for _ in 0..70 {
+            let _ = tx.seal(b"filler", next_header::IPV4).unwrap();
+        }
+        let fresh = tx.seal(b"fresh", next_header::IPV4).unwrap();
+        assert_eq!(rx.open(&fresh).unwrap().0, b"fresh");
+        assert_eq!(rx.open(&old).unwrap_err(), IkeError::Crypto("ESP replay detected"));
+    }
+
     fn aead_ciphers() -> Vec<SkCipher> {
         vec![SkCipher::Aes128Gcm, SkCipher::Aes192Gcm, SkCipher::Aes256Gcm, SkCipher::ChaCha20Poly1305]
     }
@@ -507,7 +595,7 @@ mod tests {
             let enc = vec![0x24u8; cipher.key_len() + cipher.salt_len()];
             for len in [0usize, 1, 15, 16, 17, 40] {
                 let mut tx = EspSa::new_with_cipher(1, cipher, &enc, &[]).unwrap();
-                let rx = EspSa::new_with_cipher(1, cipher, &enc, &[]).unwrap();
+                let mut rx = EspSa::new_with_cipher(1, cipher, &enc, &[]).unwrap();
                 let inner: Vec<u8> = (0..len as u8).collect();
                 let packet = tx.seal(&inner, next_header::IPV4).unwrap();
                 let (out, nh) = rx.open(&packet).unwrap();
@@ -525,7 +613,7 @@ mod tests {
             let ik = vec![0x62u8; integ.key_len()];
             for len in [0usize, 1, 15, 16, 17, 40] {
                 let mut tx = EspSa::new_with_cipher(1, cipher, &enc, &ik).unwrap();
-                let rx = EspSa::new_with_cipher(1, cipher, &enc, &ik).unwrap();
+                let mut rx = EspSa::new_with_cipher(1, cipher, &enc, &ik).unwrap();
                 let inner: Vec<u8> = (0..len as u8).collect();
                 let packet = tx.seal(&inner, next_header::IPV6).unwrap();
                 let (out, nh) = rx.open(&packet).unwrap();
@@ -559,7 +647,7 @@ mod tests {
             let enc = vec![0x44u8; cipher.key_len()];
             let ik = vec![0x55u8; integ.key_len()];
             let mut tx = EspSa::new_with_cipher(5, cipher, &enc, &ik).unwrap();
-            let rx = EspSa::new_with_cipher(5, cipher, &enc, &ik).unwrap();
+            let mut rx = EspSa::new_with_cipher(5, cipher, &enc, &ik).unwrap();
             let mut packet = tx.seal(b"hello world", 4).unwrap();
             let last = packet.len() - 1;
             packet[last] ^= 1;
@@ -568,7 +656,7 @@ mod tests {
             let mut bad_ik = ik.clone();
             bad_ik[0] ^= 0xff;
             let mut tx2 = EspSa::new_with_cipher(5, cipher, &enc, &ik).unwrap();
-            let rx2 = EspSa::new_with_cipher(5, cipher, &enc, &bad_ik).unwrap();
+            let mut rx2 = EspSa::new_with_cipher(5, cipher, &enc, &bad_ik).unwrap();
             let good = tx2.seal(b"y", 4).unwrap();
             assert_eq!(rx2.open(&good).unwrap_err(), IkeError::BadIntegrity, "{cipher:?}");
         }

@@ -697,6 +697,38 @@ mod tests {
     }
 
     #[test]
+    fn initiator_auth_request_always_carries_initial_contact() {
+        // RFC 7296 §2.4: we keep no state across restarts, so every first
+        // IKE_AUTH we send asserts INITIAL_CONTACT -- the responder uses this
+        // to drop any stale SA of ours it's still holding.
+        let (init_sa, resp_sa) = run_sa_init();
+        let psk = b"pw".to_vec();
+        let icfg = AuthConfig::psk(Identification::fqdn("client.example"), psk.clone());
+        let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), psk);
+        let req = initiator_auth_request(&init_sa, &icfg, 1, &esp_offer(0), &[1u8; 8]).unwrap();
+        let (_resp, _peer, _spi, initial_contact) =
+            responder_process_auth(&resp_sa, &req, &rcfg, 2, &[2u8; 8], None).unwrap();
+        assert!(initial_contact);
+    }
+
+    #[test]
+    fn eap_request_variants_also_carry_initial_contact() {
+        let (init_sa, resp_sa) = run_sa_init();
+        let id = Identification::fqdn("eap.example");
+        let req = initiator_eap_request(&init_sa, &id, 1, false, &esp_offer(0), &[1u8; 8]).unwrap();
+        let (first, inner) = crate::ikev2::sk::open_encrypted(resp_sa.suite.sk_cipher(), &req, &resp_sa.keys.sk_ei, &resp_sa.keys.sk_ai).unwrap();
+        let got = parse_auth_inner(first, &inner);
+        // EAP-mode has no AUTH payload yet, so parse_auth_inner errors on the
+        // missing AUTH -- what we care about here is that it got far enough to
+        // see the Notify, i.e. the payload chain parsed. Re-derive directly:
+        let has_initial_contact = payloads(first, &inner)
+            .filter_map(|p| p.ok())
+            .any(|p| p.payload_type == PayloadType::Notify && Notify::parse(p.data).map(|n| n.notify_type == notify_type::INITIAL_CONTACT).unwrap_or(false));
+        assert!(has_initial_contact);
+        assert!(got.is_err()); // sanity: still no AUTH payload in EAP mode
+    }
+
+    #[test]
     fn ike_auth_assigns_inner_ip_via_config_payload() {
         // The responder hands the initiator an inner IP + DNS in a CFG_REPLY;
         // the initiator parses it out of the IKE_AUTH response. This is what a

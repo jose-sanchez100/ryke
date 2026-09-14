@@ -872,6 +872,24 @@ mod tests {
         assert_eq!(drive(initiator, responder), Outcome::Established);
     }
 
+    // Regression test for a real FortiGate finding: its own certificate
+    // legitimately names its public hostname, which need not match whatever
+    // the client's configured connect address is (e.g. an internal DNS name
+    // or IP) -- `expected_dns: None` must accept a cert with an unrelated
+    // SAN as long as it chains to a trusted CA, matching the old charon/VICI
+    // backend's equivalent (chain-only, no hostname check).
+    #[test]
+    fn eap_with_certificate_server_auth_succeeds_without_a_dns_check() {
+        let (init_sa, resp_sa) = sa_pair();
+        let verify = ServerVerify::TrustedCas { cas: vec![CA_CERT_DER.to_vec()], expected_dns: None, now_unix: valid_now() };
+        let initiator = EapInitiator::new(init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111, verify);
+        // The responder's own ID has nothing to do with the leaf's SAN
+        // (vpn.example.com) -- proving the check is genuinely skipped, not
+        // accidentally still matching.
+        let responder = EapResponder::new(resp_sa, Identification::fqdn("totally-unrelated-name"), cert_server(), b"alice".to_vec(), "s3cret".into(), 0x2222);
+        assert_eq!(drive(initiator, responder), Outcome::Established);
+    }
+
     #[test]
     fn multi_user_selects_password_by_identity() {
         // Two provisioned users; a client authenticating as the *second* must

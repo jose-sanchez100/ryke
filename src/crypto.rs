@@ -845,14 +845,16 @@ pub fn derive_session_keys(
     let mut nonces = Vec::with_capacity(ni.len() + nr.len());
     nonces.extend_from_slice(ni);
     nonces.extend_from_slice(nr);
-    let skeyseed = prf(algo, &nonces, shared_secret);
+    let mut skeyseed = prf(algo, &nonces, shared_secret);
 
     let mut seed = nonces; // Ni | Nr | SPIi | SPIr
     seed.extend_from_slice(&spi_i.to_be_bytes());
     seed.extend_from_slice(&spi_r.to_be_bytes());
 
     let total = 3 * lengths.prf + 2 * lengths.integ + 2 * lengths.encr;
-    let km = prf_plus(algo, &skeyseed, &seed, total);
+    let mut km = prf_plus(algo, &skeyseed, &seed, total);
+    skeyseed.zeroize();
+    seed.zeroize();
 
     let mut off = 0;
     let mut take = |n: usize| {
@@ -860,7 +862,7 @@ pub fn derive_session_keys(
         off += n;
         slice
     };
-    SessionKeys {
+    let keys = SessionKeys {
         sk_d: take(lengths.prf),
         sk_ai: take(lengths.integ),
         sk_ar: take(lengths.integ),
@@ -868,7 +870,9 @@ pub fn derive_session_keys(
         sk_er: take(lengths.encr),
         sk_pi: take(lengths.prf),
         sk_pr: take(lengths.prf),
-    }
+    };
+    km.zeroize();
+    keys
 }
 
 /// Derive new IKE keys for an **IKE-SA rekey** (RFC 7296 §2.18). Unlike
@@ -895,7 +899,8 @@ pub fn derive_rekey_session_keys(
     data.extend_from_slice(shared_secret);
     data.extend_from_slice(ni);
     data.extend_from_slice(nr);
-    let skeyseed = prf(algo, sk_d_old, &data);
+    let mut skeyseed = prf(algo, sk_d_old, &data);
+    data.zeroize();
 
     let mut seed = Vec::with_capacity(ni.len() + nr.len() + 16);
     seed.extend_from_slice(ni);
@@ -904,14 +909,16 @@ pub fn derive_rekey_session_keys(
     seed.extend_from_slice(&spi_r.to_be_bytes());
 
     let total = 3 * lengths.prf + 2 * lengths.integ + 2 * lengths.encr;
-    let km = prf_plus(algo, &skeyseed, &seed, total);
+    let mut km = prf_plus(algo, &skeyseed, &seed, total);
+    skeyseed.zeroize();
+    seed.zeroize();
     let mut off = 0;
     let mut take = |n: usize| {
         let slice = km[off..off + n].to_vec();
         off += n;
         slice
     };
-    SessionKeys {
+    let keys = SessionKeys {
         sk_d: take(lengths.prf),
         sk_ai: take(lengths.integ),
         sk_ar: take(lengths.integ),
@@ -919,7 +926,9 @@ pub fn derive_rekey_session_keys(
         sk_er: take(lengths.encr),
         sk_pi: take(lengths.prf),
         sk_pr: take(lengths.prf),
-    }
+    };
+    km.zeroize();
+    keys
 }
 
 /// ESP/AH CHILD SA keys, in the order `KEYMAT` provides them (RFC 7296 §2.17).
@@ -960,7 +969,8 @@ fn derive_child_keys_inner(
     }
     seed.extend_from_slice(ni);
     seed.extend_from_slice(nr);
-    let km = prf_plus(algo, sk_d, &seed, 2 * (encr_len + integ_len));
+    let mut km = prf_plus(algo, sk_d, &seed, 2 * (encr_len + integ_len));
+    seed.zeroize();
 
     let mut off = 0;
     let mut take = |n: usize| {
@@ -968,12 +978,14 @@ fn derive_child_keys_inner(
         off += n;
         slice
     };
-    ChildKeys {
+    let keys = ChildKeys {
         encr_i: take(encr_len),
         integ_i: take(integ_len),
         encr_r: take(encr_len),
         integ_r: take(integ_len),
-    }
+    };
+    km.zeroize();
+    keys
 }
 
 /// Derive CHILD SA keys for the SA created by `IKE_AUTH` (no PFS):

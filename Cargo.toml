@@ -57,3 +57,8 @@ zeroize = { version = "1", features = ["derive"] }
 [dev-dependencies]
 # Only tests build throwaway certificates; the builder never ships in the library.
 x509-cert = { version = "0.2.5", default-features = false, features = ["std", "builder"] }
+# Only the ike_client_eap_fortigate example uses this, for a raw IPPROTO_ESP
+# socket (no NAT-T in play means ESP travels as raw IP protocol 50, which
+# std::net has no way to open) -- never a library dependency. "all" is needed
+# for Type::RAW.
+socket2 = { version = "0.5", features = ["all"] }

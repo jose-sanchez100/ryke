@@ -27,7 +27,7 @@ aead = "0.5"
 # EAP-MSCHAPv2 (RFC 2759) legacy crypto — required only for that auth method.
 md4 = "0.10"
 des = "0.8"
-sha1 = "0.10"
+sha1 = { version = "0.10", features = ["oid"] }
 # MD5 PRF/INTEG (IKEv2 transform IDs 1/1) and ChaCha20-Poly1305 (ENCR 28,
 # RFC 7634) -- legacy and modern ends of the algorithm-agility matrix.
 md-5 = "0.10"

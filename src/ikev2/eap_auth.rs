@@ -385,12 +385,14 @@ impl EapInitiator {
             Ok(a) => a,
             Err(_) => return false,
         };
-        if auth.method != auth_method::DIGITAL_SIGNATURE {
+        if auth.method != auth_method::DIGITAL_SIGNATURE && auth.method != auth_method::RSA_SIG {
             return false;
         }
         let octets = responder_signed_octets(self.sa.suite.prf_algorithm(), &self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, idr);
         // Path validation (chain + dates + CA) + SAN binding + signature.
-        crate::ikev2::sign::verify_cert_auth(leaf, &certs[1..], cas, expected_dns.as_deref(), now, &auth.data, &octets).is_ok()
+        // `auth.method` selects RFC 7427 method 14 or classic method 1 (a
+        // real FortiGate "Certificates + EAP" sends method 1, not 14).
+        crate::ikev2::sign::verify_cert_auth(leaf, &certs[1..], cas, expected_dns.as_deref(), now, auth.method, &auth.data, &octets).is_ok()
     }
 
     /// First message: `SK{ IDi, SAi2, TSi, TSr }` (no AUTH — request EAP).

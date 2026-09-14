@@ -340,7 +340,7 @@ fn verify_peer_auth(
     match &cfg.peer {
         PeerAuth::Psk(psk) => verify_psk(algo, &got.auth, psk, expected_octets),
         PeerAuth::Cert { cas, expected_dns, now_unix } => {
-            if got.auth.method != auth_method::DIGITAL_SIGNATURE {
+            if got.auth.method != auth_method::DIGITAL_SIGNATURE && got.auth.method != auth_method::RSA_SIG {
                 return Err(IkeError::AuthFailed);
             }
             let leaf = got.certs.first().ok_or(IkeError::MissingPayload("CERT"))?;
@@ -350,6 +350,7 @@ fn verify_peer_auth(
                 cas,
                 expected_dns.as_deref(),
                 *now_unix,
+                got.auth.method,
                 &got.auth.data,
                 expected_octets,
             )

@@ -246,6 +246,26 @@ impl VerifyingKey {
             .map_err(|_| IkeError::AuthFailed)
     }
 
+    /// Verify classic RFC 7296 §3.8 method-1 (RSA Digital Signature) AUTH
+    /// Data: a plain PKCS#1 v1.5 signature over the §2.15 `signed_octets`
+    /// with a `DigestInfo`-prefixed digest, unlike method 14's
+    /// algorithm-tagged encoding. Tries SHA-256 first, then falls back to
+    /// SHA-1 (the historical RFC 7296 default) since peers vary on which
+    /// digest they actually used.
+    pub fn verify_classic_rsa_auth_data(&self, sig: &[u8], signed_octets: &[u8]) -> Result<(), IkeError> {
+        let VerifyingKey::Rsa(pk) = self else {
+            return Err(IkeError::Crypto("method 1 (RSA Digital Signature) needs an RSA certificate key"));
+        };
+        if pk.verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &Sha256::digest(signed_octets), sig).is_ok() {
+            return Ok(());
+        }
+        use sha1::Sha1;
+        if pk.verify(rsa::Pkcs1v15Sign::new::<Sha1>(), &Sha1::digest(signed_octets), sig).is_ok() {
+            return Ok(());
+        }
+        Err(IkeError::AuthFailed)
+    }
+
     /// Verify method-14 AUTH Data against the §2.15 `signed_octets`.
     pub fn verify_auth_data(&self, auth_data: &[u8], signed_octets: &[u8]) -> Result<(), IkeError> {
         let (alg, sig) = parse_auth_data(auth_data)?;
@@ -435,10 +455,15 @@ pub fn validate_chain(
     Err(IkeError::AuthFailed)
 }
 
-/// The full peer-certificate check for RFC 7427 auth: the leaf must be trusted
-/// (pinned exactly in `trusted`, or chain to one of the trusted anchors through
-/// `intermediates`), be within validity, vouch for `expected_dns` if given, and
-/// carry a signature over `signed_octets` that verifies under its key.
+/// The full peer-certificate check for cert-based auth: the leaf must be
+/// trusted (pinned exactly in `trusted`, or chain to one of the trusted
+/// anchors through `intermediates`), be within validity, vouch for
+/// `expected_dns` if given, and carry a signature over `signed_octets` that
+/// verifies under its key. `auth_method` selects the AUTH payload's wire
+/// format: RFC 7427 Digital Signature (14, self-describing algorithm) or the
+/// classic RFC 7296 §3.8 method 1 (RSA Digital Signature, a bare PKCS#1 v1.5
+/// signature) — a real FortiGate ("Certificates + EAP") sends method 1, not
+/// 14, live-confirmed.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_cert_auth(
     leaf_der: &[u8],
@@ -446,6 +471,7 @@ pub fn verify_cert_auth(
     trusted: &[Vec<u8>],
     expected_dns: Option<&str>,
     now_unix: u64,
+    auth_method: u8,
     auth_data: &[u8],
     signed_octets: &[u8],
 ) -> Result<(), IkeError> {
@@ -462,7 +488,12 @@ pub fn verify_cert_auth(
         }
     }
     // The AUTH signature must verify under the leaf's key.
-    VerifyingKey::from_cert_der(leaf_der)?.verify_auth_data(auth_data, signed_octets)
+    let vk = VerifyingKey::from_cert_der(leaf_der)?;
+    match auth_method {
+        crate::ikev2::payload::auth_method::DIGITAL_SIGNATURE => vk.verify_auth_data(auth_data, signed_octets),
+        crate::ikev2::payload::auth_method::RSA_SIG => vk.verify_classic_rsa_auth_data(auth_data, signed_octets),
+        _ => Err(IkeError::Crypto("unsupported AUTH method for certificate verification")),
+    }
 }
 
 /// The SHA-1 of a certificate's DER `SubjectPublicKeyInfo` — the trust-anchor

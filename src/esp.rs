@@ -282,7 +282,16 @@ impl EspSa {
         if plaintext.len() < 2 + pad_len {
             return Err(IkeError::Crypto("ESP pad length exceeds plaintext"));
         }
-        let inner = plaintext[..plaintext.len() - 2 - pad_len].to_vec();
+        // RFC 4303 §2.4: padding bytes are 1, 2, 3, … pad_len -- the same
+        // pattern `seal` writes below. Catches corruption/tampering that
+        // slipped past a forged-but-consistent trailer.
+        let pad_start = plaintext.len() - 2 - pad_len;
+        for (i, &b) in plaintext[pad_start..plaintext.len() - 2].iter().enumerate() {
+            if b != (i + 1) as u8 {
+                return Err(IkeError::Crypto("ESP padding bytes malformed"));
+            }
+        }
+        let inner = plaintext[..pad_start].to_vec();
         Ok((inner, next_header))
     }
 }
@@ -444,6 +453,38 @@ mod tests {
         let rx2 = EspSa::new(5, &[8u8; 36]).unwrap();
         let good = tx2.seal(b"y", 4).unwrap();
         assert_eq!(rx2.open(&good).unwrap_err(), IkeError::BadIntegrity);
+    }
+
+    #[test]
+    fn malformed_padding_bytes_are_rejected() {
+        // Forge a packet whose AEAD tag is valid (so it passes authentication)
+        // but whose padding trailer doesn't follow the RFC 4303 §2.4
+        // 1,2,3,... pattern -- exercises the new padding check independently
+        // of the (already-covered) tag-tamper path.
+        let tx = EspSa::new(1, &[4u8; 36]).unwrap();
+        let rx = EspSa::new(1, &[4u8; 36]).unwrap();
+
+        let inner = b"hello".to_vec();
+        let pad_len = 3u8;
+        let mut plaintext = inner.clone();
+        plaintext.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // wrong: should be 1,2,3
+        plaintext.push(pad_len);
+        plaintext.push(next_header::IPV4);
+
+        let seq: u32 = 1;
+        let iv_bytes = [0x11u8; IV_LEN];
+        let mut aad = [0u8; ESP_HEADER_LEN];
+        aad[..4].copy_from_slice(&tx.spi.to_be_bytes());
+        aad[4..].copy_from_slice(&seq.to_be_bytes());
+
+        let ct_and_tag = aead_seal_dispatch(tx.cipher, &tx.enc_key, &tx.nonce(&iv_bytes), &aad, &plaintext).unwrap();
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&aad);
+        packet.extend_from_slice(&iv_bytes);
+        packet.extend_from_slice(&ct_and_tag);
+
+        assert_eq!(rx.open(&packet).unwrap_err(), IkeError::Crypto("ESP padding bytes malformed"));
     }
 
     fn aead_ciphers() -> Vec<SkCipher> {

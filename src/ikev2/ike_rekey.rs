@@ -154,6 +154,7 @@ pub fn responder_process_ike_rekey(
         init_message: Vec::new(),
         resp_message: Vec::new(),
         peer_signature_hashes: old_sa.peer_signature_hashes.clone(),
+        peer_supports_fragmentation: old_sa.peer_supports_fragmentation,
     };
     Ok((response, new_sa))
 }

@@ -223,7 +223,8 @@ impl IkeHeader {
 pub struct RawPayload<'a> {
     pub payload_type: PayloadType,
     /// The critical bit (RFC 7296 §2.5): if set and the type is unknown, the
-    /// whole message must be rejected. We surface it; enforcement is later.
+    /// whole message is rejected by [`PayloadIter`] before this struct is
+    /// ever produced for that payload.
     pub critical: bool,
     /// Payload body, excluding the 4-byte generic payload header.
     pub data: &'a [u8],
@@ -284,6 +285,16 @@ impl<'a> Iterator for PayloadIter<'a> {
         let data = &self.rest[4..length as usize];
         self.rest = &self.rest[length as usize..];
         self.next = next_payload;
+
+        // RFC 7296 §2.5: a payload of unrecognized type with the critical bit
+        // set MUST cause the whole message to be rejected.
+        if critical {
+            if let PayloadType::Other(unknown_type) = this_type {
+                self.done = true;
+                return Some(Err(IkeError::UnsupportedCriticalPayload(unknown_type)));
+            }
+        }
+
         Some(Ok(RawPayload {
             payload_type: this_type,
             critical,
@@ -455,6 +466,31 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(err, IkeError::ShortPayload(2));
+    }
+
+    #[test]
+    fn payload_chain_rejects_unknown_type_with_critical_bit_set() {
+        // A payload of unrecognized type 200 (`first`), critical bit (0x80) set,
+        // next payload = none.
+        let body = [0x00, 0x80, 0x00, 0x08, 0xAA, 0xAA, 0xAA, 0xAA];
+        let err = payloads(PayloadType::Other(200), &body)
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err, IkeError::UnsupportedCriticalPayload(200));
+    }
+
+    #[test]
+    fn payload_chain_ignores_unknown_type_without_critical_bit() {
+        // Same unrecognized type, critical bit clear -- must be surfaced as
+        // an ordinary payload, not rejected.
+        let body = [0x00, 0x00, 0x00, 0x08, 0xAA, 0xAA, 0xAA, 0xAA];
+        let got: Vec<RawPayload> = payloads(PayloadType::Other(200), &body)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].payload_type, PayloadType::Other(200));
+        assert!(!got[0].critical);
     }
 
     #[test]

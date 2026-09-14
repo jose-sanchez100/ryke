@@ -17,6 +17,12 @@ pub enum IkeError {
     #[error("payload length {0} is smaller than the 4-byte generic header")]
     ShortPayload(u16),
 
+    /// A payload of unrecognized type arrived with the critical bit set
+    /// (RFC 7296 §2.5: "If the critical flag is set and the payload type is
+    /// unrecognized, the message MUST be rejected").
+    #[error("unrecognized payload type {0} with the critical bit set")]
+    UnsupportedCriticalPayload(u8),
+
     /// The header's major version isn't one this crate speaks (RFC 7296
     /// §3.1: a responder MUST reject a higher major version with
     /// INVALID_MAJOR_VERSION; we reject any non-2 major version outright

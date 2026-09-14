@@ -84,6 +84,10 @@ pub struct CompletedSaInit {
     /// (empty if none). A method-14 signer must pick one of these; an empty list
     /// means the peer forbids Digital Signature auth.
     pub peer_signature_hashes: Vec<u16>,
+    /// Whether the peer's `IKE_SA_INIT` advertised `IKEV2_FRAGMENTATION_SUPPORTED`
+    /// (RFC 7383 §2.4). A caller MUST NOT send it SKF fragments unless this is
+    /// true.
+    pub peer_supports_fragmentation: bool,
 }
 
 impl LocalSecret {
@@ -131,6 +135,10 @@ struct SaInitPayloads {
     nat_dest: Option<Vec<u8>>,
     /// The peer's `NAT_DETECTION_SOURCE_IP` notify data, if it sent one.
     nat_source: Option<Vec<u8>>,
+    /// Whether the sender advertised `IKEV2_FRAGMENTATION_SUPPORTED` (RFC 7383
+    /// §2.4): a message MUST NOT be fragmented to a peer unless it announced
+    /// support for reassembling fragments here.
+    fragmentation_supported: bool,
 }
 
 /// Decode a `SIGNATURE_HASH_ALGORITHMS` notify's data — a bare list of 16-bit
@@ -147,6 +155,7 @@ fn parse_sa_init(header: &IkeHeader, body: &[u8]) -> Result<SaInitPayloads, IkeE
     let mut cookie = None;
     let mut nat_dest = None;
     let mut nat_source = None;
+    let mut fragmentation_supported = false;
     for payload in payloads(header.next_payload, body) {
         let payload = payload?;
         match payload.payload_type {
@@ -173,6 +182,8 @@ fn parse_sa_init(header: &IkeHeader, body: &[u8]) -> Result<SaInitPayloads, IkeE
                         nat_dest = Some(n.data);
                     } else if n.notify_type == notify_type::NAT_DETECTION_SOURCE_IP {
                         nat_source = Some(n.data);
+                    } else if n.notify_type == notify_type::IKEV2_FRAGMENTATION_SUPPORTED {
+                        fragmentation_supported = true;
                     }
                 }
             }
@@ -188,6 +199,7 @@ fn parse_sa_init(header: &IkeHeader, body: &[u8]) -> Result<SaInitPayloads, IkeE
         cookie,
         nat_dest,
         nat_source,
+        fragmentation_supported,
     })
 }
 
@@ -199,6 +211,12 @@ fn sighash_notify() -> Notify {
         data.extend_from_slice(&h.to_be_bytes());
     }
     Notify::status(notify_type::SIGNATURE_HASH_ALGORITHMS, data)
+}
+
+/// The `IKEV2_FRAGMENTATION_SUPPORTED` notify (RFC 7383 §2.4, empty payload):
+/// ryke can both send and reassemble SKF fragments, and always advertises so.
+fn fragmentation_supported_notify() -> Notify {
+    Notify::status(notify_type::IKEV2_FRAGMENTATION_SUPPORTED, Vec::new())
 }
 
 fn base_header(spi_i: u64, spi_r: u64, flags: Flags) -> IkeHeader {
@@ -221,7 +239,8 @@ fn build_sa_init(header: IkeHeader, sa: &SecurityAssociation, dh_group: u16, dh_
         .push(PayloadType::SecurityAssociation, sa.to_bytes())
         .push(PayloadType::KeyExchange, ke.to_bytes())
         .push(PayloadType::Nonce, Nonce { data: nonce.to_vec() }.to_bytes())
-        .push(PayloadType::Notify, sighash_notify().to_bytes());
+        .push(PayloadType::Notify, sighash_notify().to_bytes())
+        .push(PayloadType::Notify, fragmentation_supported_notify().to_bytes());
     for n in extra_notifies {
         b = b.push(PayloadType::Notify, n.to_bytes());
     }
@@ -461,6 +480,7 @@ fn responder_respond_inner(
         init_message: request.to_vec(),
         resp_message: response.clone(),
         peer_signature_hashes: payloads.signature_hashes,
+        peer_supports_fragmentation: payloads.fragmentation_supported,
     };
     Ok(SaInitResult::Established { response, sa: completed })
 }
@@ -500,6 +520,7 @@ pub fn initiator_complete(local: &LocalSecret, request: &[u8], response: &[u8]) 
         init_message: request.to_vec(),
         resp_message: response.to_vec(),
         peer_signature_hashes: payloads.signature_hashes,
+        peer_supports_fragmentation: payloads.fragmentation_supported,
     })
 }
 
@@ -673,6 +694,17 @@ mod tests {
         let init_done = initiator_complete(&init_secret(), &request, &response).unwrap();
         assert!(resp_done.peer_signature_hashes.contains(&sighash::SHA2_256));
         assert!(init_done.peer_signature_hashes.contains(&sighash::SHA2_256));
+    }
+
+    #[test]
+    fn sa_init_advertises_and_captures_fragmentation_support() {
+        // RFC 7383 §2.4: both sides always advertise
+        // IKEV2_FRAGMENTATION_SUPPORTED, and each records the other's.
+        let request = initiator_request(&init_secret(), &default_offer());
+        let (response, resp_done) = responder_respond(&request, &resp_secret()).unwrap();
+        let init_done = initiator_complete(&init_secret(), &request, &response).unwrap();
+        assert!(resp_done.peer_supports_fragmentation, "responder must see the initiator's notify");
+        assert!(init_done.peer_supports_fragmentation, "initiator must see the responder's notify");
     }
 
     #[test]

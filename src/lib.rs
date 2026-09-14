@@ -54,10 +54,11 @@ pub const fn natt_port() -> u16 {
 
 pub use ikev2::client::Client;
 pub use crypto::{
-    derive_child_keys, derive_session_keys, prf, prf_plus, ChildKeys, DhGroup, KeyLengths,
-    SessionKeys,
+    derive_child_keys, derive_session_keys, prf, prf_plus, ChildKeys, DhGroup, IntegAlgorithm,
+    KeyLengths, SessionKeys,
 };
-pub use ikev2::eap_auth::{EapEvent, EapInitiator, EapResponder, ServerAuth, ServerVerify};
+pub use ikev1::quick::{ChildKeyMaterial, RekeyedChild};
+pub use ikev2::eap_auth::{EapEvent, EapFailureReason, EapInitiator, EapResponder, ServerAuth, ServerVerify};
 pub use entropy::{Entropy, SeedEntropy};
 pub use error::IkeError;
 pub use esp::{ChildSa, EspSa};
@@ -89,7 +90,7 @@ pub use ikev2::payload::{
 };
 pub use ikev2::sign::{SigningKey, VerifyingKey};
 pub use role::Role;
-pub use ikev2::sk::{build_encrypted_gcm, open_encrypted_gcm};
+pub use ikev2::sk::{build_encrypted_gcm, open_encrypted_gcm, SkCipher};
 pub use ikev2::server::{Server, ServerEvent};
 pub use transport::{DriverError, UdpTransport};
 pub use tunnel::Tunnel;

@@ -96,8 +96,11 @@ fn main() {
                 }
                 return;
             }
-            EapEvent::Failed => {
-                eprintln!("❌ EAP failed at step {step}");
+            EapEvent::Failed(reason) => {
+                match reason {
+                    Some(r) => eprintln!("❌ EAP failed at step {step}: {}", r.raw),
+                    None => eprintln!("❌ EAP failed at step {step}"),
+                }
                 std::process::exit(1);
             }
         }

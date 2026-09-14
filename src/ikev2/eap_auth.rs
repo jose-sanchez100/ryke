@@ -84,8 +84,32 @@ pub enum EapEvent {
     Reply(Vec<u8>),
     /// Handshake complete. If `Some`, send this final message first.
     Established(Option<Vec<u8>>),
-    /// The peer failed authentication.
-    Failed,
+    /// The peer failed authentication. `Some` when EAP-MSCHAPv2 gave a
+    /// specific, parsed reason (RFC 2759 §4's Failure message); `None` for
+    /// a bare EAP-Failure or any other protocol-level abort (unexpected
+    /// message, server-auth mismatch, etc) with no stated reason.
+    Failed(Option<EapFailureReason>),
+}
+
+/// A server-stated EAP-MSCHAPv2 failure reason (RFC 2759 §4:
+/// `"E=eeeeeeeeee R=r C=cccccccccccccccccccccccccccccccc V=v M=<msg>"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EapFailureReason {
+    /// The full ASCII message, verbatim, for logging.
+    pub raw: String,
+    /// `true` for `E=691` (`ERROR_AUTHENTICATION_FAILURE`) — a definitive
+    /// "these credentials are wrong", not a transient/protocol failure.
+    pub credentials_rejected: bool,
+}
+
+impl EapFailureReason {
+    fn parse(raw: std::borrow::Cow<'_, str>) -> Self {
+        let credentials_rejected = raw
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("E="))
+            .is_some_and(|code| code == "691");
+        EapFailureReason { raw: raw.into_owned(), credentials_rejected }
+    }
 }
 
 /// A decrypted message's payloads, each as `(type, raw body)`.
@@ -371,7 +395,7 @@ impl EapInitiator {
             && find(&ps, PayloadType::Authentication).is_some()
         {
             if !self.verify_server(&ps) {
-                return Ok(EapEvent::Failed);
+                return Ok(EapEvent::Failed(None));
             }
             self.server_verified = true;
         }
@@ -382,7 +406,7 @@ impl EapInitiator {
         // walk us through EAP, harvesting the username + a crackable MSCHAPv2
         // response. `Insecure` opts out (only for a PSK server in a trusted path).
         if matches!(self.verify, ServerVerify::TrustedCas { .. } | ServerVerify::Psk(_)) && !self.server_verified {
-            return Ok(EapEvent::Failed);
+            return Ok(EapEvent::Failed(None));
         }
 
         let Some(eap_bytes) = find(&ps, PayloadType::Eap) else {
@@ -392,7 +416,7 @@ impl EapInitiator {
             let (Some(auth_bytes), Some(sar2)) =
                 (find(&ps, PayloadType::Authentication), find(&ps, PayloadType::SecurityAssociation))
             else {
-                return Ok(EapEvent::Failed);
+                return Ok(EapEvent::Failed(None));
             };
             let idr = find(&ps, PayloadType::IdResponder).unwrap_or(&[]);
             let msk = mschapv2::derive_msk(&self.password, &self.nt_response);
@@ -413,13 +437,13 @@ impl EapInitiator {
             return Ok(if got.method == auth_method::SHARED_KEY && got.data == expect {
                 EapEvent::Established(None)
             } else {
-                EapEvent::Failed
+                EapEvent::Failed(None)
             });
         };
 
         let eap = eap::EapPacket::parse(eap_bytes)?;
         if eap.code == eap::code::FAILURE {
-            return Ok(EapEvent::Failed);
+            return Ok(EapEvent::Failed(None));
         }
         if eap.code == eap::code::SUCCESS {
             // EAP done: send AUTH keyed by the MSK.
@@ -450,7 +474,17 @@ impl EapInitiator {
             Some(t) if t == eap::eap_type::MSCHAPV2 && eap.data.get(1) == Some(&eap::op::SUCCESS) => {
                 eap::EapPacket { code: eap::code::RESPONSE, identifier: eap.identifier, data: vec![eap::eap_type::MSCHAPV2, eap::op::SUCCESS] }
             }
-            _ => return Ok(EapEvent::Failed),
+            Some(t) if t == eap::eap_type::MSCHAPV2 && eap.data.get(1) == Some(&eap::op::FAILURE) => {
+                // The server's own stated reason, e.g. "E=691 R=1 C=<chal> V=3"
+                // (RFC 2759 -- E=691 is ERROR_AUTHENTICATION_FAILURE, a
+                // rejected username/password, not a protocol problem). Bytes
+                // 5.. are the ASCII message, mirroring `eap::build_success`'s
+                // layout for the Success case.
+                let reason = eap.data.get(5..).map(String::from_utf8_lossy).unwrap_or_default();
+                let reason = EapFailureReason::parse(reason);
+                return Ok(EapEvent::Failed(Some(reason)));
+            }
+            _ => return Ok(EapEvent::Failed(None)),
         };
         let msg = build_sk(&self.sa, next_id, false, &[(PayloadType::Eap, resp.to_bytes())], &iv(entropy))?;
         Ok(EapEvent::Reply(msg))
@@ -545,7 +579,7 @@ impl EapResponder {
         // start EAP with an Identity request: SK{ IDr, [CERT,] AUTH, EAP }.
         if find(&ps, PayloadType::Eap).is_none() && find(&ps, PayloadType::Authentication).is_none() {
             let Some(sai2) = find(&ps, PayloadType::SecurityAssociation) else {
-                return Ok(EapEvent::Failed);
+                return Ok(EapEvent::Failed(None));
             };
             // Capture the initiator's ESP SPI (for the CHILD SA) and its IDi
             // verbatim (its final AUTH signs over it).
@@ -593,7 +627,7 @@ impl EapResponder {
                     psk_auth(algo, &msk, &initiator_signed_octets(algo, &self.sa.init_message, &self.sa.nr, &self.sa.keys.sk_pi, &self.peer_idi));
                 let got = crate::ikev2::payload::Authentication::parse(auth_bytes)?;
                 if got.data != expect {
-                    return Ok(EapEvent::Failed);
+                    return Ok(EapEvent::Failed(None));
                 }
                 // Send our final AUTH(MSK) + SAr2 + TSi + TSr.
                 let idr = self.id.to_bytes();
@@ -650,7 +684,7 @@ impl EapResponder {
                         self.user = claimed;
                         self.password = pw.clone();
                     }
-                    None => return Ok(EapEvent::Failed),
+                    None => return Ok(EapEvent::Failed(None)),
                 }
                 // Got the identity → send an MSCHAPv2 Challenge.
                 entropy.fill(&mut self.auth_challenge);
@@ -660,7 +694,7 @@ impl EapResponder {
                 let resp = eap::parse_response(&eap.data)?;
                 self.nt_response = mschapv2::generate_nt_response(&self.auth_challenge, &resp.peer_challenge, &self.user, &self.password);
                 if self.nt_response != resp.nt_response {
-                    return Ok(EapEvent::Failed);
+                    return Ok(EapEvent::Failed(None));
                 }
                 let auth_resp = mschapv2::generate_authenticator_response(&self.password, &self.nt_response, &resp.peer_challenge, &self.auth_challenge, &self.user);
                 eap::build_success(1, &auth_resp)
@@ -672,7 +706,7 @@ impl EapResponder {
                     eap::EapPacket { code: eap::code::SUCCESS, identifier: eap.identifier, data: vec![] }.to_bytes(),
                 )], &iv(entropy))?));
             }
-            _ => return Ok(EapEvent::Failed),
+            _ => return Ok(EapEvent::Failed(None)),
         };
         let req = eap::EapPacket { code: eap::code::REQUEST, identifier: self.eap_id, data: out };
         Ok(EapEvent::Reply(build_sk(&self.sa, msg_id, true, &[(PayloadType::Eap, req.to_bytes())], &iv(entropy))?))
@@ -712,7 +746,7 @@ mod tests {
                 EapEvent::Reply(m) => match initiator.handle(&m, &mut ie).unwrap() {
                     EapEvent::Reply(m2) => in_flight = m2,
                     EapEvent::Established(_) => return Outcome::Established,
-                    EapEvent::Failed => return Outcome::Failed,
+                    EapEvent::Failed(_) => return Outcome::Failed,
                 },
                 EapEvent::Established(Some(final_msg)) => {
                     // The responder is up; the initiator must accept the final message.
@@ -722,7 +756,7 @@ mod tests {
                     };
                 }
                 EapEvent::Established(None) => return Outcome::Established,
-                EapEvent::Failed => return Outcome::Failed,
+                EapEvent::Failed(_) => return Outcome::Failed,
             }
         }
         Outcome::Failed
@@ -925,6 +959,49 @@ mod tests {
         let eap = eap::EapPacket { code: eap::code::REQUEST, identifier: 1, data: vec![eap::eap_type::IDENTITY] };
         let rogue = build_sk(&resp_sa, 1, true, &[(PayloadType::Eap, eap.to_bytes())], &[0u8; 8]).unwrap();
         let mut ie = SeedEntropy::new(1);
-        assert!(matches!(initiator.handle(&rogue, &mut ie).unwrap(), EapEvent::Failed));
+        assert!(matches!(initiator.handle(&rogue, &mut ie).unwrap(), EapEvent::Failed(_)));
+    }
+
+    #[test]
+    fn eap_failure_reason_flags_e691_as_credentials_rejected() {
+        // E=691 is RFC 2759's ERROR_AUTHENTICATION_FAILURE -- a rejected
+        // username/password, the one case old charon's EAP_AUTH_HARD_FAILURE
+        // grepped its debug log for.
+        let r = EapFailureReason::parse("E=691 R=1 C=00112233445566778899AABBCCDDEEFF V=3".into());
+        assert!(r.credentials_rejected);
+
+        // Other MSCHAPv2 failure codes (e.g. 648 = ERROR_PASSWD_EXPIRED) are
+        // real account states, not "wrong password" -- not the same signal.
+        let r = EapFailureReason::parse("E=648 R=1 C=00112233445566778899AABBCCDDEEFF V=3".into());
+        assert!(!r.credentials_rejected);
+
+        // No parseable E= field at all -- treated as not a hard failure.
+        let r = EapFailureReason::parse("garbage".into());
+        assert!(!r.credentials_rejected);
+    }
+
+    #[test]
+    fn eap_mschapv2_failure_e691_surfaces_as_a_hard_failure_with_the_reason() {
+        // The gateway sends an EAP-Req/MSCHAPv2-Failure with E=691 instead of
+        // a Challenge/Success -- e.g. a definitively wrong password. The
+        // client must surface the parsed, typed reason (not just a bare
+        // Failed) so a caller retrying other gateway hosts can tell this
+        // apart from a transient/protocol failure.
+        let (init_sa, resp_sa) = sa_pair();
+        let mut initiator = EapInitiator::new(init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "wrong-password".into(), 0x1111, ServerVerify::Insecure);
+        let failure_msg = b"E=691 R=1 C=00112233445566778899AABBCCDDEEFF V=3";
+        let mut d = vec![eap::eap_type::MSCHAPV2, eap::op::FAILURE, 1u8];
+        d.extend_from_slice(&((4 + failure_msg.len()) as u16).to_be_bytes());
+        d.extend_from_slice(failure_msg);
+        let eap = eap::EapPacket { code: eap::code::REQUEST, identifier: 1, data: d };
+        let msg = build_sk(&resp_sa, 1, true, &[(PayloadType::Eap, eap.to_bytes())], &[0u8; 8]).unwrap();
+        let mut ie = SeedEntropy::new(1);
+        match initiator.handle(&msg, &mut ie).unwrap() {
+            EapEvent::Failed(Some(reason)) => {
+                assert!(reason.credentials_rejected);
+                assert_eq!(reason.raw, String::from_utf8_lossy(failure_msg));
+            }
+            other => panic!("expected EapEvent::Failed(Some(_)), got {other:?}"),
+        }
     }
 }

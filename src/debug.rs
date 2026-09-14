@@ -39,11 +39,11 @@ pub fn level() -> u8 {
     LEVEL.load(Ordering::Relaxed)
 }
 
-pub(crate) fn enabled(wanted: u8) -> bool {
+pub fn enabled(wanted: u8) -> bool {
     level() >= wanted
 }
 
-pub(crate) fn emit(args: std::fmt::Arguments) {
+pub fn emit(args: std::fmt::Arguments) {
     eprintln!("[ryke] {args}");
 }
 

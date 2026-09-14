@@ -282,6 +282,7 @@ pub mod id_type {
     pub const FQDN: u8 = 2;
     pub const RFC822_ADDR: u8 = 3;
     pub const IPV6_ADDR: u8 = 5;
+    pub const DER_ASN1_DN: u8 = 9;
     pub const KEY_ID: u8 = 11;
 }
 

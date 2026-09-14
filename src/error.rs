@@ -64,6 +64,16 @@ pub enum IkeError {
     #[error("peer authentication (AUTH payload) failed")]
     AuthFailed,
 
+    /// EAP authentication was rejected for a definitive, stated reason
+    /// (currently: an EAP-MSCHAPv2 Failure message with `E=691`,
+    /// RFC 2759's `ERROR_AUTHENTICATION_FAILURE` — "these credentials are
+    /// wrong", not a transient/protocol failure). Kept distinct from the
+    /// generic `AuthFailed` so a caller retrying other gateway hosts with
+    /// the same credentials can tell the two apart and stop immediately
+    /// instead of repeating a doomed attempt against every remaining host.
+    #[error("EAP authentication rejected: {0}")]
+    EapCredentialsRejected(String),
+
     /// A cryptographic precondition was violated (e.g. bad key length).
     #[error("crypto error: {0}")]
     Crypto(&'static str),

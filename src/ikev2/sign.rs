@@ -120,6 +120,16 @@ impl SigningKey {
         Ok(SigningKey::RsaSha256(Box::new(key)))
     }
 
+    /// Load an RSA signing key from a PKCS#1 DER document
+    /// (`-----BEGIN RSA PRIVATE KEY-----`) — the older, PKCS#8-less form some
+    /// tooling still emits (e.g. `openssl genrsa` without `pkcs8` wrapping).
+    pub fn rsa_from_pkcs1_der(der: &[u8]) -> Result<Self, IkeError> {
+        use rsa::pkcs1::DecodeRsaPrivateKey;
+        let key = rsa::RsaPrivateKey::from_pkcs1_der(der)
+            .map_err(|_| IkeError::Crypto("bad RSA PKCS#1 DER private key"))?;
+        Ok(SigningKey::RsaSha256(Box::new(key)))
+    }
+
     /// The DER `AlgorithmIdentifier` this key advertises in the AUTH payload.
     pub fn algorithm_id(&self) -> &'static [u8] {
         match self {

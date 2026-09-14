@@ -22,26 +22,22 @@ pub trait Entropy {
     }
 }
 
-/// OS cryptographic randomness, read from `/dev/urandom` (Linux/unix).
-#[cfg(unix)]
-pub struct OsEntropy {
-    file: std::fs::File,
-}
+/// Cross-platform OS cryptographic randomness (via `getrandom`: `/dev/urandom`
+/// or `getrandom(2)` on Linux, `BCryptGenRandom` on Windows, etc.).
+pub struct OsEntropy;
 
-#[cfg(unix)]
 impl OsEntropy {
     pub fn new() -> std::io::Result<Self> {
-        Ok(Self { file: std::fs::File::open("/dev/urandom")? })
+        let mut probe = [0u8; 1];
+        getrandom::getrandom(&mut probe)
+            .map_err(|error| std::io::Error::other(format!("OS CSPRNG unavailable: {error}")))?;
+        Ok(Self)
     }
 }
 
-#[cfg(unix)]
 impl Entropy for OsEntropy {
     fn fill(&mut self, out: &mut [u8]) {
-        use std::io::Read;
-        self.file
-            .read_exact(out)
-            .expect("read from /dev/urandom must not fail");
+        getrandom::getrandom(out).expect("operating-system randomness must be available");
     }
 }
 
@@ -87,5 +83,12 @@ mod tests {
         let mut c = SeedEntropy::new(42);
         // Two consecutive draws should differ.
         assert_ne!(c.next_array32(), c.next_array32());
+    }
+
+    #[test]
+    fn os_entropy_fills_on_the_host() {
+        let mut entropy = OsEntropy::new().unwrap();
+        let mut bytes = [0u8; 32];
+        entropy.fill(&mut bytes);
     }
 }

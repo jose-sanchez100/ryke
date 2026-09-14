@@ -13,6 +13,9 @@ authors = ["Vladimir Chebotarev"]
 
 [dependencies]
 thiserror = "2"
+# Cross-platform OS CSPRNG (Windows BCryptGenRandom, Linux getrandom(2)/-dev-urandom, etc.)
+# -- see entropy.rs::OsEntropy.
+getrandom = "0.2"
 hmac = "0.12"
 sha2 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }

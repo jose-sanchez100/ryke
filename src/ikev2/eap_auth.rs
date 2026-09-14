@@ -185,6 +185,10 @@ pub struct EapInitiator {
     /// see [`crate::ikev2::ike_auth`]'s `AuthPayloads::tsr` doc for why this
     /// is often more authoritative than CFG_REPLY's `INTERNAL_IP4_SUBNET`.
     granted_ts: Option<TrafficSelectors>,
+    /// The full CFG_REPLY Configuration payload, if the responder sent one --
+    /// a superset of `assigned_ip4`/`granted_ts` for callers that want the
+    /// other attributes too (DNS servers, split-tunnel subnets, IPv6).
+    configuration: Option<Configuration>,
 }
 
 impl EapInitiator {
@@ -227,6 +231,7 @@ impl EapInitiator {
             peer_esp_suite: None,
             assigned_ip4: None,
             granted_ts: None,
+            configuration: None,
         }
     }
 
@@ -269,6 +274,14 @@ impl EapInitiator {
     /// The responder's actual granted `TSr` from the final message, if any.
     pub fn granted_ts(&self) -> Option<&TrafficSelectors> {
         self.granted_ts.as_ref()
+    }
+
+    /// The full CFG_REPLY Configuration payload, once known -- lets a caller
+    /// read attributes [`Self::assigned_ip4`]/[`Self::granted_ts`] don't
+    /// surface directly, e.g. `Configuration::assigned_dns`,
+    /// `assigned_subnets`, or the IPv6 equivalents.
+    pub fn configuration(&self) -> Option<&Configuration> {
+        self.configuration.as_ref()
     }
 
     /// Authenticate the server from its first response (`SK{ IDr, [CERT,] AUTH,
@@ -376,6 +389,7 @@ impl EapInitiator {
                 self.peer_esp_suite = SecurityAssociation::parse(sar2).ok().and_then(|sa| negotiate::select_esp(&sa));
                 if let Some(cp) = find(&ps, PayloadType::Configuration).and_then(|d| Configuration::parse(d).ok()) {
                     self.assigned_ip4 = cp.assigned_ipv4();
+                    self.configuration = Some(cp);
                 }
                 if let Some(ts) = find(&ps, PayloadType::TrafficSelectorResponder).and_then(|d| TrafficSelectors::parse(d).ok()) {
                     self.granted_ts = Some(ts);

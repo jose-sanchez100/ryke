@@ -69,6 +69,31 @@ fn main() {
             }
             EapEvent::Established(_) => {
                 println!("✅ EAP-MSCHAPv2 established — username/password accepted 🎉");
+                if let Some(ip4) = init.assigned_ip4() {
+                    println!("  assigned IPv4: {ip4}");
+                }
+                if let Some(cfg) = init.configuration() {
+                    for dns in cfg.assigned_dns() {
+                        println!("  DNS (v4): {dns}");
+                    }
+                    for (net, prefix) in cfg.assigned_subnets() {
+                        println!("  split-tunnel subnet (v4): {net}/{prefix}");
+                    }
+                    if let Some((addr, prefix)) = cfg.assigned_ipv6() {
+                        println!("  assigned IPv6: {addr}/{prefix}");
+                    }
+                    for dns in cfg.assigned_ipv6_dns() {
+                        println!("  DNS (v6): {dns}");
+                    }
+                    for (net, prefix) in cfg.assigned_ipv6_subnets() {
+                        println!("  split-tunnel subnet (v6): {net}/{prefix}");
+                    }
+                } else {
+                    println!("  (no CFG_REPLY Configuration payload in the final message)");
+                }
+                if let Some(ts) = init.granted_ts() {
+                    println!("  granted TSr: {ts:?}");
+                }
                 return;
             }
             EapEvent::Failed => {

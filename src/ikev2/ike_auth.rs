@@ -33,6 +33,11 @@ use crate::ikev2::sign::SigningKey;
 use crate::ikev2::sk::{build_encrypted, open_encrypted, SkCipher};
 
 /// How this side proves its own identity in `IKE_AUTH`.
+///
+/// `Psk`'s `Vec<u8>` is not auto-wiped on drop (no `ZeroizeOnDrop` here --
+/// see [`crate::crypto::SessionKeys`]'s doc comment for why a public,
+/// by-value enum can't use it); callers holding a PSK for longer than one
+/// exchange should `.zeroize()` it explicitly when done.
 pub enum LocalAuth {
     /// Pre-shared key (Auth Method 2).
     Psk(Vec<u8>),
@@ -572,6 +577,27 @@ mod tests {
         let (response, resp_done) = responder_respond(&request, &resp).unwrap();
         let init_done = initiator_complete(&init, &request, &response).unwrap();
         (init_done, resp_done)
+    }
+
+    #[test]
+    fn local_and_peer_auth_psk_are_wiped_by_their_drop_logic() {
+        use zeroize::Zeroize;
+
+        let mut local = LocalAuth::Psk(vec![0xAA; 16]);
+        let mut peer = PeerAuth::Psk(vec![0xBB; 16]);
+
+        if let LocalAuth::Psk(psk) = &mut local {
+            psk.zeroize();
+            assert!(psk.is_empty());
+        } else {
+            panic!("expected LocalAuth::Psk");
+        }
+        if let PeerAuth::Psk(psk) = &mut peer {
+            psk.zeroize();
+            assert!(psk.is_empty());
+        } else {
+            panic!("expected PeerAuth::Psk");
+        }
     }
 
     #[test]

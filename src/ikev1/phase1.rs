@@ -143,6 +143,12 @@ fn is_xauth_auth(method: u16) -> bool {
 }
 
 /// How this side proves its own identity in Phase 1 (RFC 2409 §5.1/§5.4).
+///
+/// No `Drop`-based auto-wipe of the `Psk` secret: this is a public, by-value
+/// type cloned into every Phase-1 message state (see [`crate::crypto::SessionKeys`]'s
+/// doc comment for the general reasoning) -- a caller done with a value can
+/// match out the `Psk` buffer and wipe it explicitly with
+/// `zeroize::Zeroize::zeroize`.
 #[derive(Clone)]
 pub enum Ikev1LocalAuth {
     /// Pre-shared key (§5.4) — both sides use the same secret.
@@ -188,11 +194,21 @@ pub struct Phase1Config {
 }
 
 /// Everything Phase 1 establishes, carried into the encrypted exchanges.
-#[derive(Clone)]
+///
+/// Implements `Zeroize` over the derived key material (`skeyid*`, `enc_key`)
+/// -- see [`crate::crypto::SessionKeys`]'s doc comment for why this is
+/// `Zeroize`, not `ZeroizeOnDrop` (this type is public and callers read its
+/// fields by value). The other fields (cookies, DH public shares, nonces,
+/// SA/ID bodies) aren't secret and are skipped.
+#[derive(Clone, zeroize::Zeroize)]
 pub struct Phase1State {
+    #[zeroize(skip)]
     pub prf: Prf,
+    #[zeroize(skip)]
     pub group: DhGroup,
+    #[zeroize(skip)]
     pub cky_i: [u8; 8],
+    #[zeroize(skip)]
     pub cky_r: [u8; 8],
     pub skeyid: Vec<u8>,
     pub skeyid_d: Vec<u8>,
@@ -201,15 +217,23 @@ pub struct Phase1State {
     /// Derived AES-256 key.
     pub enc_key: Vec<u8>,
     /// `HASH(g^xi | g^xr)` — the seed for every post-Phase-1 message IV.
+    #[zeroize(skip)]
     pub phase1_iv: Vec<u8>,
+    #[zeroize(skip)]
     pub gxi: Vec<u8>,
+    #[zeroize(skip)]
     pub gxr: Vec<u8>,
+    #[zeroize(skip)]
     pub ni: Vec<u8>,
+    #[zeroize(skip)]
     pub nr: Vec<u8>,
     /// The initiator's SA-payload body and ID body — needed to verify `HASH_I`.
+    #[zeroize(skip)]
     sai_b: Vec<u8>,
+    #[zeroize(skip)]
     idii_b: Vec<u8>,
     /// Whether the peer's own Phase-1 message echoed [`DPD_VENDOR_ID`].
+    #[zeroize(skip)]
     pub peer_supports_dpd: bool,
     /// Whether RFC 3947 NAT detection (see [`natd_float_needed`]) decided
     /// this exchange must float to UDP 4500 for everything after the point
@@ -222,6 +246,7 @@ pub struct Phase1State {
     /// doc for why (no VID/NAT-D info survives a restart); a genuinely
     /// floated session resumed this way would need its caller to already
     /// know to keep using the port-4500 socket regardless.
+    #[zeroize(skip)]
     pub floated: bool,
     /// The Phase-1 SA lifetime actually in force, in seconds -- the
     /// responder's own value if it echoed one (RFC 2407 §4.5: the responder
@@ -229,6 +254,7 @@ pub struct Phase1State {
     /// unilaterally choose a shorter one), falling back to whatever this
     /// side itself offered if the responder's chosen transform carried no
     /// `LIFE_DURATION` attribute at all. See [`negotiated_p1_lifetime`].
+    #[zeroize(skip)]
     pub negotiated_lifetime_secs: u32,
 }
 
@@ -1458,6 +1484,57 @@ mod tests {
     use super::*;
     use super::super::payloads::id_type;
     use crate::entropy::SeedEntropy;
+
+    #[test]
+    fn phase1_state_zeroize_wipes_the_derived_key_material_but_not_public_fields() {
+        let mut state = Phase1State {
+            prf: Prf::Sha256,
+            group: DhGroup::Modp2048,
+            cky_i: [1u8; 8],
+            cky_r: [2u8; 8],
+            skeyid: vec![0xAAu8; 32],
+            skeyid_d: vec![0xAAu8; 32],
+            skeyid_a: vec![0xAAu8; 32],
+            skeyid_e: vec![0xAAu8; 32],
+            enc_key: vec![0xAAu8; 32],
+            phase1_iv: vec![3u8; 16],
+            gxi: vec![4u8; 16],
+            gxr: vec![5u8; 16],
+            ni: vec![6u8; 16],
+            nr: vec![7u8; 16],
+            sai_b: vec![8u8; 4],
+            idii_b: vec![9u8; 4],
+            peer_supports_dpd: true,
+            floated: false,
+            negotiated_lifetime_secs: 28800,
+        };
+        zeroize::Zeroize::zeroize(&mut state);
+        assert!(state.skeyid.is_empty());
+        assert!(state.skeyid_d.is_empty());
+        assert!(state.skeyid_a.is_empty());
+        assert!(state.skeyid_e.is_empty());
+        assert!(state.enc_key.is_empty());
+        // Non-secret fields are `#[zeroize(skip)]`d -- unaffected.
+        assert_eq!(state.cky_i, [1u8; 8]);
+        assert_eq!(state.gxi, vec![4u8; 16]);
+        assert_eq!(state.negotiated_lifetime_secs, 28800);
+    }
+
+    #[test]
+    fn ikev1_local_auth_psk_can_be_wiped_explicitly() {
+        // `Ikev1LocalAuth` is a public, by-value type (clones flow through
+        // every Phase-1 message-state transition) so it deliberately doesn't
+        // auto-wipe on drop -- a caller that's done with it can still wipe
+        // the PSK explicitly, which is what this proves.
+        let mut auth = Ikev1LocalAuth::Psk(vec![0xAAu8; 16]);
+        if let Ikev1LocalAuth::Psk(psk) = &mut auth {
+            zeroize::Zeroize::zeroize(psk);
+        }
+        match &auth {
+            Ikev1LocalAuth::Psk(psk) => assert!(psk.is_empty(), "PSK was not wiped"),
+            Ikev1LocalAuth::Sig { .. } => unreachable!(),
+        }
+    }
 
     fn android_sa() -> SaPayload {
         use super::super::payloads::{life, Attribute, IPSEC_DOI, SIT_IDENTITY_ONLY};

@@ -28,6 +28,7 @@ use crate::ikev2::payload::{
     Proposal, SecurityAssociation, Transform,
 };
 use crate::role::Role;
+use zeroize::Zeroize;
 
 /// The signature hashes ryke advertises (and can verify) in an RFC 7427 Digital
 /// Signature AUTH. Only SHA-256 for now — every native iOS/Android client offers
@@ -36,14 +37,29 @@ pub const SUPPORTED_SIGNATURE_HASHES: &[u16] = &[sighash::SHA2_256];
 
 /// Our per-exchange ephemeral inputs. In production these come from the OS RNG;
 /// in tests they are fixed for determinism.
-#[derive(Debug, Clone)]
+///
+/// Implements `Zeroize` (not `ZeroizeOnDrop`) and redacts `dh_private`/
+/// `nonce` from `Debug` -- see [`crate::crypto::SessionKeys`]'s doc comment
+/// for why a `Drop`-based auto-wipe isn't used on this public, by-value type.
+#[derive(Clone, Zeroize)]
 pub struct LocalSecret {
     /// X25519 private scalar.
     pub dh_private: [u8; 32],
     /// Our nonce (Ni if we initiate, Nr if we respond).
     pub nonce: Vec<u8>,
     /// Our SPI (SPIi if we initiate, SPIr if we respond); must be non-zero.
+    #[zeroize(skip)]
     pub spi: u64,
+}
+
+impl std::fmt::Debug for LocalSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalSecret")
+            .field("dh_private", &"[32 bytes REDACTED]")
+            .field("nonce", &format_args!("[{} bytes REDACTED]", self.nonce.len()))
+            .field("spi", &self.spi)
+            .finish()
+    }
 }
 
 /// The result of a completed `IKE_SA_INIT`, from one side's perspective.
@@ -562,6 +578,27 @@ mod tests {
     fn resp_secret() -> LocalSecret {
         LocalSecret { dh_private: [9u8; 32], nonce: vec![0x22; 32], spi: 0xBBBB_BBBB_3333_4444 }
     }
+
+    #[test]
+    fn local_secret_debug_never_prints_the_raw_dh_private_or_nonce() {
+        let secret = init_secret();
+        let printed = format!("{secret:?}");
+        assert!(!printed.contains("7, 7, 7"));
+        assert!(!printed.contains("17, 17, 17"));
+        assert!(printed.contains("REDACTED"));
+        assert!(printed.contains(&secret.spi.to_string()));
+    }
+
+    #[test]
+    fn local_secret_is_wiped_by_its_zeroize_impl() {
+        use zeroize::Zeroize;
+        let mut secret = init_secret();
+        secret.zeroize();
+        assert_eq!(secret.dh_private, [0u8; 32]);
+        assert!(secret.nonce.is_empty());
+        assert_eq!(secret.spi, 0xAAAA_AAAA_1111_2222);
+    }
+
     #[test]
     fn initiator_natt_detects_when_we_are_translated() {
         // The initiator claims a private address; the responder observes a

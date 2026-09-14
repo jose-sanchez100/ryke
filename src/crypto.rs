@@ -16,6 +16,7 @@ use md5::Md5;
 use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
 /// A negotiated PRF (RFC 7296 §3.3.2 Transform Type 2). Used for `prf`/`prf+`
 /// throughout the key schedule *and* for the AUTH/MACedIDFor* payloads
@@ -785,7 +786,18 @@ pub struct KeyLengths {
 }
 
 /// The seven IKE SA keys derived by `IKE_SA_INIT` (RFC 7296 §2.14).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Its `Debug` impl prints only lengths -- never raw bytes -- so an
+/// accidental `{:?}`/`dbg!()`/failed `assert_eq!` can't leak a key to a log
+/// (mirrors strongSwan/charon's "masking" hardening for the same class of
+/// secret). Implements `Zeroize` so a caller that's done with a value can
+/// wipe it explicitly (`keys.zeroize()`); deliberately does **not**
+/// `ZeroizeOnDrop` -- callers move these fields out by value into their own
+/// long-lived structures (e.g. handing key material to a kernel XFRM
+/// consumer), and a type with `Drop` can't have its fields moved out of, so
+/// auto-wiping here would break that pattern for every downstream user of
+/// this public struct.
+#[derive(Clone, PartialEq, Eq, Zeroize)]
 pub struct SessionKeys {
     /// Seeds CHILD SA keying material.
     pub sk_d: Vec<u8>,
@@ -798,6 +810,20 @@ pub struct SessionKeys {
     /// Keys used inside the AUTH payload computation.
     pub sk_pi: Vec<u8>,
     pub sk_pr: Vec<u8>,
+}
+
+impl std::fmt::Debug for SessionKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionKeys")
+            .field("sk_d", &format_args!("[{} bytes REDACTED]", self.sk_d.len()))
+            .field("sk_ai", &format_args!("[{} bytes REDACTED]", self.sk_ai.len()))
+            .field("sk_ar", &format_args!("[{} bytes REDACTED]", self.sk_ar.len()))
+            .field("sk_ei", &format_args!("[{} bytes REDACTED]", self.sk_ei.len()))
+            .field("sk_er", &format_args!("[{} bytes REDACTED]", self.sk_er.len()))
+            .field("sk_pi", &format_args!("[{} bytes REDACTED]", self.sk_pi.len()))
+            .field("sk_pr", &format_args!("[{} bytes REDACTED]", self.sk_pr.len()))
+            .finish()
+    }
 }
 
 /// Derive SKEYSEED and the SK_* set (RFC 7296 §2.14):
@@ -897,12 +923,26 @@ pub fn derive_rekey_session_keys(
 }
 
 /// ESP/AH CHILD SA keys, in the order `KEYMAT` provides them (RFC 7296 §2.17).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// See [`SessionKeys`]'s doc comment for why this implements `Zeroize` but
+/// not `ZeroizeOnDrop`, and why `Debug` is redacted.
+#[derive(Clone, PartialEq, Eq, Zeroize)]
 pub struct ChildKeys {
     pub encr_i: Vec<u8>,
     pub integ_i: Vec<u8>,
     pub encr_r: Vec<u8>,
     pub integ_r: Vec<u8>,
+}
+
+impl std::fmt::Debug for ChildKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildKeys")
+            .field("encr_i", &format_args!("[{} bytes REDACTED]", self.encr_i.len()))
+            .field("integ_i", &format_args!("[{} bytes REDACTED]", self.integ_i.len()))
+            .field("encr_r", &format_args!("[{} bytes REDACTED]", self.encr_r.len()))
+            .field("integ_r", &format_args!("[{} bytes REDACTED]", self.integ_r.len()))
+            .finish()
+    }
 }
 
 fn derive_child_keys_inner(
@@ -980,6 +1020,36 @@ pub fn derive_child_keys_pfs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_keys_debug_never_prints_the_raw_key_bytes() {
+        let keys = SessionKeys {
+            sk_d: vec![0xAB; 32],
+            sk_ai: vec![0xCD; 32],
+            sk_ar: vec![0xCD; 32],
+            sk_ei: vec![0xEF; 32],
+            sk_er: vec![0xEF; 32],
+            sk_pi: vec![0x12; 32],
+            sk_pr: vec![0x12; 32],
+        };
+        let out = format!("{keys:?}");
+        for byte in [0xABu8, 0xCD, 0xEF, 0x12] {
+            assert!(!out.contains(&format!("{byte:02x}")) && !out.contains(&format!("{byte:02X}")));
+        }
+        assert!(out.contains("REDACTED"));
+    }
+
+    #[test]
+    fn child_keys_debug_never_prints_the_raw_key_bytes() {
+        let keys = ChildKeys { encr_i: vec![0x11; 16], integ_i: vec![], encr_r: vec![0x22; 16], integ_r: vec![] };
+        let out = format!("{keys:?}");
+        assert!(!out.contains(&hex_upper(&[0x11; 16])) && !out.contains(&hex_upper(&[0x22; 16])));
+        assert!(out.contains("REDACTED"));
+    }
+
+    fn hex_upper(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02X}")).collect()
+    }
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())

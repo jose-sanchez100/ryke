@@ -279,7 +279,13 @@ impl EapInitiator {
     }
 
     /// Include a `CERTREQ` in the first message (mirrors a strongSwan client) —
-    /// used to exercise a responder's CERTREQ-based cert selection.
+    /// used to exercise a responder's CERTREQ-based cert selection. When
+    /// [`Self::verify`] is [`ServerVerify::TrustedCas`], the hashes sent are
+    /// real SHA-1(SPKI) hashes of its trusted CAs (RFC 7296 §3.7) so the
+    /// responder can pick a matching certificate to present; otherwise a
+    /// single all-zero placeholder hash is sent (no CA list is known to
+    /// hash), matching this method's behavior before `TrustedCas`-aware
+    /// hashing existed.
     pub fn set_send_certreq(&mut self, on: bool) {
         self.send_certreq = on;
     }
@@ -305,6 +311,16 @@ impl EapInitiator {
     /// asks for an inner address.
     pub fn set_want_cfg(&mut self, on: bool) {
         self.want_cfg = on;
+    }
+
+    fn certreq_ca_hashes(&self) -> Vec<[u8; 20]> {
+        match &self.verify {
+            ServerVerify::TrustedCas { cas, .. } => {
+                let hashes: Vec<_> = cas.iter().filter_map(|ca| crate::ikev2::sign::ca_key_hash(ca).ok()).collect();
+                if hashes.is_empty() { vec![[0u8; 20]] } else { hashes }
+            }
+            _ => vec![[0u8; 20]],
+        }
     }
 
     /// The completed `IKE_SA_INIT` state — `sk_d`/nonces/role, what
@@ -398,7 +414,7 @@ impl EapInitiator {
     /// First message: `SK{ IDi, SAi2, TSi, TSr }` (no AUTH — request EAP).
     pub fn start(&self, entropy: &mut impl Entropy) -> Result<Vec<u8>, IkeError> {
         if !self.client_certs.is_empty() {
-            let ca_hashes = self.send_certreq.then(|| vec![[0u8; 20]]);
+            let ca_hashes = self.send_certreq.then(|| self.certreq_ca_hashes());
             initiator_eap_request_with_certs(
                 &self.sa,
                 &self.id,
@@ -416,7 +432,7 @@ impl EapInitiator {
                 self.child_spi,
                 self.want_cfg,
                 &self.esp_offer,
-                vec![[0u8; 20]],
+                self.certreq_ca_hashes(),
                 &iv(entropy),
             )
         } else {

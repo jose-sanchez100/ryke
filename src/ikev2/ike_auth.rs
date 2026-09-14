@@ -24,9 +24,9 @@ use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
 };
 use crate::ikev2::payload::{
-    auth_method, protocol_id, sighash, transform_id, transform_type, Authentication, CertRequest,
-    Certificate, Configuration, Identification, Proposal, SecurityAssociation, TrafficSelector,
-    TrafficSelectors, Transform,
+    auth_method, notify_type, protocol_id, sighash, transform_id, transform_type, Authentication,
+    CertRequest, Certificate, Configuration, Identification, Notify, Proposal, SecurityAssociation,
+    TrafficSelector, TrafficSelectors, Transform,
 };
 use std::net::Ipv4Addr;
 use crate::ikev2::sign::SigningKey;
@@ -185,6 +185,11 @@ struct AuthPayloads {
     /// CFG_REPLY `INTERNAL_IP4_SUBNET`. `None` only if the payload is missing
     /// or malformed, not if it narrows to nothing.
     tsr: Option<TrafficSelectors>,
+    /// Whether the peer sent `N(INITIAL_CONTACT)` (RFC 7296 §2.4) — this is
+    /// the initiator's first SA with us since it last restarted, so any prior
+    /// IKE SA we hold for the same peer identity is stale and should be torn
+    /// down once this one authenticates.
+    initial_contact: bool,
 }
 
 /// The ESP CHILD SA SPI carried by an IKE_AUTH SA payload — the 4-byte SPI of the
@@ -207,6 +212,7 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
     let mut esp_suite = None;
     let mut assigned_ip4 = None;
     let mut tsr = None;
+    let mut initial_contact = false;
     for payload in payloads(first, inner) {
         let payload = payload?;
         match payload.payload_type {
@@ -231,7 +237,14 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
                     tsr = Some(ts);
                 }
             }
-            _ => {} // TSi / N / CERTREQ not needed here
+            PayloadType::Notify => {
+                if let Ok(n) = Notify::parse(payload.data) {
+                    if n.notify_type == notify_type::INITIAL_CONTACT {
+                        initial_contact = true;
+                    }
+                }
+            }
+            _ => {} // TSi / CERTREQ not needed here
         }
     }
     Ok(AuthPayloads {
@@ -242,6 +255,7 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
         esp_suite,
         assigned_ip4,
         tsr,
+        initial_contact,
     })
 }
 
@@ -376,6 +390,10 @@ pub fn initiator_auth_request_with_cfg(
     let (auth, cert_payloads) = build_local_auth(cfg, sa, &octets)?;
 
     let mut inner = vec![(PayloadType::IdInitiator, idi_body)];
+    // RFC 7296 §2.4: we hold no state across restarts, so this is always our
+    // first (and only) SA with this peer -- tells the responder to tear down
+    // any stale SA it still has for our identity.
+    inner.push((PayloadType::Notify, Notify::status(notify_type::INITIAL_CONTACT, Vec::new()).to_bytes()));
     inner.extend(cert_payloads);
     // Ask the responder for its certificate when we authenticate it by cert.
     if let PeerAuth::Cert { cas, .. } = &cfg.peer {
@@ -407,6 +425,7 @@ pub fn initiator_eap_request(
         (PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()),
         (PayloadType::TrafficSelectorInitiator, full_tunnel_ts()),
         (PayloadType::TrafficSelectorResponder, full_tunnel_ts()),
+        (PayloadType::Notify, Notify::status(notify_type::INITIAL_CONTACT, Vec::new()).to_bytes()),
     ];
     let first = first_payload_type(&inner);
     let inner_bytes = encode_payload_chain(&inner);
@@ -430,6 +449,7 @@ pub fn initiator_eap_request_with_certreq(
         (PayloadType::TrafficSelectorInitiator, full_tunnel_ts()),
         (PayloadType::TrafficSelectorResponder, full_tunnel_ts()),
         (PayloadType::CertRequest, CertRequest::x509(ca_hashes).to_bytes()),
+        (PayloadType::Notify, Notify::status(notify_type::INITIAL_CONTACT, Vec::new()).to_bytes()),
     ];
     let first = first_payload_type(&inner);
     let inner_bytes = encode_payload_chain(&inner);
@@ -438,7 +458,10 @@ pub fn initiator_eap_request_with_certreq(
 
 /// Responder: decrypt + verify the initiator's `IKE_AUTH` request, then build
 /// the encrypted response `SK { IDr, AUTH, SAr2, TSi, TSr }`. Returns the
-/// response bytes and the initiator's verified identity.
+/// response bytes, the initiator's verified identity, its CHILD SA SPI, and
+/// whether it sent `N(INITIAL_CONTACT)` (RFC 7296 §2.4) -- the caller should
+/// tear down any prior IKE/CHILD SA it holds for the same peer identity when
+/// this is set, since it only has meaning once AUTH has verified.
 pub fn responder_process_auth(
     sa: &CompletedSaInit,
     request: &[u8],
@@ -446,7 +469,7 @@ pub fn responder_process_auth(
     child_spi: u32,
     iv: &[u8; 8],
     assigned: Option<&AssignedConfig>,
-) -> Result<(Vec<u8>, Identification, u32), IkeError> {
+) -> Result<(Vec<u8>, Identification, u32, bool), IkeError> {
     // The initiator encrypts with SK_ei.
     let (first, inner) = open_encrypted(sa.suite.sk_cipher(), request, &sa.keys.sk_ei, &sa.keys.sk_ai)?;
     let got = parse_auth_inner(first, &inner)?;
@@ -486,7 +509,7 @@ pub fn responder_process_auth(
     let first_out = first_payload_type(&inner_out);
     let inner_bytes = encode_payload_chain(&inner_out);
     let response = build_encrypted(sa.suite.sk_cipher(), ike_auth_header(sa, true), first_out, &inner_bytes, &sa.keys.sk_er, &sa.keys.sk_ar, iv)?;
-    Ok((response, peer_id, peer_child_spi))
+    Ok((response, peer_id, peer_child_spi, got.initial_contact))
 }
 
 /// Decrypt an `IKE_AUTH` request and return the peer's claimed identity (`IDi`)
@@ -608,7 +631,7 @@ mod tests {
         let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), psk);
 
         let req = initiator_auth_request(&init_sa, &icfg, 0xDEADBEEF, &esp_offer(0), &[1u8; 8]).unwrap();
-        let (resp, learned_initiator, init_spi) = responder_process_auth(&resp_sa, &req, &rcfg, 0xCAFEBABE, &[2u8; 8], None).unwrap();
+        let (resp, learned_initiator, init_spi, _ic) = responder_process_auth(&resp_sa, &req, &rcfg, 0xCAFEBABE, &[2u8; 8], None).unwrap();
         // The responder decrypted the initiator's SK{} — proves the keys agree.
         assert_eq!(learned_initiator, Identification::fqdn("client.example"));
         assert_eq!(init_spi, 0xDEADBEEF); // and learned its CHILD SA SPI
@@ -633,7 +656,7 @@ mod tests {
             ip: Ipv4Addr::new(10, 8, 0, 4),
             dns: vec![Ipv4Addr::new(1, 1, 1, 1)],
         };
-        let (resp, learned_i, _spi) =
+        let (resp, learned_i, _spi, _ic) =
             responder_process_auth(&resp_sa, &req, &rcfg, 0xCAFEBABE, &[2u8; 8], Some(&assigned)).unwrap();
         assert_eq!(learned_i, Identification::fqdn("client.example"));
         let (_learned_r, _rspi, _esp_suite, got_ip, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg).unwrap();
@@ -647,7 +670,7 @@ mod tests {
         let icfg = AuthConfig::psk(Identification::fqdn("c"), psk.clone());
         let rcfg = AuthConfig::psk(Identification::fqdn("s"), psk);
         let req = initiator_auth_request(&init_sa, &icfg, 1, &esp_offer(0), &[1u8; 8]).unwrap();
-        let (resp, _, _) = responder_process_auth(&resp_sa, &req, &rcfg, 2, &[2u8; 8], None).unwrap();
+        let (resp, _, _, _ic) = responder_process_auth(&resp_sa, &req, &rcfg, 2, &[2u8; 8], None).unwrap();
         let (_, _, _esp_suite, got_ip, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg).unwrap();
         assert_eq!(got_ip, None);
     }
@@ -701,7 +724,7 @@ mod tests {
     fn ike_auth_mutual_certificate_succeeds() {
         let (init_sa, resp_sa) = run_sa_init();
         let req = initiator_auth_request(&init_sa, &cert_config(), 0xDEADBEEF, &esp_offer(0), &[1u8; 8]).unwrap();
-        let (resp, learned_i, _init_spi) = responder_process_auth(&resp_sa, &req, &cert_config(), 0xCAFEBABE, &[2u8; 8], None).unwrap();
+        let (resp, learned_i, _init_spi, _ic) = responder_process_auth(&resp_sa, &req, &cert_config(), 0xCAFEBABE, &[2u8; 8], None).unwrap();
         assert_eq!(learned_i, Identification::fqdn("vpn.example.com"));
         let (learned_r, _resp_spi, _esp_suite, _assigned, _tsr) = initiator_verify_auth(&init_sa, &resp, &cert_config()).unwrap();
         assert_eq!(learned_r, Identification::fqdn("vpn.example.com"));

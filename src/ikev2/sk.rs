@@ -156,17 +156,6 @@ impl SkCipher {
     }
 }
 
-/// Split a 36-byte `SK_e` into (32-byte AES key, 4-byte salt) — the fixed
-/// AES-256-GCM shape [`build_encrypted_gcm`]/[`open_encrypted_gcm`] use.
-fn split_key(sk_e: &[u8]) -> Result<(&[u8], &[u8]), IkeError> {
-    if sk_e.len() != 32 + SALT_LEN {
-        return Err(IkeError::Crypto(
-            "SK_e must be 36 bytes (32-byte AES-256 key + 4-byte GCM salt)",
-        ));
-    }
-    Ok((&sk_e[..32], &sk_e[32..]))
-}
-
 pub(crate) fn aead_nonce(salt: &[u8], iv: &[u8; IV_LEN]) -> [u8; SALT_LEN + IV_LEN] {
     let mut nonce = [0u8; SALT_LEN + IV_LEN];
     nonce[..SALT_LEN].copy_from_slice(salt);
@@ -188,19 +177,6 @@ fn aead_open<C: Aead + AeadKeyInit>(key: &[u8], nonce: &[u8], aad: &[u8], ct_and
         .map_err(|_| IkeError::BadIntegrity)
 }
 
-/// Low-level AES-256-GCM seal → ciphertext‖tag. Shared by the SK payload and by
-/// SKF fragments ([`crate::ikev2::fragment`], which is AES-256-GCM-only today).
-pub(crate) fn gcm_seal(sk_e: &[u8], iv: &[u8; IV_LEN], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, IkeError> {
-    let (key, salt) = split_key(sk_e)?;
-    aead_seal::<Aes256GcmC>(key, &aead_nonce(salt, iv), aad, plaintext)
-}
-
-/// Low-level AES-256-GCM open (verifies the tag) → plaintext.
-pub(crate) fn gcm_open(sk_e: &[u8], iv: &[u8; IV_LEN], aad: &[u8], ct_and_tag: &[u8]) -> Result<Vec<u8>, IkeError> {
-    let (key, salt) = split_key(sk_e)?;
-    aead_open::<Aes256GcmC>(key, &aead_nonce(salt, iv), aad, ct_and_tag)
-}
-
 /// Expand an 8-byte caller-supplied fresh IV seed into a classic cipher's
 /// actual wire IV length (16 bytes for AES-CBC, 8 for 3DES-CBC) via SHA-256
 /// counter mode. AEAD ciphers use the 8 bytes directly as their explicit IV,
@@ -208,7 +184,7 @@ pub(crate) fn gcm_open(sk_e: &[u8], iv: &[u8; IV_LEN], aad: &[u8], ct_and_tag: &
 /// unpredictable per key, which expanding a fresh 8-byte value this way
 /// satisfies — without widening the `iv: &[u8; 8]` shape every `IKE_AUTH`/
 /// rekey call site across two repos already commits to.
-fn expand_iv(seed: &[u8; 8], len: usize) -> Vec<u8> {
+pub(crate) fn expand_iv(seed: &[u8; 8], len: usize) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     let mut out = Vec::with_capacity(len + 32);
     let mut counter: u8 = 0;
@@ -226,7 +202,7 @@ fn expand_iv(seed: &[u8; 8], len: usize) -> Vec<u8> {
 
 /// Constant-time byte-slice equality — avoids a timing side channel verifying
 /// a classic cipher's HMAC ICV.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

@@ -566,6 +566,30 @@ mod tests {
     }
 
     #[test]
+    fn classic_rsa_method1_auth_verifies_sha256_and_sha1_and_rejects_tampering() {
+        // RFC 7296 §3.8 method 1 ("RSA Digital Signature") has no in-band hash
+        // indicator -- a real FortiGate configured for "Certificates + EAP"
+        // sends this method (not 14) live-signed with SHA-256, but the
+        // original RFC 2409/4306 text assumed SHA-1, so both must verify.
+        use rsa::pkcs8::DecodePrivateKey;
+        use sha1::Sha1;
+        let key = rsa::RsaPrivateKey::from_pkcs8_der(RSA_KEY_PK8).unwrap();
+        let pubk = VerifyingKey::Rsa(key.to_public_key());
+        let octets = b"ResponderSignedOctets under classic RSA method 1";
+
+        let sig256 = key.sign(rsa::Pkcs1v15Sign::new::<Sha256>(), &Sha256::digest(octets)).unwrap();
+        pubk.verify_classic_rsa_auth_data(&sig256, octets).unwrap();
+
+        let sig1 = key.sign(rsa::Pkcs1v15Sign::new::<Sha1>(), &Sha1::digest(octets)).unwrap();
+        pubk.verify_classic_rsa_auth_data(&sig1, octets).unwrap();
+
+        assert!(pubk.verify_classic_rsa_auth_data(&sig256, b"different octets").is_err());
+        // An RFC 7427-wrapped (method 14) blob is not a bare signature and must not verify as one.
+        let wrapped = SigningKey::RsaSha256(Box::new(key)).sign_auth_data(octets).unwrap();
+        assert!(pubk.verify_classic_rsa_auth_data(&wrapped, octets).is_err());
+    }
+
+    #[test]
     fn classic_rsa_raw_sign_verify_roundtrips_and_rejects_tampering_and_prefixed_signatures() {
         // The IKEv1 SIG-payload primitive (RFC 2409 §5.1): signs `data`
         // directly (here, a stand-in for an already-computed HASH_I/HASH_R),
@@ -625,6 +649,24 @@ mod tests {
     }
 
     #[test]
+    fn rsa_from_pkcs8_der_signs_like_a_directly_constructed_key() {
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        let key = SigningKey::rsa_from_pkcs8_der(RSA_KEY_PK8).unwrap();
+        assert_eq!(key.algorithm_id(), sig_alg::RSA_SHA256);
+        let (_, verifier) = rsa_signer();
+        let octets = b"octets signed by a PKCS#8-loaded RSA key";
+        verifier.verify_auth_data(&key.sign_auth_data(octets).unwrap(), octets).unwrap();
+
+        // Round-trip through PKCS#1 DER (the traditional `BEGIN RSA PRIVATE
+        // KEY` form) and confirm it loads and signs identically.
+        use rsa::pkcs8::DecodePrivateKey;
+        let pkcs8_key = rsa::RsaPrivateKey::from_pkcs8_der(RSA_KEY_PK8).unwrap();
+        let pkcs1_der = pkcs8_key.to_pkcs1_der().unwrap();
+        let key1 = SigningKey::rsa_from_pkcs1_der(pkcs1_der.as_bytes()).unwrap();
+        verifier.verify_auth_data(&key1.sign_auth_data(octets).unwrap(), octets).unwrap();
+    }
+
+    #[test]
     fn parse_auth_data_rejects_truncation() {
         assert!(parse_auth_data(&[]).is_err());
         assert!(parse_auth_data(&[0x0c, 0x30, 0x0a]).is_err()); // claims 12, has 2
@@ -653,10 +695,42 @@ mod tests {
     }
 
     #[test]
+    fn chain_validates_even_when_the_peer_also_sends_the_self_signed_root() {
+        // Some gateways (a real FortiGate, live-tested) attach their own
+        // trust-anchor cert as an extra trailing "intermediate" alongside the
+        // real chain -- e.g. leaf -> int -> root, with the self-signed root
+        // itself included as the last CERT payload. The anchor-match check
+        // must still terminate one hop early via `anchors`, not get stuck
+        // trying to chain through the self-signed cert as an intermediate.
+        use crate::test_certs::{CHAIN_INT_DER, CHAIN_LEAF_DER, CHAIN_ROOT_DER};
+        let (nb, _na) = cert_validity(CHAIN_LEAF_DER).unwrap();
+        let now = nb + 1;
+        validate_chain(
+            CHAIN_LEAF_DER,
+            &[CHAIN_INT_DER.to_vec(), CHAIN_ROOT_DER.to_vec()],
+            &[CHAIN_ROOT_DER.to_vec()],
+            now,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn direct_leaf_to_anchor_still_validates() {
         // The simple two-cert fixtures: leaf issued straight off the CA anchor.
         let (nb, _na) = cert_validity(LEAF_CERT_DER).unwrap();
         validate_chain(LEAF_CERT_DER, &[], &[CA_CERT_DER.to_vec()], nb + 1).unwrap();
+    }
+
+    #[test]
+    fn cert_subject_dn_is_der_and_round_trips_through_x509_cert() {
+        use der::Decode;
+        let dn = cert_subject_dn(LEAF_CERT_DER).unwrap();
+        // Must be the exact TBSCertificate.subject field, re-parseable as a Name.
+        let parsed = x509_cert::name::Name::from_der(&dn).unwrap();
+        let cert = x509_cert::Certificate::from_der(LEAF_CERT_DER).unwrap();
+        assert_eq!(parsed, cert.tbs_certificate.subject);
+        // Leaf and CA have different subjects.
+        assert_ne!(cert_subject_dn(LEAF_CERT_DER).unwrap(), cert_subject_dn(CA_CERT_DER).unwrap());
     }
 
     #[test]

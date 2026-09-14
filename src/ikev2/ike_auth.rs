@@ -469,6 +469,47 @@ pub fn initiator_eap_request_with_certreq(
     build_encrypted(sa.suite.sk_cipher(), ike_auth_header(sa, false), first, &inner_bytes, &sa.keys.sk_ei, &sa.keys.sk_ai, iv)
 }
 
+/// Like [`initiator_eap_request`], but also attaches the client's own X.509
+/// certificate chain (`certs[0]` = leaf) and, optionally, a `CERTREQ` listing
+/// `ca_hashes`. There is still no AUTH payload here (RFC 7296 §2.16: the
+/// initiator authenticates via the EAP exchange that follows, not this
+/// message), so the attached certs are bare identity presentation, not a
+/// signature — this is not standard RFC 4739 Multiple Authentication, it
+/// mirrors what a real FortiClient sends against a FortiGate policy
+/// configured for "Certificate + EAP": the gateway wants to see the client's
+/// certificate for its own identity/policy matching, on top of EAP actually
+/// deciding whether the connection is authenticated. Payload order matches
+/// [`initiator_auth_request_with_cfg`]'s (IDi, CFG, CERT.., CERTREQ, SA,
+/// TSi, TSr) for consistency between the two "attach a cert" call sites.
+/// Also honors `want_cfg` the same way [`initiator_eap_request`] does.
+#[allow(clippy::too_many_arguments)]
+pub fn initiator_eap_request_with_certs(
+    sa: &CompletedSaInit,
+    id: &Identification,
+    child_spi: u32,
+    want_cfg: bool,
+    esp_offer: &SecurityAssociation,
+    certs: &[Vec<u8>],
+    ca_hashes: Option<Vec<[u8; 20]>>,
+    iv: &[u8; 8],
+) -> Result<Vec<u8>, IkeError> {
+    let mut inner = vec![(PayloadType::IdInitiator, id.to_bytes())];
+    if want_cfg {
+        inner.push((PayloadType::Configuration, Configuration::request_ipv4().to_bytes()));
+    }
+    inner.extend(certs.iter().map(|c| (PayloadType::Certificate, Certificate::x509(c.clone()).to_bytes())));
+    if let Some(hashes) = ca_hashes {
+        inner.push((PayloadType::CertRequest, CertRequest::x509(hashes).to_bytes()));
+    }
+    inner.push((PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()));
+    inner.push((PayloadType::TrafficSelectorInitiator, full_tunnel_ts()));
+    inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+    inner.push((PayloadType::Notify, Notify::status(notify_type::INITIAL_CONTACT, Vec::new()).to_bytes()));
+    let first = first_payload_type(&inner);
+    let inner_bytes = encode_payload_chain(&inner);
+    build_encrypted(sa.suite.sk_cipher(), ike_auth_header(sa, false), first, &inner_bytes, &sa.keys.sk_ei, &sa.keys.sk_ai, iv)
+}
+
 /// Responder: decrypt + verify the initiator's `IKE_AUTH` request, then build
 /// the encrypted response `SK { IDr, AUTH, SAr2, TSi, TSr }`. Returns the
 /// response bytes, the initiator's verified identity, its CHILD SA SPI, and
@@ -761,5 +802,38 @@ mod tests {
             responder_process_auth(&resp_sa, &req, &rcfg, 2, &[2u8; 8], None).unwrap_err(),
             IkeError::AuthFailed
         );
+    }
+
+    // `initiator_eap_request_with_certs` (the "Certificate + EAP" hybrid a
+    // FortiGate dialup policy can require, per eap_auth::EapInitiator's
+    // `set_client_certs`) carries no AUTH -- verified here by decrypting the
+    // built message directly and inspecting its payload chain, rather than
+    // through a live EAP round trip (covered separately in session.rs).
+    #[test]
+    fn initiator_eap_request_with_certs_carries_the_cert_chain_and_certreq() {
+        use crate::test_certs::{CA_CERT_DER, LEAF_CERT_DER};
+        let (init_sa, _resp_sa) = run_sa_init();
+        let id = Identification::fqdn("client.example");
+        let chain = vec![LEAF_CERT_DER.to_vec()];
+        let ca_hashes = vec![crate::ikev2::sign::ca_key_hash(CA_CERT_DER).unwrap()];
+        let req = initiator_eap_request_with_certs(&init_sa, &id, 0xC0FFEE, true, &esp_offer(0), &chain, Some(ca_hashes.clone()), &[3u8; 8])
+            .unwrap();
+
+        let (first, inner) = open_encrypted(init_sa.suite.sk_cipher(), &req, &init_sa.keys.sk_ei, &init_sa.keys.sk_ai).unwrap();
+        let mut certs = Vec::new();
+        let mut certreqs = Vec::new();
+        let mut saw_auth = false;
+        for p in payloads(first, &inner) {
+            let p = p.unwrap();
+            match p.payload_type {
+                PayloadType::Certificate => certs.push(Certificate::parse(p.data).unwrap().data),
+                PayloadType::CertRequest => certreqs.push(CertRequest::parse(p.data).unwrap().ca_hashes),
+                PayloadType::Authentication => saw_auth = true,
+                _ => {}
+            }
+        }
+        assert_eq!(certs, chain, "the client's own leaf must be attached as bare identity");
+        assert_eq!(certreqs, vec![ca_hashes], "CERTREQ must carry the real trusted-CA hashes, not a placeholder");
+        assert!(!saw_auth, "no AUTH payload -- the initiator still authenticates via the EAP exchange that follows");
     }
 }

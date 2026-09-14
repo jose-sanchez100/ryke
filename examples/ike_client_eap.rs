@@ -41,7 +41,7 @@ fn main() {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let verify = ServerVerify::TrustedCas {
         cas: vec![ca],
-        expected_dns: server_id.clone(),
+        expected_dns: Some(server_id.clone()),
         now_unix: now,
     };
     let mut init = EapInitiator::new(

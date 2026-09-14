@@ -27,7 +27,7 @@ use crate::error::IkeError;
 use crate::ikev2::exchange::CompletedSaInit;
 use crate::ikev2::ike_auth::{
     esp_offer, esp_spi_from_sa, initiator_eap_request, initiator_eap_request_with_certreq,
-    AssignedConfig,
+    initiator_eap_request_with_certs, AssignedConfig,
 };
 use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
@@ -66,12 +66,21 @@ pub enum ServerVerify {
     /// Require the server's leaf certificate to (a) build a valid X.509 path to
     /// one of these trusted CA certificates (DER) — checking each hop's
     /// signature, validity window, and CA status — (b) carry `expected_dns` in
-    /// its SubjectAltName, and (c) produce a valid RFC 7427 signature. Revocation
-    /// (CRL/OCSP) and EKU are still the consumer's to add.
+    /// its SubjectAltName when given, and (c) produce a valid RFC 7427
+    /// signature. Revocation (CRL/OCSP) and EKU are still the consumer's to
+    /// add.
     TrustedCas {
         cas: Vec<Vec<u8>>,
-        /// The dNSName the client intends to reach (its "remote identifier").
-        expected_dns: String,
+        /// The dNSName the client intends to reach, if it wants that bound
+        /// to the cert's SAN. `None` skips this check entirely — trusting
+        /// any cert that chains to `cas`, regardless of name. Confirmed live
+        /// against a real FortiGate dialup policy: the gateway's own TLS
+        /// certificate (a public Let's Encrypt-issued cert) legitimately
+        /// names its own public hostname, which need not match whatever the
+        /// profile's configured connect address happens to be (e.g. an
+        /// internal DNS name or IP) — a prior charon/VICI backend's
+        /// equivalent check never enforced this either, only chain-to-CA.
+        expected_dns: Option<String>,
         /// Current time (Unix seconds) for certificate validity checks.
         now_unix: u64,
     },
@@ -216,6 +225,11 @@ pub struct EapInitiator {
     /// Whether to carry a CFG_REQUEST in the EAP-triggering first message --
     /// see [`Self::set_want_cfg`].
     want_cfg: bool,
+    /// The client's own X.509 chain (`client_certs[0]` = leaf) to attach to
+    /// the EAP-triggering first message -- see
+    /// [`crate::ikev2::ike_auth::initiator_eap_request_with_certs`]'s doc for
+    /// why this exists (a FortiGate "Certificate + EAP" combined round).
+    client_certs: Vec<Vec<u8>>,
 }
 
 impl EapInitiator {
@@ -260,6 +274,7 @@ impl EapInitiator {
             granted_ts: None,
             configuration: None,
             want_cfg: false,
+            client_certs: Vec::new(),
         }
     }
 
@@ -267,6 +282,19 @@ impl EapInitiator {
     /// used to exercise a responder's CERTREQ-based cert selection.
     pub fn set_send_certreq(&mut self, on: bool) {
         self.send_certreq = on;
+    }
+
+    /// Attach the client's own X.509 certificate chain (`chain[0]` = leaf) to
+    /// the EAP-triggering first message — for a FortiGate policy configured
+    /// for "Certificate + EAP": the gateway wants to see the client's
+    /// certificate for its own identity/policy matching, on top of EAP
+    /// actually deciding whether the connection is authenticated. An empty
+    /// chain (the default) reproduces plain EAP-MSCHAPv2 with no certs
+    /// attached at all. See
+    /// [`crate::ikev2::ike_auth::initiator_eap_request_with_certs`]'s doc for
+    /// the full rationale.
+    pub fn set_client_certs(&mut self, chain: Vec<Vec<u8>>) {
+        self.client_certs = chain;
     }
 
     /// Carry a CFG_REQUEST ([`Configuration::request_ipv4`]) in the
@@ -362,12 +390,24 @@ impl EapInitiator {
         }
         let octets = responder_signed_octets(self.sa.suite.prf_algorithm(), &self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, idr);
         // Path validation (chain + dates + CA) + SAN binding + signature.
-        crate::ikev2::sign::verify_cert_auth(leaf, &certs[1..], cas, Some(expected_dns), now, &auth.data, &octets).is_ok()
+        crate::ikev2::sign::verify_cert_auth(leaf, &certs[1..], cas, expected_dns.as_deref(), now, &auth.data, &octets).is_ok()
     }
 
     /// First message: `SK{ IDi, SAi2, TSi, TSr }` (no AUTH — request EAP).
     pub fn start(&self, entropy: &mut impl Entropy) -> Result<Vec<u8>, IkeError> {
-        if self.send_certreq {
+        if !self.client_certs.is_empty() {
+            let ca_hashes = self.send_certreq.then(|| vec![[0u8; 20]]);
+            initiator_eap_request_with_certs(
+                &self.sa,
+                &self.id,
+                self.child_spi,
+                self.want_cfg,
+                &self.esp_offer,
+                &self.client_certs,
+                ca_hashes,
+                &iv(entropy),
+            )
+        } else if self.send_certreq {
             initiator_eap_request_with_certreq(
                 &self.sa,
                 &self.id,
@@ -773,7 +813,7 @@ mod tests {
 
     /// Trust the given CAs and expect the leaf-fixture's dNSName, at a valid time.
     fn trust(cas: Vec<Vec<u8>>) -> ServerVerify {
-        ServerVerify::TrustedCas { cas, expected_dns: "vpn.example.com".into(), now_unix: valid_now() }
+        ServerVerify::TrustedCas { cas, expected_dns: Some("vpn.example.com".into()), now_unix: valid_now() }
     }
 
     fn cert_server() -> ServerAuth {
@@ -888,7 +928,7 @@ mod tests {
         let (init_sa, resp_sa) = sa_pair();
         let initiator = EapInitiator::new(
             init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111,
-            ServerVerify::TrustedCas { cas: vec![CA_CERT_DER.to_vec()], expected_dns: "other.example.com".into(), now_unix: valid_now() },
+            ServerVerify::TrustedCas { cas: vec![CA_CERT_DER.to_vec()], expected_dns: Some("other.example.com".into()), now_unix: valid_now() },
         );
         let responder = EapResponder::new(resp_sa, Identification::fqdn("vpn.example.com"), cert_server(), b"alice".to_vec(), "s3cret".into(), 0x2222);
         assert_eq!(drive(initiator, responder), Outcome::Failed);
@@ -903,7 +943,7 @@ mod tests {
         let now = crate::ikev2::sign::cert_validity(CHAIN_LEAF_DER).unwrap().0 + 1;
         let initiator = EapInitiator::new(
             init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111,
-            ServerVerify::TrustedCas { cas: vec![CHAIN_ROOT_DER.to_vec()], expected_dns: "vpn.example.com".into(), now_unix: now },
+            ServerVerify::TrustedCas { cas: vec![CHAIN_ROOT_DER.to_vec()], expected_dns: Some("vpn.example.com".into()), now_unix: now },
         );
         let responder = EapResponder::new(
             resp_sa, Identification::fqdn("vpn.example.com"),
@@ -924,7 +964,7 @@ mod tests {
         let expired = crate::ikev2::sign::cert_validity(LEAF_CERT_DER).unwrap().1 + 1;
         let initiator = EapInitiator::new(
             init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111,
-            ServerVerify::TrustedCas { cas: vec![CA_CERT_DER.to_vec()], expected_dns: "vpn.example.com".into(), now_unix: expired },
+            ServerVerify::TrustedCas { cas: vec![CA_CERT_DER.to_vec()], expected_dns: Some("vpn.example.com".into()), now_unix: expired },
         );
         let responder = EapResponder::new(resp_sa, Identification::fqdn("vpn.example.com"), cert_server(), b"alice".to_vec(), "s3cret".into(), 0x2222);
         assert_eq!(drive(initiator, responder), Outcome::Failed);

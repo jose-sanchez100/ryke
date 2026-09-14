@@ -80,7 +80,7 @@ const UDP_ENCAP_ESPINUDP: libc::c_int = 2;
 /// never reach the kernel in the first place, sitting as ordinary payload on
 /// *this* socket instead. A no-op outside Linux.
 #[cfg(target_os = "linux")]
-pub(crate) fn enable_udp_encap(socket: &UdpSocket) -> io::Result<()> {
+pub fn enable_udp_encap(socket: &UdpSocket) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
     let value: libc::c_int = UDP_ENCAP_ESPINUDP;
     let ret = unsafe {
@@ -95,7 +95,7 @@ pub(crate) fn enable_udp_encap(socket: &UdpSocket) -> io::Result<()> {
     if ret != 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn enable_udp_encap(_socket: &UdpSocket) -> io::Result<()> {
+pub fn enable_udp_encap(_socket: &UdpSocket) -> io::Result<()> {
     Ok(())
 }
 

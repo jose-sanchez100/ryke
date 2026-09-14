@@ -119,7 +119,7 @@ fn find_ke(first: PayloadType, inner: &[u8]) -> Result<Option<KeyExchange>, IkeE
 /// The DH transform on an ESP proposal's first alternative, if any -- the
 /// PFS-wanted signal (its mere presence, not any negotiation of it) per this
 /// module's own doc comment.
-fn dh_transform_id(sa: &SecurityAssociation) -> Option<u16> {
+pub fn dh_transform_id(sa: &SecurityAssociation) -> Option<u16> {
     sa.proposals.first()?.transforms.iter().find(|t| t.transform_type == transform_type::DH).map(|t| t.transform_id)
 }
 

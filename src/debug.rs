@@ -48,6 +48,7 @@ pub(crate) fn emit(args: std::fmt::Arguments) {
 }
 
 /// Level-1 milestone line.
+#[macro_export]
 macro_rules! ike_debug {
     ($($arg:tt)*) => {
         if $crate::debug::enabled(1) {
@@ -55,7 +56,7 @@ macro_rules! ike_debug {
         }
     };
 }
-pub(crate) use ike_debug;
+pub use ike_debug;
 
 fn hex(data: &[u8]) -> String {
     let mut s = String::with_capacity(data.len() * 2);
@@ -68,7 +69,7 @@ fn hex(data: &[u8]) -> String {
 /// Level-2 raw datagram dump -- wire bytes as sent/received, still
 /// SK{}-encrypted past `IKE_SA_INIT`. `direction` is `">>>"` (sent) or
 /// `"<<<"` (received).
-pub(crate) fn dump(direction: &str, addr: SocketAddr, data: &[u8]) {
+pub fn dump(direction: &str, addr: SocketAddr, data: &[u8]) {
     if enabled(2) {
         emit(format_args!("{direction} {addr} ({} bytes): {}", data.len(), hex(data)));
     }

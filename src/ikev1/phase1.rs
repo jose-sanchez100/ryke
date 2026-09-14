@@ -1152,42 +1152,74 @@ pub struct MainIdSent {
     negotiated_p1_lifetime_secs: u32,
 }
 
+/// [`MainIdSent::complete_id`]'s error case: the responder's AUTH did not
+/// verify, but SKEYID_a/SKEYID_e were already derived from the DH exchange
+/// alone (RFC 2409 App. B -- Main Mode's own identity-protection property is
+/// that messages 5/6 are encrypted *before* either side's identity is
+/// checked), so this side can still send a real, correctly authenticated and
+/// encrypted ISAKMP Delete for the cookie pair it just rejected, instead of
+/// silently vanishing and leaving the gateway to notice only once its own
+/// DPD/lifetime timer expires.
+#[derive(Debug)]
+pub struct AuthFailure {
+    pub error: IkeError,
+    /// `None` when even building the Delete itself failed (e.g. the entropy
+    /// source is down) — never withheld just because AUTH failed. The caller
+    /// should send this best-effort (its own doc: Deletes are fire-and-forget,
+    /// no ack expected) before propagating `error`.
+    pub teardown: Option<Vec<u8>>,
+}
+
+impl From<IkeError> for AuthFailure {
+    /// Wraps a hard parse/structural failure (message 6 didn't even decrypt,
+    /// or was missing a required payload) that leaves nothing trustworthy to
+    /// build a Delete from.
+    fn from(error: IkeError) -> Self {
+        AuthFailure { error, teardown: None }
+    }
+}
+
 impl MainIdSent {
     /// Process message 6 (`HDR*, IDr, HASH_R` or `HDR*, IDr, CERT.., SIG`,
     /// encrypted): verify the responder's authentication and return the
-    /// completed, authenticated [`Phase1State`].
-    pub fn complete_id(self, msg6: &[u8]) -> Result<Phase1State, IkeError> {
+    /// completed, authenticated [`Phase1State`]. On an AUTH failure specifically
+    /// (as opposed to a malformed message), see [`AuthFailure`]'s doc for why the
+    /// error carries a teardown Delete the caller should send.
+    pub fn complete_id(self, msg6: &[u8], entropy: &mut impl Entropy) -> Result<Phase1State, AuthFailure> {
         let (_hdr, ps, iv_after_msg6) = phase2::decrypt_payloads(msg6, &self.enc_key, &self.iv_after_msg5)?;
         let idr_b = find(&ps, payload::ID).ok_or(IkeError::MissingPayload("ID"))?.data.clone();
         let expect_hr = crypto1::hash_r(self.prf, &self.skeyid, &self.gxr, &self.gxi, &self.cky_r, &self.cky_i, &self.sai_b, &idr_b);
-        if self.is_sig {
-            let certs = collect_certs(&ps)?;
-            let sig = find(&ps, payload::SIG).ok_or(IkeError::MissingPayload("SIG"))?.data.clone();
-            if let Ok((subject, issuer)) = cert_subject_issuer_display(&certs[0]) {
-                ike_debug!(
-                    "Main Mode: gateway sent {} certificate(s); leaf subject='{subject}' issuer='{issuer}'",
-                    certs.len()
-                );
+        let verify: Result<(), IkeError> = (|| {
+            if self.is_sig {
+                let certs = collect_certs(&ps)?;
+                let sig = find(&ps, payload::SIG).ok_or(IkeError::MissingPayload("SIG"))?.data.clone();
+                if let Ok((subject, issuer)) = cert_subject_issuer_display(&certs[0]) {
+                    ike_debug!(
+                        "Main Mode: gateway sent {} certificate(s); leaf subject='{subject}' issuer='{issuer}'",
+                        certs.len()
+                    );
+                }
+                if let Err(e) = validate_chain(&certs[0], &certs[1..], &self.trusted_cas, self.now_unix) {
+                    ike_debug!(
+                        "Main Mode: gateway certificate chain did not validate against the trust store ({} intermediate(s) sent) -- \
+                         likely a missing intermediate CA in the gateway's CERT payload, or the leaf's issuer isn't a trusted root: {e}",
+                        certs.len().saturating_sub(1)
+                    );
+                    return Err(e);
+                }
+                if let Err(e) = VerifyingKey::from_cert_der(&certs[0])?.verify_classic_rsa_raw(&sig, &expect_hr) {
+                    ike_debug!("Main Mode: gateway certificate chain is trusted, but its SIG payload did not verify: {e}");
+                    return Err(e);
+                }
+            } else {
+                let hash_r_got = find(&ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
+                if hash_r_got != expect_hr {
+                    return Err(IkeError::AuthFailed);
+                }
             }
-            if let Err(e) = validate_chain(&certs[0], &certs[1..], &self.trusted_cas, self.now_unix) {
-                ike_debug!(
-                    "Main Mode: gateway certificate chain did not validate against the trust store ({} intermediate(s) sent) -- \
-                     likely a missing intermediate CA in the gateway's CERT payload, or the leaf's issuer isn't a trusted root: {e}",
-                    certs.len().saturating_sub(1)
-                );
-                return Err(e);
-            }
-            if let Err(e) = VerifyingKey::from_cert_der(&certs[0])?.verify_classic_rsa_raw(&sig, &expect_hr) {
-                ike_debug!("Main Mode: gateway certificate chain is trusted, but its SIG payload did not verify: {e}");
-                return Err(e);
-            }
-        } else {
-            let hash_r_got = find(&ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
-            if hash_r_got != expect_hr {
-                return Err(IkeError::AuthFailed);
-            }
-        }
-        Ok(Phase1State {
+            Ok(())
+        })();
+        let state = Phase1State {
             prf: self.prf,
             group: self.group,
             cky_i: self.cky_i,
@@ -1220,7 +1252,14 @@ impl MainIdSent {
             peer_supports_dpd: self.peer_supports_dpd,
             floated: self.floated,
             negotiated_lifetime_secs: self.negotiated_p1_lifetime_secs,
-        })
+        };
+        match verify {
+            Ok(()) => Ok(state),
+            Err(error) => {
+                let teardown = super::informational::build_isakmp_delete(&state, entropy).ok();
+                Err(AuthFailure { error, teardown })
+            }
+        }
     }
 }
 
@@ -1804,7 +1843,7 @@ mod tests {
         let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
         let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
         let (msg6, rstate) = r2.complete_id(&msg5).unwrap();
-        let istate = id_sent.complete_id(&msg6).unwrap();
+        let istate = id_sent.complete_id(&msg6, &mut ie).unwrap();
 
         assert_eq!(istate.skeyid_e, rstate.skeyid_e, "both sides must derive the same SKEYID_e");
         assert_eq!(istate.enc_key, rstate.enc_key);
@@ -1923,7 +1962,7 @@ mod tests {
         let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
         assert!(id_sent.floated, "initiator must detect the NAT from message 4's NAT-D");
         let (msg6, rstate) = r2.complete_id(&msg5).unwrap();
-        let istate = id_sent.complete_id(&msg6).unwrap();
+        let istate = id_sent.complete_id(&msg6, &mut ie).unwrap();
 
         assert!(istate.floated, "initiator's completed Phase1State must carry the float decision forward");
         assert!(rstate.floated, "responder must independently detect the same NAT from message 3's NAT-D");
@@ -2017,7 +2056,7 @@ mod tests {
         let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
         let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
         let (msg6, rstate) = r2.complete_id(&msg5).unwrap();
-        let istate = id_sent.complete_id(&msg6).unwrap();
+        let istate = id_sent.complete_id(&msg6, &mut ie).unwrap();
 
         assert_eq!(istate.enc_key.len(), 24, "AES-192 key must be 24 bytes");
         assert_eq!(istate.enc_key, rstate.enc_key, "both sides must derive the identical AES-192 key");
@@ -2074,7 +2113,7 @@ mod tests {
         let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
         let (mut msg6, _rstate) = r2.complete_id(&msg5).unwrap();
         *msg6.last_mut().unwrap() ^= 0xFF; // corrupt the tail of the encrypted HASH_R
-        assert!(id_sent.complete_id(&msg6).is_err(), "a tampered HASH_R must never verify");
+        assert!(id_sent.complete_id(&msg6, &mut ie).is_err(), "a tampered HASH_R must never verify");
     }
 
     /// A self-signed RSA certificate built at test time from the crate's
@@ -2164,7 +2203,7 @@ mod tests {
         let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
         let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
         let (msg6, rstate) = r2.complete_id(&msg5).unwrap();
-        let istate = id_sent.complete_id(&msg6).unwrap();
+        let istate = id_sent.complete_id(&msg6, &mut ie).unwrap();
 
         assert_eq!(istate.skeyid_e, rstate.skeyid_e, "both sides must derive the same SKEYID_e");
         assert_eq!(istate.enc_key, rstate.enc_key);
@@ -2226,7 +2265,13 @@ mod tests {
         let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
         let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
         let (msg6, _rstate) = r2.complete_id(&msg5).unwrap();
-        assert!(id_sent.complete_id(&msg6).is_err(), "an untrusted responder cert must never verify");
+        let Err(failure) = id_sent.complete_id(&msg6, &mut ie) else {
+            panic!("an untrusted responder cert must never verify");
+        };
+        assert!(
+            failure.teardown.is_some(),
+            "SKEYID_a/e come from the DH exchange alone, so a Delete should still be buildable even though AUTH failed"
+        );
     }
 
     fn natd_msg(vid: bool, natd: &[(u8, Vec<u8>)]) -> Vec<isakmp::Payload> {
@@ -2395,7 +2440,7 @@ mod tests {
         let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
         let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
         let (msg6, rstate) = r2.complete_id(&msg5).unwrap();
-        let istate = id_sent.complete_id(&msg6).unwrap();
+        let istate = id_sent.complete_id(&msg6, &mut ie).unwrap();
         assert_eq!(istate.negotiated_lifetime_secs, 1200);
         assert_eq!(rstate.negotiated_lifetime_secs, 1200);
     }

@@ -189,8 +189,19 @@ pub fn build_r_u_there_ack(st: &Phase1State, entropy: &mut impl Entropy, seq: u3
 /// teardown logging/policy off the explicit ESP delete directly.
 pub fn build_delete(st: &Phase1State, entropy: &mut impl Entropy, esp_spi: u32) -> Result<(Vec<u8>, Vec<u8>), IkeError> {
     let esp_msg = build_single_informational(st, entropy, payload::DELETE, delete_body(protocol::ESP, &esp_spi.to_be_bytes()))?;
-    let isakmp_msg = build_single_informational(st, entropy, payload::DELETE, delete_body(protocol::ISAKMP, &isakmp_spi(st)))?;
+    let isakmp_msg = build_isakmp_delete(st, entropy)?;
     Ok((esp_msg, isakmp_msg))
+}
+
+/// Just the ISAKMP-SA half of [`build_delete`] — for a caller with no CHILD
+/// SA to name because Phase 1 itself never got that far (see
+/// [`super::phase1::AuthFailure`]: an initiator that rejects the responder's
+/// Main-Mode AUTH still holds a real SKEYID_a/SKEYID_e, derived from the DH
+/// exchange alone before either side's identity was checked, so it can still
+/// send this gateway a properly authenticated-and-encrypted teardown instead
+/// of silently vanishing and leaving the gateway's own DPD timer to notice).
+pub fn build_isakmp_delete(st: &Phase1State, entropy: &mut impl Entropy) -> Result<Vec<u8>, IkeError> {
+    build_single_informational(st, entropy, payload::DELETE, delete_body(protocol::ISAKMP, &isakmp_spi(st)))
 }
 
 /// Result of [`peek`]/[`probe`] — mirrors

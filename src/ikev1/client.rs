@@ -324,7 +324,22 @@ impl<E: Entropy> Client<E> {
                 self.send_step(&msg5, server, id_sent.floated)?;
                 let msg6 = self.recv_matching(cky_i, Some(cky_r), exchange::MAIN, id_sent.floated)?;
                 let msg6_len = msg6.len();
-                let phase1 = id_sent.complete_id(&msg6)?;
+                let floated = id_sent.floated;
+                let phase1 = match id_sent.complete_id(&msg6, &mut self.entropy) {
+                    Ok(p) => p,
+                    Err(failure) => {
+                        // See `phase1::AuthFailure`'s doc: SKEYID_a/e are
+                        // valid regardless of the failed AUTH check, so this
+                        // Delete is a real one the gateway will accept --
+                        // best-effort, same as every other Informational this
+                        // crate sends (no ack defined, ignore send errors).
+                        if let Some(teardown) = failure.teardown {
+                            ike_debug!("Main Mode: gateway AUTH did not verify -- sending an ISAKMP Delete so it doesn't spin DPD probes against a peer that already gave up");
+                            let _ = self.send_step(&teardown, server, floated);
+                        }
+                        return Err(failure.error.into());
+                    }
+                };
                 // Unlike Aggressive Mode, message 6 is a real reply the
                 // initiator already waited for above, so Phase 1 is known
                 // complete on both sides here -- no artificial pause needed

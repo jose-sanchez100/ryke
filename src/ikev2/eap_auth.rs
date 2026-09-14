@@ -57,6 +57,12 @@ pub enum ServerVerify {
     /// Do not authenticate the server. Only tolerable with a PSK server in an
     /// already-trusted setting; a real phone-style client must not use this.
     Insecure,
+    /// Require the server's `AUTH(psk)` to match what we independently compute
+    /// from this pre-shared key over its own signed octets (RFC 7296 §2.15) —
+    /// the actual verification `Insecure` skips. Fits gateways (e.g. a
+    /// FortiGate PSK+EAP dialup policy) that authenticate themselves via PSK
+    /// rather than a certificate.
+    Psk(Vec<u8>),
     /// Require the server's leaf certificate to (a) build a valid X.509 path to
     /// one of these trusted CA certificates (DER) — checking each hop's
     /// signature, validity window, and CA status — (b) carry `expected_dns` in
@@ -270,14 +276,24 @@ impl EapInitiator {
     /// dNSName, and produce a valid RFC 7427 signature over the responder's
     /// signed octets. Returns `false` on any failure so the caller can abort.
     fn verify_server(&self, ps: &Payloads) -> bool {
-        let (cas, expected_dns, now) = match &self.verify {
-            ServerVerify::Insecure => return true,
-            ServerVerify::TrustedCas { cas, expected_dns, now_unix } => (cas, expected_dns, *now_unix),
-        };
         let (Some(idr), Some(auth_bytes)) =
             (find(ps, PayloadType::IdResponder), find(ps, PayloadType::Authentication))
         else {
             return false;
+        };
+
+        let (cas, expected_dns, now) = match &self.verify {
+            ServerVerify::Insecure => return true,
+            ServerVerify::Psk(psk) => {
+                let Ok(auth) = Authentication::parse(auth_bytes) else { return false };
+                if auth.method != auth_method::SHARED_KEY {
+                    return false;
+                }
+                let algo = self.sa.suite.prf_algorithm();
+                let octets = responder_signed_octets(algo, &self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, idr);
+                return auth.data == psk_auth(algo, psk, &octets);
+            }
+            ServerVerify::TrustedCas { cas, expected_dns, now_unix } => (cas, expected_dns, *now_unix),
         };
         // Every CERT payload, in order: [0] is the leaf, the rest intermediates.
         let certs: Vec<Vec<u8>> = ps
@@ -337,7 +353,7 @@ impl EapInitiator {
         // could send a first message with no IDr/AUTH (skipping verify_server) and
         // walk us through EAP, harvesting the username + a crackable MSCHAPv2
         // response. `Insecure` opts out (only for a PSK server in a trusted path).
-        if matches!(self.verify, ServerVerify::TrustedCas { .. }) && !self.server_verified {
+        if matches!(self.verify, ServerVerify::TrustedCas { .. } | ServerVerify::Psk(_)) && !self.server_verified {
             return Ok(EapEvent::Failed);
         }
 
@@ -699,6 +715,30 @@ mod tests {
 
     fn cert_server() -> ServerAuth {
         ServerAuth::Cert { key: ecdsa_leaf_key(), chain: vec![LEAF_CERT_DER.to_vec()] }
+    }
+
+    #[test]
+    fn server_psk_verify_succeeds_when_psk_matches() {
+        // The gateway shape this variant exists for: no certificate, the
+        // responder authenticates itself with a group PSK, and the client can
+        // now actually check that (previously only Insecure/TrustedCas
+        // existed, so a PSK-authenticated server could only be blindly
+        // trusted, never verified).
+        let (init_sa, resp_sa) = sa_pair();
+        let initiator = EapInitiator::new(init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111, ServerVerify::Psk(b"group-psk".to_vec()));
+        let responder = EapResponder::new(resp_sa, Identification::fqdn("gw"), ServerAuth::Psk(b"group-psk".to_vec()), b"alice".to_vec(), "s3cret".into(), 0x2222);
+        assert_eq!(drive(initiator, responder), Outcome::Established);
+    }
+
+    #[test]
+    fn server_psk_verify_rejects_wrong_psk() {
+        // Same responder, but the client was configured with the wrong group
+        // PSK -- it must not proceed to EAP (would otherwise disclose the
+        // username/password to an unverified peer).
+        let (init_sa, resp_sa) = sa_pair();
+        let initiator = EapInitiator::new(init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111, ServerVerify::Psk(b"wrong-psk".to_vec()));
+        let responder = EapResponder::new(resp_sa, Identification::fqdn("gw"), ServerAuth::Psk(b"group-psk".to_vec()), b"alice".to_vec(), "s3cret".into(), 0x2222);
+        assert_eq!(drive(initiator, responder), Outcome::Failed, "a mismatched PSK must fail server verification");
     }
 
     #[test]

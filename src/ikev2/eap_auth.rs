@@ -189,6 +189,9 @@ pub struct EapInitiator {
     /// a superset of `assigned_ip4`/`granted_ts` for callers that want the
     /// other attributes too (DNS servers, split-tunnel subnets, IPv6).
     configuration: Option<Configuration>,
+    /// Whether to carry a CFG_REQUEST in the EAP-triggering first message --
+    /// see [`Self::set_want_cfg`].
+    want_cfg: bool,
 }
 
 impl EapInitiator {
@@ -232,6 +235,7 @@ impl EapInitiator {
             assigned_ip4: None,
             granted_ts: None,
             configuration: None,
+            want_cfg: false,
         }
     }
 
@@ -239,6 +243,16 @@ impl EapInitiator {
     /// used to exercise a responder's CERTREQ-based cert selection.
     pub fn set_send_certreq(&mut self, on: bool) {
         self.send_certreq = on;
+    }
+
+    /// Carry a CFG_REQUEST ([`Configuration::request_ipv4`]) in the
+    /// EAP-triggering first message -- RFC 7296 §2.19 lets mode-config run
+    /// alongside any authentication method; some responders require it to
+    /// complete before they'll finish an EAP exchange at all. Off by default,
+    /// matching the wire behavior of a plain EAP-MSCHAPv2 client that never
+    /// asks for an inner address.
+    pub fn set_want_cfg(&mut self, on: bool) {
+        self.want_cfg = on;
     }
 
     /// The completed `IKE_SA_INIT` state — `sk_d`/nonces/role, what
@@ -334,12 +348,13 @@ impl EapInitiator {
                 &self.sa,
                 &self.id,
                 self.child_spi,
+                self.want_cfg,
                 &self.esp_offer,
                 vec![[0u8; 20]],
                 &iv(entropy),
             )
         } else {
-            initiator_eap_request(&self.sa, &self.id, self.child_spi, &self.esp_offer, &iv(entropy))
+            initiator_eap_request(&self.sa, &self.id, self.child_spi, self.want_cfg, &self.esp_offer, &iv(entropy))
         }
     }
 

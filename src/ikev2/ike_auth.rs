@@ -381,7 +381,7 @@ pub fn initiator_auth_request_with_cfg(
     sa: &CompletedSaInit,
     cfg: &AuthConfig,
     child_spi: u32,
-    _want_cfg: bool,
+    want_cfg: bool,
     esp_offer: &SecurityAssociation,
     iv: &[u8; 8],
 ) -> Result<Vec<u8>, IkeError> {
@@ -390,6 +390,9 @@ pub fn initiator_auth_request_with_cfg(
     let (auth, cert_payloads) = build_local_auth(cfg, sa, &octets)?;
 
     let mut inner = vec![(PayloadType::IdInitiator, idi_body)];
+    if want_cfg {
+        inner.push((PayloadType::Configuration, Configuration::request_ipv4().to_bytes()));
+    }
     // RFC 7296 §2.4: we hold no state across restarts, so this is always our
     // first (and only) SA with this peer -- tells the responder to tear down
     // any stale SA it still has for our identity.
@@ -409,24 +412,31 @@ pub fn initiator_auth_request_with_cfg(
     build_encrypted(sa.suite.sk_cipher(), ike_auth_header(sa, false), first, &inner_bytes, &sa.keys.sk_ei, &sa.keys.sk_ai, iv)
 }
 
-/// Initiator: build the **EAP-mode** `IKE_AUTH` request `SK { IDi, SAi2, TSi, TSr }`
-/// — no AUTH payload, which tells the responder the initiator will authenticate
-/// via EAP (RFC 7296 §2.16). The multi-message EAP exchange then follows.
-/// See [`initiator_auth_request_with_cfg`] for `esp_offer`'s contract.
+/// Initiator: build the **EAP-mode** `IKE_AUTH` request `SK { IDi, [CFG],
+/// SAi2, TSi, TSr }` — no AUTH payload, which tells the responder the
+/// initiator will authenticate via EAP (RFC 7296 §2.16). The multi-message
+/// EAP exchange then follows. Carries a CFG_REQUEST
+/// ([`Configuration::request_ipv4`]) when `want_cfg` is set — RFC 7296
+/// §2.19 lets mode-config run alongside any authentication method; some
+/// responders require it to complete before they'll finish an EAP exchange
+/// at all, so this is opt-in rather than unconditional. See
+/// [`initiator_auth_request_with_cfg`] for `esp_offer`'s contract.
 pub fn initiator_eap_request(
     sa: &CompletedSaInit,
     id: &Identification,
     child_spi: u32,
+    want_cfg: bool,
     esp_offer: &SecurityAssociation,
     iv: &[u8; 8],
 ) -> Result<Vec<u8>, IkeError> {
-    let inner = vec![
-        (PayloadType::IdInitiator, id.to_bytes()),
-        (PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()),
-        (PayloadType::TrafficSelectorInitiator, full_tunnel_ts()),
-        (PayloadType::TrafficSelectorResponder, full_tunnel_ts()),
-        (PayloadType::Notify, Notify::status(notify_type::INITIAL_CONTACT, Vec::new()).to_bytes()),
-    ];
+    let mut inner = vec![(PayloadType::IdInitiator, id.to_bytes())];
+    if want_cfg {
+        inner.push((PayloadType::Configuration, Configuration::request_ipv4().to_bytes()));
+    }
+    inner.push((PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()));
+    inner.push((PayloadType::TrafficSelectorInitiator, full_tunnel_ts()));
+    inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+    inner.push((PayloadType::Notify, Notify::status(notify_type::INITIAL_CONTACT, Vec::new()).to_bytes()));
     let first = first_payload_type(&inner);
     let inner_bytes = encode_payload_chain(&inner);
     build_encrypted(sa.suite.sk_cipher(), ike_auth_header(sa, false), first, &inner_bytes, &sa.keys.sk_ei, &sa.keys.sk_ai, iv)
@@ -435,22 +445,25 @@ pub fn initiator_eap_request(
 /// Like [`initiator_eap_request`] but also carries a `CERTREQ` payload listing
 /// `ca_hashes` — mirrors a strongSwan client that advertises the CAs it trusts.
 /// Lets a responder that selects its cert by CERTREQ presence be exercised.
+/// Also honors `want_cfg` the same way [`initiator_eap_request`] does.
 pub fn initiator_eap_request_with_certreq(
     sa: &CompletedSaInit,
     id: &Identification,
     child_spi: u32,
+    want_cfg: bool,
     esp_offer: &SecurityAssociation,
     ca_hashes: Vec<[u8; 20]>,
     iv: &[u8; 8],
 ) -> Result<Vec<u8>, IkeError> {
-    let inner = vec![
-        (PayloadType::IdInitiator, id.to_bytes()),
-        (PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()),
-        (PayloadType::TrafficSelectorInitiator, full_tunnel_ts()),
-        (PayloadType::TrafficSelectorResponder, full_tunnel_ts()),
-        (PayloadType::CertRequest, CertRequest::x509(ca_hashes).to_bytes()),
-        (PayloadType::Notify, Notify::status(notify_type::INITIAL_CONTACT, Vec::new()).to_bytes()),
-    ];
+    let mut inner = vec![(PayloadType::IdInitiator, id.to_bytes())];
+    if want_cfg {
+        inner.push((PayloadType::Configuration, Configuration::request_ipv4().to_bytes()));
+    }
+    inner.push((PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()));
+    inner.push((PayloadType::TrafficSelectorInitiator, full_tunnel_ts()));
+    inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+    inner.push((PayloadType::CertRequest, CertRequest::x509(ca_hashes).to_bytes()));
+    inner.push((PayloadType::Notify, Notify::status(notify_type::INITIAL_CONTACT, Vec::new()).to_bytes()));
     let first = first_payload_type(&inner);
     let inner_bytes = encode_payload_chain(&inner);
     build_encrypted(sa.suite.sk_cipher(), ike_auth_header(sa, false), first, &inner_bytes, &sa.keys.sk_ei, &sa.keys.sk_ai, iv)

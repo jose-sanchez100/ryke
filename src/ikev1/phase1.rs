@@ -20,7 +20,8 @@ use super::payloads::{
 use crate::crypto::DhGroup;
 use crate::entropy::Entropy;
 use crate::error::IkeError;
-use crate::ikev2::sign::{cert_subject_dn, validate_chain, SigningKey, VerifyingKey};
+use crate::debug::ike_debug;
+use crate::ikev2::sign::{cert_subject_dn, cert_subject_issuer_display, validate_chain, SigningKey, VerifyingKey};
 use crate::ikev2::sk::SkCipher;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1162,8 +1163,24 @@ impl MainIdSent {
         if self.is_sig {
             let certs = collect_certs(&ps)?;
             let sig = find(&ps, payload::SIG).ok_or(IkeError::MissingPayload("SIG"))?.data.clone();
-            validate_chain(&certs[0], &certs[1..], &self.trusted_cas, self.now_unix)?;
-            VerifyingKey::from_cert_der(&certs[0])?.verify_classic_rsa_raw(&sig, &expect_hr)?;
+            if let Ok((subject, issuer)) = cert_subject_issuer_display(&certs[0]) {
+                ike_debug!(
+                    "Main Mode: gateway sent {} certificate(s); leaf subject='{subject}' issuer='{issuer}'",
+                    certs.len()
+                );
+            }
+            if let Err(e) = validate_chain(&certs[0], &certs[1..], &self.trusted_cas, self.now_unix) {
+                ike_debug!(
+                    "Main Mode: gateway certificate chain did not validate against the trust store ({} intermediate(s) sent) -- \
+                     likely a missing intermediate CA in the gateway's CERT payload, or the leaf's issuer isn't a trusted root: {e}",
+                    certs.len().saturating_sub(1)
+                );
+                return Err(e);
+            }
+            if let Err(e) = VerifyingKey::from_cert_der(&certs[0])?.verify_classic_rsa_raw(&sig, &expect_hr) {
+                ike_debug!("Main Mode: gateway certificate chain is trusted, but its SIG payload did not verify: {e}");
+                return Err(e);
+            }
         } else {
             let hash_r_got = find(&ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
             if hash_r_got != expect_hr {

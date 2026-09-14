@@ -354,6 +354,15 @@ pub fn cert_subject_dn(cert_der: &[u8]) -> Result<Vec<u8>, IkeError> {
     subject_dn(cert_der)
 }
 
+/// Human-readable (RFC 4514) subject/issuer strings, for `AuthFailed`
+/// diagnostics only -- callers that need the DER form for chain-building use
+/// [`cert_subject_dn`]/the crate-private `subject_dn`/`issuer_dn` instead.
+pub fn cert_subject_issuer_display(cert_der: &[u8]) -> Result<(String, String), IkeError> {
+    use der::Decode;
+    let cert = x509_cert::Certificate::from_der(cert_der).map_err(|_| IkeError::Crypto("malformed certificate DER"))?;
+    Ok((cert.tbs_certificate.subject.to_string(), cert.tbs_certificate.issuer.to_string()))
+}
+
 /// DER of a certificate's subject / issuer distinguished name (for chaining).
 fn subject_dn(cert_der: &[u8]) -> Result<Vec<u8>, IkeError> {
     use der::{Decode, Encode};

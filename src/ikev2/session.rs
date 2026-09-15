@@ -22,6 +22,7 @@
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::crypto::{derive_child_keys, DhGroup, IntegAlgorithm};
@@ -128,6 +129,20 @@ pub struct LivenessSession {
     /// the next one's `REKEY_SA` notify references the right value.
     child_local_spi: u32,
     child_peer_spi: u32,
+    /// Windows only, unused (`None`) everywhere else -- see
+    /// `platform::windows::xfrm`'s module doc. On Linux the kernel's
+    /// `UDP_ENCAP` sockopt steals ESP-shaped datagrams away from this
+    /// session's own socket before `recv_and_classify` ever sees them, so it
+    /// can safely call `self.sock.recv` directly: only IKE ever arrives
+    /// there. Windows has no such trick, so a single background thread owns
+    /// the real `recv_from` loop instead (demuxing IKE from raw
+    /// ESP-in-UDP itself) and hands this session its already-classified IKE
+    /// datagrams through a channel via [`Self::install_external_receiver`]
+    /// -- two independent readers on `try_clone()`'d handles of the same
+    /// socket would otherwise race for each other's traffic. `None` (the
+    /// default produced by every existing constructor) preserves today's
+    /// direct-socket-read behavior unchanged.
+    external_rx: Option<mpsc::Receiver<Vec<u8>>>,
 }
 
 /// Result of one [`LivenessSession::probe`] call.
@@ -278,6 +293,19 @@ impl LivenessSession {
         self.pfs_group.is_some()
     }
 
+    /// Windows only -- see [`Self`]'s `external_rx` doc. Redirects every
+    /// future [`Self::probe`]/[`Self::peek`] read from this session's own
+    /// socket to `rx` instead: the caller is expected to already own a
+    /// background thread that is the socket's sole reader, demuxing IKE
+    /// datagrams (which it forwards here, whole and still wrapped, exactly
+    /// as `recv_and_classify` would have read them itself) from raw
+    /// ESP-in-UDP (which it handles on its own). Sending (DPD requests,
+    /// acks) still goes straight out `self.sock` unaffected -- only the read
+    /// side needs arbitration.
+    pub fn install_external_receiver(&mut self, rx: mpsc::Receiver<Vec<u8>>) {
+        self.external_rx = Some(rx);
+    }
+
     /// Initiate a `CREATE_CHILD_SA` rekey (RFC 7296 §2.8) of this tunnel's
     /// CHILD SA, applying PFS when this session was configured with a group
     /// (see [`Self::pfs_configured`]). This is the *only* point in an IKEv2
@@ -400,13 +428,32 @@ impl LivenessSession {
         self.sock.set_read_timeout(Some(timeout))?;
         let mut buf = [0u8; 8192];
         loop {
-            let n = match self.sock.recv(&mut buf) {
-                Ok(n) => n,
-                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                    return Ok(if expected_mid.is_some() { Liveness::NoReply } else { Liveness::Alive });
+            // See `external_rx`'s own doc: on Windows a background thread is
+            // this socket's sole reader and forwards already-demuxed IKE
+            // datagrams here instead.
+            let raw: &[u8] = if let Some(rx) = &self.external_rx {
+                match rx.recv_timeout(timeout) {
+                    Ok(datagram) => {
+                        buf[..datagram.len()].copy_from_slice(&datagram);
+                        &buf[..datagram.len()]
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        return Ok(if expected_mid.is_some() { Liveness::NoReply } else { Liveness::Alive });
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Ok(if expected_mid.is_some() { Liveness::NoReply } else { Liveness::Alive });
+                    }
                 }
-                Err(e) => return Err(e.into()),
+            } else {
+                match self.sock.recv(&mut buf) {
+                    Ok(n) => &buf[..n],
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                        return Ok(if expected_mid.is_some() { Liveness::NoReply } else { Liveness::Alive });
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             };
+            let n = raw.len();
             crate::debug::dump("<<<", self.dest, &buf[..n]);
             let msg = unwrap(&buf[..n], self.float)?;
             let header = IkeHeader::parse(&msg)?;
@@ -898,6 +945,7 @@ impl<E: Entropy> Ikev2Session<E> {
             pfs_group,
             child_local_spi: local_spi,
             child_peer_spi: peer_spi,
+            external_rx: None,
         };
         Ok(ConnectedTunnel {
             local_spi,
@@ -1148,6 +1196,7 @@ impl<E: Entropy> Ikev2Session<E> {
             pfs_group,
             child_local_spi: local_spi,
             child_peer_spi: peer_spi,
+            external_rx: None,
         };
 
         Ok(ConnectedTunnel {
@@ -1256,7 +1305,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0 };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
@@ -1285,7 +1334,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0 };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None };
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
@@ -1315,7 +1364,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0 };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -1342,7 +1391,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0 };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None };
         liveness.close().unwrap();
         responder.join().unwrap();
     }
@@ -1356,7 +1405,7 @@ mod tests {
         let (init_sa, _resp_sa) = liveness_sa_pair();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0 };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None };
         liveness.close().unwrap();
     }
 
@@ -1370,7 +1419,7 @@ mod tests {
         let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0 };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None };
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::NoReply);
     }
 
@@ -1380,7 +1429,7 @@ mod tests {
         let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0 };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None };
         // Unlike probe(), silence on a peek is Alive (nothing new to
         // report), not NoReply -- peek never asked anything.
         assert_eq!(liveness.peek(Duration::from_millis(50)).unwrap(), Liveness::Alive);
@@ -1414,7 +1463,7 @@ mod tests {
         probe_sock.send_to(b"hello", bind).unwrap();
 
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0 };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -1457,6 +1506,7 @@ mod tests {
             pfs_group: None,
             child_local_spi: 0,
             child_peer_spi: 0xAAAA,
+            external_rx: None,
         };
         // The stale Delete is ignored and the wait times out -- silence
         // (nothing new to report) is Alive, exactly as if nothing had
@@ -1495,6 +1545,7 @@ mod tests {
             pfs_group: None,
             child_local_spi: 0,
             child_peer_spi: 0xAAAA,
+            external_rx: None,
         };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();

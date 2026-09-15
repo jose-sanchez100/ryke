@@ -99,5 +99,8 @@ pub use ikev2::server::{Server, ServerEvent};
 pub use transport::{DriverError, UdpTransport};
 pub use tunnel::Tunnel;
 
-#[cfg(unix)]
+// `entropy::OsEntropy` itself is genuinely cross-platform (backed by the
+// `getrandom` crate: BCryptGenRandom on Windows, getrandom(2)/-urandom on
+// Linux) -- this re-export was mistakenly unix-gated even though nothing
+// about it is unix-specific.
 pub use entropy::OsEntropy;

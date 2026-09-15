@@ -573,19 +573,20 @@ impl Configuration {
     /// virtual-IP requests) plus empty INTERNAL_IP4_SUBNET/INTERNAL_IP6_SUBNET
     /// attributes (a responder that has split-tunnel subnets to offer
     /// replies with one per range, read back with [`Self::assigned_subnets`]
-    /// / [`Self::assigned_ipv6_subnets`]) plus an empty INTERNAL_IP4_DNS
-    /// attribute (read back with [`Self::assigned_dns`]) -- without this,
-    /// a compliant responder has no reason to hand back DNS servers at all
-    /// per RFC 7296 §3.15.1 ("attribute value MAY be omitted...if the value
-    /// was not requested"); confirmed live against a real FortiGate that
-    /// this attribute was missing from the request, and CFG_REPLY came back
-    /// with no INTERNAL_IP4_DNS as a direct result, same as the IKEv1
-    /// Mode-Config counterpart (`ikev1::modecfg::ConfigPayload::request_ipv4`)
-    /// already includes. Per RFC 7296 §3.15.1, an attribute a responder
-    /// doesn't support or have a value for is simply omitted from
-    /// CFG_REPLY, so requesting IPv6 here is a no-op against an IPv4-only
-    /// responder — an initiator that never asks for INTERNAL_IP6_ADDRESS
-    /// never gets one back either way.
+    /// / [`Self::assigned_ipv6_subnets`]) plus empty INTERNAL_IP4_DNS/
+    /// INTERNAL_IP6_DNS attributes (read back with [`Self::assigned_dns`] /
+    /// [`Self::assigned_ipv6_dns`]) -- without these, a compliant responder
+    /// has no reason to hand back DNS servers at all per RFC 7296 §3.15.1
+    /// ("attribute value MAY be omitted...if the value was not requested");
+    /// confirmed live against a real FortiGate that INTERNAL_IP4_DNS was
+    /// missing from the request, and CFG_REPLY came back with no DNS as a
+    /// direct result, same as the IKEv1 Mode-Config counterpart
+    /// (`ikev1::modecfg::ConfigPayload::request_ipv4`) already includes for
+    /// IPv4. Per RFC 7296 §3.15.1, an attribute a responder doesn't support
+    /// or have a value for is simply omitted from CFG_REPLY, so requesting
+    /// IPv6 here (address/subnet/DNS alike) is a no-op against an
+    /// IPv4-only responder — an initiator that never asks for an IPv6
+    /// attribute never gets one back either way.
     pub fn request_ipv4() -> Self {
         Configuration {
             cfg_type: cfg_type::REQUEST,
@@ -595,6 +596,7 @@ impl Configuration {
                 ConfigAttr { attr_type: config_attr::INTERNAL_IP4_DNS, value: Vec::new() },
                 ConfigAttr { attr_type: config_attr::INTERNAL_IP6_ADDRESS, value: Vec::new() },
                 ConfigAttr { attr_type: config_attr::INTERNAL_IP6_SUBNET, value: Vec::new() },
+                ConfigAttr { attr_type: config_attr::INTERNAL_IP6_DNS, value: Vec::new() },
             ],
         }
     }
@@ -1086,6 +1088,7 @@ mod tests {
         assert!(types.contains(&config_attr::INTERNAL_IP4_DNS));
         assert!(types.contains(&config_attr::INTERNAL_IP6_ADDRESS));
         assert!(types.contains(&config_attr::INTERNAL_IP6_SUBNET));
+        assert!(types.contains(&config_attr::INTERNAL_IP6_DNS));
         assert!(req.attrs.iter().all(|a| a.value.is_empty()), "a CFG_REQUEST asks with empty attribute values");
     }
 

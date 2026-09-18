@@ -21,7 +21,7 @@
 //! default AES-GCM-256 one).
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -71,6 +71,14 @@ pub struct ConnectedTunnel {
     pub key_in: ChildKeyMaterial,
     pub assigned_ip4: Option<Ipv4Addr>,
     pub dns: Vec<Ipv4Addr>,
+    /// Every `INTERNAL_IP6_DNS` attribute CFG_REPLY carried, if any --
+    /// requested alongside the IPv4 attributes ([`Configuration::request_ipv4`]),
+    /// but note the app currently blackholes all IPv6 traffic on every
+    /// backend (see `xfrm::set_ipv6_blackhole_table_220`), so a
+    /// dual-stack gateway that hands these back can't actually have them
+    /// reached over the tunnel yet -- kept here so a caller can at least
+    /// log/surface what the gateway offered, not silently drop it.
+    pub dns6: Vec<Ipv6Addr>,
     /// The *first* `INTERNAL_IP4_SUBNET` attribute from CFG_REPLY, if the
     /// responder sent at least one -- kept for backward compat / diagnostics
     /// only. A responder that hands back several (one per split-tunnel
@@ -929,6 +937,7 @@ impl<E: Entropy> Ikev2Session<E> {
         ike_debug!("IKE_AUTH: authenticated -- peer_spi={peer_spi:08x} assigned_ip={assigned_ip4:?}");
         let cfg_reply = want_cfg.then(|| scan_cfg_reply(&response, &sa)).flatten();
         let dns = cfg_reply.as_ref().map(Configuration::assigned_dns).unwrap_or_default();
+        let dns6 = cfg_reply.as_ref().map(Configuration::assigned_ipv6_dns).unwrap_or_default();
         let cfg_subnets = cfg_reply.as_ref().map(Configuration::assigned_subnets).unwrap_or_default();
         let subnet = cfg_subnets.first().copied();
 
@@ -954,6 +963,7 @@ impl<E: Entropy> Ikev2Session<E> {
             key_in,
             assigned_ip4,
             dns,
+            dns6,
             subnet,
             granted_subnets: granted_subnets(tsr.as_ref(), &cfg_subnets),
             local_addr: our_addr,
@@ -1178,6 +1188,7 @@ impl<E: Entropy> Ikev2Session<E> {
         let sa = initiator.ike_sa();
         let cfg_reply = scan_cfg_reply(&last_message, sa);
         let dns = cfg_reply.as_ref().map(Configuration::assigned_dns).unwrap_or_default();
+        let dns6 = cfg_reply.as_ref().map(Configuration::assigned_ipv6_dns).unwrap_or_default();
         let cfg_subnets = cfg_reply.as_ref().map(Configuration::assigned_subnets).unwrap_or_default();
         let subnet = cfg_subnets.first().copied();
         let (key_out, key_in) = Self::derive_keys(sa, cipher);
@@ -1206,6 +1217,7 @@ impl<E: Entropy> Ikev2Session<E> {
             key_in,
             assigned_ip4,
             dns,
+            dns6,
             subnet,
             granted_subnets: granted_subnets(tsr.as_ref(), &cfg_subnets),
             local_addr: our_addr,

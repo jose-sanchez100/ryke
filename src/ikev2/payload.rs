@@ -694,14 +694,30 @@ impl Configuration {
     /// Every INTERNAL_IP6_SUBNET attribute, as (network, prefix length) --
     /// same split-tunnel allowance as [`Self::assigned_subnets`]. Each value
     /// is 17 octets: a 16-byte prefix plus a 1-byte prefix length.
+    ///
+    /// A `/0` entry is dropped regardless of the address bytes alongside
+    /// it: a zero prefix length covers the entire address space no matter
+    /// what those bytes are, so it can never be a real split-tunnel grant
+    /// for this app's model (which has no full-IPv6-tunnel mode -- see
+    /// `ryke::ConnectedTunnel::granted_subnets6`'s doc). Confirmed live
+    /// against a real FortiGate with IPv6 left unconfigured: rather than
+    /// omitting INTERNAL_IP6_SUBNET per RFC 7296 §3.15.1's own guidance for
+    /// an attribute it has nothing to offer, it sends one back anyway with
+    /// an all-zero value (`::`, prefix `0`). Left in the list, that value
+    /// would read as "subnets were granted" to a caller checking
+    /// `is_empty()` (defeating an IPv6 kill-switch gated on exactly that,
+    /// as `daemon::service::finish_connect` is) or, on a gateway that also
+    /// assigned an address, get installed as a literal route-everything
+    /// entry nothing about the exchange actually asked for.
     pub fn assigned_ipv6_subnets(&self) -> Vec<(Ipv6Addr, u8)> {
         self.attrs
             .iter()
             .filter(|a| a.attr_type == config_attr::INTERNAL_IP6_SUBNET && a.value.len() == 17)
-            .map(|a| {
+            .filter_map(|a| {
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&a.value[..16]);
-                (Ipv6Addr::from(octets), a.value[16])
+                let prefix_len = a.value[16];
+                (prefix_len != 0).then(|| (Ipv6Addr::from(octets), prefix_len))
             })
             .collect()
     }
@@ -1120,6 +1136,39 @@ mod tests {
         // Round-trips through wire encoding too.
         let parsed = Configuration::parse(&cfg.to_bytes()).unwrap();
         assert_eq!(parsed.assigned_ipv6(), Some((addr, 64)));
+    }
+
+    /// Real FortiGate behavior with IPv6 left unconfigured: instead of
+    /// omitting INTERNAL_IP6_SUBNET, it sends one back with an all-zero
+    /// value (`::`, prefix `0`). Must read back as no subnets granted at
+    /// all -- a caller (`daemon::service::finish_connect`) gates the IPv6
+    /// kill-switch on `is_empty()`, so a `/0` entry surviving here would
+    /// silently disable it on every IPv4-only gateway that does this.
+    #[test]
+    fn assigned_ipv6_subnets_drops_all_zero_slash_zero_entries() {
+        let mut junk_value = Ipv6Addr::UNSPECIFIED.octets().to_vec();
+        junk_value.push(0); // prefix length
+
+        let real_subnet = Ipv6Addr::new(0xfd00, 0, 0, 0x10, 0, 0, 0, 0);
+        let mut real_value = real_subnet.octets().to_vec();
+        real_value.push(64);
+
+        let junk_only = Configuration {
+            cfg_type: cfg_type::REPLY,
+            attrs: vec![ConfigAttr { attr_type: config_attr::INTERNAL_IP6_SUBNET, value: junk_value.clone() }],
+        };
+        assert_eq!(junk_only.assigned_ipv6_subnets(), Vec::new());
+
+        // A real subnet alongside the junk one still comes through --
+        // only the meaningless /0 entry is dropped.
+        let mixed = Configuration {
+            cfg_type: cfg_type::REPLY,
+            attrs: vec![
+                ConfigAttr { attr_type: config_attr::INTERNAL_IP6_SUBNET, value: junk_value },
+                ConfigAttr { attr_type: config_attr::INTERNAL_IP6_SUBNET, value: real_value },
+            ],
+        };
+        assert_eq!(mixed.assigned_ipv6_subnets(), vec![(real_subnet, 64)]);
     }
 
     #[test]

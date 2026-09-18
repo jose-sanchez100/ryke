@@ -72,13 +72,28 @@ pub struct ConnectedTunnel {
     pub assigned_ip4: Option<Ipv4Addr>,
     pub dns: Vec<Ipv4Addr>,
     /// Every `INTERNAL_IP6_DNS` attribute CFG_REPLY carried, if any --
-    /// requested alongside the IPv4 attributes ([`Configuration::request_ipv4`]),
-    /// but note the app currently blackholes all IPv6 traffic on every
-    /// backend (see `xfrm::set_ipv6_blackhole_table_220`), so a
-    /// dual-stack gateway that hands these back can't actually have them
-    /// reached over the tunnel yet -- kept here so a caller can at least
-    /// log/surface what the gateway offered, not silently drop it.
+    /// requested alongside the IPv4 attributes ([`Configuration::request_ipv4`]).
+    /// Still not actually reachable over the tunnel on Windows (which
+    /// unconditionally blackholes all IPv6 -- see
+    /// `platform::windows::xfrm::set_ipv6_blackhole_table_220`); on Linux,
+    /// only reachable if the resolver address itself falls inside
+    /// [`Self::granted_subnets6`]. Kept here regardless so a caller can at
+    /// least log/surface what the gateway offered, not silently drop it.
     pub dns6: Vec<Ipv6Addr>,
+    /// The `INTERNAL_IP6_ADDRESS` CFG_REPLY attribute, if the responder
+    /// sent one -- (address, prefix length), the prefix length travelling
+    /// with the attribute itself (see [`Configuration::assigned_ipv6`]'s
+    /// doc). `None` on a v4-only gateway, or when CFG wasn't requested.
+    pub assigned_ip6: Option<(Ipv6Addr, u8)>,
+    /// What to route through the tunnel for IPv6: every
+    /// `INTERNAL_IP6_SUBNET` attribute CFG_REPLY carried -- mirrors
+    /// [`Self::granted_subnets`]'s IPv4 role, except with no `TSr` fallback:
+    /// unlike a `TSr`-derived guess, a responder that never sends
+    /// `INTERNAL_IP6_SUBNET` isn't offering IPv6 split-tunnel routing at
+    /// all, and the kill-switch (`xfrm::set_ipv6_blackhole_table_220`)
+    /// already blocks anything not listed here by default -- empty is the
+    /// correct answer for that case, not a gap to fill in.
+    pub granted_subnets6: Vec<(Ipv6Addr, u8)>,
     /// The *first* `INTERNAL_IP4_SUBNET` attribute from CFG_REPLY, if the
     /// responder sent at least one -- kept for backward compat / diagnostics
     /// only. A responder that hands back several (one per split-tunnel
@@ -940,16 +955,9 @@ impl<E: Entropy> Ikev2Session<E> {
         let dns6 = cfg_reply.as_ref().map(Configuration::assigned_ipv6_dns).unwrap_or_default();
         let cfg_subnets = cfg_reply.as_ref().map(Configuration::assigned_subnets).unwrap_or_default();
         let subnet = cfg_subnets.first().copied();
-        // Diagnostic only, not yet consumed anywhere -- see ConnectedTunnel's
-        // `dns6` doc for why (no IPv6 data-plane/routing support yet). Logs
-        // whatever the responder actually sent so a real deployment (e.g. a
-        // FortiGate offering INTERNAL_IP6_SUBNET split-tunnel ranges) can be
-        // confirmed/inspected before that support is built.
-        ike_debug!(
-            "IKE_AUTH: CFG_REPLY IPv6 -- assigned_ipv6={:?} assigned_ipv6_subnets={:?}",
-            cfg_reply.as_ref().and_then(Configuration::assigned_ipv6),
-            cfg_reply.as_ref().map(Configuration::assigned_ipv6_subnets).unwrap_or_default()
-        );
+        let assigned_ip6 = cfg_reply.as_ref().and_then(Configuration::assigned_ipv6);
+        let granted_subnets6 = cfg_reply.as_ref().map(Configuration::assigned_ipv6_subnets).unwrap_or_default();
+        ike_debug!("IKE_AUTH: CFG_REPLY IPv6 -- assigned_ipv6={assigned_ip6:?} assigned_ipv6_subnets={granted_subnets6:?}");
 
         let cipher = resolve_esp_cipher(esp_suite)?;
         let (key_out, key_in) = Self::derive_keys(&sa, cipher);
@@ -974,6 +982,8 @@ impl<E: Entropy> Ikev2Session<E> {
             assigned_ip4,
             dns,
             dns6,
+            assigned_ip6,
+            granted_subnets6,
             subnet,
             granted_subnets: granted_subnets(tsr.as_ref(), &cfg_subnets),
             local_addr: our_addr,
@@ -1202,11 +1212,9 @@ impl<E: Entropy> Ikev2Session<E> {
         let cfg_subnets = cfg_reply.as_ref().map(Configuration::assigned_subnets).unwrap_or_default();
         let subnet = cfg_subnets.first().copied();
         // See the identical block in the non-EAP IKE_AUTH path above.
-        ike_debug!(
-            "IKE_AUTH (EAP): CFG_REPLY IPv6 -- assigned_ipv6={:?} assigned_ipv6_subnets={:?}",
-            cfg_reply.as_ref().and_then(Configuration::assigned_ipv6),
-            cfg_reply.as_ref().map(Configuration::assigned_ipv6_subnets).unwrap_or_default()
-        );
+        let assigned_ip6 = cfg_reply.as_ref().and_then(Configuration::assigned_ipv6);
+        let granted_subnets6 = cfg_reply.as_ref().map(Configuration::assigned_ipv6_subnets).unwrap_or_default();
+        ike_debug!("IKE_AUTH (EAP): CFG_REPLY IPv6 -- assigned_ipv6={assigned_ip6:?} assigned_ipv6_subnets={granted_subnets6:?}");
         let (key_out, key_in) = Self::derive_keys(sa, cipher);
         // The next message ID we may originate is one past the last request
         // the peer sent us (its own EAP-round message IDs) -- our own
@@ -1234,6 +1242,8 @@ impl<E: Entropy> Ikev2Session<E> {
             assigned_ip4,
             dns,
             dns6,
+            assigned_ip6,
+            granted_subnets6,
             subnet,
             granted_subnets: granted_subnets(tsr.as_ref(), &cfg_subnets),
             local_addr: our_addr,

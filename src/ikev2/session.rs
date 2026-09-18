@@ -940,6 +940,16 @@ impl<E: Entropy> Ikev2Session<E> {
         let dns6 = cfg_reply.as_ref().map(Configuration::assigned_ipv6_dns).unwrap_or_default();
         let cfg_subnets = cfg_reply.as_ref().map(Configuration::assigned_subnets).unwrap_or_default();
         let subnet = cfg_subnets.first().copied();
+        // Diagnostic only, not yet consumed anywhere -- see ConnectedTunnel's
+        // `dns6` doc for why (no IPv6 data-plane/routing support yet). Logs
+        // whatever the responder actually sent so a real deployment (e.g. a
+        // FortiGate offering INTERNAL_IP6_SUBNET split-tunnel ranges) can be
+        // confirmed/inspected before that support is built.
+        ike_debug!(
+            "IKE_AUTH: CFG_REPLY IPv6 -- assigned_ipv6={:?} assigned_ipv6_subnets={:?}",
+            cfg_reply.as_ref().and_then(Configuration::assigned_ipv6),
+            cfg_reply.as_ref().map(Configuration::assigned_ipv6_subnets).unwrap_or_default()
+        );
 
         let cipher = resolve_esp_cipher(esp_suite)?;
         let (key_out, key_in) = Self::derive_keys(&sa, cipher);
@@ -1191,6 +1201,12 @@ impl<E: Entropy> Ikev2Session<E> {
         let dns6 = cfg_reply.as_ref().map(Configuration::assigned_ipv6_dns).unwrap_or_default();
         let cfg_subnets = cfg_reply.as_ref().map(Configuration::assigned_subnets).unwrap_or_default();
         let subnet = cfg_subnets.first().copied();
+        // See the identical block in the non-EAP IKE_AUTH path above.
+        ike_debug!(
+            "IKE_AUTH (EAP): CFG_REPLY IPv6 -- assigned_ipv6={:?} assigned_ipv6_subnets={:?}",
+            cfg_reply.as_ref().and_then(Configuration::assigned_ipv6),
+            cfg_reply.as_ref().map(Configuration::assigned_ipv6_subnets).unwrap_or_default()
+        );
         let (key_out, key_in) = Self::derive_keys(sa, cipher);
         // The next message ID we may originate is one past the last request
         // the peer sent us (its own EAP-round message IDs) -- our own

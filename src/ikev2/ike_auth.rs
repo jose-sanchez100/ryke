@@ -134,6 +134,18 @@ fn full_tunnel_ts() -> Vec<u8> {
     TrafficSelectors { selectors: vec![TrafficSelector::ipv4_any()] }.to_bytes()
 }
 
+/// TSi/TSr an *initiator* proposes. Asking for mode-config (`want_cfg`, which
+/// requests IPv6 attributes alongside the IPv4 ones -- see
+/// [`Configuration::request_ipv4`]) also asks to carry IPv6 in the CHILD SA:
+/// without an IPv6 traffic selector the responder has nothing to grant for it,
+/// so the assigned `INTERNAL_IP6_ADDRESS`/`INTERNAL_IP6_SUBNET` would name a
+/// network no ESP traffic can reach. A responder that doesn't do IPv6 narrows
+/// the offer back down to IPv4 (RFC 7296 §2.9). Without `want_cfg` this stays
+/// the IPv4-only offer it always was.
+pub(crate) fn initiator_ts(want_cfg: bool) -> Vec<u8> {
+    TrafficSelectors::full_tunnel(want_cfg).to_bytes()
+}
+
 /// Stamp `spi` onto every proposal in `offer` — the SPI is ours to choose
 /// per-connection, so a caller-supplied `esp_offer` template's own SPI value
 /// (if any) is always overwritten here rather than sent as-is.
@@ -406,8 +418,8 @@ pub fn initiator_auth_request_with_cfg(
     }
     inner.push((PayloadType::Authentication, auth.to_bytes()));
     inner.push((PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()));
-    inner.push((PayloadType::TrafficSelectorInitiator, full_tunnel_ts()));
-    inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+    inner.push((PayloadType::TrafficSelectorInitiator, initiator_ts(want_cfg)));
+    inner.push((PayloadType::TrafficSelectorResponder, initiator_ts(want_cfg)));
     let first = first_payload_type(&inner);
     let inner_bytes = encode_payload_chain(&inner);
     build_encrypted(sa.suite.sk_cipher(), ike_auth_header(sa, false), first, &inner_bytes, &sa.keys.sk_ei, &sa.keys.sk_ai, iv)
@@ -435,8 +447,8 @@ pub fn initiator_eap_request(
         inner.push((PayloadType::Configuration, Configuration::request_ipv4().to_bytes()));
     }
     inner.push((PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()));
-    inner.push((PayloadType::TrafficSelectorInitiator, full_tunnel_ts()));
-    inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+    inner.push((PayloadType::TrafficSelectorInitiator, initiator_ts(want_cfg)));
+    inner.push((PayloadType::TrafficSelectorResponder, initiator_ts(want_cfg)));
     inner.push((PayloadType::Notify, Notify::status(notify_type::INITIAL_CONTACT, Vec::new()).to_bytes()));
     let first = first_payload_type(&inner);
     let inner_bytes = encode_payload_chain(&inner);
@@ -461,8 +473,8 @@ pub fn initiator_eap_request_with_certreq(
         inner.push((PayloadType::Configuration, Configuration::request_ipv4().to_bytes()));
     }
     inner.push((PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()));
-    inner.push((PayloadType::TrafficSelectorInitiator, full_tunnel_ts()));
-    inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+    inner.push((PayloadType::TrafficSelectorInitiator, initiator_ts(want_cfg)));
+    inner.push((PayloadType::TrafficSelectorResponder, initiator_ts(want_cfg)));
     inner.push((PayloadType::CertRequest, CertRequest::x509(ca_hashes).to_bytes()));
     inner.push((PayloadType::Notify, Notify::status(notify_type::INITIAL_CONTACT, Vec::new()).to_bytes()));
     let first = first_payload_type(&inner);
@@ -503,8 +515,8 @@ pub fn initiator_eap_request_with_certs(
         inner.push((PayloadType::CertRequest, CertRequest::x509(hashes).to_bytes()));
     }
     inner.push((PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()));
-    inner.push((PayloadType::TrafficSelectorInitiator, full_tunnel_ts()));
-    inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+    inner.push((PayloadType::TrafficSelectorInitiator, initiator_ts(want_cfg)));
+    inner.push((PayloadType::TrafficSelectorResponder, initiator_ts(want_cfg)));
     inner.push((PayloadType::Notify, Notify::status(notify_type::INITIAL_CONTACT, Vec::new()).to_bytes()));
     let first = first_payload_type(&inner);
     let inner_bytes = encode_payload_chain(&inner);
@@ -709,6 +721,43 @@ mod tests {
         let (_resp, _peer, _spi, initial_contact) =
             responder_process_auth(&resp_sa, &req, &rcfg, 2, &[2u8; 8], None).unwrap();
         assert!(initial_contact);
+    }
+
+    /// The (TSi, TSr) selector lists an initiator request carries.
+    fn proposed_ts(resp_sa: &CompletedSaInit, req: &[u8]) -> (Vec<TrafficSelector>, Vec<TrafficSelector>) {
+        let (first, inner) = crate::ikev2::sk::open_encrypted(resp_sa.suite.sk_cipher(), req, &resp_sa.keys.sk_ei, &resp_sa.keys.sk_ai).unwrap();
+        let (mut tsi, mut tsr) = (Vec::new(), Vec::new());
+        for p in payloads(first, &inner).filter_map(|p| p.ok()) {
+            match p.payload_type {
+                PayloadType::TrafficSelectorInitiator => tsi = TrafficSelectors::parse(p.data).unwrap().selectors,
+                PayloadType::TrafficSelectorResponder => tsr = TrafficSelectors::parse(p.data).unwrap().selectors,
+                _ => {}
+            }
+        }
+        (tsi, tsr)
+    }
+
+    #[test]
+    fn initiator_proposes_ipv6_selectors_only_when_asking_for_mode_config() {
+        // Mode-config requests IPv6 attributes too, so the CHILD SA has to be
+        // offered IPv6 traffic selectors or nothing could ever be granted for
+        // the address/subnet the gateway hands back; without CFG it stays
+        // the IPv4-only offer.
+        let (init_sa, resp_sa) = run_sa_init();
+        let icfg = AuthConfig::psk(Identification::fqdn("client.example"), b"pw".to_vec());
+        let id = Identification::fqdn("eap.example");
+        let dual = vec![TrafficSelector::ipv4_any(), TrafficSelector::ipv6_any()];
+        let v4_only = vec![TrafficSelector::ipv4_any()];
+
+        let psk_cfg = initiator_auth_request_with_cfg(&init_sa, &icfg, 1, true, &esp_offer(0), &[1u8; 8]).unwrap();
+        assert_eq!(proposed_ts(&resp_sa, &psk_cfg), (dual.clone(), dual.clone()));
+        let psk_plain = initiator_auth_request_with_cfg(&init_sa, &icfg, 1, false, &esp_offer(0), &[1u8; 8]).unwrap();
+        assert_eq!(proposed_ts(&resp_sa, &psk_plain), (v4_only.clone(), v4_only.clone()));
+
+        let eap_cfg = initiator_eap_request(&init_sa, &id, 1, true, &esp_offer(0), &[1u8; 8]).unwrap();
+        assert_eq!(proposed_ts(&resp_sa, &eap_cfg), (dual.clone(), dual));
+        let eap_plain = initiator_eap_request(&init_sa, &id, 1, false, &esp_offer(0), &[1u8; 8]).unwrap();
+        assert_eq!(proposed_ts(&resp_sa, &eap_plain), (v4_only.clone(), v4_only));
     }
 
     #[test]

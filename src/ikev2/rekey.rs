@@ -159,6 +159,26 @@ pub fn build_rekey_request_with_pfs(
     pfs: Option<PfsKeyExchange>,
     iv: &[u8; 8],
 ) -> Result<Vec<u8>, IkeError> {
+    build_rekey_request_with_pfs_ts(sa, message_id, rekeyed_spi, new_spi, ni, cipher, pfs, false, iv)
+}
+
+/// Like [`build_rekey_request_with_pfs`], with `dual_stack_ts` choosing
+/// whether TSi/TSr also propose `::/0` next to `0.0.0.0/0`. A rekey has to
+/// re-propose the same traffic selectors the original CHILD SA was negotiated
+/// with (`ike_auth::initiator_ts`), or a CHILD SA that carries IPv6 would
+/// silently lose it at its first rekey.
+#[allow(clippy::too_many_arguments)]
+pub fn build_rekey_request_with_pfs_ts(
+    sa: &CompletedSaInit,
+    message_id: u32,
+    rekeyed_spi: u32,
+    new_spi: u32,
+    ni: &[u8],
+    cipher: SkCipher,
+    pfs: Option<PfsKeyExchange>,
+    dual_stack_ts: bool,
+    iv: &[u8; 8],
+) -> Result<Vec<u8>, IkeError> {
     let rekey_notify = Notify {
         protocol_id: protocol_id::ESP,
         spi: rekeyed_spi.to_be_bytes().to_vec(),
@@ -178,8 +198,8 @@ pub fn build_rekey_request_with_pfs(
         let ke = KeyExchange { dh_group: group.transform_id(), data: group.public(dh_private) };
         inner.push((PayloadType::KeyExchange, ke.to_bytes()));
     }
-    inner.push((PayloadType::TrafficSelectorInitiator, full_tunnel_ts()));
-    inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+    inner.push((PayloadType::TrafficSelectorInitiator, TrafficSelectors::full_tunnel(dual_stack_ts).to_bytes()));
+    inner.push((PayloadType::TrafficSelectorResponder, TrafficSelectors::full_tunnel(dual_stack_ts).to_bytes()));
     let header = create_child_header(sa, message_id, false);
     let first = first_payload_type(&inner);
     let bytes = encode_payload_chain(&inner);

@@ -397,6 +397,18 @@ impl TrafficSelector {
         }
     }
 
+    /// The "everything" IPv6 selector: any protocol, all ports, `::`-`ffff:...:ffff`.
+    pub fn ipv6_any() -> Self {
+        TrafficSelector {
+            ts_type: ts_type::IPV6_ADDR_RANGE,
+            ip_protocol: 0,
+            start_port: 0,
+            end_port: 65535,
+            start_addr: vec![0; 16],
+            end_addr: vec![0xff; 16],
+        }
+    }
+
     /// If this selector's address range is exactly one CIDR block, returns it
     /// as `(network, prefix_len)` -- covers both the full-tunnel grant
     /// (`0.0.0.0/0`) and a single narrowed subnet, the two shapes a real
@@ -419,6 +431,29 @@ impl TrafficSelector {
             let network = start & mask;
             if network == start && (network | !mask) == end {
                 return Some((Ipv4Addr::from(network), prefix));
+            }
+        }
+        None
+    }
+
+    /// IPv6 counterpart of [`Self::to_ipv4_cidr`]: the selector's address
+    /// range as `(network, prefix_len)` when it is exactly one CIDR block --
+    /// `::/0` for a full-tunnel grant, or a single narrowed prefix. `None`
+    /// for IPv4 selectors, a malformed range, or one that isn't CIDR-aligned.
+    pub fn to_ipv6_cidr(&self) -> Option<(Ipv6Addr, u8)> {
+        if self.ts_type != ts_type::IPV6_ADDR_RANGE {
+            return None;
+        }
+        let start = u128::from_be_bytes(self.start_addr.clone().try_into().ok()?);
+        let end = u128::from_be_bytes(self.end_addr.clone().try_into().ok()?);
+        if start > end {
+            return None;
+        }
+        for prefix in 0..=128u32 {
+            let mask: u128 = if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) };
+            let network = start & mask;
+            if network == start && (network | !mask) == end {
+                return Some((Ipv6Addr::from(network), prefix as u8));
             }
         }
         None
@@ -465,6 +500,19 @@ pub struct TrafficSelectors {
 }
 
 impl TrafficSelectors {
+    /// What an initiator proposes for both TSi and TSr: everything IPv4
+    /// (`0.0.0.0/0`), plus everything IPv6 (`::/0`) when `dual_stack` is set.
+    /// A responder narrows this to what it actually offers (RFC 7296 §2.9), so
+    /// listing IPv6 here is only a request -- against a v4-only responder it
+    /// simply comes back without the IPv6 selector.
+    pub fn full_tunnel(dual_stack: bool) -> TrafficSelectors {
+        let mut selectors = vec![TrafficSelector::ipv4_any()];
+        if dual_stack {
+            selectors.push(TrafficSelector::ipv6_any());
+        }
+        TrafficSelectors { selectors }
+    }
+
     pub fn parse(body: &[u8]) -> Result<TrafficSelectors, IkeError> {
         if body.len() < 4 {
             return Err(IkeError::Truncated { need: 4, have: body.len() });
@@ -1194,6 +1242,50 @@ mod tests {
         assert_eq!(bytes[1], 4); // SPI size
         assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), 2); // count
         assert_eq!(Delete::parse(&bytes).unwrap(), esp);
+    }
+
+    #[test]
+    fn ipv6_selector_cidr_conversion() {
+        assert_eq!(TrafficSelector::ipv6_any().to_ipv6_cidr(), Some((Ipv6Addr::UNSPECIFIED, 0)));
+        assert_eq!(TrafficSelector::ipv6_any().to_ipv4_cidr(), None);
+        assert_eq!(TrafficSelector::ipv4_any().to_ipv6_cidr(), None);
+
+        // A /64: start = prefix, end = prefix | host bits.
+        let net = Ipv6Addr::new(0x2001, 0x470, 0xda14, 1, 0, 0, 0, 0);
+        let sel = TrafficSelector {
+            ts_type: ts_type::IPV6_ADDR_RANGE,
+            ip_protocol: 0,
+            start_port: 0,
+            end_port: 65535,
+            start_addr: net.octets().to_vec(),
+            end_addr: Ipv6Addr::new(0x2001, 0x470, 0xda14, 1, 0xffff, 0xffff, 0xffff, 0xffff).octets().to_vec(),
+        };
+        assert_eq!(sel.to_ipv6_cidr(), Some((net, 64)));
+
+        // A single host is a /128.
+        let host = Ipv6Addr::new(0x2001, 0x470, 0xda14, 0x200, 0, 0, 0, 1);
+        let host_sel = TrafficSelector { start_addr: host.octets().to_vec(), end_addr: host.octets().to_vec(), ..sel.clone() };
+        assert_eq!(host_sel.to_ipv6_cidr(), Some((host, 128)));
+
+        // Not CIDR-aligned (::1 - ::2) and inverted ranges have no single-prefix form.
+        let unaligned = TrafficSelector {
+            start_addr: Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1).octets().to_vec(),
+            end_addr: Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2).octets().to_vec(),
+            ..sel.clone()
+        };
+        assert_eq!(unaligned.to_ipv6_cidr(), None);
+        let inverted = TrafficSelector { start_addr: sel.end_addr.clone(), end_addr: sel.start_addr.clone(), ..sel };
+        assert_eq!(inverted.to_ipv6_cidr(), None);
+    }
+
+    #[test]
+    fn full_tunnel_selectors_add_ipv6_only_when_dual_stack() {
+        let v4_only = TrafficSelectors::full_tunnel(false);
+        assert_eq!(v4_only.selectors, vec![TrafficSelector::ipv4_any()]);
+
+        let dual = TrafficSelectors::full_tunnel(true);
+        assert_eq!(dual.selectors, vec![TrafficSelector::ipv4_any(), TrafficSelector::ipv6_any()]);
+        assert_eq!(TrafficSelectors::parse(&dual.to_bytes()).unwrap(), dual);
     }
 
     #[test]

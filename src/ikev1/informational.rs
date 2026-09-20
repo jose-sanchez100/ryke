@@ -56,7 +56,7 @@
 //! Mode-Config/Xauth, reused as-is here for every Informational message this
 //! module builds, Delete or Notify alike.
 
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use super::crypto1::{self, AES_BLOCK};
@@ -68,7 +68,7 @@ use crate::debug::ike_debug;
 use crate::entropy::Entropy;
 use crate::error::IkeError;
 use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
-use crate::transport::DriverError;
+use crate::transport::{DriverError, IkeSocket};
 
 /// RFC 2408 §3.15 Delete payload body: `DOI(4) | Protocol-Id(1) | SPI-Size(1)
 /// | #SPIs(2, always 1 here) | SPI`.
@@ -220,7 +220,7 @@ pub fn build_isakmp_delete(st: &Phase1State, entropy: &mut impl Entropy) -> Resu
 /// R-U-THERE or ACK never arrived and the gateway's DPD tore the tunnel down.
 /// `peer` is the caller's already-correct destination (the 4500 address once
 /// floated), so only the framing is decided here.
-fn send_ike(sock: &UdpSocket, st: &Phase1State, peer: SocketAddr, msg: &[u8]) -> std::io::Result<()> {
+fn send_ike(sock: &dyn IkeSocket, st: &Phase1State, peer: SocketAddr, msg: &[u8]) -> std::io::Result<()> {
     if st.floated {
         let wire = wrap_ike_4500(msg);
         crate::debug::dump(">>>", peer, &wire);
@@ -294,7 +294,7 @@ enum Seen {
 /// regardless of how long ago it arrived, so even a short `timeout`
 /// reliably catches anything already pending.
 fn watch(
-    sock: &UdpSocket,
+    sock: &dyn IkeSocket,
     st: &Phase1State,
     entropy: &mut impl Entropy,
     peer: SocketAddr,
@@ -444,7 +444,7 @@ fn error_notify_name(t: u16) -> &'static str {
 /// `current_peer_spi` is our CHILD SA's currently-in-use inbound SPI — an
 /// ESP Delete naming any other SPI (e.g. one just superseded by a rekey) is
 /// ignored rather than misread as a full teardown.
-pub fn peek(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, timeout: Duration, current_peer_spi: u32) -> Result<Liveness, DriverError> {
+pub fn peek(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, timeout: Duration, current_peer_spi: u32) -> Result<Liveness, DriverError> {
     match watch(sock, st, entropy, peer, timeout, None, current_peer_spi)? {
         Seen::Nothing | Seen::AckMatched => Ok(Liveness::Alive),
         Seen::PeerTornDown => Ok(Liveness::PeerTornDown),
@@ -458,7 +458,7 @@ pub fn peek(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer
 /// should keep using [`peek`] only, exactly as before this function existed.
 /// `current_peer_spi` is our CHILD SA's currently-in-use inbound SPI — see
 /// [`peek`]'s doc.
-pub fn probe(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, seq: u32, timeout: Duration, current_peer_spi: u32) -> Result<Liveness, DriverError> {
+pub fn probe(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, seq: u32, timeout: Duration, current_peer_spi: u32) -> Result<Liveness, DriverError> {
     let msg = build_r_u_there(st, entropy, seq)?;
     ike_debug!("DPD: sending R-U-THERE seq={seq} to {peer}");
     send_ike(sock, st, peer, &msg)?;
@@ -883,5 +883,58 @@ mod tests {
         let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 42, std::time::Duration::from_secs(2), 0).unwrap();
         assert_eq!(got, Liveness::Alive);
         responder.join().unwrap();
+    }
+    /// A host that runs its own `recv_from` loop on the IKE port (an ESP pump)
+    /// would otherwise swallow the gateway's ACK: with the pump forwarding IKE
+    /// datagrams through a [`ChannelIo`], the probe still gets its answer even
+    /// though ESP and keepalives arrive on the same socket in between.
+    #[test]
+    fn floated_probe_gets_its_ack_through_a_channel_while_a_pump_owns_the_socket() {
+        use crate::transport::{spawn_pump_reader, ChannelIo};
+        let (client_st, gw_st) = floated_pair();
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        let gw_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gw_addr = gw_sock.local_addr().unwrap();
+        let (rx, _pump) = spawn_pump_reader(&client_sock, true);
+        let io = ChannelIo::new(client_sock, rx, gw_addr);
+
+        let responder = std::thread::spawn(move || {
+            gw_sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let mut buf = [0u8; 8192];
+            let n = gw_sock.recv(&mut buf).unwrap();
+            let (_, data) = gateway_reads_notify(&gw_st, &buf[..n]);
+            let seq = u32::from_be_bytes(<[u8; 4]>::try_from(data.as_slice()).unwrap());
+            gw_sock.send_to(&[0xFF], client_addr).unwrap(); // NAT keepalive
+            gw_sock.send_to(&[0x5a; 96], client_addr).unwrap(); // ESP
+            let mut ge = SeedEntropy::new(0x37);
+            let ack = build_r_u_there_ack(&gw_st, &mut ge, seq).unwrap();
+            gw_sock.send_to(&crate::ikev2::natt::wrap_ike_4500(&ack), client_addr).unwrap();
+        });
+
+        let mut ce = SeedEntropy::new(0x38);
+        let got = probe(&io, &client_st, &mut ce, gw_addr, 43, std::time::Duration::from_secs(2), 0).unwrap();
+        assert_eq!(got, Liveness::Alive);
+        responder.join().unwrap();
+    }
+
+    /// The passive check, over the same arrangement: a Delete the gateway sends
+    /// unprompted reaches `peek` through the channel.
+    #[test]
+    fn floated_peek_sees_the_gateways_delete_through_a_channel_while_a_pump_owns_the_socket() {
+        use crate::transport::{spawn_pump_reader, ChannelIo};
+        let (client_st, gw_st) = floated_pair();
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        let gw_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gw_addr = gw_sock.local_addr().unwrap();
+        let (rx, _pump) = spawn_pump_reader(&client_sock, true);
+        let io = ChannelIo::new(client_sock, rx, gw_addr);
+
+        let mut e = SeedEntropy::new(0x39);
+        assert_eq!(peek(&io, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(50), 0x77).unwrap(), Liveness::Alive);
+        let (esp_msg, _isakmp_msg) = build_delete(&gw_st, &mut e, 0x77).unwrap();
+        gw_sock.send_to(&crate::ikev2::natt::wrap_ike_4500(&esp_msg), client_addr).unwrap();
+        assert_eq!(peek(&io, &client_st, &mut e, gw_addr, std::time::Duration::from_secs(2), 0x77).unwrap(), Liveness::PeerTornDown);
     }
 }

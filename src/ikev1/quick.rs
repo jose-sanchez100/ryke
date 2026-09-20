@@ -26,7 +26,7 @@
 //! Quick Mode negotiates PFS on the *initial* Phase-2 exchange, so it's
 //! testable at connect time.
 
-use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use super::crypto1::{self, Prf, AES_BLOCK};
@@ -45,7 +45,7 @@ use crate::esp::{ChildSa, EspSa};
 use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
 use crate::ikev2::payload::transform_id;
 use crate::ikev2::sk::SkCipher;
-use crate::transport::DriverError;
+use crate::transport::{DriverError, IkeSocket};
 use zeroize::Zeroize;
 
 /// One direction's derived ESP key material -- cipher-tagged so the caller
@@ -655,7 +655,7 @@ impl QuickResponder {
 /// will eventually be reaped by its own lifetime expiry either way.
 #[allow(clippy::too_many_arguments)]
 pub fn rekey_child(
-    sock: &UdpSocket,
+    sock: &dyn IkeSocket,
     st: &Phase1State,
     entropy: &mut impl Entropy,
     peer: SocketAddr,
@@ -685,7 +685,7 @@ pub fn rekey_child(
 /// IPv4 CHILD SA and the Phase-1 SA are unaffected either way.
 #[allow(clippy::too_many_arguments)]
 pub fn create_child_ipv6(
-    sock: &UdpSocket,
+    sock: &dyn IkeSocket,
     st: &Phase1State,
     entropy: &mut impl Entropy,
     peer: SocketAddr,
@@ -703,7 +703,7 @@ pub fn create_child_ipv6(
 /// only labels the trace lines.
 #[allow(clippy::too_many_arguments)]
 fn quick_ipv6(
-    sock: &UdpSocket,
+    sock: &dyn IkeSocket,
     st: &Phase1State,
     entropy: &mut impl Entropy,
     peer: SocketAddr,
@@ -724,7 +724,7 @@ fn quick_ipv6(
 /// (`old_local_spi`, our own inbound SPI for it).
 #[allow(clippy::too_many_arguments)]
 pub fn rekey_child_ipv6(
-    sock: &UdpSocket,
+    sock: &dyn IkeSocket,
     st: &Phase1State,
     entropy: &mut impl Entropy,
     peer: SocketAddr,
@@ -743,7 +743,7 @@ pub fn rekey_child_ipv6(
 
 /// Send `msg` to `peer`, wrapped with the non-ESP marker on port 4500 when
 /// `st` floated (RFC 3947/3948) -- the same rule `Client::send_step` applies.
-fn send_ike(sock: &UdpSocket, st: &Phase1State, peer: SocketAddr, msg: &[u8]) -> std::io::Result<()> {
+fn send_ike(sock: &dyn IkeSocket, st: &Phase1State, peer: SocketAddr, msg: &[u8]) -> std::io::Result<()> {
     if st.floated {
         let dest = SocketAddr::new(peer.ip(), crate::natt_port());
         let wire = wrap_ike_4500(msg);
@@ -759,7 +759,7 @@ fn send_ike(sock: &UdpSocket, st: &Phase1State, peer: SocketAddr, msg: &[u8]) ->
 /// Best-effort Delete for the CHILD SA a rekey just superseded -- a failure to
 /// build or send it never fails the rekey (the new SA is already live and the
 /// old one will expire on its own lifetime either way).
-fn delete_superseded(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, old_local_spi: u32) {
+fn delete_superseded(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, old_local_spi: u32) {
     ike_debug!("INFORMATIONAL: sending ESP Delete for superseded CHILD SA spi_in={old_local_spi:08x} to {peer}");
     match informational::build_esp_delete(st, entropy, old_local_spi) {
         Ok(delete_msg) => {
@@ -778,7 +778,7 @@ fn delete_superseded(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entr
 /// skipped -- except an error Notify from the peer for this ISAKMP SA, which
 /// ends the wait at once as [`IkeError::PeerRejected`].
 fn quick_exchange(
-    sock: &UdpSocket,
+    sock: &dyn IkeSocket,
     st: &Phase1State,
     peer: SocketAddr,
     timeout: Duration,
@@ -852,6 +852,7 @@ fn quick_exchange(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::UdpSocket;
     use crate::crypto::{DhGroup, IntegAlgorithm};
     use crate::entropy::SeedEntropy;
     use crate::ikev1::payloads::Id;
@@ -1553,5 +1554,72 @@ mod tests {
             &isock, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, (v6("fd00::1"), 128), (v6("::"), 0), 3600, Duration::from_millis(300),
         );
         assert!(matches!(err, Err(DriverError::Ike(IkeError::Crypto(m))) if m.contains("timed out")), "got {:?}", err.map(|_| ()));
+    }
+    /// The reason `IkeSocket` exists: a host whose ESP pump is the only reader
+    /// of the IKE socket hands the exchange its IKE datagrams through a
+    /// [`ChannelIo`]. A Quick Mode rekey then completes -- reply read from the
+    /// channel, both the exchange messages and the trailing Delete sent out
+    /// through the shared socket -- although ESP arrives on that socket too.
+    #[test]
+    fn rekey_child_completes_through_a_channel_while_a_pump_owns_the_socket() {
+        use crate::transport::{spawn_pump_reader, ChannelIo};
+        let (isock, rsock, iaddr, raddr) = loopback_pair();
+        let (istate, rstate, mut ie, re) = phase1_pair(0x9701, 0x9702, iaddr, raddr);
+        let old_local_spi = 0x0bad_f00d;
+        let responder = spawn_quick_responder(rsock, rstate, re, iaddr, true);
+        // Everything is forwarded here (`marked_only: false`): this Phase 1 is
+        // not floated, so its datagrams carry no non-ESP marker.
+        let (rx, _pump) = spawn_pump_reader(&isock, false);
+        let io = ChannelIo::new(isock, rx, raddr);
+
+        let ts = ([10, 212, 134, 202], [255, 255, 255, 255]);
+        let (rekeyed, lifetime) =
+            rekey_child(&io, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, ts, ([0; 4], [0; 4]), 1800, Duration::from_secs(5), old_local_spi).unwrap();
+        assert_eq!(lifetime, 1800);
+        assert_ne!(rekeyed.local_spi, old_local_spi);
+
+        let (mut rchild, delete, _rstate) = responder.join().unwrap();
+        assert!(delete.is_some(), "the Delete for the superseded SA must go out through the channel's socket");
+        let mut ours = EspSa::new_with_cipher(rekeyed.local_spi, rekeyed.key_in.cipher, &rekeyed.key_in.enc, &rekeyed.key_in.integ).unwrap();
+        let pkt: Vec<u8> = (0..40u8).collect();
+        let sealed = rchild.outbound.seal(&pkt, 4).unwrap();
+        assert_eq!(ours.open(&sealed).unwrap(), (pkt, 4));
+    }
+
+    /// The IPv6 CHILD SA creation takes the same route.
+    #[test]
+    fn create_child_ipv6_completes_through_a_channel_while_a_pump_owns_the_socket() {
+        use crate::transport::{spawn_pump_reader, ChannelIo};
+        let (isock, rsock, iaddr, raddr) = loopback_pair();
+        let (istate, rstate, mut ie, re) = phase1_pair(0x9801, 0x9802, iaddr, raddr);
+        let responder = spawn_quick_responder(rsock, rstate, re, iaddr, false);
+        let (rx, _pump) = spawn_pump_reader(&isock, false);
+        let io = ChannelIo::new(isock, rx, raddr);
+
+        let (_rekeyed, lifetime) = create_child_ipv6(
+            &io, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, (v6("fd00::1"), 128), (v6("::"), 0), 1800, Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(lifetime, 1800);
+        responder.join().unwrap();
+    }
+
+    /// A silent peer still runs out the timeout through the channel, and a
+    /// dead channel is an error rather than a hang.
+    #[test]
+    fn create_child_ipv6_through_a_channel_times_out_and_reports_a_dead_reader() {
+        use crate::transport::{spawn_pump_reader, ChannelIo};
+        let (isock, _rsock, iaddr, raddr) = loopback_pair();
+        let (istate, _rstate, mut ie, _re) = phase1_pair(0x9901, 0x9902, iaddr, raddr);
+        let (rx, pump) = spawn_pump_reader(&isock, false);
+        let io = ChannelIo::new(isock, rx, raddr);
+        let ask = |ie: &mut SeedEntropy| {
+            create_child_ipv6(&io, &istate, ie, raddr, SkCipher::Aes256Gcm, None, (v6("fd00::1"), 128), (v6("::"), 0), 3600, Duration::from_millis(300))
+        };
+        let err = ask(&mut ie);
+        assert!(matches!(err, Err(DriverError::Ike(IkeError::Crypto(m))) if m.contains("timed out")), "got {:?}", err.map(|_| ()));
+
+        drop(pump); // the reader is gone, its sender with it
+        assert!(matches!(ask(&mut ie), Err(DriverError::Io(e)) if e.kind() == std::io::ErrorKind::BrokenPipe));
     }
 }

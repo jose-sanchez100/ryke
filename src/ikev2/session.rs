@@ -491,7 +491,7 @@ impl LivenessSession {
         crate::debug::dump(">>>", self.dest, &wire);
         self.sock.send_to(&wire, self.dest)?;
         let mut buf = [0u8; 4096];
-        let n = self.sock.recv(&mut buf)?;
+        let n = self.recv_datagram(&mut buf, timeout)?;
         crate::debug::dump("<<<", self.dest, &buf[..n]);
         let response = unwrap(&buf[..n], self.float)?;
         let (child, tsr) = rekey::initiator_complete_child(
@@ -533,6 +533,26 @@ impl LivenessSession {
             integ: child.inbound.integ_key().to_vec(),
         };
         Ok((RekeyedChild { local_spi: child.inbound.spi(), peer_spi: child.outbound.spi(), key_out, key_in }, tsr))
+    }
+
+    /// The next IKE datagram, waiting at most `timeout`: from `external_rx`
+    /// when one is installed (see its doc -- the socket then has another
+    /// reader and would never show it to us), straight off the socket
+    /// otherwise. Timeouts surface as [`io::ErrorKind::TimedOut`] in both
+    /// cases. The socket's own read timeout is the caller's to set beforehand.
+    fn recv_datagram(&self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+        match &self.external_rx {
+            Some(rx) => match rx.recv_timeout(timeout) {
+                Ok(datagram) => {
+                    let n = datagram.len().min(buf.len());
+                    buf[..n].copy_from_slice(&datagram[..n]);
+                    Ok(n)
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(io::ErrorKind::TimedOut.into()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::ErrorKind::BrokenPipe.into()),
+            },
+            None => self.sock.recv(buf),
+        }
     }
 
     /// Send an INFORMATIONAL Delete (RFC 7296 §1.4.1/§3.10) for a single ESP
@@ -2126,6 +2146,118 @@ mod tests {
             EspSa::new_with_cipher(rekeyed.peer_spi, rekeyed.key_out.cipher, &rekeyed.key_out.enc, &rekeyed.key_out.integ).unwrap();
         let pkt = client_out.seal(b"after ikev2 pfs rekey", next_header::IPV4).unwrap();
         assert_eq!(resp_child.inbound.open(&pkt).unwrap().0, b"after ikev2 pfs rekey");
+    }
+
+    /// Windows' arrangement: a background thread (the ESP pump's reader) is
+    /// the session socket's *only* reader and hands IKE datagrams to the
+    /// session through `external_rx`, so the gateway's replies never show up
+    /// on the session's own socket. Every `CREATE_CHILD_SA` -- a rekey, and
+    /// the separate IPv6 CHILD SA too -- must still take its response from
+    /// that channel. Modelled deterministically: a proxy sits between the
+    /// session and the responder and delivers the responder's replies to the
+    /// channel only, never to the socket.
+    #[test]
+    fn child_exchange_takes_its_response_from_external_rx_when_the_socket_never_sees_it() {
+        use crate::esp::{next_header, EspSa};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let responder = thread::spawn({
+            let psk = psk.clone();
+            move || run_psk_responder_then_rekey(bind, psk, None)
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+        let cfg = AuthConfig::psk(Identification::fqdn("client.test"), psk);
+        let mut tunnel = session
+            .connect_direct_on_port(bind, &default_ike_offer(), &cfg, false, &default_esp_offer(), next_addr().port())
+            .unwrap();
+
+        let proxy = UdpSocket::bind("127.0.0.1:0").unwrap();
+        proxy.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let proxy_thread = thread::spawn({
+            let stop = stop.clone();
+            move || {
+                let mut buf = [0u8; 8192];
+                while !stop.load(Ordering::Relaxed) {
+                    match proxy.recv_from(&mut buf) {
+                        Ok((n, from)) if from == bind => {
+                            let _ = tx.send(buf[..n].to_vec());
+                        }
+                        Ok((n, _client)) => {
+                            let _ = proxy.send_to(&buf[..n], bind);
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        });
+        tunnel.liveness.dest = proxy_addr;
+        tunnel.liveness.install_external_receiver(rx);
+
+        let old_local_spi = tunnel.local_spi;
+        let rekeyed = tunnel.liveness.rekey_child(Duration::from_secs(3));
+        stop.store(true, Ordering::Relaxed);
+        proxy_thread.join().unwrap();
+        let rekeyed = rekeyed.expect("the CREATE_CHILD_SA response never reached the session");
+        assert_ne!(rekeyed.local_spi, old_local_spi);
+
+        let (mut resp_child, deleted_spi) = responder.join().unwrap();
+        assert_eq!(deleted_spi, Some(old_local_spi));
+        let mut client_out =
+            EspSa::new_with_cipher(rekeyed.peer_spi, rekeyed.key_out.cipher, &rekeyed.key_out.enc, &rekeyed.key_out.integ).unwrap();
+        let pkt = client_out.seal(b"after a rekey answered through external_rx", next_header::IPV4).unwrap();
+        assert_eq!(resp_child.inbound.open(&pkt).unwrap().0, b"after a rekey answered through external_rx");
+    }
+
+    /// A session over a throwaway loopback socket, for exercising
+    /// [`LivenessSession::recv_datagram`] on its own.
+    fn recv_test_session(external_rx: Option<mpsc::Receiver<Vec<u8>>>) -> LivenessSession {
+        let (init_sa, _resp_sa) = liveness_sa_pair();
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dest = sock.local_addr().unwrap();
+        LivenessSession { sock, sa: init_sa, dest, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx, child6: None, cfg_subnets6: Vec::new() }
+    }
+
+    #[test]
+    fn recv_datagram_reads_the_socket_when_no_external_receiver_is_installed() {
+        let session = recv_test_session(None);
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        session.sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        sender.send_to(b"from the socket", session.sock.local_addr().unwrap()).unwrap();
+        let mut buf = [0u8; 64];
+        let n = session.recv_datagram(&mut buf, Duration::from_secs(2)).unwrap();
+        assert_eq!(&buf[..n], b"from the socket");
+
+        session.sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let e = session.recv_datagram(&mut buf, Duration::from_millis(50)).unwrap_err();
+        assert!(matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut), "got {e:?}");
+    }
+
+    #[test]
+    fn recv_datagram_reads_the_external_receiver_and_never_the_socket_when_one_is_installed() {
+        let (tx, rx) = mpsc::channel();
+        let session = recv_test_session(Some(rx));
+        // A datagram on the socket itself must stay invisible: another
+        // thread owns that socket in this arrangement.
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(b"on the socket", session.sock.local_addr().unwrap()).unwrap();
+        tx.send(b"through the channel".to_vec()).unwrap();
+        let mut buf = [0u8; 64];
+        let n = session.recv_datagram(&mut buf, Duration::from_secs(2)).unwrap();
+        assert_eq!(&buf[..n], b"through the channel");
+
+        let e = session.recv_datagram(&mut buf, Duration::from_millis(50)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        drop(tx);
+        let e = session.recv_datagram(&mut buf, Duration::from_millis(50)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
     }
 
     /// Responder for the IPv6 CHILD SA flow: the same handshake, then a

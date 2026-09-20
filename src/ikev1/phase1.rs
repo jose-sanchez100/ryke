@@ -608,6 +608,16 @@ pub struct InitiatorConfig {
     /// completed Configuration Method") if this round is skipped. `false`
     /// reproduces the original no-Mode-Config behavior.
     pub mode_cfg: bool,
+    /// Also ask for IPv6 in the Mode-Config round (`INTERNAL_IP6_ADDRESS`/
+    /// `_NETMASK`/`_DNS`/`_SUBNET`, see
+    /// [`crate::ikev1::modecfg::ConfigPayload::request_dual_stack`]) and report
+    /// what came back in [`crate::ikev1::client::Established::assigned_ip6`] and
+    /// friends. Only consulted when `mode_cfg` is set. Off by default so a
+    /// caller with no IPv6 data plane (there is no point asking) keeps sending
+    /// the exact IPv4-only request it always did; the IPv6 CHILD SA itself is
+    /// a separate Quick Mode the caller starts afterwards
+    /// ([`crate::ikev1::quick::create_child_ipv6`]).
+    pub ipv6: bool,
     /// Which Phase-1 exchange to run -- see [`Ikev1ExchangeMode`].
     pub mode: Ikev1ExchangeMode,
     /// Phase-1 SA lifetime to offer, in seconds (RFC 2407 §4.5 `LIFE_DURATION`,
@@ -1782,6 +1792,7 @@ mod tests {
             esp_cipher: crate::ikev2::sk::SkCipher::Aes256Gcm,
             pfs_group: None,
             mode_cfg: false,
+            ipv6: false,
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
@@ -1818,6 +1829,7 @@ mod tests {
             esp_cipher: crate::ikev2::sk::SkCipher::Aes256Gcm,
             pfs_group: None,
             mode_cfg: false,
+            ipv6: false,
             mode: Ikev1ExchangeMode::Main,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
@@ -2004,6 +2016,7 @@ mod tests {
             esp_cipher: crate::ikev2::sk::SkCipher::Aes256Gcm,
             pfs_group: None,
             mode_cfg: false,
+            ipv6: false,
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
@@ -2184,6 +2197,7 @@ mod tests {
             esp_cipher: crate::ikev2::sk::SkCipher::Aes256Gcm,
             pfs_group: None,
             mode_cfg: false,
+            ipv6: false,
             mode: Ikev1ExchangeMode::Main,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
@@ -2243,6 +2257,7 @@ mod tests {
             esp_cipher: crate::ikev2::sk::SkCipher::Aes256Gcm,
             pfs_group: None,
             mode_cfg: false,
+            ipv6: false,
             mode: Ikev1ExchangeMode::Main,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
@@ -2410,6 +2425,7 @@ mod tests {
             esp_cipher: crate::ikev2::sk::SkCipher::Aes256Gcm,
             pfs_group: None,
             mode_cfg: false,
+            ipv6: false,
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 1200,
             p2_lifetime_secs: 3600,

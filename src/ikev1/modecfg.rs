@@ -6,7 +6,7 @@
 
 use super::payloads::{self, Attribute};
 use crate::error::IkeError;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Configuration exchange types (the `cfg-type` octet).
 pub mod cfg {
@@ -26,7 +26,16 @@ pub mod cfg_attr {
     pub const INTERNAL_ADDRESS_EXPIRY: u16 = 5;
     pub const INTERNAL_IP4_DHCP: u16 = 6;
     pub const APPLICATION_VERSION: u16 = 7;
+    // The IPv6 half of the same registry (draft-dukes-ike-mode-cfg-02 §3.2;
+    // the numbers RFC 7296 §3.15.1 later kept for IKEv2, minus NETMASK which
+    // IKEv2 folded into INTERNAL_IP6_ADDRESS's own prefix-length octet).
+    pub const INTERNAL_IP6_ADDRESS: u16 = 8;
+    pub const INTERNAL_IP6_NETMASK: u16 = 9;
+    pub const INTERNAL_IP6_DNS: u16 = 10;
+    pub const INTERNAL_IP6_NBNS: u16 = 11;
+    pub const INTERNAL_IP6_DHCP: u16 = 12;
     pub const INTERNAL_IP4_SUBNET: u16 = 13;
+    pub const INTERNAL_IP6_SUBNET: u16 = 15;
     // XAUTH (draft-beaulieu-ike-xauth). Type 16520..16529.
     pub const XAUTH_TYPE: u16 = 16520;
     pub const XAUTH_USER_NAME: u16 = 16521;
@@ -112,6 +121,25 @@ impl ConfigPayload {
         )
     }
 
+    /// [`Self::request_ipv4`] plus the IPv6 counterparts (address, netmask,
+    /// DNS, split-tunnel subnet), all empty -- one dual-stack CFG_REQUEST
+    /// rather than a second Transaction exchange, the way strongSwan asks for
+    /// both families at once. A responder that has no IPv6 to give simply
+    /// leaves those attributes out of its reply (or, as a FortiGate with IPv6
+    /// unconfigured does over IKEv2, answers with an all-zero placeholder --
+    /// see [`Self::assigned_ipv6`]/[`Self::assigned_ipv6_subnets`], which
+    /// both ignore such junk).
+    pub fn request_dual_stack(identifier: u16) -> Self {
+        let mut req = Self::request_ipv4(identifier);
+        req.attributes.extend([
+            Attribute::long_bytes(cfg_attr::INTERNAL_IP6_ADDRESS, Vec::new()),
+            Attribute::long_bytes(cfg_attr::INTERNAL_IP6_NETMASK, Vec::new()),
+            Attribute::long_bytes(cfg_attr::INTERNAL_IP6_DNS, Vec::new()),
+            Attribute::long_bytes(cfg_attr::INTERNAL_IP6_SUBNET, Vec::new()),
+        ]);
+        req
+    }
+
     /// The first INTERNAL_IP4_ADDRESS attribute value, if present and well-formed.
     pub fn assigned_ipv4(&self) -> Option<Ipv4Addr> {
         self.attr(cfg_attr::INTERNAL_IP4_ADDRESS)
@@ -159,6 +187,85 @@ impl ConfigPayload {
     }
 }
 
+impl ConfigPayload {
+    /// The first usable INTERNAL_IP6_ADDRESS, as (address, prefix length).
+    ///
+    /// Two wire shapes exist for this attribute: the IKEv2-style 17 octets
+    /// (16-byte address + 1-byte prefix length, RFC 7296 §3.15.1 -- what
+    /// gateways that share one Mode-Config codepath across both IKE versions
+    /// send) and the original draft's bare 16-byte address, whose prefix then
+    /// comes from a separate INTERNAL_IP6_NETMASK attribute (16-byte mask).
+    /// With neither prefix source the address is treated as a host (`/128`):
+    /// the only claim that is safe without knowing the on-link prefix.
+    ///
+    /// An all-zero address is not an assignment (it is the placeholder a
+    /// gateway with IPv6 left unconfigured sends instead of omitting the
+    /// attribute), so it reads as `None` -- callers gate the IPv6 CHILD SA on
+    /// this returning `Some`.
+    pub fn assigned_ipv6(&self) -> Option<(Ipv6Addr, u8)> {
+        let attr = self.attributes.iter().find(|a| a.attr_type == cfg_attr::INTERNAL_IP6_ADDRESS)?;
+        let value = attr.bytes();
+        let addr = match value.len() {
+            16 | 17 => Ipv6Addr::from(<[u8; 16]>::try_from(&value[..16]).ok()?),
+            _ => return None,
+        };
+        if addr.is_unspecified() {
+            return None;
+        }
+        let prefix = if value.len() == 17 {
+            value[16]
+        } else {
+            self.attr(cfg_attr::INTERNAL_IP6_NETMASK)
+                .map(Attribute::bytes)
+                .and_then(|m| <[u8; 16]>::try_from(m.as_slice()).ok())
+                .and_then(|m| contiguous_prefix_len(u128::from_be_bytes(m)))
+                .unwrap_or(128)
+        };
+        (prefix <= 128).then_some((addr, prefix))
+    }
+
+    /// Every INTERNAL_IP6_DNS attribute value (16-byte address) -- same
+    /// multi-resolver allowance as [`Self::assigned_dns`]. All-zero
+    /// placeholders are dropped, same reasoning as [`Self::assigned_ipv6`].
+    pub fn assigned_ipv6_dns(&self) -> Vec<Ipv6Addr> {
+        self.attributes
+            .iter()
+            .filter(|a| a.attr_type == cfg_attr::INTERNAL_IP6_DNS)
+            .map(Attribute::bytes)
+            .filter_map(|b| <[u8; 16]>::try_from(b.as_slice()).ok())
+            .map(Ipv6Addr::from)
+            .filter(|a| !a.is_unspecified())
+            .collect()
+    }
+
+    /// Every INTERNAL_IP6_SUBNET attribute (16-byte prefix + 1-byte prefix
+    /// length), as (network, prefix length) -- the IPv6 split-tunnel ranges,
+    /// same role as [`Self::assigned_subnets`]. A `/0` entry is dropped: it
+    /// covers the whole address space whatever the address bytes say, so it
+    /// is not a split-tunnel range (a FortiGate with IPv6 unconfigured sends
+    /// exactly that placeholder over IKEv2; see
+    /// `ikev2::payload::Configuration::assigned_ipv6_subnets`).
+    pub fn assigned_ipv6_subnets(&self) -> Vec<(Ipv6Addr, u8)> {
+        self.attributes
+            .iter()
+            .filter(|a| a.attr_type == cfg_attr::INTERNAL_IP6_SUBNET)
+            .map(Attribute::bytes)
+            .filter(|b| b.len() == 17)
+            .filter_map(|b| {
+                let prefix_len = b[16];
+                (prefix_len != 0 && prefix_len <= 128).then(|| (Ipv6Addr::from(<[u8; 16]>::try_from(&b[..16]).unwrap()), prefix_len))
+            })
+            .collect()
+    }
+}
+
+/// The prefix length of a netmask made of leading ones then trailing zeros,
+/// `None` for a non-contiguous (malformed) mask.
+fn contiguous_prefix_len(mask: u128) -> Option<u8> {
+    let ones = mask.leading_ones();
+    (mask == (!0u128).checked_shl(128 - ones).unwrap_or(0)).then_some(ones as u8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +287,102 @@ mod tests {
         assert_eq!(back.identifier, 0x1234);
         assert_eq!(back.attr(cfg_attr::XAUTH_TYPE).unwrap().as_u16(), Some(xauth_type::GENERIC));
         assert!(back.attr(cfg_attr::XAUTH_USER_NAME).is_some());
+    }
+
+    fn v6(a: &str) -> Ipv6Addr {
+        a.parse().unwrap()
+    }
+
+    fn reply(attrs: Vec<Attribute>) -> ConfigPayload {
+        ConfigPayload::parse(&ConfigPayload::new(cfg::REPLY, 1, attrs).to_bytes()).unwrap()
+    }
+
+    #[test]
+    fn dual_stack_request_adds_the_ipv6_attributes_to_the_ipv4_ones() {
+        let req = ConfigPayload::request_dual_stack(7);
+        let v4 = ConfigPayload::request_ipv4(7);
+        // The IPv4 half is byte-for-byte what a v4-only request carries.
+        assert_eq!(&req.attributes[..v4.attributes.len()], &v4.attributes[..]);
+        for t in [cfg_attr::INTERNAL_IP6_ADDRESS, cfg_attr::INTERNAL_IP6_NETMASK, cfg_attr::INTERNAL_IP6_DNS, cfg_attr::INTERNAL_IP6_SUBNET] {
+            let a = req.attr(t).unwrap_or_else(|| panic!("attribute {t} missing"));
+            assert!(a.bytes().is_empty(), "requests carry empty values");
+        }
+        // And it survives the wire.
+        assert_eq!(ConfigPayload::parse(&req.to_bytes()).unwrap(), req);
+    }
+
+    #[test]
+    fn assigned_ipv6_reads_the_ikev2_style_17_octet_value() {
+        let mut v = v6("fd00::1234").octets().to_vec();
+        v.push(64);
+        let got = reply(vec![Attribute::long_bytes(cfg_attr::INTERNAL_IP6_ADDRESS, v)]);
+        assert_eq!(got.assigned_ipv6(), Some((v6("fd00::1234"), 64)));
+    }
+
+    #[test]
+    fn assigned_ipv6_takes_the_prefix_from_a_separate_netmask_for_a_bare_16_octet_value() {
+        let mask = u128::MAX << 64; // /64
+        let got = reply(vec![
+            Attribute::long_bytes(cfg_attr::INTERNAL_IP6_ADDRESS, v6("fd00::1234").octets().to_vec()),
+            Attribute::long_bytes(cfg_attr::INTERNAL_IP6_NETMASK, mask.to_be_bytes().to_vec()),
+        ]);
+        assert_eq!(got.assigned_ipv6(), Some((v6("fd00::1234"), 64)));
+    }
+
+    #[test]
+    fn assigned_ipv6_is_a_host_when_nothing_says_otherwise_or_the_netmask_is_malformed() {
+        let bare = reply(vec![Attribute::long_bytes(cfg_attr::INTERNAL_IP6_ADDRESS, v6("fd00::1234").octets().to_vec())]);
+        assert_eq!(bare.assigned_ipv6(), Some((v6("fd00::1234"), 128)));
+
+        // Non-contiguous mask: not a prefix, so ignored rather than guessed at.
+        let holey = 0xF0F0_0000_0000_0000_0000_0000_0000_0000u128;
+        let bad = reply(vec![
+            Attribute::long_bytes(cfg_attr::INTERNAL_IP6_ADDRESS, v6("fd00::1234").octets().to_vec()),
+            Attribute::long_bytes(cfg_attr::INTERNAL_IP6_NETMASK, holey.to_be_bytes().to_vec()),
+        ]);
+        assert_eq!(bad.assigned_ipv6(), Some((v6("fd00::1234"), 128)));
+    }
+
+    #[test]
+    fn assigned_ipv6_ignores_placeholders_and_malformed_values() {
+        // The all-zero "nothing to give" placeholder is not an assignment.
+        let mut zero17 = vec![0u8; 16];
+        zero17.push(0);
+        assert_eq!(reply(vec![Attribute::long_bytes(cfg_attr::INTERNAL_IP6_ADDRESS, zero17)]).assigned_ipv6(), None);
+        assert_eq!(reply(vec![Attribute::long_bytes(cfg_attr::INTERNAL_IP6_ADDRESS, vec![0u8; 16])]).assigned_ipv6(), None);
+        // Wrong length / absent / an impossible prefix length.
+        assert_eq!(reply(vec![Attribute::long_bytes(cfg_attr::INTERNAL_IP6_ADDRESS, vec![1u8; 4])]).assigned_ipv6(), None);
+        assert_eq!(reply(Vec::new()).assigned_ipv6(), None);
+        let mut too_long = v6("fd00::1").octets().to_vec();
+        too_long.push(200);
+        assert_eq!(reply(vec![Attribute::long_bytes(cfg_attr::INTERNAL_IP6_ADDRESS, too_long)]).assigned_ipv6(), None);
+    }
+
+    #[test]
+    fn ipv6_dns_and_subnets_are_read_back_and_placeholders_dropped() {
+        let mut real_subnet = v6("fd00:0:0:10::").octets().to_vec();
+        real_subnet.push(60);
+        let mut junk_subnet = vec![0u8; 16];
+        junk_subnet.push(0);
+        let got = reply(vec![
+            Attribute::long_bytes(cfg_attr::INTERNAL_IP6_DNS, v6("2001:db8::1").octets().to_vec()),
+            Attribute::long_bytes(cfg_attr::INTERNAL_IP6_DNS, v6("2001:db8::2").octets().to_vec()),
+            Attribute::long_bytes(cfg_attr::INTERNAL_IP6_DNS, vec![0u8; 16]),
+            Attribute::long_bytes(cfg_attr::INTERNAL_IP6_SUBNET, junk_subnet),
+            Attribute::long_bytes(cfg_attr::INTERNAL_IP6_SUBNET, real_subnet),
+        ]);
+        assert_eq!(got.assigned_ipv6_dns(), vec![v6("2001:db8::1"), v6("2001:db8::2")]);
+        assert_eq!(got.assigned_ipv6_subnets(), vec![(v6("fd00:0:0:10::"), 60)]);
+    }
+
+    #[test]
+    fn contiguous_prefix_len_accepts_only_leading_ones() {
+        assert_eq!(contiguous_prefix_len(0), Some(0));
+        assert_eq!(contiguous_prefix_len(u128::MAX), Some(128));
+        assert_eq!(contiguous_prefix_len(u128::MAX << 64), Some(64));
+        assert_eq!(contiguous_prefix_len(u128::MAX << 1), Some(127));
+        assert_eq!(contiguous_prefix_len(1), None);
+        assert_eq!(contiguous_prefix_len(0x00FF << 100), None);
     }
 
     #[test]

@@ -26,7 +26,7 @@
 //! Quick Mode negotiates PFS on the *initial* Phase-2 exchange, so it's
 //! testable at connect time.
 
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 use super::crypto1::{self, Prf, AES_BLOCK};
@@ -231,6 +231,18 @@ fn ts_id(addr: [u8; 4], mask: [u8; 4]) -> Vec<u8> {
     Id { id_type: id_type::IPV4_ADDR_SUBNET, protocol: 0, port: 0, data }.to_bytes()
 }
 
+/// An ID payload body for an IPv6 subnet traffic selector: network address +
+/// netmask, 16 bytes each (RFC 2407 §4.6.2.1) -- the IPv6 twin of [`ts_id`].
+/// A host selector is `prefix_len` 128, same convention as the IPv4 side's
+/// `/32` narrowing to the assigned address.
+fn ts_id_v6(addr: Ipv6Addr, prefix_len: u8) -> Vec<u8> {
+    let prefix_len = prefix_len.min(128);
+    let mask = if prefix_len == 0 { 0 } else { u128::MAX << (128 - prefix_len) };
+    let mut data = (u128::from(addr) & mask).to_be_bytes().to_vec();
+    data.extend_from_slice(&mask.to_be_bytes());
+    Id { id_type: id_type::IPV6_ADDR_SUBNET, protocol: 0, port: 0, data }.to_bytes()
+}
+
 /// Read the peer's inbound ESP SPI from the SA payload of a Quick-Mode message.
 fn peer_esp_spi(ps: &[Payload]) -> Result<u32, IkeError> {
     let sa_p = find(ps, payload::SA).ok_or(IkeError::MissingPayload("SA"))?;
@@ -389,6 +401,56 @@ pub fn initiate_quick_with_pfs(
     pfs_group: Option<DhGroup>,
     life_duration: u32,
 ) -> Result<(Vec<u8>, QuickInitiator), IkeError> {
+    initiate_quick_with_ids(
+        st,
+        entropy,
+        cipher,
+        ts_id(ts_local.0, ts_local.1),
+        ts_id(ts_remote.0, ts_remote.1),
+        pfs_group,
+        life_duration,
+    )
+}
+
+/// [`initiate_quick_with_pfs`] for an **IPv6** CHILD SA: `ts_local`/`ts_remote`
+/// are `(network, prefix length)` selectors offered as IDci/IDcr (typically our
+/// assigned address as a `/128` and `::/0`). IKEv1 has no CREATE_CHILD_SA --
+/// an additional CHILD SA under the same Phase 1 is simply another Quick Mode
+/// exchange, this one with IPv6 identities, exactly as a gateway that keeps its
+/// IPv4 and IPv6 Phase 2 selectors separate (a FortiGate does) expects.
+#[allow(clippy::too_many_arguments)]
+pub fn initiate_quick_ipv6(
+    st: &Phase1State,
+    entropy: &mut impl Entropy,
+    cipher: SkCipher,
+    ts_local: (Ipv6Addr, u8),
+    ts_remote: (Ipv6Addr, u8),
+    pfs_group: Option<DhGroup>,
+    life_duration: u32,
+) -> Result<(Vec<u8>, QuickInitiator), IkeError> {
+    initiate_quick_with_ids(
+        st,
+        entropy,
+        cipher,
+        ts_id_v6(ts_local.0, ts_local.1),
+        ts_id_v6(ts_remote.0, ts_remote.1),
+        pfs_group,
+        life_duration,
+    )
+}
+
+/// The address-family-agnostic body of the initiator entry points above:
+/// `id_local`/`id_remote` are the ready-made IDci/IDcr payload bodies.
+#[allow(clippy::too_many_arguments)]
+fn initiate_quick_with_ids(
+    st: &Phase1State,
+    entropy: &mut impl Entropy,
+    cipher: SkCipher,
+    id_local: Vec<u8>,
+    id_remote: Vec<u8>,
+    pfs_group: Option<DhGroup>,
+    life_duration: u32,
+) -> Result<(Vec<u8>, QuickInitiator), IkeError> {
     let mut spi_b = [0u8; 4];
     entropy.fill(&mut spi_b);
     let local_spi = u32::from_be_bytes(spi_b);
@@ -408,8 +470,8 @@ pub fn initiate_quick_with_pfs(
     if let Some((group, dh_private)) = &pfs {
         after.push((payload::KE, group.public(dh_private)));
     }
-    after.push((payload::ID, ts_id(ts_local.0, ts_local.1)));
-    after.push((payload::ID, ts_id(ts_remote.0, ts_remote.1)));
+    after.push((payload::ID, id_local));
+    after.push((payload::ID, id_remote));
     let (msg1, iv1) = phase2::build_encrypted(qm_header(st.cky_i, st.cky_r, msgid), st.prf, &st.skeyid_a, &st.enc_key, &iv0, &after)?;
     Ok((msg1, QuickInitiator {
         prf: st.prf,
@@ -604,31 +666,110 @@ pub fn rekey_child(
     timeout: Duration,
     old_local_spi: u32,
 ) -> Result<(RekeyedChild, u32), DriverError> {
-    let send = |msg: &[u8]| -> std::io::Result<()> {
-        if st.floated {
-            sock.send_to(&wrap_ike_4500(msg), SocketAddr::new(peer.ip(), crate::natt_port()))?;
-        } else {
-            sock.send_to(msg, peer)?;
-        }
-        Ok(())
-    };
-
     let (msg1, qi) = initiate_quick_with_pfs(st, entropy, cipher, ts_local, ts_remote, pfs_group, life_duration)?;
+    let out = quick_exchange(sock, st, peer, timeout, msg1, qi)?;
+    delete_superseded(sock, st, entropy, peer, old_local_spi);
+    Ok(out)
+}
+
+/// Create the tunnel's additional **IPv6** CHILD SA: one more Quick Mode
+/// exchange under the live Phase-1 SA (`st`), offering IPv6 selectors
+/// (`ts_local`/`ts_remote` as `(network, prefix length)`, see
+/// [`initiate_quick_ipv6`]). Same transport handling as [`rekey_child`]
+/// (`sock` must be the socket the peer is reachable on, NAT-T floated per
+/// `st.floated`), minus the trailing Delete: nothing is being replaced. An
+/// error Notify from the peer (typically NO-PROPOSAL-CHOSEN /
+/// INVALID-ID-INFORMATION when its Phase 2 has no IPv6 selector) comes back as
+/// [`IkeError::PeerRejected`] straight away rather than after `timeout`; the
+/// IPv4 CHILD SA and the Phase-1 SA are unaffected either way.
+#[allow(clippy::too_many_arguments)]
+pub fn create_child_ipv6(
+    sock: &UdpSocket,
+    st: &Phase1State,
+    entropy: &mut impl Entropy,
+    peer: SocketAddr,
+    cipher: SkCipher,
+    pfs_group: Option<DhGroup>,
+    ts_local: (Ipv6Addr, u8),
+    ts_remote: (Ipv6Addr, u8),
+    life_duration: u32,
+    timeout: Duration,
+) -> Result<(RekeyedChild, u32), DriverError> {
+    let (msg1, qi) = initiate_quick_ipv6(st, entropy, cipher, ts_local, ts_remote, pfs_group, life_duration)?;
+    quick_exchange(sock, st, peer, timeout, msg1, qi)
+}
+
+/// [`rekey_child`] for the IPv6 CHILD SA created by [`create_child_ipv6`]:
+/// renegotiates it with the same selectors and then deletes the superseded SA
+/// (`old_local_spi`, our own inbound SPI for it).
+#[allow(clippy::too_many_arguments)]
+pub fn rekey_child_ipv6(
+    sock: &UdpSocket,
+    st: &Phase1State,
+    entropy: &mut impl Entropy,
+    peer: SocketAddr,
+    cipher: SkCipher,
+    pfs_group: Option<DhGroup>,
+    ts_local: (Ipv6Addr, u8),
+    ts_remote: (Ipv6Addr, u8),
+    life_duration: u32,
+    timeout: Duration,
+    old_local_spi: u32,
+) -> Result<(RekeyedChild, u32), DriverError> {
+    let out = create_child_ipv6(sock, st, entropy, peer, cipher, pfs_group, ts_local, ts_remote, life_duration, timeout)?;
+    delete_superseded(sock, st, entropy, peer, old_local_spi);
+    Ok(out)
+}
+
+/// Send `msg` to `peer`, wrapped with the non-ESP marker on port 4500 when
+/// `st` floated (RFC 3947/3948) -- the same rule `Client::send_step` applies.
+fn send_ike(sock: &UdpSocket, st: &Phase1State, peer: SocketAddr, msg: &[u8]) -> std::io::Result<()> {
+    if st.floated {
+        sock.send_to(&wrap_ike_4500(msg), SocketAddr::new(peer.ip(), crate::natt_port()))?;
+    } else {
+        sock.send_to(msg, peer)?;
+    }
+    Ok(())
+}
+
+/// Best-effort Delete for the CHILD SA a rekey just superseded -- a failure to
+/// build or send it never fails the rekey (the new SA is already live and the
+/// old one will expire on its own lifetime either way).
+fn delete_superseded(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, old_local_spi: u32) {
+    if let Ok(delete_msg) = informational::build_esp_delete(st, entropy, old_local_spi) {
+        let _ = send_ike(sock, st, peer, &delete_msg);
+    }
+}
+
+/// Drive one initiator Quick Mode exchange to completion over `sock`: send
+/// `msg1`, wait (up to `timeout`) for the matching message 2, answer with
+/// message 3, and hand back the derived CHILD SA's SPIs/keys plus the
+/// negotiated lifetime. Datagrams that aren't this exchange's message 2 are
+/// skipped -- except an error Notify from the peer for this ISAKMP SA, which
+/// ends the wait at once as [`IkeError::PeerRejected`].
+fn quick_exchange(
+    sock: &UdpSocket,
+    st: &Phase1State,
+    peer: SocketAddr,
+    timeout: Duration,
+    msg1: Vec<u8>,
+    qi: QuickInitiator,
+) -> Result<(RekeyedChild, u32), DriverError> {
     let msgid = IsakmpHeader::parse(&msg1)?.message_id;
-    send(&msg1)?;
+    send_ike(sock, st, peer, &msg1)?;
 
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 8192];
     let msg2 = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(IkeError::Crypto("rekey_child: timed out waiting for the Quick Mode reply").into());
+            return Err(IkeError::Crypto("Quick Mode: timed out waiting for the Quick Mode reply").into());
         }
         sock.set_read_timeout(Some(remaining))?;
         let n = match sock.recv(&mut buf) {
             Ok(n) => n,
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                return Err(IkeError::Crypto("rekey_child: timed out waiting for the Quick Mode reply").into());
+                return Err(IkeError::Crypto("Quick Mode: timed out waiting for the Quick Mode reply").into());
             }
             Err(e) => return Err(e.into()),
         };
@@ -642,6 +783,9 @@ pub fn rekey_child(
             raw.to_vec()
         };
         let Ok(hdr) = IsakmpHeader::parse(&msg) else { continue };
+        if let Some((notify_type, name)) = informational::peer_error_notify(st, &msg) {
+            return Err(IkeError::PeerRejected { notify_type, name }.into());
+        }
         if hdr.init_cookie != st.cky_i || hdr.resp_cookie != st.cky_r || hdr.exchange_type != exchange::QUICK || hdr.message_id != msgid {
             continue;
         }
@@ -649,7 +793,7 @@ pub fn rekey_child(
     };
 
     let (msg3, child, negotiated_lifetime) = qi.complete(&msg2)?;
-    send(&msg3)?;
+    send_ike(sock, st, peer, &msg3)?;
 
     let key_out = ChildKeyMaterial {
         cipher: child.outbound.cipher(),
@@ -662,12 +806,6 @@ pub fn rekey_child(
         integ: child.inbound.integ_key().to_vec(),
     };
     let rekeyed = RekeyedChild { local_spi: child.inbound.spi(), peer_spi: child.outbound.spi(), key_out, key_in };
-
-    // Best-effort: never fails the rekey itself (see doc above).
-    if let Ok((delete_msg, _next_iv)) = informational::build_delete(st, entropy, old_local_spi) {
-        let _ = send(&delete_msg);
-    }
-
     Ok((rekeyed, negotiated_lifetime))
 }
 
@@ -700,6 +838,7 @@ mod tests {
             esp_cipher: SkCipher::Aes256Gcm,
             pfs_group: None,
             mode_cfg: false,
+            ipv6: false,
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
@@ -754,6 +893,7 @@ mod tests {
             esp_cipher: SkCipher::Aes256Gcm,
             pfs_group: None,
             mode_cfg: false,
+            ipv6: false,
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
@@ -813,6 +953,7 @@ mod tests {
             esp_cipher: cipher,
             pfs_group: None,
             mode_cfg: false,
+            ipv6: false,
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
@@ -867,6 +1008,7 @@ mod tests {
             esp_cipher: SkCipher::Aes256Gcm,
             pfs_group: None,
             mode_cfg: false,
+            ipv6: false,
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
@@ -923,6 +1065,7 @@ mod tests {
             esp_cipher: SkCipher::Aes256Gcm,
             pfs_group: None,
             mode_cfg: false,
+            ipv6: false,
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
@@ -969,6 +1112,7 @@ mod tests {
             esp_cipher: SkCipher::Aes256Gcm,
             pfs_group: None,
             mode_cfg: false,
+            ipv6: false,
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
@@ -1052,6 +1196,7 @@ mod tests {
             esp_cipher: SkCipher::Aes256Gcm,
             pfs_group: None,
             mode_cfg: false,
+            ipv6: false,
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
@@ -1141,5 +1286,232 @@ mod tests {
         let (proto, spi) = informational::parse_delete(&del.data).unwrap();
         assert_eq!(proto, protocol::ESP);
         assert_eq!(spi, old_local_spi.to_be_bytes());
+    }
+
+    // ---- IPv6 CHILD SA ----
+
+    fn v6(a: &str) -> Ipv6Addr {
+        a.parse().unwrap()
+    }
+
+    /// A completed Phase 1 (Aggressive, PSK) between an initiator and a
+    /// responder, as `(initiator state, responder state, initiator entropy,
+    /// responder entropy)`.
+    fn phase1_pair(seed_i: u64, seed_r: u64, i_addr: SocketAddr, r_addr: SocketAddr) -> (Phase1State, Phase1State, SeedEntropy, SeedEntropy) {
+        let psk = b"correct horse battery staple".to_vec();
+        let icfg = InitiatorConfig {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            key_len: 32,
+            our_id: Id::ipv4([10, 1, 1, 1]),
+            group: DhGroup::Modp1024,
+            xauth: false,
+            xauth_creds: None,
+            ts_local: ([0; 4], [0; 4]),
+            ts_remote: ([0; 4], [0; 4]),
+            esp_cipher: SkCipher::Aes256Gcm,
+            pfs_group: None,
+            mode_cfg: false,
+            ipv6: true,
+            mode: Ikev1ExchangeMode::Aggressive,
+            p1_lifetime_secs: 28800,
+            p2_lifetime_secs: 3600,
+        };
+        let rcfg = Phase1Config { local_auth: Ikev1LocalAuth::Psk(psk), trusted_cas: Vec::new(), now_unix: 0, our_id: Id::ipv4([192, 168, 0, 1]) };
+        let mut ie = SeedEntropy::new(seed_i);
+        let mut re = SeedEntropy::new(seed_r);
+        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie, i_addr, r_addr);
+        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re, r_addr, i_addr).unwrap();
+        let (msg3, istate) = ai.complete(&msg2, i_addr, r_addr).unwrap();
+        rstate.verify_hash_i(&msg3).unwrap();
+        (istate, rstate, ie, re)
+    }
+
+    #[test]
+    fn ts_id_v6_encodes_network_and_mask_masking_host_bits() {
+        let id = |b: Vec<u8>| Id::parse(&b).unwrap();
+
+        let any = id(ts_id_v6(v6("::"), 0));
+        assert_eq!(any.id_type, id_type::IPV6_ADDR_SUBNET);
+        assert_eq!(any.data, vec![0u8; 32]);
+
+        let host = id(ts_id_v6(v6("fd00::1234"), 128));
+        assert_eq!(&host.data[..16], &v6("fd00::1234").octets());
+        assert_eq!(&host.data[16..], &[0xffu8; 16]);
+
+        // Host bits below the prefix are cleared from the network address.
+        let net = id(ts_id_v6(v6("2001:db8:1:2:3:4:5:6"), 64));
+        assert_eq!(&net.data[..16], &v6("2001:db8:1:2::").octets());
+        assert_eq!(&net.data[16..], &(u128::MAX << 64).to_be_bytes());
+
+        // An out-of-range prefix length is clamped, never a shift overflow.
+        assert_eq!(id(ts_id_v6(v6("fd00::1"), 250)).data[16..], [0xffu8; 16]);
+    }
+
+    /// The IPv6 Quick Mode carries IPv6 subnet identities on the wire, the
+    /// responder echoes them, and the two CHILD SAs interoperate.
+    #[test]
+    fn ikev1_quick_mode_ipv6_carries_ipv6_identities_and_esp_roundtrips() {
+        let (istate, rstate, mut ie, mut re) = phase1_pair(0x9101, 0x9102, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let vip = v6("fd00::abcd");
+        let (qm1, qi) = initiate_quick_ipv6(&istate, &mut ie, SkCipher::Aes256Gcm, (vip, 128), (v6("::"), 0), None, 3600).unwrap();
+
+        // What the responder sees: IDci = our VIP/128, IDcr = ::/0, both IPv6 subnets.
+        let msgid = IsakmpHeader::parse(&qm1).unwrap().message_id;
+        let iv0 = crypto1::phase2_iv(rstate.prf, &rstate.phase1_iv, msgid, AES_BLOCK);
+        let (_h, ps, _iv) = phase2::parse_encrypted(&qm1, rstate.prf, &rstate.skeyid_a, &rstate.enc_key, &iv0).unwrap();
+        let ids: Vec<Id> = ps.iter().filter(|p| p.payload_type == payload::ID).map(|p| Id::parse(&p.data).unwrap()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().all(|i| i.id_type == id_type::IPV6_ADDR_SUBNET && i.data.len() == 32));
+        assert_eq!(&ids[0].data[..16], &vip.octets());
+        assert_eq!(&ids[0].data[16..], &[0xffu8; 16]);
+        assert_eq!(ids[1].data, vec![0u8; 32]);
+
+        let (qm2, qr) = respond_quick(&rstate, &qm1, &mut re).unwrap();
+        let (qm3, mut ichild, _lifetime) = qi.complete(&qm2).unwrap();
+        let mut rchild = qr.complete(&qm3).unwrap();
+
+        let pkt: Vec<u8> = (0..40u8).collect();
+        let sealed = ichild.outbound.seal(&pkt, 41).unwrap();
+        let (got, nh) = rchild.inbound.open(&sealed).unwrap();
+        assert_eq!((got, nh), (pkt.clone(), 41));
+        let sealed_r = rchild.outbound.seal(&pkt, 41).unwrap();
+        assert_eq!(ichild.inbound.open(&sealed_r).unwrap().0, pkt);
+    }
+
+    /// Two Quick Modes under one Phase 1 -- the IPv4 CHILD SA and the IPv6
+    /// one -- are independent: distinct SPIs and distinct keys.
+    #[test]
+    fn a_second_quick_mode_for_ipv6_yields_an_independent_child_sa() {
+        let (istate, rstate, mut ie, mut re) = phase1_pair(0x9201, 0x9202, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let ts4 = ([10, 212, 134, 202], [255, 255, 255, 255]);
+        let (qm1, qi) = initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, ts4, ([0; 4], [0; 4]), 3600).unwrap();
+        let (qm2, qr) = respond_quick(&rstate, &qm1, &mut re).unwrap();
+        let (qm3, child4, _) = qi.complete(&qm2).unwrap();
+        qr.complete(&qm3).unwrap();
+
+        let (qm1, qi) = initiate_quick_ipv6(&istate, &mut ie, SkCipher::Aes256Gcm, (v6("fd00::1"), 128), (v6("::"), 0), None, 3600).unwrap();
+        let (qm2, qr) = respond_quick(&rstate, &qm1, &mut re).unwrap();
+        let (qm3, child6, _) = qi.complete(&qm2).unwrap();
+        qr.complete(&qm3).unwrap();
+
+        assert_ne!(child4.inbound.spi(), child6.inbound.spi());
+        assert_ne!(child4.outbound.spi(), child6.outbound.spi());
+        assert_ne!(child4.outbound.key_material(), child6.outbound.key_material());
+    }
+
+    /// A responder loop for the tests below: answers one Quick Mode (msg1 →
+    /// msg2, msg3), then optionally reads the trailing Delete.
+    fn spawn_quick_responder(
+        sock: UdpSocket,
+        rstate: Phase1State,
+        mut re: SeedEntropy,
+        reply_to: SocketAddr,
+        expect_delete: bool,
+    ) -> std::thread::JoinHandle<(ChildSa, Option<Vec<u8>>, Phase1State)> {
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            let n = sock.recv(&mut buf).unwrap();
+            let (msg2, qr) = respond_quick(&rstate, &buf[..n], &mut re).unwrap();
+            sock.send_to(&msg2, reply_to).unwrap();
+            let n = sock.recv(&mut buf).unwrap();
+            let child = qr.complete(&buf[..n]).unwrap();
+            let delete = expect_delete.then(|| {
+                let n = sock.recv(&mut buf).unwrap();
+                buf[..n].to_vec()
+            });
+            (child, delete, rstate)
+        })
+    }
+
+    fn loopback_pair() -> (UdpSocket, UdpSocket, SocketAddr, SocketAddr) {
+        let a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").unwrap();
+        a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (aa, ba) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+        (a, b, aa, ba)
+    }
+
+    #[test]
+    fn create_child_ipv6_over_loopback_interoperates_and_sends_no_delete() {
+        let (isock, rsock, iaddr, raddr) = loopback_pair();
+        let (istate, rstate, mut ie, re) = phase1_pair(0x9301, 0x9302, iaddr, raddr);
+        let responder = spawn_quick_responder(rsock, rstate, re, iaddr, false);
+
+        let (rekeyed, lifetime) = create_child_ipv6(
+            &isock, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, (v6("fd00::1"), 128), (v6("::"), 0), 1800, Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(lifetime, 1800);
+
+        let (mut rchild, delete, _rstate) = responder.join().unwrap();
+        assert!(delete.is_none());
+        let mut ours = EspSa::new_with_cipher(rekeyed.local_spi, rekeyed.key_in.cipher, &rekeyed.key_in.enc, &rekeyed.key_in.integ).unwrap();
+        let pkt: Vec<u8> = (0..40u8).collect();
+        let sealed = rchild.outbound.seal(&pkt, 41).unwrap();
+        assert_eq!(ours.open(&sealed).unwrap(), (pkt, 41));
+    }
+
+    /// The IPv6 rekey renegotiates with IPv6 identities and then deletes the
+    /// superseded IPv6 SA -- by its own SPI, leaving the IPv4 SA alone.
+    #[test]
+    fn rekey_child_ipv6_over_loopback_deletes_the_superseded_ipv6_sa() {
+        let (isock, rsock, iaddr, raddr) = loopback_pair();
+        let (istate, rstate, mut ie, re) = phase1_pair(0x9401, 0x9402, iaddr, raddr);
+        let old_local_spi = 0x0bad_cafe;
+        let responder = spawn_quick_responder(rsock, rstate, re, iaddr, true);
+
+        let (rekeyed, _) = rekey_child_ipv6(
+            &isock, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, (v6("fd00::1"), 128), (v6("::"), 0), 1800, Duration::from_secs(5), old_local_spi,
+        )
+        .unwrap();
+        let (_rchild, delete, rstate) = responder.join().unwrap();
+        assert_ne!(rekeyed.local_spi, old_local_spi);
+
+        let delete = delete.unwrap();
+        let hdr = IsakmpHeader::parse(&delete).unwrap();
+        let iv0 = crypto1::phase2_iv(rstate.prf, &rstate.phase1_iv, hdr.message_id, AES_BLOCK);
+        let (_h, ps, _iv) = phase2::parse_encrypted(&delete, rstate.prf, &rstate.skeyid_a, &rstate.enc_key, &iv0).unwrap();
+        let del = ps.iter().find(|p| p.payload_type == payload::DELETE).unwrap();
+        let (proto, spi) = informational::parse_delete(&del.data).unwrap();
+        assert_eq!((proto, spi), (protocol::ESP, &old_local_spi.to_be_bytes()[..]));
+    }
+
+    /// A gateway with no IPv6 Phase 2 rejects with an error Notify: the create
+    /// fails at once with the real reason instead of running out the timeout.
+    #[test]
+    fn create_child_ipv6_fails_fast_when_the_peer_answers_with_an_error_notify() {
+        let (isock, rsock, iaddr, raddr) = loopback_pair();
+        let (istate, rstate, mut ie, mut re) = phase1_pair(0x9501, 0x9502, iaddr, raddr);
+        let responder = std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            rsock.recv(&mut buf).unwrap();
+            let reject = informational::build_error_notify(&rstate, &mut re, 18).unwrap();
+            rsock.send_to(&reject, iaddr).unwrap();
+        });
+
+        let started = Instant::now();
+        let err = match create_child_ipv6(
+            &isock, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, (v6("fd00::1"), 128), (v6("::"), 0), 3600, Duration::from_secs(4),
+        ) {
+            Err(DriverError::Ike(e)) => e,
+            other => panic!("expected an IKE error, got {:?}", other.map(|_| ())),
+        };
+        responder.join().unwrap();
+        assert_eq!(err, IkeError::PeerRejected { notify_type: 18, name: "INVALID_ID_INFORMATION" });
+        assert!(started.elapsed() < Duration::from_secs(3), "must not wait out the timeout");
+    }
+
+    /// Anything else the peer sends is skipped and the timeout still applies.
+    #[test]
+    fn create_child_ipv6_times_out_when_the_peer_stays_silent() {
+        let (isock, _rsock, iaddr, raddr) = loopback_pair();
+        let (istate, _rstate, mut ie, _re) = phase1_pair(0x9601, 0x9602, iaddr, raddr);
+        let err = create_child_ipv6(
+            &isock, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, (v6("fd00::1"), 128), (v6("::"), 0), 3600, Duration::from_millis(300),
+        );
+        assert!(matches!(err, Err(DriverError::Ike(IkeError::Crypto(m))) if m.contains("timed out")), "got {:?}", err.map(|_| ()));
     }
 }

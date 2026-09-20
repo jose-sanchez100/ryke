@@ -69,6 +69,10 @@ pub mod id_type {
     pub const FQDN: u8 = 2;
     pub const USER_FQDN: u8 = 3;
     pub const IPV4_ADDR_SUBNET: u8 = 4;
+    pub const IPV6_ADDR: u8 = 5;
+    /// Payload data: 16-byte network address + 16-byte netmask (RFC 2407
+    /// §4.6.2.1), the IPv6 twin of `IPV4_ADDR_SUBNET`.
+    pub const IPV6_ADDR_SUBNET: u8 = 6;
     pub const KEY_ID: u8 = 11;
     /// A certificate's own Subject DN, DER-encoded — see
     /// [`crate::ikev2::sign::cert_subject_dn`], reused as-is here since the

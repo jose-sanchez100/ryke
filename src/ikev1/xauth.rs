@@ -196,6 +196,7 @@ mod tests {
             esp_cipher: SkCipher::Aes256Gcm,
             pfs_group: None,
             mode_cfg: false,
+            ipv6: false,
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,

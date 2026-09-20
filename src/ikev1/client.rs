@@ -3,7 +3,8 @@
 //! signature — see [`crate::ikev1::phase1::Ikev1LocalAuth`]), an optional
 //! XAUTH round (see [`crate::ikev1::xauth`]) when the gateway requires one,
 //! an optional Mode-Config round (see [`crate::ikev1::cfg`],
-//! `InitiatorConfig::mode_cfg`) for an assigned inner IPv4, then Quick Mode
+//! `InitiatorConfig::mode_cfg`) for an assigned inner IPv4 (and, with
+//! `InitiatorConfig::ipv6`, IPv6), then Quick Mode
 //! (optionally with PFS, see `InitiatorConfig::pfs_group`), establishing an
 //! ESP CHILD SA.
 //!
@@ -19,7 +20,7 @@
 //! details; this module only owns the transport-switching side of it.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
 use crate::debug::ike_debug;
@@ -49,6 +50,16 @@ pub struct Established {
     pub netmask: Option<Ipv4Addr>,
     pub dns: Vec<Ipv4Addr>,
     pub subnets: Vec<(Ipv4Addr, u8)>,
+    /// The IPv6 counterparts of `assigned_ip4`/`dns`/`subnets`, from the same
+    /// Mode-Config reply -- only ever populated when
+    /// `InitiatorConfig::ipv6` asked for them *and* the gateway actually had
+    /// IPv6 to give (an all-zero placeholder reads as `None`/empty, see
+    /// [`crate::ikev1::modecfg::ConfigPayload::assigned_ipv6`]). Nothing here
+    /// creates an IPv6 CHILD SA by itself: with `assigned_ip6` set, the caller
+    /// runs [`crate::ikev1::quick::create_child_ipv6`].
+    pub assigned_ip6: Option<(Ipv6Addr, u8)>,
+    pub dns6: Vec<Ipv6Addr>,
+    pub subnets6: Vec<(Ipv6Addr, u8)>,
     /// The CHILD SA's negotiated ESP lifetime, in seconds (RFC 2407 §4.5 --
     /// the responder's own chosen value if it echoed one, else whatever we
     /// offered; see `quick::negotiated_p2_lifetime`) -- a caller scheduling a
@@ -379,12 +390,13 @@ impl<E: Entropy> Client<E> {
         // Quick Mode proposal outright ("peer has not completed Configuration
         // Method") if this round is skipped.
         let (mut assigned_ip4, mut netmask, mut dns, mut subnets) = (None, None, Vec::new(), Vec::new());
+        let (mut assigned_ip6, mut dns6, mut subnets6) = (None, Vec::new(), Vec::new());
         if cfg.mode_cfg {
-            ike_debug!("Mode-Config: requesting an assigned IPv4");
+            ike_debug!("Mode-Config: requesting an assigned IPv4{}", if cfg.ipv6 { " and IPv6" } else { "" });
             let mut mid_b = [0u8; 4];
             self.entropy.fill(&mut mid_b);
             let msgid = u32::from_be_bytes(mid_b) | 1; // non-zero
-            let (request, next_iv) = modecfg::build_cfg_request(&phase1, msgid)?;
+            let (request, next_iv) = modecfg::build_cfg_request_with(&phase1, msgid, cfg.ipv6)?;
             self.send_step(&request, server, phase1.floated)?;
             let reply = self.recv_matching(phase1.cky_i, Some(phase1.cky_r), exchange::TRANSACTION, phase1.floated)?;
             let got = modecfg::parse_cfg_reply(&phase1, &reply, &next_iv)?;
@@ -392,7 +404,12 @@ impl<E: Entropy> Client<E> {
             netmask = got.assigned_netmask();
             dns = got.assigned_dns();
             subnets = got.assigned_subnets();
-            ike_debug!("Mode-Config: assigned {assigned_ip4:?}");
+            if cfg.ipv6 {
+                assigned_ip6 = got.assigned_ipv6();
+                dns6 = got.assigned_ipv6_dns();
+                subnets6 = got.assigned_ipv6_subnets();
+            }
+            ike_debug!("Mode-Config: assigned {assigned_ip4:?}, IPv6 {assigned_ip6:?}");
         }
 
         // Phase 2: Quick Mode, optionally with PFS (see `InitiatorConfig::pfs_group`'s doc).
@@ -433,7 +450,7 @@ impl<E: Entropy> Client<E> {
         // an IKEv2 NAT-T path would use too.
         let local_addr =
             if phase1.floated { SocketAddr::new(our_addr.ip(), crate::natt_port()) } else { self.transport.local_addr_for(server)? };
-        Ok(Established { phase1, child, assigned_ip4, netmask, dns, subnets, local_addr, p2_lifetime_secs, ts_local, ts_remote: cfg.ts_remote })
+        Ok(Established { phase1, child, assigned_ip4, netmask, dns, subnets, assigned_ip6, dns6, subnets6, local_addr, p2_lifetime_secs, ts_local, ts_remote: cfg.ts_remote })
     }
 }
 

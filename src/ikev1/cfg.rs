@@ -48,7 +48,14 @@ fn attribute_payload(ps: &[Payload]) -> Result<&Payload, IkeError> {
 /// Returns the request bytes and the IV the paired CFG_REPLY (same
 /// message-id) chains from — pass it to [`parse_cfg_reply`].
 pub fn build_cfg_request(st: &Phase1State, msgid: u32) -> Result<(Vec<u8>, Vec<u8>), IkeError> {
-    let req = ConfigPayload::request_ipv4(msgid as u16);
+    build_cfg_request_with(st, msgid, false)
+}
+
+/// [`build_cfg_request`], optionally also asking for an inner IPv6 address /
+/// DNS / split-tunnel subnet ([`ConfigPayload::request_dual_stack`]) in the
+/// same round. `ipv6: false` is byte-for-byte the IPv4-only request.
+pub fn build_cfg_request_with(st: &Phase1State, msgid: u32, ipv6: bool) -> Result<(Vec<u8>, Vec<u8>), IkeError> {
+    let req = if ipv6 { ConfigPayload::request_dual_stack(msgid as u16) } else { ConfigPayload::request_ipv4(msgid as u16) };
     let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
     let hdr = cfg_header(st.cky_i, st.cky_r, msgid);
     let (msg, next_iv) = phase2::build_encrypted(hdr, st.prf, &st.skeyid_a, &st.enc_key, &iv0, &[(payload::ATTRIBUTE, req.to_bytes())])?;
@@ -78,7 +85,37 @@ pub(crate) mod test_gateway {
     use super::*;
     use crate::ikev1::modecfg::cfg_attr;
     use crate::ikev1::payloads::Attribute;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    /// [`handle_request`]'s dual-stack twin: same IPv4 grant, plus `addr6`
+    /// (17-octet address+prefix form), one IPv6 DNS server and one split
+    /// subnet -- what a gateway with IPv6 configured answers a
+    /// [`build_cfg_request_with`]`(.., true)` with.
+    pub fn handle_request_dual_stack(st: &Phase1State, request: &[u8], msgid: u32, addr: Ipv4Addr, addr6: (Ipv6Addr, u8)) -> Vec<u8> {
+        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
+        let (_h, ps, iv1) = phase2::parse_encrypted(request, st.prf, &st.skeyid_a, &st.enc_key, &iv0).unwrap();
+        let got = ConfigPayload::parse(&attribute_payload(&ps).unwrap().data).unwrap();
+        assert_eq!(got.cfg_type, cfg::REQUEST);
+
+        let mut a6 = addr6.0.octets().to_vec();
+        a6.push(addr6.1);
+        let mut subnet6 = "fd00:0:0:10::".parse::<Ipv6Addr>().unwrap().octets().to_vec();
+        subnet6.push(60);
+        let reply = ConfigPayload::new(
+            cfg::REPLY,
+            got.identifier,
+            vec![
+                Attribute::long_bytes(cfg_attr::INTERNAL_IP4_ADDRESS, addr.octets().to_vec()),
+                Attribute::long_bytes(cfg_attr::INTERNAL_IP4_NETMASK, [255, 255, 255, 0]),
+                Attribute::long_bytes(cfg_attr::INTERNAL_IP6_ADDRESS, a6),
+                Attribute::long_bytes(cfg_attr::INTERNAL_IP6_DNS, "2001:db8::53".parse::<Ipv6Addr>().unwrap().octets().to_vec()),
+                Attribute::long_bytes(cfg_attr::INTERNAL_IP6_SUBNET, subnet6),
+            ],
+        );
+        let hdr = cfg_header(st.cky_i, st.cky_r, msgid);
+        let (msg, _next) = phase2::build_encrypted(hdr, st.prf, &st.skeyid_a, &st.enc_key, &iv1, &[(payload::ATTRIBUTE, reply.to_bytes())]).unwrap();
+        msg
+    }
 
     /// Decrypt the client's REQUEST (using `iv0` computed the same way
     /// [`build_cfg_request`] did) and build a REPLY granting `addr` (plus a
@@ -114,7 +151,7 @@ mod tests {
         initiate_aggressive, respond_aggressive, Ikev1ExchangeMode, Ikev1LocalAuth, InitiatorConfig, Phase1Config,
     };
     use crate::ikev2::sk::SkCipher;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn phase1_pair() -> (Phase1State, Phase1State) {
         let psk = b"correct horse battery staple".to_vec();
@@ -132,6 +169,7 @@ mod tests {
             esp_cipher: SkCipher::Aes256Gcm,
             pfs_group: None,
             mode_cfg: false,
+            ipv6: false,
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
@@ -161,6 +199,50 @@ mod tests {
         assert_eq!(got.assigned_ipv4(), Some(Ipv4Addr::new(10, 212, 134, 202)));
         assert_eq!(got.assigned_netmask(), Some(Ipv4Addr::new(255, 255, 255, 0)));
         assert_eq!(got.assigned_dns(), vec![Ipv4Addr::new(8, 8, 8, 8)]);
+    }
+
+    #[test]
+    fn dual_stack_cfg_round_trip_yields_the_gateways_ipv6_grant_too() {
+        let (client_st, gw_st) = phase1_pair();
+        let msgid = 0x5000_0011;
+        let (request, next_iv) = build_cfg_request_with(&client_st, msgid, true).unwrap();
+        let addr6: Ipv6Addr = "fd00::abcd".parse().unwrap();
+        let reply = test_gateway::handle_request_dual_stack(&gw_st, &request, msgid, Ipv4Addr::new(10, 212, 134, 202), (addr6, 64));
+        let got = parse_cfg_reply(&client_st, &reply, &next_iv).unwrap();
+        assert_eq!(got.assigned_ipv4(), Some(Ipv4Addr::new(10, 212, 134, 202)));
+        assert_eq!(got.assigned_ipv6(), Some((addr6, 64)));
+        assert_eq!(got.assigned_ipv6_dns(), vec!["2001:db8::53".parse::<Ipv6Addr>().unwrap()]);
+        assert_eq!(got.assigned_ipv6_subnets(), vec![("fd00:0:0:10::".parse::<Ipv6Addr>().unwrap(), 60)]);
+    }
+
+    /// A v4-only gateway answering the dual-stack request just leaves the IPv6
+    /// attributes out -- `assigned_ipv6` reads `None`, which is what keeps the
+    /// caller from ever starting an IPv6 CHILD SA.
+    #[test]
+    fn dual_stack_request_against_an_ipv4_only_gateway_yields_no_ipv6() {
+        let (client_st, gw_st) = phase1_pair();
+        let msgid = 0x5000_0021;
+        let (request, next_iv) = build_cfg_request_with(&client_st, msgid, true).unwrap();
+        let reply = test_gateway::handle_request(&gw_st, &request, msgid, Ipv4Addr::new(10, 212, 134, 202));
+        let got = parse_cfg_reply(&client_st, &reply, &next_iv).unwrap();
+        assert_eq!(got.assigned_ipv4(), Some(Ipv4Addr::new(10, 212, 134, 202)));
+        assert_eq!(got.assigned_ipv6(), None);
+        assert!(got.assigned_ipv6_dns().is_empty());
+        assert!(got.assigned_ipv6_subnets().is_empty());
+    }
+
+    /// `ipv6: false` must stay the exact request it always was.
+    #[test]
+    fn ipv4_only_request_is_unchanged_by_the_ipv6_option() {
+        let (client_st, _gw_st) = phase1_pair();
+        let msgid = 0x5000_0031;
+        // Same message-id => same IV and same plaintext => identical bytes,
+        // as the encryption is deterministic and there is no random padding.
+        let plain = build_cfg_request(&client_st, msgid).unwrap();
+        let off = build_cfg_request_with(&client_st, msgid, false).unwrap();
+        assert_eq!(plain, off);
+        let on = build_cfg_request_with(&client_st, msgid, true).unwrap();
+        assert_ne!(plain.0, on.0);
     }
 
     #[test]

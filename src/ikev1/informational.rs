@@ -188,9 +188,17 @@ pub fn build_r_u_there_ack(st: &Phase1State, entropy: &mut impl Entropy, seq: u3
 /// real-world implementations, for compatibility with gateways that key
 /// teardown logging/policy off the explicit ESP delete directly.
 pub fn build_delete(st: &Phase1State, entropy: &mut impl Entropy, esp_spi: u32) -> Result<(Vec<u8>, Vec<u8>), IkeError> {
-    let esp_msg = build_single_informational(st, entropy, payload::DELETE, delete_body(protocol::ESP, &esp_spi.to_be_bytes()))?;
+    let esp_msg = build_esp_delete(st, entropy, esp_spi)?;
     let isakmp_msg = build_isakmp_delete(st, entropy)?;
     Ok((esp_msg, isakmp_msg))
+}
+
+/// Just the ESP half of [`build_delete`] -- for tearing down one CHILD SA
+/// among several under the same Phase 1 (`esp_spi`: our own inbound SPI, same
+/// convention as [`build_delete`]). A tunnel with a second, IPv6 CHILD SA
+/// sends this for it ahead of the ISAKMP delete.
+pub fn build_esp_delete(st: &Phase1State, entropy: &mut impl Entropy, esp_spi: u32) -> Result<Vec<u8>, IkeError> {
+    build_single_informational(st, entropy, payload::DELETE, delete_body(protocol::ESP, &esp_spi.to_be_bytes()))
 }
 
 /// Just the ISAKMP-SA half of [`build_delete`] — for a caller with no CHILD
@@ -332,6 +340,48 @@ fn watch(
     }
 }
 
+/// If `msg` is an encrypted Informational for `st`'s ISAKMP SA carrying an
+/// **error** Notify (RFC 2408 §3.14.1: types 1..=16383), its type and name.
+/// A responder that rejects a Quick Mode proposal it cannot accept answers with
+/// one of these instead of a Quick Mode message 2 (e.g. NO-PROPOSAL-CHOSEN, or
+/// INVALID-ID-INFORMATION for a traffic selector it has no policy for), so a
+/// caller waiting on message 2 can fail at once with the real reason instead
+/// of running out its timeout. Anything else -- a different SA, a message that
+/// doesn't decrypt or fails HASH(1), a status Notify, a Delete -- is `None`.
+pub(crate) fn peer_error_notify(st: &Phase1State, msg: &[u8]) -> Option<(u16, &'static str)> {
+    let header = IsakmpHeader::parse(msg).ok()?;
+    if header.exchange_type != exchange::INFORMATIONAL || header.init_cookie != st.cky_i || header.resp_cookie != st.cky_r {
+        return None;
+    }
+    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, header.message_id, AES_BLOCK);
+    let (_h, payloads, _next) = phase2::parse_encrypted(msg, st.prf, &st.skeyid_a, &st.enc_key, &iv0).ok()?;
+    let notify = payloads.iter().find(|p| p.payload_type == payload::NOTIFY)?;
+    let (msg_type, _data) = parse_notify(&notify.data)?;
+    (1..16384).contains(&msg_type).then(|| (msg_type, error_notify_name(msg_type)))
+}
+
+/// Test double for a peer's rejection: an encrypted Informational carrying an
+/// error Notify of `msg_type` (the shape [`peer_error_notify`] recognizes).
+#[cfg(test)]
+pub(crate) fn build_error_notify(st: &Phase1State, entropy: &mut impl Entropy, msg_type: u16) -> Result<Vec<u8>, IkeError> {
+    build_single_informational(st, entropy, payload::NOTIFY, notify_body(protocol::ISAKMP, &isakmp_spi(st), msg_type, &[]))
+}
+
+/// RFC 2408 §3.14.1 names for the error Notify types a Quick Mode rejection
+/// realistically carries; everything else reads as a generic error.
+fn error_notify_name(t: u16) -> &'static str {
+    match t {
+        14 => "NO_PROPOSAL_CHOSEN",
+        15 => "BAD_PROPOSAL_SYNTAX",
+        16 => "PAYLOAD_MALFORMED",
+        17 => "INVALID_KEY_INFORMATION",
+        18 => "INVALID_ID_INFORMATION",
+        23 => "INVALID_HASH_INFORMATION",
+        24 => "AUTHENTICATION_FAILED",
+        _ => "error notification",
+    }
+}
+
 /// Passive check: has the peer said anything unprompted (a Delete, or its
 /// own R-U-THERE probe, which gets auto-ack'd) since the last check? Safe to
 /// call on every routine status poll instead of [`probe`]'s full round trip
@@ -392,6 +442,7 @@ mod tests {
             esp_cipher: SkCipher::Aes256Gcm,
             pfs_group: None,
             mode_cfg: false,
+            ipv6: false,
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,

@@ -66,6 +66,7 @@ use super::phase1::Phase1State;
 use super::phase2;
 use crate::entropy::Entropy;
 use crate::error::IkeError;
+use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
 use crate::transport::DriverError;
 
 /// RFC 2408 §3.15 Delete payload body: `DOI(4) | Protocol-Id(1) | SPI-Size(1)
@@ -212,6 +213,21 @@ pub fn build_isakmp_delete(st: &Phase1State, entropy: &mut impl Entropy) -> Resu
     build_single_informational(st, entropy, payload::DELETE, delete_body(protocol::ISAKMP, &isakmp_spi(st)))
 }
 
+/// Send `msg` to `peer` exactly as given, prefixed with the non-ESP marker
+/// when `st` floated to UDP 4500 (RFC 3947/3948 §2.2): a datagram on 4500
+/// without it reads as ESP to the gateway, which drops it -- so an unmarked
+/// R-U-THERE or ACK never arrived and the gateway's DPD tore the tunnel down.
+/// `peer` is the caller's already-correct destination (the 4500 address once
+/// floated), so only the framing is decided here.
+fn send_ike(sock: &UdpSocket, st: &Phase1State, peer: SocketAddr, msg: &[u8]) -> std::io::Result<()> {
+    if st.floated {
+        sock.send_to(&wrap_ike_4500(msg), peer)?;
+    } else {
+        sock.send_to(msg, peer)?;
+    }
+    Ok(())
+}
+
 /// Result of [`peek`]/[`probe`] — mirrors
 /// [`crate::ikev2::session::Liveness`]'s three-variant shape, kept as its own
 /// local type rather than shared across the ikev1/ikev2 modules (they don't
@@ -297,12 +313,22 @@ fn watch(
             }
             Err(e) => return Err(e),
         };
-        let Ok(header) = IsakmpHeader::parse(&buf[..n]) else { continue };
+        // On a floated tunnel (UDP 4500) IKE is the marked datagrams; an
+        // unmarked one is ESP or a NAT keepalive, never ours to parse.
+        let datagram: &[u8] = if st.floated {
+            match unwrap_ike_4500(&buf[..n]) {
+                Some(ike) => ike,
+                None => continue,
+            }
+        } else {
+            &buf[..n]
+        };
+        let Ok(header) = IsakmpHeader::parse(datagram) else { continue };
         if header.exchange_type != exchange::INFORMATIONAL || header.init_cookie != st.cky_i || header.resp_cookie != st.cky_r {
             continue; // not an Informational for this ISAKMP SA -- ignore, keep waiting out the timeout
         }
         let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, header.message_id, AES_BLOCK);
-        let Ok((_h, payloads, _next)) = phase2::parse_encrypted(&buf[..n], st.prf, &st.skeyid_a, &st.enc_key, &iv0) else {
+        let Ok((_h, payloads, _next)) = phase2::parse_encrypted(datagram, st.prf, &st.skeyid_a, &st.enc_key, &iv0) else {
             continue;
         };
         if let Some(del) = payloads.iter().find(|p| p.payload_type == payload::DELETE) {
@@ -324,7 +350,7 @@ fn watch(
             notify_type::R_U_THERE => {
                 if let Ok(seq_bytes) = <[u8; 4]>::try_from(data) {
                     if let Ok(ack) = build_r_u_there_ack(st, entropy, u32::from_be_bytes(seq_bytes)) {
-                        let _ = sock.send_to(&ack, peer);
+                        let _ = send_ike(sock, st, peer, &ack);
                     }
                 }
             }
@@ -406,7 +432,7 @@ pub fn peek(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer
 /// [`peek`]'s doc.
 pub fn probe(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, seq: u32, timeout: Duration, current_peer_spi: u32) -> Result<Liveness, DriverError> {
     let msg = build_r_u_there(st, entropy, seq)?;
-    sock.send_to(&msg, peer)?;
+    send_ike(sock, st, peer, &msg)?;
     match watch(sock, st, entropy, peer, timeout, Some(seq), current_peer_spi)? {
         Seen::Nothing => Ok(Liveness::NoReply),
         Seen::PeerTornDown => Ok(Liveness::PeerTornDown),
@@ -710,6 +736,116 @@ mod tests {
         let mut ce = SeedEntropy::new(0xB);
         let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 100, std::time::Duration::from_millis(200), 0x2222_2222).unwrap();
         assert_eq!(got, Liveness::NoReply);
+        responder.join().unwrap();
+    }
+
+    // --- NAT-T (RFC 3947/3948): once the tunnel floated to UDP 4500 every IKE
+    // datagram carries the 4-byte non-ESP marker in both directions; without it
+    // a gateway reads ours as ESP and we read its DPD probes as garbage -- so it
+    // never got an R-U-THERE-ACK and tore the tunnel down (confirmed live on a
+    // FortiGate with a floated IKEv1 tunnel).
+
+    fn floated_pair() -> (Phase1State, Phase1State) {
+        let (mut c, mut g) = phase1_pair();
+        c.floated = true;
+        g.floated = true;
+        (c, g)
+    }
+
+    /// Strips the marker off a datagram the client sent and decrypts its single
+    /// Notify -- what a floated gateway does with our DPD traffic.
+    fn gateway_reads_notify(gw_st: &Phase1State, datagram: &[u8]) -> (u16, Vec<u8>) {
+        let ike = crate::ikev2::natt::unwrap_ike_4500(datagram).expect("the client must send IKE on 4500 with the non-ESP marker");
+        let hdr = IsakmpHeader::parse(ike).unwrap();
+        let iv0 = crypto1::phase2_iv(gw_st.prf, &gw_st.phase1_iv, hdr.message_id, AES_BLOCK);
+        let (_h, payloads, _next) = phase2::parse_encrypted(ike, gw_st.prf, &gw_st.skeyid_a, &gw_st.enc_key, &iv0).unwrap();
+        let notify = payloads.into_iter().find(|p| p.payload_type == payload::NOTIFY).unwrap();
+        let (t, d) = parse_notify(&notify.data).unwrap();
+        (t, d.to_vec())
+    }
+
+    #[test]
+    fn floated_peek_acks_a_marker_wrapped_r_u_there_with_a_marker_wrapped_ack() {
+        let (client_st, gw_st) = floated_pair();
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        let gw_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gw_addr = gw_sock.local_addr().unwrap();
+
+        let mut ge = SeedEntropy::new(0x31);
+        let probe_msg = build_r_u_there(&gw_st, &mut ge, 7).unwrap();
+        gw_sock.send_to(&crate::ikev2::natt::wrap_ike_4500(&probe_msg), client_addr).unwrap();
+
+        let mut ce = SeedEntropy::new(0x32);
+        let got = peek(&client_sock, &client_st, &mut ce, gw_addr, std::time::Duration::from_millis(200), 0).unwrap();
+        assert_eq!(got, Liveness::Alive);
+
+        gw_sock.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+        let mut buf = [0u8; 8192];
+        let n = gw_sock.recv(&mut buf).expect("the R-U-THERE-ACK never arrived");
+        let (msg_type, data) = gateway_reads_notify(&gw_st, &buf[..n]);
+        assert_eq!(msg_type, notify_type::R_U_THERE_ACK);
+        assert_eq!(data, 7u32.to_be_bytes());
+    }
+
+    #[test]
+    fn floated_peek_classifies_a_marker_wrapped_delete_as_torn_down() {
+        let (client_st, gw_st) = floated_pair();
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        let gw_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gw_addr = gw_sock.local_addr().unwrap();
+
+        let mut e = SeedEntropy::new(0x33);
+        let (_esp_msg, isakmp_msg) = build_delete(&gw_st, &mut e, 0xAAAA_BBBB).unwrap();
+        gw_sock.send_to(&crate::ikev2::natt::wrap_ike_4500(&isakmp_msg), client_addr).unwrap();
+
+        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(200), 0).unwrap();
+        assert_eq!(got, Liveness::PeerTornDown);
+    }
+
+    #[test]
+    fn floated_peek_skips_datagrams_without_the_marker() {
+        // On UDP 4500 an unmarked datagram is ESP (or a keepalive), never IKE:
+        // it must be skipped, not parsed as an ISAKMP header.
+        let (client_st, gw_st) = floated_pair();
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        let gw_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gw_addr = gw_sock.local_addr().unwrap();
+
+        let mut e = SeedEntropy::new(0x34);
+        let (_esp_msg, isakmp_msg) = build_delete(&gw_st, &mut e, 1).unwrap();
+        gw_sock.send_to(&isakmp_msg, client_addr).unwrap(); // a Delete, but no marker
+        gw_sock.send_to(&[0xFF], client_addr).unwrap(); // NAT keepalive
+
+        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(100), 0).unwrap();
+        assert_eq!(got, Liveness::Alive);
+    }
+
+    #[test]
+    fn floated_probe_sends_a_marker_wrapped_r_u_there_and_accepts_a_marker_wrapped_ack() {
+        let (client_st, gw_st) = floated_pair();
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        let gw_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gw_addr = gw_sock.local_addr().unwrap();
+
+        let responder = std::thread::spawn(move || {
+            gw_sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let mut buf = [0u8; 8192];
+            let n = gw_sock.recv(&mut buf).unwrap();
+            let (msg_type, data) = gateway_reads_notify(&gw_st, &buf[..n]);
+            assert_eq!(msg_type, notify_type::R_U_THERE);
+            let seq = u32::from_be_bytes(<[u8; 4]>::try_from(data.as_slice()).unwrap());
+            let mut ge = SeedEntropy::new(0x35);
+            let ack = build_r_u_there_ack(&gw_st, &mut ge, seq).unwrap();
+            gw_sock.send_to(&crate::ikev2::natt::wrap_ike_4500(&ack), client_addr).unwrap();
+        });
+
+        let mut ce = SeedEntropy::new(0x36);
+        let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 42, std::time::Duration::from_secs(2), 0).unwrap();
+        assert_eq!(got, Liveness::Alive);
         responder.join().unwrap();
     }
 }

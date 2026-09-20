@@ -1579,11 +1579,12 @@ mod tests {
     #[test]
     fn liveness_probe_times_out_when_the_peer_never_answers() {
         let (init_sa, _resp_sa) = liveness_sa_pair();
-        // A destination nothing is listening on: the OS won't route the
-        // datagram out at all (loopback, unbound port), so this reliably
-        // exercises the timeout path rather than an ICMP-port-unreachable
-        // race.
-        let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        // A bound socket that never reads or answers, so the probe reliably
+        // exercises the timeout path on every OS. (A *closed* port would
+        // make Windows answer with ICMP Port Unreachable and surface it as
+        // WSAECONNRESET on the next recv, which isn't what's under test.)
+        let silent_peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let unreachable: SocketAddr = silent_peer.local_addr().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
             LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new() };

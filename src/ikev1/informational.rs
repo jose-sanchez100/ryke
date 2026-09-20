@@ -690,7 +690,11 @@ mod tests {
     fn probe_times_out_to_no_reply_when_nothing_answers() {
         let (client_st, _gw_st) = phase1_pair();
         let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let dead_peer: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        // A bound socket that never reads or answers: a *closed* port would
+        // make Windows reply with ICMP Port Unreachable and surface it as
+        // WSAECONNRESET on the next recv, which isn't what's under test.
+        let silent_peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_peer = silent_peer.local_addr().unwrap();
         let mut e = SeedEntropy::new(0x7);
         let got = probe(&client_sock, &client_st, &mut e, dead_peer, 1, std::time::Duration::from_millis(50), 0).unwrap();
         assert_eq!(got, Liveness::NoReply);

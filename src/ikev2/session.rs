@@ -85,14 +85,16 @@ pub struct ConnectedTunnel {
     /// with the attribute itself (see [`Configuration::assigned_ipv6`]'s
     /// doc). `None` on a v4-only gateway, or when CFG wasn't requested.
     pub assigned_ip6: Option<(Ipv6Addr, u8)>,
-    /// What to route through the tunnel for IPv6: every
+    /// What to route through the tunnel for IPv6: every non-`/0`
     /// `INTERNAL_IP6_SUBNET` attribute CFG_REPLY carried -- mirrors
-    /// [`Self::granted_subnets`]'s IPv4 role, except with no `TSr` fallback:
-    /// unlike a `TSr`-derived guess, a responder that never sends
-    /// `INTERNAL_IP6_SUBNET` isn't offering IPv6 split-tunnel routing at
-    /// all, and the kill-switch (`xfrm::set_ipv6_blackhole_table_220`)
-    /// already blocks anything not listed here by default -- empty is the
-    /// correct answer for that case, not a gap to fill in.
+    /// [`Self::granted_subnets`]'s IPv4 role, except with no `TSr` fallback
+    /// (this crate only proposes IPv4 traffic selectors). Empty is
+    /// ambiguous on its own: together with [`Self::assigned_ip6`] being
+    /// `Some` it means the gateway assigned an address but restricted
+    /// nothing (a full IPv6 tunnel, like a v4 grant of `0.0.0.0/0`); with
+    /// `assigned_ip6` `None` it means the gateway isn't offering IPv6 at
+    /// all, and the caller's kill-switch
+    /// (`xfrm::set_ipv6_blackhole_table_220`) should block it.
     pub granted_subnets6: Vec<(Ipv6Addr, u8)>,
     /// The *first* `INTERNAL_IP4_SUBNET` attribute from CFG_REPLY, if the
     /// responder sent at least one -- kept for backward compat / diagnostics

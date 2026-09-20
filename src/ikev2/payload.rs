@@ -697,18 +697,18 @@ impl Configuration {
     ///
     /// A `/0` entry is dropped regardless of the address bytes alongside
     /// it: a zero prefix length covers the entire address space no matter
-    /// what those bytes are, so it can never be a real split-tunnel grant
-    /// for this app's model (which has no full-IPv6-tunnel mode -- see
-    /// `ryke::ConnectedTunnel::granted_subnets6`'s doc). Confirmed live
+    /// what those bytes are, so it isn't a split-tunnel range -- it carries
+    /// no more information than the attribute being absent. Confirmed live
     /// against a real FortiGate with IPv6 left unconfigured: rather than
     /// omitting INTERNAL_IP6_SUBNET per RFC 7296 §3.15.1's own guidance for
     /// an attribute it has nothing to offer, it sends one back anyway with
-    /// an all-zero value (`::`, prefix `0`). Left in the list, that value
-    /// would read as "subnets were granted" to a caller checking
-    /// `is_empty()` (defeating an IPv6 kill-switch gated on exactly that,
-    /// as `daemon::service::finish_connect` is) or, on a gateway that also
-    /// assigned an address, get installed as a literal route-everything
-    /// entry nothing about the exchange actually asked for.
+    /// an all-zero value (`::`, prefix `0`) -- and no INTERNAL_IP6_ADDRESS.
+    /// Left in the list, that value would read as "subnets were granted" to
+    /// a caller checking `is_empty()`. Returning an empty list for it lets
+    /// the caller tell "gateway offers no IPv6" (no address either) from
+    /// "IPv6 full tunnel" (an address, nothing restricting it) by
+    /// [`Self::assigned_ipv6`] alone, as `daemon::service::finish_connect`
+    /// does.
     pub fn assigned_ipv6_subnets(&self) -> Vec<(Ipv6Addr, u8)> {
         self.attrs
             .iter()

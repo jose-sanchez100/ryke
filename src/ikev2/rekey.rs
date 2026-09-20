@@ -159,47 +159,53 @@ pub fn build_rekey_request_with_pfs(
     pfs: Option<PfsKeyExchange>,
     iv: &[u8; 8],
 ) -> Result<Vec<u8>, IkeError> {
-    build_rekey_request_with_pfs_ts(sa, message_id, rekeyed_spi, new_spi, ni, cipher, pfs, false, iv)
+    let ts = TrafficSelectors { selectors: vec![TrafficSelector::ipv4_any()] };
+    build_child_request(sa, message_id, Some(rekeyed_spi), new_spi, ni, cipher, pfs, &ts, iv)
 }
 
-/// Like [`build_rekey_request_with_pfs`], with `dual_stack_ts` choosing
-/// whether TSi/TSr also propose `::/0` next to `0.0.0.0/0`. A rekey has to
-/// re-propose the same traffic selectors the original CHILD SA was negotiated
-/// with (`ike_auth::initiator_ts`), or a CHILD SA that carries IPv6 would
-/// silently lose it at its first rekey.
+/// The `CREATE_CHILD_SA` request behind both a CHILD SA rekey and the
+/// creation of an *additional* CHILD SA next to the one `IKE_AUTH` made
+/// (RFC 7296 §1.3.1): `rekeyed_spi` is `Some(peer's SPI of the SA being
+/// replaced)` for a rekey (adds the `REKEY_SA` notify) and `None` for a
+/// brand-new CHILD SA. `ts` is proposed as both TSi and TSr, so a caller
+/// negotiating a separate IPv6 CHILD SA passes `::/0` here. Some gateways
+/// (FortiGate) keep IPv4 and IPv6 as separate Phase 2 selectors and only ever
+/// grant one address family per CHILD SA, so IPv6 can't simply ride along in
+/// the `IKE_AUTH` offer.
 #[allow(clippy::too_many_arguments)]
-pub fn build_rekey_request_with_pfs_ts(
+pub fn build_child_request(
     sa: &CompletedSaInit,
     message_id: u32,
-    rekeyed_spi: u32,
+    rekeyed_spi: Option<u32>,
     new_spi: u32,
     ni: &[u8],
     cipher: SkCipher,
     pfs: Option<PfsKeyExchange>,
-    dual_stack_ts: bool,
+    ts: &TrafficSelectors,
     iv: &[u8; 8],
 ) -> Result<Vec<u8>, IkeError> {
-    let rekey_notify = Notify {
-        protocol_id: protocol_id::ESP,
-        spi: rekeyed_spi.to_be_bytes().to_vec(),
-        notify_type: notify_type::REKEY_SA,
-        data: Vec::new(),
-    };
     let mut offer = esp_offer_for_cipher(new_spi, cipher);
     if let Some((group, _)) = pfs {
         offer.proposals[0].transforms.push(Transform { transform_type: transform_type::DH, transform_id: group.transform_id(), key_length: None });
     }
-    let mut inner = vec![
-        (PayloadType::Notify, rekey_notify.to_bytes()),
-        (PayloadType::SecurityAssociation, offer.to_bytes()),
-        (PayloadType::Nonce, ni.to_vec()),
-    ];
+    let mut inner = Vec::new();
+    if let Some(rekeyed_spi) = rekeyed_spi {
+        let rekey_notify = Notify {
+            protocol_id: protocol_id::ESP,
+            spi: rekeyed_spi.to_be_bytes().to_vec(),
+            notify_type: notify_type::REKEY_SA,
+            data: Vec::new(),
+        };
+        inner.push((PayloadType::Notify, rekey_notify.to_bytes()));
+    }
+    inner.push((PayloadType::SecurityAssociation, offer.to_bytes()));
+    inner.push((PayloadType::Nonce, ni.to_vec()));
     if let Some((group, dh_private)) = pfs {
         let ke = KeyExchange { dh_group: group.transform_id(), data: group.public(dh_private) };
         inner.push((PayloadType::KeyExchange, ke.to_bytes()));
     }
-    inner.push((PayloadType::TrafficSelectorInitiator, TrafficSelectors::full_tunnel(dual_stack_ts).to_bytes()));
-    inner.push((PayloadType::TrafficSelectorResponder, TrafficSelectors::full_tunnel(dual_stack_ts).to_bytes()));
+    inner.push((PayloadType::TrafficSelectorInitiator, ts.to_bytes()));
+    inner.push((PayloadType::TrafficSelectorResponder, ts.to_bytes()));
     let header = create_child_header(sa, message_id, false);
     let first = first_payload_type(&inner);
     let bytes = encode_payload_chain(&inner);
@@ -339,7 +345,43 @@ pub fn initiator_complete_rekey_with_pfs(
     dh_private: Option<&[u8]>,
     response: &[u8],
 ) -> Result<ChildSa, IkeError> {
+    initiator_complete_child(sa, ni, new_spi, cipher, dh_private, response).map(|(child, _tsr)| child)
+}
+
+/// Like [`initiator_complete_rekey_with_pfs`], for either kind of
+/// `CREATE_CHILD_SA` request [`build_child_request`] builds, and also returns
+/// the `TSr` the responder granted (`None` if it sent none) -- for a newly
+/// created CHILD SA that is what decides what the caller routes into it. A
+/// response carrying an error Notify (`NO_PROPOSAL_CHOSEN`, `TS_UNACCEPTABLE`,
+/// ...) is [`IkeError::PeerRejected`] rather than a confusing missing-payload
+/// error.
+pub fn initiator_complete_child(
+    sa: &CompletedSaInit,
+    ni: &[u8],
+    new_spi: u32,
+    cipher: SkCipher,
+    dh_private: Option<&[u8]>,
+    response: &[u8],
+) -> Result<(ChildSa, Option<TrafficSelectors>), IkeError> {
     let (first, inner) = open_encrypted(sa.suite.sk_cipher(), response, peer_sk_e(sa), peer_sk_a(sa))?;
+    let mut tsr = None;
+    for payload in payloads(first, &inner) {
+        let p = payload?;
+        match p.payload_type {
+            PayloadType::Notify => {
+                if let Ok(n) = Notify::parse(p.data) {
+                    if n.is_error() {
+                        return Err(IkeError::PeerRejected {
+                            notify_type: n.notify_type,
+                            name: crate::ikev2::payload::notify_type_name(n.notify_type),
+                        });
+                    }
+                }
+            }
+            PayloadType::TrafficSelectorResponder => tsr = Some(TrafficSelectors::parse(p.data)?),
+            _ => {}
+        }
+    }
     let (sa_bytes, nr) = find_sa_and_nonce(first, &inner)?;
     let peer_spi = esp_spi_from_sa(&sa_bytes)?;
     let peer_sa = SecurityAssociation::parse(&sa_bytes)?;
@@ -357,10 +399,11 @@ pub fn initiator_complete_rekey_with_pfs(
         _ => return Err(IkeError::MissingPayload("KE")),
     };
 
-    Ok(match &pfs_secret {
+    let child = match &pfs_secret {
         Some(secret) => ChildSa::derive_with_cipher_pfs(sa.suite.prf_algorithm(), cipher, secret, &sa.keys.sk_d, ni, &nr, Role::Initiator, new_spi, peer_spi),
         None => ChildSa::derive_with_cipher(sa.suite.prf_algorithm(), cipher, &sa.keys.sk_d, ni, &nr, Role::Initiator, new_spi, peer_spi),
-    })
+    };
+    Ok((child, tsr))
 }
 
 #[cfg(test)]
@@ -482,6 +525,85 @@ mod tests {
         assert_eq!(resp_child.inbound.cipher(), cipher);
         let pkt = init_child.outbound.seal(b"cbc after rekey", next_header::IPV4).unwrap();
         assert_eq!(resp_child.inbound.open(&pkt).unwrap().0, b"cbc after rekey");
+    }
+
+    /// The (REKEY_SA notify present?, TSi, TSr) a responder sees in a
+    /// CREATE_CHILD_SA request.
+    fn inspect_child_request(req: &[u8], resp_sa: &CompletedSaInit) -> (bool, TrafficSelectors, TrafficSelectors) {
+        let (first, dec) = open_encrypted_gcm(req, peer_sk_e(resp_sa)).unwrap();
+        let (mut rekey_sa, mut tsi, mut tsr) = (false, None, None);
+        for p in payloads(first, &dec) {
+            let p = p.unwrap();
+            match p.payload_type {
+                PayloadType::Notify => {
+                    rekey_sa |= Notify::parse(p.data).unwrap().notify_type == notify_type::REKEY_SA;
+                }
+                PayloadType::TrafficSelectorInitiator => tsi = Some(TrafficSelectors::parse(p.data).unwrap()),
+                PayloadType::TrafficSelectorResponder => tsr = Some(TrafficSelectors::parse(p.data).unwrap()),
+                _ => {}
+            }
+        }
+        (rekey_sa, tsi.unwrap(), tsr.unwrap())
+    }
+
+    /// A brand-new CHILD SA (the IPv6 one, next to the IPv4 one IKE_AUTH made)
+    /// is a CREATE_CHILD_SA *without* REKEY_SA, proposing exactly the
+    /// selectors it is given -- and a rekey still carries the notify.
+    #[test]
+    fn new_child_request_has_no_rekey_notify_and_carries_the_given_selectors() {
+        let (init_sa, resp_sa) = sa_pair();
+        let v6 = TrafficSelectors::ipv6_full_tunnel();
+        let new_child =
+            build_child_request(&init_sa, 2, None, 0x1111_1111, &[0x33u8; 32], SkCipher::Aes256Gcm, None, &v6, &[1u8; 8]).unwrap();
+        assert_eq!(inspect_child_request(&new_child, &resp_sa), (false, v6.clone(), v6.clone()));
+
+        let rekey = build_child_request(&init_sa, 2, Some(0xDEAD_BEEF), 0x1111_1111, &[0x33u8; 32], SkCipher::Aes256Gcm, None, &v6, &[1u8; 8]).unwrap();
+        assert_eq!(inspect_child_request(&rekey, &resp_sa), (true, v6.clone(), v6));
+
+        // The IPv4 rekey wrapper keeps proposing IPv4 only.
+        let v4_rekey = build_rekey_request(&init_sa, 2, 0xDEAD_BEEF, 0x1111_1111, &[0x33u8; 32], &[1u8; 8]).unwrap();
+        let v4 = TrafficSelectors { selectors: vec![TrafficSelector::ipv4_any()] };
+        assert_eq!(inspect_child_request(&v4_rekey, &resp_sa), (true, v4.clone(), v4));
+    }
+
+    #[test]
+    fn new_ipv6_child_yields_matching_esp_sas_and_reports_the_granted_tsr() {
+        let (init_sa, resp_sa) = sa_pair();
+        let v6 = TrafficSelectors::ipv6_full_tunnel();
+        let req = build_child_request(&init_sa, 2, None, 0x1111_1111, &[0x33u8; 32], SkCipher::Aes256Gcm, None, &v6, &[1u8; 8]).unwrap();
+        // With no assignment the responder echoes the initiator's selectors.
+        let (resp, mut resp_child) = responder_process_rekey(&resp_sa, &req, 0x2222_2222, &[0x44u8; 32], &[2u8; 8], None).unwrap();
+        let (mut init_child, granted) =
+            initiator_complete_child(&init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, None, &resp).unwrap();
+        assert_eq!(granted, Some(v6));
+
+        let pkt = init_child.outbound.seal(b"v6 child A->B", next_header::IPV6).unwrap();
+        assert_eq!(resp_child.inbound.open(&pkt).unwrap().0, b"v6 child A->B");
+    }
+
+    /// A gateway with no IPv6 Phase 2 answers the CHILD SA request with an
+    /// error notify alone -- that must read as a rejection, not as a
+    /// missing-SA-payload parse error.
+    #[test]
+    fn child_reply_with_an_error_notify_is_peer_rejected() {
+        let (init_sa, resp_sa) = sa_pair();
+        let inner = vec![(
+            PayloadType::Notify,
+            Notify { protocol_id: 0, spi: Vec::new(), notify_type: notify_type::TS_UNACCEPTABLE, data: Vec::new() }.to_bytes(),
+        )];
+        let reply = build_encrypted_gcm(
+            create_child_header(&resp_sa, 2, true),
+            first_payload_type(&inner),
+            &encode_payload_chain(&inner),
+            our_sk_e(&resp_sa),
+            &[2u8; 8],
+        )
+        .unwrap();
+        let err = initiator_complete_child(&init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, None, &reply).err().unwrap();
+        assert!(
+            matches!(err, IkeError::PeerRejected { notify_type: notify_type::TS_UNACCEPTABLE, .. }),
+            "expected PeerRejected(TS_UNACCEPTABLE), got {err:?}"
+        );
     }
 
     fn extract_tsi(resp: &[u8], init_sa: &CompletedSaInit) -> Vec<u8> {

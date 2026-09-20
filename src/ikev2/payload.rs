@@ -500,17 +500,13 @@ pub struct TrafficSelectors {
 }
 
 impl TrafficSelectors {
-    /// What an initiator proposes for both TSi and TSr: everything IPv4
-    /// (`0.0.0.0/0`), plus everything IPv6 (`::/0`) when `dual_stack` is set.
-    /// A responder narrows this to what it actually offers (RFC 7296 §2.9), so
-    /// listing IPv6 here is only a request -- against a v4-only responder it
-    /// simply comes back without the IPv6 selector.
-    pub fn full_tunnel(dual_stack: bool) -> TrafficSelectors {
-        let mut selectors = vec![TrafficSelector::ipv4_any()];
-        if dual_stack {
-            selectors.push(TrafficSelector::ipv6_any());
-        }
-        TrafficSelectors { selectors }
+    /// Everything IPv6 (`::/0`), and nothing else -- what an initiator
+    /// proposes for a CHILD SA of its own dedicated to IPv6 (see
+    /// `rekey::build_child_request`). Kept apart from the IPv4 offer because
+    /// some gateways (FortiGate) treat each address family as a separate
+    /// Phase 2 selector and grant only one per CHILD SA.
+    pub fn ipv6_full_tunnel() -> TrafficSelectors {
+        TrafficSelectors { selectors: vec![TrafficSelector::ipv6_any()] }
     }
 
     pub fn parse(body: &[u8]) -> Result<TrafficSelectors, IkeError> {
@@ -752,11 +748,11 @@ impl Configuration {
     /// an attribute it has nothing to offer, it sends one back anyway with
     /// an all-zero value (`::`, prefix `0`) -- and no INTERNAL_IP6_ADDRESS.
     /// Left in the list, that value would read as "subnets were granted" to
-    /// a caller checking `is_empty()`. Returning an empty list for it lets
-    /// the caller tell "gateway offers no IPv6" (no address either) from
-    /// "IPv6 full tunnel" (an address, nothing restricting it) by
-    /// [`Self::assigned_ipv6`] alone, as `daemon::service::finish_connect`
-    /// does.
+    /// a caller checking `is_empty()`. Returning an empty list for it keeps
+    /// "no split-tunnel range" distinct from a real one; whether the gateway
+    /// offers IPv6 at all is told by [`Self::assigned_ipv6`] (which
+    /// `daemon::service::finish_connect` gates the IPv6 CHILD SA on), and how
+    /// much of it is tunneled by the `TSr` that CHILD SA is granted.
     pub fn assigned_ipv6_subnets(&self) -> Vec<(Ipv6Addr, u8)> {
         self.attrs
             .iter()
@@ -1279,13 +1275,10 @@ mod tests {
     }
 
     #[test]
-    fn full_tunnel_selectors_add_ipv6_only_when_dual_stack() {
-        let v4_only = TrafficSelectors::full_tunnel(false);
-        assert_eq!(v4_only.selectors, vec![TrafficSelector::ipv4_any()]);
-
-        let dual = TrafficSelectors::full_tunnel(true);
-        assert_eq!(dual.selectors, vec![TrafficSelector::ipv4_any(), TrafficSelector::ipv6_any()]);
-        assert_eq!(TrafficSelectors::parse(&dual.to_bytes()).unwrap(), dual);
+    fn ipv6_full_tunnel_is_a_lone_ipv6_selector() {
+        let ts = TrafficSelectors::ipv6_full_tunnel();
+        assert_eq!(ts.selectors, vec![TrafficSelector::ipv6_any()]);
+        assert_eq!(TrafficSelectors::parse(&ts.to_bytes()).unwrap(), ts);
     }
 
     #[test]

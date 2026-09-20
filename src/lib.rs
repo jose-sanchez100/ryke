@@ -73,7 +73,7 @@ pub use ikev2::natt::{
 pub use ikev2::informational::{build_informational, dpd_request, open_informational};
 pub use ikev2::session::{
     default_esp_offer, default_ike_offer, ike_port, ConnectedTunnel, EapCreds, Ikev2Session,
-    Liveness, LivenessSession,
+    Ipv6Child, Liveness, LivenessSession,
 };
 pub use ikev2::rekey::responder_process_rekey;
 pub use ikev2::ike_rekey::{is_ike_sa_rekey, responder_process_ike_rekey};

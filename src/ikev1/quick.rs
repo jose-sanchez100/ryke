@@ -38,6 +38,7 @@ use super::payloads::{
 use super::phase1::Phase1State;
 use super::phase2;
 use crate::crypto::{DhGroup, IntegAlgorithm};
+use crate::debug::ike_debug;
 use crate::entropy::Entropy;
 use crate::error::IkeError;
 use crate::esp::{ChildSa, EspSa};
@@ -667,7 +668,7 @@ pub fn rekey_child(
     old_local_spi: u32,
 ) -> Result<(RekeyedChild, u32), DriverError> {
     let (msg1, qi) = initiate_quick_with_pfs(st, entropy, cipher, ts_local, ts_remote, pfs_group, life_duration)?;
-    let out = quick_exchange(sock, st, peer, timeout, msg1, qi)?;
+    let out = quick_exchange(sock, st, peer, timeout, msg1, qi, "IPv4 rekey")?;
     delete_superseded(sock, st, entropy, peer, old_local_spi);
     Ok(out)
 }
@@ -695,8 +696,27 @@ pub fn create_child_ipv6(
     life_duration: u32,
     timeout: Duration,
 ) -> Result<(RekeyedChild, u32), DriverError> {
+    quick_ipv6(sock, st, entropy, peer, cipher, pfs_group, ts_local, ts_remote, life_duration, timeout, "IPv6 CHILD SA")
+}
+
+/// The shared body of [`create_child_ipv6`] and [`rekey_child_ipv6`]; `what`
+/// only labels the trace lines.
+#[allow(clippy::too_many_arguments)]
+fn quick_ipv6(
+    sock: &UdpSocket,
+    st: &Phase1State,
+    entropy: &mut impl Entropy,
+    peer: SocketAddr,
+    cipher: SkCipher,
+    pfs_group: Option<DhGroup>,
+    ts_local: (Ipv6Addr, u8),
+    ts_remote: (Ipv6Addr, u8),
+    life_duration: u32,
+    timeout: Duration,
+    what: &str,
+) -> Result<(RekeyedChild, u32), DriverError> {
     let (msg1, qi) = initiate_quick_ipv6(st, entropy, cipher, ts_local, ts_remote, pfs_group, life_duration)?;
-    quick_exchange(sock, st, peer, timeout, msg1, qi)
+    quick_exchange(sock, st, peer, timeout, msg1, qi, what)
 }
 
 /// [`rekey_child`] for the IPv6 CHILD SA created by [`create_child_ipv6`]:
@@ -716,7 +736,7 @@ pub fn rekey_child_ipv6(
     timeout: Duration,
     old_local_spi: u32,
 ) -> Result<(RekeyedChild, u32), DriverError> {
-    let out = create_child_ipv6(sock, st, entropy, peer, cipher, pfs_group, ts_local, ts_remote, life_duration, timeout)?;
+    let out = quick_ipv6(sock, st, entropy, peer, cipher, pfs_group, ts_local, ts_remote, life_duration, timeout, "IPv6 rekey")?;
     delete_superseded(sock, st, entropy, peer, old_local_spi);
     Ok(out)
 }
@@ -725,8 +745,12 @@ pub fn rekey_child_ipv6(
 /// `st` floated (RFC 3947/3948) -- the same rule `Client::send_step` applies.
 fn send_ike(sock: &UdpSocket, st: &Phase1State, peer: SocketAddr, msg: &[u8]) -> std::io::Result<()> {
     if st.floated {
-        sock.send_to(&wrap_ike_4500(msg), SocketAddr::new(peer.ip(), crate::natt_port()))?;
+        let dest = SocketAddr::new(peer.ip(), crate::natt_port());
+        let wire = wrap_ike_4500(msg);
+        crate::debug::dump(">>>", dest, &wire);
+        sock.send_to(&wire, dest)?;
     } else {
+        crate::debug::dump(">>>", peer, msg);
         sock.send_to(msg, peer)?;
     }
     Ok(())
@@ -736,8 +760,14 @@ fn send_ike(sock: &UdpSocket, st: &Phase1State, peer: SocketAddr, msg: &[u8]) ->
 /// build or send it never fails the rekey (the new SA is already live and the
 /// old one will expire on its own lifetime either way).
 fn delete_superseded(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, old_local_spi: u32) {
-    if let Ok(delete_msg) = informational::build_esp_delete(st, entropy, old_local_spi) {
-        let _ = send_ike(sock, st, peer, &delete_msg);
+    ike_debug!("INFORMATIONAL: sending ESP Delete for superseded CHILD SA spi_in={old_local_spi:08x} to {peer}");
+    match informational::build_esp_delete(st, entropy, old_local_spi) {
+        Ok(delete_msg) => {
+            if let Err(e) = send_ike(sock, st, peer, &delete_msg) {
+                ike_debug!("INFORMATIONAL: failed to send the ESP Delete for spi_in={old_local_spi:08x} (new CHILD SA unaffected): {e}");
+            }
+        }
+        Err(e) => ike_debug!("INFORMATIONAL: failed to build the ESP Delete for spi_in={old_local_spi:08x} (new CHILD SA unaffected): {e}"),
     }
 }
 
@@ -754,8 +784,10 @@ fn quick_exchange(
     timeout: Duration,
     msg1: Vec<u8>,
     qi: QuickInitiator,
+    what: &str,
 ) -> Result<(RekeyedChild, u32), DriverError> {
     let msgid = IsakmpHeader::parse(&msg1)?.message_id;
+    ike_debug!("Quick Mode ({what}): sending msg1 to {peer} (msgid={msgid:08x})");
     send_ike(sock, st, peer, &msg1)?;
 
     let deadline = Instant::now() + timeout;
@@ -763,16 +795,19 @@ fn quick_exchange(
     let msg2 = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            ike_debug!("Quick Mode ({what}): timed out after {timeout:?} waiting for the gateway's reply");
             return Err(IkeError::Crypto("Quick Mode: timed out waiting for the Quick Mode reply").into());
         }
         sock.set_read_timeout(Some(remaining))?;
-        let n = match sock.recv(&mut buf) {
-            Ok(n) => n,
+        let (n, from) = match sock.recv_from(&mut buf) {
+            Ok(r) => r,
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                ike_debug!("Quick Mode ({what}): timed out after {timeout:?} waiting for the gateway's reply");
                 return Err(IkeError::Crypto("Quick Mode: timed out waiting for the Quick Mode reply").into());
             }
             Err(e) => return Err(e.into()),
         };
+        crate::debug::dump("<<<", from, &buf[..n]);
         let raw = &buf[..n];
         let msg = if st.floated {
             match unwrap_ike_4500(raw) {
@@ -784,6 +819,7 @@ fn quick_exchange(
         };
         let Ok(hdr) = IsakmpHeader::parse(&msg) else { continue };
         if let Some((notify_type, name)) = informational::peer_error_notify(st, &msg) {
+            ike_debug!("Quick Mode ({what}): gateway rejected the proposal with {name} (notify type {notify_type})");
             return Err(IkeError::PeerRejected { notify_type, name }.into());
         }
         if hdr.init_cookie != st.cky_i || hdr.resp_cookie != st.cky_r || hdr.exchange_type != exchange::QUICK || hdr.message_id != msgid {
@@ -806,6 +842,10 @@ fn quick_exchange(
         integ: child.inbound.integ_key().to_vec(),
     };
     let rekeyed = RekeyedChild { local_spi: child.inbound.spi(), peer_spi: child.outbound.spi(), key_out, key_in };
+    ike_debug!(
+        "Quick Mode ({what}): complete -- spi_in={:08x} spi_out={:08x}, lifetime {negotiated_lifetime}s",
+        rekeyed.local_spi, rekeyed.peer_spi
+    );
     Ok((rekeyed, negotiated_lifetime))
 }
 

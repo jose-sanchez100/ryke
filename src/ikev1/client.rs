@@ -363,6 +363,11 @@ impl<E: Entropy> Client<E> {
             }
         };
 
+        ike_debug!(
+            "Phase 1: established -- prf={:?} group={:?} lifetime={}s floated={} peer DPD support={}",
+            phase1.prf, phase1.group, phase1.negotiated_lifetime_secs, phase1.floated, phase1.peer_supports_dpd
+        );
+
         // XAUTH: the gateway (not us) sends the first message here — see
         // crate::ikev1::xauth's doc comment. Only run when the caller actually
         // has credentials to answer with; `xauth: true, xauth_creds: None`
@@ -409,7 +414,9 @@ impl<E: Entropy> Client<E> {
                 dns6 = got.assigned_ipv6_dns();
                 subnets6 = got.assigned_ipv6_subnets();
             }
-            ike_debug!("Mode-Config: assigned {assigned_ip4:?}, IPv6 {assigned_ip6:?}");
+            ike_debug!(
+                "Mode-Config: assigned {assigned_ip4:?}/{netmask:?}, IPv6 {assigned_ip6:?}; dns={dns:?} dns6={dns6:?}; subnets={subnets:?} subnets6={subnets6:?}"
+            );
         }
 
         // Phase 2: Quick Mode, optionally with PFS (see `InitiatorConfig::pfs_group`'s doc).
@@ -439,7 +446,10 @@ impl<E: Entropy> Client<E> {
         let qm2 = self.recv_matching(phase1.cky_i, Some(phase1.cky_r), exchange::QUICK, phase1.floated)?;
         let (qm3, child, p2_lifetime_secs) = qi.complete(&qm2)?;
         self.send_step(&qm3, server, phase1.floated)?;
-        ike_debug!("Quick Mode: complete -- CHILD SA established");
+        ike_debug!(
+            "Quick Mode (IPv4 CHILD SA): complete -- spi_in={:08x} spi_out={:08x}, lifetime {p2_lifetime_secs}s",
+            child.inbound.spi(), child.outbound.spi()
+        );
 
         // Post-float, our own reported address's port must be 4500 too, not
         // just the peer's -- a caller deciding whether to install a

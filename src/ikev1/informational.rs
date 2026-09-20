@@ -64,6 +64,7 @@ use super::isakmp::{exchange, payload, IsakmpHeader};
 use super::payloads::{protocol, IPSEC_DOI};
 use super::phase1::Phase1State;
 use super::phase2;
+use crate::debug::ike_debug;
 use crate::entropy::Entropy;
 use crate::error::IkeError;
 use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
@@ -221,8 +222,11 @@ pub fn build_isakmp_delete(st: &Phase1State, entropy: &mut impl Entropy) -> Resu
 /// floated), so only the framing is decided here.
 fn send_ike(sock: &UdpSocket, st: &Phase1State, peer: SocketAddr, msg: &[u8]) -> std::io::Result<()> {
     if st.floated {
-        sock.send_to(&wrap_ike_4500(msg), peer)?;
+        let wire = wrap_ike_4500(msg);
+        crate::debug::dump(">>>", peer, &wire);
+        sock.send_to(&wire, peer)?;
     } else {
+        crate::debug::dump(">>>", peer, msg);
         sock.send_to(msg, peer)?;
     }
     Ok(())
@@ -306,13 +310,14 @@ fn watch(
             return Ok(Seen::Nothing);
         }
         sock.set_read_timeout(Some(remaining))?;
-        let n = match sock.recv(&mut buf) {
-            Ok(n) => n,
+        let (n, from) = match sock.recv_from(&mut buf) {
+            Ok(r) => r,
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
                 return Ok(Seen::Nothing);
             }
             Err(e) => return Err(e),
         };
+        crate::debug::dump("<<<", from, &buf[..n]);
         // On a floated tunnel (UDP 4500) IKE is the marked datagrams; an
         // unmarked one is ESP or a NAT keepalive, never ours to parse.
         let datagram: &[u8] = if st.floated {
@@ -333,9 +338,22 @@ fn watch(
         };
         if let Some(del) = payloads.iter().find(|p| p.payload_type == payload::DELETE) {
             let tears_down = match parse_delete(&del.data) {
-                Some((proto, _spi)) if proto == protocol::ISAKMP => true,
+                Some((proto, _spi)) if proto == protocol::ISAKMP => {
+                    ike_debug!("INFORMATIONAL: peer sent an ISAKMP SA Delete -- tunnel torn down by the gateway");
+                    true
+                }
                 Some((proto, spi)) if proto == protocol::ESP => {
-                    matches!(<[u8; 4]>::try_from(spi), Ok(b) if u32::from_be_bytes(b) == current_peer_spi)
+                    let named = <[u8; 4]>::try_from(spi).ok().map(u32::from_be_bytes);
+                    if named == Some(current_peer_spi) {
+                        ike_debug!("INFORMATIONAL: peer sent an ESP Delete for the CHILD SA in use (spi_in={current_peer_spi:08x}) -- tunnel torn down by the gateway");
+                        true
+                    } else {
+                        ike_debug!(
+                            "INFORMATIONAL: ignoring peer ESP Delete for spi={} (the CHILD SA in use is spi_in={current_peer_spi:08x})",
+                            named.map_or_else(|| "<malformed>".to_string(), |v| format!("{v:08x}"))
+                        );
+                        false
+                    }
                 }
                 _ => false,
             };
@@ -349,16 +367,26 @@ fn watch(
         match msg_type {
             notify_type::R_U_THERE => {
                 if let Ok(seq_bytes) = <[u8; 4]>::try_from(data) {
-                    if let Ok(ack) = build_r_u_there_ack(st, entropy, u32::from_be_bytes(seq_bytes)) {
-                        let _ = send_ike(sock, st, peer, &ack);
+                    let seq = u32::from_be_bytes(seq_bytes);
+                    ike_debug!("DPD: peer sent R-U-THERE seq={seq} -- answering with R-U-THERE-ACK");
+                    match build_r_u_there_ack(st, entropy, seq) {
+                        Ok(ack) => {
+                            if let Err(e) = send_ike(sock, st, peer, &ack) {
+                                ike_debug!("DPD: failed to send R-U-THERE-ACK seq={seq}: {e}");
+                            }
+                        }
+                        Err(e) => ike_debug!("DPD: failed to build R-U-THERE-ACK seq={seq}: {e}"),
                     }
                 }
             }
             notify_type::R_U_THERE_ACK => {
-                if let (Some(want), Ok(seq_bytes)) = (expect_ack_seq, <[u8; 4]>::try_from(data)) {
-                    if u32::from_be_bytes(seq_bytes) == want {
+                if let Ok(seq_bytes) = <[u8; 4]>::try_from(data) {
+                    let seq = u32::from_be_bytes(seq_bytes);
+                    if expect_ack_seq == Some(seq) {
+                        ike_debug!("DPD: R-U-THERE-ACK seq={seq} received -- peer is alive");
                         return Ok(Seen::AckMatched);
                     }
+                    ike_debug!("DPD: ignoring R-U-THERE-ACK seq={seq} (expecting {expect_ack_seq:?})");
                 }
             }
             _ => {}
@@ -432,9 +460,13 @@ pub fn peek(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer
 /// [`peek`]'s doc.
 pub fn probe(sock: &UdpSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, seq: u32, timeout: Duration, current_peer_spi: u32) -> Result<Liveness, DriverError> {
     let msg = build_r_u_there(st, entropy, seq)?;
+    ike_debug!("DPD: sending R-U-THERE seq={seq} to {peer}");
     send_ike(sock, st, peer, &msg)?;
     match watch(sock, st, entropy, peer, timeout, Some(seq), current_peer_spi)? {
-        Seen::Nothing => Ok(Liveness::NoReply),
+        Seen::Nothing => {
+            ike_debug!("DPD: no R-U-THERE-ACK for seq={seq} within {timeout:?}");
+            Ok(Liveness::NoReply)
+        }
         Seen::PeerTornDown => Ok(Liveness::PeerTornDown),
         Seen::AckMatched => Ok(Liveness::Alive),
     }

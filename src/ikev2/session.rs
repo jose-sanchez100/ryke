@@ -37,7 +37,7 @@ use crate::ikev2::exchange::{
 use crate::ikev2::fragment;
 use crate::ikev2::ike_auth::{self, AuthConfig, ChildTsOffer};
 use crate::ikev2::informational::{build_informational, dpd_request, open_informational};
-use crate::ikev2::message::{payloads, IkeHeader, PayloadType};
+use crate::ikev2::message::{payloads, ExchangeType, IkeHeader, PayloadType};
 use crate::ikev1::quick::{ChildKeyMaterial, RekeyedChild};
 use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
 use crate::ikev2::negotiate::{self, ChosenEspSuite};
@@ -134,12 +134,12 @@ pub struct ConnectedTunnel {
     pub liveness: LivenessSession,
 }
 
-/// The SPI pair of one CHILD SA, tracked per SA so a rekey's `REKEY_SA`
-/// notify and the post-rekey Delete reference the right values.
+/// One CHILD SA's inbound SPI (the one *we* expect on ESP packets), tracked
+/// per SA: both a rekey's `REKEY_SA` notify (RFC 7296 §1.3.3) and the
+/// post-rekey Delete name that value, not the peer's.
 #[derive(Clone, Copy)]
 struct ChildSpis {
     local: u32,
-    peer: u32,
 }
 
 /// What [`LivenessSession::create_child_ipv6`] negotiated: the new SA's SPIs
@@ -386,7 +386,7 @@ impl LivenessSession {
     /// `ike_auth::esp_offer_for_cipher`'s own doc) -- a rekey only ever adds
     /// PFS on top of what's running, never silently changes algorithm.
     pub fn rekey_child(&mut self, timeout: Duration) -> Result<RekeyedChild, DriverError> {
-        let old = ChildSpis { local: self.child_local_spi, peer: self.child_peer_spi };
+        let old = ChildSpis { local: self.child_local_spi };
         // A unified SA keeps being proposed as one: rekeying it IPv4-only would
         // silently drop IPv6 at the first rekey.
         let ts = if self.child_carries_ipv6 { TrafficSelectors::unified_full_tunnel() } else { TrafficSelectors::ipv4_full_tunnel() };
@@ -438,7 +438,7 @@ impl LivenessSession {
             .into());
         }
         ike_debug!("CREATE_CHILD_SA (new IPv6 CHILD SA): granted TSr={tsr:?} -> routing {granted_subnets6:?}");
-        self.child6 = Some(ChildSpis { local: child.local_spi, peer: child.peer_spi });
+        self.child6 = Some(ChildSpis { local: child.local_spi });
         Ok(Ipv6Child { child, granted_subnets6 })
     }
 
@@ -461,7 +461,7 @@ impl LivenessSession {
     pub fn rekey_child_ipv6(&mut self, timeout: Duration) -> Result<RekeyedChild, DriverError> {
         let old = self.child6.ok_or(IkeError::Crypto("no IPv6 CHILD SA to rekey"))?;
         let (rekeyed, _tsr) = self.child_exchange(Some(old), &TrafficSelectors::ipv6_full_tunnel(), "rekey IPv6", timeout)?;
-        self.child6 = Some(ChildSpis { local: rekeyed.local_spi, peer: rekeyed.peer_spi });
+        self.child6 = Some(ChildSpis { local: rekeyed.local_spi });
         Ok(rekeyed)
     }
 
@@ -649,8 +649,32 @@ impl LivenessSession {
                 continue; // a stale/unrelated response -- keep waiting
             }
 
-            // An unsolicited request from the peer -- ack it regardless of
-            // content, then decide what it means.
+            // An unsolicited request from the peer. A CREATE_CHILD_SA is the
+            // peer rekeying on its own timer (RFC 7296 §1.3), which this side
+            // can't answer: refuse it *as a CREATE_CHILD_SA* -- the reply the
+            // exchange calls for -- rather than with the INFORMATIONAL ack
+            // below, which a gateway such as strongSwan takes as a protocol
+            // error and answers by destroying the whole IKE SA.
+            match header.exchange_type {
+                ExchangeType::Informational => {}
+                ExchangeType::CreateChildSa => {
+                    // Only answer what authenticates (`open_informational` is
+                    // just the SK decrypt+verify, whatever the exchange).
+                    if open_informational(&self.sa, &msg).is_ok() {
+                        let mut iv = [0u8; 8];
+                        OsEntropy::new()?.fill(&mut iv);
+                        if let Ok(refusal) = rekey::build_child_refusal(&self.sa, header.message_id, &iv) {
+                            ike_debug!("CREATE_CHILD_SA request from the peer (message id {}) -- refusing with NO_ADDITIONAL_SAS: peer-initiated rekeys are not answered", header.message_id);
+                            let _ = self.sock.send_to(&wrap(&refusal, self.float), self.dest);
+                        }
+                    }
+                    continue;
+                }
+                // Nothing else is a meaningful request on an established IKE SA.
+                _ => continue,
+            }
+            // An INFORMATIONAL request -- ack it regardless of content, then
+            // decide what it means.
             let delete = open_informational(&self.sa, &msg)
                 .ok()
                 .and_then(|ps| ps.into_iter().find(|(t, _)| *t == PayloadType::Delete))
@@ -1947,6 +1971,55 @@ mod tests {
         let mut liveness =
             LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
+        responder.join().unwrap();
+    }
+
+    /// A gateway's own rekey timer fires: its CREATE_CHILD_SA request must be
+    /// answered as a CREATE_CHILD_SA (refusal), not with the empty
+    /// INFORMATIONAL ack -- strongSwan destroys the whole IKE SA on the latter
+    /// ("received INFORMATIONAL response, but expected CREATE_CHILD_SA").
+    #[test]
+    fn a_peer_initiated_create_child_sa_is_refused_as_a_create_child_sa() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let responder_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind = responder_sock.local_addr().unwrap();
+        let responder = thread::spawn(move || {
+            responder_sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = [0u8; 2048];
+            let (_n, from) = responder_sock.recv_from(&mut buf).unwrap();
+            let request = rekey::build_child_request(
+                &resp_sa,
+                100,
+                Some(0x1111_1111),
+                0x2222_2222,
+                &[0x33u8; 32],
+                SkCipher::Aes256Gcm,
+                None,
+                &TrafficSelectors::ipv4_full_tunnel(),
+                &[7u8; 8],
+            )
+            .unwrap();
+            responder_sock.send_to(&request, from).unwrap();
+            let (n, _) = responder_sock.recv_from(&mut buf).unwrap();
+            let header = IkeHeader::parse(&buf[..n]).unwrap();
+            assert_eq!(header.exchange_type, ExchangeType::CreateChildSa, "the answer must be a CREATE_CHILD_SA response");
+            assert!(header.flags.response);
+            assert_eq!(header.message_id, 100, "the response echoes the request's message id");
+            let inner = open_informational(&resp_sa, &buf[..n]).unwrap();
+            let notify = inner
+                .iter()
+                .find(|(t, _)| *t == PayloadType::Notify)
+                .map(|(_, body)| crate::ikev2::payload::Notify::parse(body).unwrap())
+                .expect("the refusal carries a Notify");
+            assert_eq!(notify.notify_type, crate::ikev2::payload::notify_type::NO_ADDITIONAL_SAS);
+        });
+
+        let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        probe_sock.send_to(b"hello", bind).unwrap();
+        let mut liveness =
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false };
+        // The refused request is not a teardown: the IKE SA stands.
+        assert_eq!(liveness.peek(Duration::from_millis(700)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
 

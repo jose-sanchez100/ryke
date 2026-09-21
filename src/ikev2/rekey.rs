@@ -213,6 +213,22 @@ pub fn build_child_request(
     build_encrypted(sa.suite.sk_cipher(), header, first, &bytes, our_sk_e(sa), our_sk_a(sa), iv)
 }
 
+/// The response to a `CREATE_CHILD_SA` request the *peer* initiated -- its own
+/// rekey of the CHILD SA or of the IKE SA, or an extra CHILD SA (RFC 7296
+/// §1.3) -- refusing it with `NO_ADDITIONAL_SAS` (§3.10.1). This side only
+/// ever initiates rekeys, so it can't take one on; but the refusal must still
+/// be a well-formed `CREATE_CHILD_SA` response: an answer of any other
+/// exchange type (an empty INFORMATIONAL, say) is a protocol error a gateway
+/// such as strongSwan answers by destroying the whole IKE SA, where a plain
+/// refusal leaves it standing. `message_id` is the request's own.
+pub fn build_child_refusal(sa: &CompletedSaInit, message_id: u32, iv: &[u8; 8]) -> Result<Vec<u8>, IkeError> {
+    let inner = vec![(PayloadType::Notify, Notify::status(notify_type::NO_ADDITIONAL_SAS, Vec::new()).to_bytes())];
+    let header = create_child_header(sa, message_id, true);
+    let first = first_payload_type(&inner);
+    let bytes = encode_payload_chain(&inner);
+    build_encrypted(sa.suite.sk_cipher(), header, first, &bytes, our_sk_e(sa), our_sk_a(sa), iv)
+}
+
 /// The SPI a CHILD SA rekey request names in its `REKEY_SA` notify -- what a
 /// responder looks the old SA up by. Test-only: [`responder_process_rekey`]
 /// itself does not act on it.

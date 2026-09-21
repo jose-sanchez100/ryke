@@ -30,7 +30,7 @@ pub enum DriverError {
 /// The local IP our packets actually carry as their source when reaching
 /// `peer`, resolved via the OS routing table: a throwaway UDP `connect`
 /// picks the route without sending anything. Needed because the real IKE
-/// socket always binds the literal wildcard address (`0.0.0.0`, so it can
+/// socket always binds the literal wildcard address (`0.0.0.0`/`::`, so it can
 /// answer on whichever local interface a peer happens to reach it through)
 /// and `getsockname()` on a socket that was never itself `connect()`-ed
 /// reports that same `0.0.0.0` back, not the concrete interface address the
@@ -45,9 +45,21 @@ pub enum DriverError {
 /// public home for the same trick so [`UdpTransport::local_addr_for`] (and
 /// therefore [`crate::ikev1::client::Client`]) gets it too.
 pub fn local_ip_for(peer: SocketAddr) -> io::Result<IpAddr> {
-    let probe = UdpSocket::bind(("0.0.0.0", 0))?;
+    let probe = UdpSocket::bind((wildcard_for(peer), 0))?;
     probe.connect(peer)?;
     probe.local_addr().map(|a| a.ip())
+}
+
+/// The wildcard address (`0.0.0.0` or `::`) of `peer`'s own IP family. A UDP
+/// socket can only talk to peers of the family it was created for (sending an
+/// IPv6 datagram from an `AF_INET` socket fails with `EAFNOSUPPORT`, os error
+/// 97 on Linux), so every socket bound *for* a given peer -- including the
+/// throwaway probe in [`local_ip_for`] -- takes its family from that peer.
+pub fn wildcard_for(peer: SocketAddr) -> IpAddr {
+    match peer {
+        SocketAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+    }
 }
 
 /// `UDP_ENCAP` (Linux `<linux/udp.h>`) -- not exposed as a named constant by
@@ -329,6 +341,42 @@ mod tests {
         let resolved = transport.local_addr_for(peer).unwrap();
         assert_eq!(resolved.ip(), std::net::Ipv4Addr::LOCALHOST);
         assert_eq!(resolved.port(), wildcard.port());
+    }
+
+    /// `None` when this host has no IPv6 loopback (IPv6 disabled in the
+    /// kernel, or a sandbox without it) -- the v6 tests skip instead of fail.
+    fn v6_loopback_socket() -> Option<UdpSocket> {
+        UdpSocket::bind("[::1]:0").ok()
+    }
+
+    /// The probe socket must be of the peer's family: an IPv4 wildcard socket
+    /// can't `connect()` to an IPv6 peer at all (`EAFNOSUPPORT`), which used to
+    /// make every IPv6 gateway fail here before a single packet was sent.
+    #[test]
+    fn local_ip_for_an_ipv6_peer_resolves_an_ipv6_address() {
+        let Some(peer_sock) = v6_loopback_socket() else { return };
+        let peer = peer_sock.local_addr().unwrap();
+        assert_eq!(local_ip_for(peer).unwrap(), IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn wildcard_for_follows_the_peers_family() {
+        assert_eq!(wildcard_for("192.0.2.1:500".parse().unwrap()), IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        assert_eq!(wildcard_for("[2001:db8::1]:500".parse().unwrap()), IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
+    }
+
+    /// The v6 twin of `local_addr_for_resolves_the_concrete_ip_not_the_wildcard`.
+    #[test]
+    fn local_addr_for_resolves_the_concrete_ipv6_not_the_wildcard() {
+        let Some(peer_sock) = v6_loopback_socket() else { return };
+        let peer = peer_sock.local_addr().unwrap();
+
+        let transport = UdpTransport::bind("[::]:0").unwrap();
+        assert_eq!(transport.local_addr().unwrap().ip(), IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
+
+        let resolved = transport.local_addr_for(peer).unwrap();
+        assert_eq!(resolved.ip(), IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        assert_eq!(resolved.port(), transport.local_addr().unwrap().port());
     }
 
     fn channel_io() -> (ChannelIo, mpsc::Sender<Vec<u8>>, UdpSocket) {

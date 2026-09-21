@@ -659,9 +659,7 @@ pub struct Ikev2Session<E> {
 /// port (see [`Ikev2Session::sa_init_on_port`]), not whatever ephemeral port
 /// this probe happens to get.
 fn local_ip_for(peer: SocketAddr) -> io::Result<std::net::IpAddr> {
-    let probe = UdpSocket::bind(("0.0.0.0", 0))?;
-    probe.connect(peer)?;
-    Ok(probe.local_addr()?.ip())
+    crate::transport::local_ip_for(peer)
 }
 
 /// The local port everything **after** `IKE_SA_INIT` moves to once NAT-T
@@ -896,8 +894,9 @@ impl<E: Entropy> Ikev2Session<E> {
         offer: &SecurityAssociation,
         local_port: u16,
     ) -> Result<(UdpSocket, SocketAddr, CompletedSaInit, NatStatus), DriverError> {
-        let sock = UdpSocket::bind(("0.0.0.0", local_port))?;
-        let natt_sock = UdpSocket::bind(("0.0.0.0", natt_local_port(local_port)))?;
+        let wildcard = crate::transport::wildcard_for(peer);
+        let sock = UdpSocket::bind((wildcard, local_port))?;
+        let natt_sock = UdpSocket::bind((wildcard, natt_local_port(local_port)))?;
         self.sa_init_with_sockets(peer, offer, sock, natt_sock)
     }
 
@@ -1751,6 +1750,14 @@ mod tests {
         format!("127.0.0.1:{port}").parse().unwrap()
     }
 
+    /// [`next_addr`]'s IPv6-loopback twin, `None` on a host with no IPv6
+    /// loopback (the IPv6 tests then skip rather than fail).
+    fn next_addr_v6() -> Option<SocketAddr> {
+        UdpSocket::bind("[::1]:0").ok()?;
+        let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst) as u16;
+        Some(format!("[::1]:{port}").parse().unwrap())
+    }
+
     /// The regression test for the real-world bug this fixes: a client
     /// behind NAT (confirmed live against a FortiGate) kept sending from its
     /// original port-500-equivalent socket after `IKE_SA_INIT` reported
@@ -1982,6 +1989,30 @@ mod tests {
         assert_ne!(tunnel.key_out.enc, vec![0u8; tunnel.key_out.enc.len()]);
         assert_ne!(tunnel.key_in.enc, vec![0u8; tunnel.key_in.enc.len()]);
         assert_ne!(tunnel.key_out, tunnel.key_in);
+        responder.join().unwrap();
+    }
+
+    /// The same handshake against an IPv6 responder: `sa_init_on_port` must bind
+    /// its sockets on the IPv6 wildcard and resolve the local address from an
+    /// IPv6 route, or every IPv6 gateway fails before sending a single packet
+    /// (`EAFNOSUPPORT`).
+    #[test]
+    fn connect_direct_psk_against_an_ipv6_loopback_responder() {
+        let Some(bind) = next_addr_v6() else { return };
+        let psk = b"shared-secret".to_vec();
+        let responder = thread::spawn({
+            let psk = psk.clone();
+            move || run_psk_responder(bind, psk)
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+        let cfg = AuthConfig::psk(Identification::fqdn("client.test"), psk);
+        let tunnel = session
+            .connect_direct_on_port(bind, &default_ike_offer(), &cfg, false, &default_esp_offer(), next_addr().port())
+            .unwrap();
+        assert_eq!(tunnel.peer_spi, 0xC0FFEE);
+        assert!(tunnel.local_addr.is_ipv6() && tunnel.peer_addr.is_ipv6(), "outer addresses must be IPv6: {} -> {}", tunnel.local_addr, tunnel.peer_addr);
         responder.join().unwrap();
     }
 

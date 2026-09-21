@@ -9,10 +9,25 @@ use ryke::{AuthConfig, Client, Identification, Role, SeedEntropy, Server, Server
 
 #[test]
 fn full_handshake_over_udp_loopback() {
+    full_handshake("127.0.0.1:0");
+}
+
+/// The same handshake over IPv6 loopback: a v6 gateway address flows through
+/// the transport, the NAT-D hashes (16-byte addresses) and the SA setup alike.
+/// Skipped where the host has no IPv6 loopback.
+#[test]
+fn full_handshake_over_udp_ipv6_loopback() {
+    if std::net::UdpSocket::bind("[::1]:0").is_err() {
+        return;
+    }
+    full_handshake("[::1]:0");
+}
+
+fn full_handshake(bind: &str) {
     let psk = b"correct horse battery staple".to_vec();
 
     let server_auth = AuthConfig::psk(Identification::fqdn("gw.example"), psk.clone());
-    let mut server = Server::bind("127.0.0.1:0", SeedEntropy::new(0x1234), server_auth).unwrap();
+    let mut server = Server::bind(bind, SeedEntropy::new(0x1234), server_auth).unwrap();
     server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let server_addr = server.local_addr().unwrap();
 
@@ -25,7 +40,7 @@ fn full_handshake_over_udp_loopback() {
     });
 
     let client_auth = AuthConfig::psk(Identification::fqdn("client.example"), psk);
-    let mut client = Client::bind("127.0.0.1:0", SeedEntropy::new(0x5678)).unwrap();
+    let mut client = Client::bind(bind, SeedEntropy::new(0x5678)).unwrap();
     client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let (sa, server_id, mut client_child, _assigned) = client.connect(server_addr, &client_auth, 0x1234_5678).unwrap();
 

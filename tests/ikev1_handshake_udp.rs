@@ -14,6 +14,21 @@ use ryke::SeedEntropy;
 
 #[test]
 fn ikev1_full_handshake_over_udp_loopback() {
+    ikev1_full_handshake("127.0.0.1:0");
+}
+
+/// The same Aggressive Mode + Quick Mode handshake over IPv6 loopback -- a v6
+/// gateway address through the transport and the NAT-D hashes. Skipped where
+/// the host has no IPv6 loopback.
+#[test]
+fn ikev1_full_handshake_over_udp_ipv6_loopback() {
+    if std::net::UdpSocket::bind("[::1]:0").is_err() {
+        return;
+    }
+    ikev1_full_handshake("[::1]:0");
+}
+
+fn ikev1_full_handshake(bind: &str) {
     let psk = b"correct horse battery staple".to_vec();
 
     let rcfg = Phase1Config {
@@ -22,7 +37,7 @@ fn ikev1_full_handshake_over_udp_loopback() {
         now_unix: 0,
         our_id: Id::ipv4([192, 168, 0, 1]),
     };
-    let mut server = Server::bind("127.0.0.1:0", SeedEntropy::new(0x2222), rcfg).unwrap();
+    let mut server = Server::bind(bind, SeedEntropy::new(0x2222), rcfg).unwrap();
     server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let server_addr = server.local_addr().unwrap();
 
@@ -55,7 +70,7 @@ fn ikev1_full_handshake_over_udp_loopback() {
         p1_lifetime_secs: 28800,
         p2_lifetime_secs: 3600,
     };
-    let mut client = Client::bind("127.0.0.1:0", SeedEntropy::new(0x1111)).unwrap();
+    let mut client = Client::bind(bind, SeedEntropy::new(0x1111)).unwrap();
     client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut est = client.connect(server_addr, &icfg).unwrap();
 

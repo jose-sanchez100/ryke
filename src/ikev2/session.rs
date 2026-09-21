@@ -31,7 +31,7 @@ use crate::entropy::{Entropy, OsEntropy};
 use crate::error::IkeError;
 use crate::ikev2::eap_auth::{EapEvent, EapInitiator, ServerVerify};
 use crate::ikev2::exchange::{
-    default_offer, initiator_complete_natt, initiator_request_natt, CompletedSaInit, LocalSecret,
+    default_offer, initiator_complete_natt, initiator_request_natt_with, CompletedSaInit, LocalSecret,
     NatStatus,
 };
 use crate::ikev2::fragment;
@@ -649,6 +649,8 @@ impl LivenessSession {
 /// A blocking IKEv2 initiator session, driven by an [`Entropy`] source.
 pub struct Ikev2Session<E> {
     entropy: E,
+    /// Force NAT-T whatever NAT detection says -- see [`Self::with_forced_natt`].
+    force_natt: bool,
 }
 
 /// The local IP our packets actually carry as their source when reaching
@@ -875,7 +877,19 @@ fn granted_subnets_v6(tsr: Option<&TrafficSelectors>, cfg_subnets6: &[(Ipv6Addr,
 
 impl<E: Entropy> Ikev2Session<E> {
     pub fn new(entropy: E) -> Self {
-        Self { entropy }
+        Self { entropy, force_natt: false }
+    }
+
+    /// Makes every `IKE_SA_INIT` this session runs **force** NAT-T (what strongSwan
+    /// calls `forceencaps=yes`): the request's `NAT_DETECTION_SOURCE_IP` lies about
+    /// our address ([`crate::initiator_request_natt_with`]), so the gateway floats
+    /// to UDP 4500 and sends ESP as ESP-in-UDP, and this side floats with it
+    /// ([`NatStatus::forced`]). For a data plane that can only receive ESP inside
+    /// UDP -- an IPv6 gateway has no NAT in between to make that happen by itself.
+    /// The gateway must accept NAT-T on the transport in use.
+    pub fn with_forced_natt(mut self) -> Self {
+        self.force_natt = true;
+        self
     }
 
     /// Bind a socket on `local_port` (like every other real-world IKE
@@ -953,17 +967,18 @@ impl<E: Entropy> Ikev2Session<E> {
         natt_sock.set_read_timeout(Some(Duration::from_secs(10)))?;
 
         let local = LocalSecret::generate(&mut self.entropy, NONCE_LEN);
-        let req = initiator_request_natt(&local, offer, our_addr, peer);
+        let req = initiator_request_natt_with(&local, offer, our_addr, peer, self.force_natt);
         ike_debug!("IKE_SA_INIT: sending to {peer} (spi_i={:016x})", local.spi);
         let resp = send_and_retry(&sock, peer, &req)?;
-        let (sa, nat) = initiator_complete_natt(&local, &req, &resp, our_addr, peer)?;
+        let (sa, mut nat) = initiator_complete_natt(&local, &req, &resp, our_addr, peer)?;
+        nat.forced = self.force_natt;
         ike_debug!(
             "IKE_SA_INIT: matched proposal #{} encr={} prf={} integ={:?} dh={}",
             sa.suite.proposal_num, sa.suite.encr_id, sa.suite.prf_id, sa.suite.integ_id, sa.suite.dh_id
         );
         ike_debug!(
-            "IKE_SA_INIT: NAT detection -- we_are_natted={} peer_is_natted={} ({})",
-            nat.we_are_natted, nat.peer_is_natted,
+            "IKE_SA_INIT: NAT detection -- we_are_natted={} peer_is_natted={} forced={} ({})",
+            nat.we_are_natted, nat.peer_is_natted, nat.forced,
             if nat.float_to_4500() { "floating to port 4500" } else { "no float needed" }
         );
 
@@ -1831,6 +1846,52 @@ mod tests {
         // indefinitely, matching `sa_init_on_port`'s doc (the unused half of
         // the pair is dropped, not kept open).
         UdpSocket::bind(("0.0.0.0", local_port)).expect("the pre-float port must be released once floated");
+    }
+
+    /// `with_forced_natt` over a path with **no** NAT: the responder tells
+    /// `responder_respond_natt` the true source address (unlike the test above,
+    /// which fakes a translation), so only the lie in our own
+    /// `NAT_DETECTION_SOURCE_IP` can make anything float. The request that
+    /// reached the responder must carry a source hash that doesn't match, and this
+    /// side must float on its own -- its detection sees nothing.
+    #[test]
+    fn a_forced_session_floats_over_a_path_with_no_nat() {
+        for force in [false, true] {
+            let bind = next_addr();
+            let responder = thread::spawn(move || {
+                let sock = UdpSocket::bind(bind).unwrap();
+                sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut buf = [0u8; 2048];
+                let (n, from) = sock.recv_from(&mut buf).unwrap();
+                // What the responder itself would conclude about the initiator.
+                let (spi_i, source) = crate::ikev2::exchange::request_nat_source_hash(&buf[..n]).expect("NAT_DETECTION_SOURCE_IP");
+                let sees_nat = crate::ikev2::natt::peer_is_behind_nat(&source, spi_i, 0, from.ip(), from.port());
+                let resp_secret = LocalSecret::generate(&mut OsEntropy::new().unwrap(), 32);
+                let response = match responder_respond_natt(&buf[..n], &resp_secret, bind, from, None).unwrap() {
+                    crate::ikev2::exchange::SaInitResult::Established { response, .. } => response,
+                    _ => panic!("expected Established"),
+                };
+                sock.send_to(&response, from).unwrap();
+                sees_nat
+            });
+            thread::sleep(Duration::from_millis(50));
+
+            let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+            if force {
+                session = session.with_forced_natt();
+            }
+            let local_port = next_addr().port();
+            let (sock, our_addr, _sa, nat) = session.sa_init_on_port(bind, &default_ike_offer(), local_port).unwrap();
+            let responder_sees_nat = responder.join().unwrap();
+
+            assert!(!nat.we_are_natted && !nat.peer_is_natted, "there is no NAT on loopback (force={force})");
+            assert_eq!(nat.forced, force);
+            assert_eq!(responder_sees_nat, force, "the responder must conclude NAT exactly when we forced it");
+            assert_eq!(nat.float_to_4500(), force);
+            let expected_port = if force { natt_local_port(local_port) } else { local_port };
+            assert_eq!(sock.local_addr().unwrap().port(), expected_port, "force={force}: the returned socket is the one to keep using");
+            assert_eq!(our_addr.port(), expected_port);
+        }
     }
 
     /// A minimal in-process IKEv2 responder over loopback UDP, PSK-only,

@@ -291,16 +291,40 @@ pub fn initiator_request_natt(
     our_addr: std::net::SocketAddr,
     peer_addr: std::net::SocketAddr,
 ) -> Vec<u8> {
+    initiator_request_natt_with(local, offer, our_addr, peer_addr, false)
+}
+
+/// [`initiator_request_natt`], optionally **forcing** NAT-T (`force_natt`):
+/// `NAT_DETECTION_SOURCE_IP` then carries the hash of an address we can't have,
+/// so the responder concludes we sit behind a NAT and floats to UDP 4500 --
+/// after which it also sends ESP as ESP-in-UDP to our source port instead of raw
+/// IP protocol 50. strongSwan's `forceencaps=yes` does the same (it "fakes" its
+/// NAT detection payloads). For a platform whose data plane can only receive ESP
+/// inside UDP; the caller must float too, see [`NatStatus::forced`].
+pub fn initiator_request_natt_with(
+    local: &LocalSecret,
+    offer: &SecurityAssociation,
+    our_addr: std::net::SocketAddr,
+    peer_addr: std::net::SocketAddr,
+    force_natt: bool,
+) -> Vec<u8> {
     let group = offer_dh_group(offer);
     let public = group.public(&local.dh_private);
     let header = base_header(local.spi, 0, Flags { initiator: true, version: false, response: false });
+    // The wildcard address on port 0: no packet is ever sourced from it, so its
+    // hash can't match whatever source address the responder observes.
+    let claimed = if force_natt {
+        std::net::SocketAddr::new(crate::transport::wildcard_for(our_addr), 0)
+    } else {
+        our_addr
+    };
     // SPIr is unknown at this point -- the wire header carries 0, and the
     // responder reconstructs the same hash input from that same 0 (see
     // `responder_respond_inner`, which hashes with its own real spi_r once it
     // has one -- symmetric only once we re-hash with the real spi_r to check
     // *its* response, done in `initiator_complete_natt`).
     let extra_notifies = [
-        natt::source_ip_notify(local.spi, 0, our_addr.ip(), our_addr.port()),
+        natt::source_ip_notify(local.spi, 0, claimed.ip(), claimed.port()),
         natt::destination_ip_notify(local.spi, 0, peer_addr.ip(), peer_addr.port()),
     ];
     build_sa_init(header, offer, group.transform_id(), &public, &local.nonce, &extra_notifies)
@@ -524,6 +548,15 @@ pub fn initiator_complete(local: &LocalSecret, request: &[u8], response: &[u8]) 
     })
 }
 
+/// The `NAT_DETECTION_SOURCE_IP` hash inside an `IKE_SA_INIT` request, for tests
+/// in other modules that stand in for the responder (`parse_sa_init` is private).
+#[cfg(test)]
+pub(crate) fn request_nat_source_hash(request: &[u8]) -> Option<(u64, Vec<u8>)> {
+    let header = IkeHeader::parse(request).ok()?;
+    let payloads = parse_sa_init(&header, &request[IkeHeader::LEN..]).ok()?;
+    payloads.nat_source.map(|hash| (header.initiator_spi, hash))
+}
+
 /// What [`initiator_complete_natt`] found out about NAT on the path (RFC 7296
 /// §2.23). Split into its parts (rather than a single bool) so a caller can
 /// tell "the responder never sent a NAT_DETECTION notify at all" apart from
@@ -544,13 +577,17 @@ pub struct NatStatus {
     /// The responder's claimed address disagreed with what we observed the
     /// response arrive from -- meaningless if `source_notify_present` is false.
     pub peer_is_natted: bool,
+    /// We asked for NAT-T whatever detection says ([`initiator_request_natt_with`]'s
+    /// `force_natt`), so the peer floats too. Always `false` straight out of
+    /// [`initiator_complete_natt`]: whoever forced it knows, and sets it.
+    pub forced: bool,
 }
 
 impl NatStatus {
     /// Whether the exchange should float to UDP 4500 (RFC 7296 §2.23): either
-    /// end being NAT'd is enough.
+    /// end being NAT'd is enough, and so is having forced it.
     pub fn float_to_4500(&self) -> bool {
-        self.we_are_natted || self.peer_is_natted
+        self.we_are_natted || self.peer_is_natted || self.forced
     }
 }
 
@@ -583,6 +620,7 @@ pub fn initiator_complete_natt(
             .nat_source
             .as_deref()
             .is_some_and(|d| natt::peer_is_behind_nat(d, spi_i, spi_r, peer_addr.ip(), peer_addr.port())),
+        forced: false,
     };
 
     let sa = initiator_complete(local, request, response)?;
@@ -658,6 +696,53 @@ mod tests {
         let (_, status) = initiator_complete_natt(&init_secret(), &request, &response, our, responder_addr).unwrap();
         assert!(status.dest_notify_present && status.source_notify_present);
         assert!(!status.float_to_4500(), "matching addresses on both sides -- no NAT to detect");
+    }
+
+    /// What the responder sees is all that matters for a forced float: it takes the
+    /// request's `NAT_DETECTION_SOURCE_IP` hash and compares it to the address the
+    /// packet actually came from -- a mismatch is how it learns to use UDP 4500.
+    #[test]
+    fn forced_natt_makes_the_responder_see_a_nat_where_there_is_none() {
+        for (our, responder_addr) in [
+            ("203.0.113.9:500", "198.51.100.7:500"),
+            ("[2001:db8::9]:500", "[2001:db8:1::7]:500"),
+        ] {
+            let our: std::net::SocketAddr = our.parse().unwrap();
+            let responder_addr: std::net::SocketAddr = responder_addr.parse().unwrap();
+            let source_hash_matches = |force: bool| {
+                let request = initiator_request_natt_with(&init_secret(), &default_offer(), our, responder_addr, force);
+                let header = IkeHeader::parse(&request).unwrap();
+                let payloads = parse_sa_init(&header, &request[IkeHeader::LEN..]).unwrap();
+                let source = payloads.nat_source.expect("the request carries NAT_DETECTION_SOURCE_IP");
+                let dest = payloads.nat_dest.expect("the request carries NAT_DETECTION_DESTINATION_IP");
+                assert!(
+                    !natt::peer_is_behind_nat(&dest, header.initiator_spi, 0, responder_addr.ip(), responder_addr.port()),
+                    "the destination hash stays honest either way"
+                );
+                !natt::peer_is_behind_nat(&source, header.initiator_spi, 0, our.ip(), our.port())
+            };
+            assert!(source_hash_matches(false), "unforced: the responder sees the real address, no NAT ({our})");
+            assert!(!source_hash_matches(true), "forced: the responder must see a mismatch and float ({our})");
+        }
+    }
+
+    /// Forcing changes what the *responder* concludes; our own float is the caller's
+    /// decision (`NatStatus::forced`), because our own detection sees no NAT.
+    #[test]
+    fn forced_natt_does_not_change_our_own_detection() {
+        let our: std::net::SocketAddr = "203.0.113.9:500".parse().unwrap();
+        let responder_addr: std::net::SocketAddr = "198.51.100.7:500".parse().unwrap();
+
+        let request = initiator_request_natt_with(&init_secret(), &default_offer(), our, responder_addr, true);
+        let response = match responder_respond_natt(&request, &resp_secret(), responder_addr, our, None).unwrap() {
+            SaInitResult::Established { response, .. } => response,
+            other => panic!("expected Established, got {other:?}", other = std::mem::discriminant(&other)),
+        };
+        let (_, mut status) = initiator_complete_natt(&init_secret(), &request, &response, our, responder_addr).unwrap();
+        assert!(!status.we_are_natted && !status.peer_is_natted && !status.forced);
+        assert!(!status.float_to_4500(), "detection alone sees nothing");
+        status.forced = true;
+        assert!(status.float_to_4500(), "...and forcing is what makes us float");
     }
 
     #[test]

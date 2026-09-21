@@ -64,7 +64,7 @@ pub use error::IkeError;
 pub use esp::{ChildSa, EspSa};
 pub use ikev2::exchange::{
     default_offer, ike_cookie, initiator_complete, initiator_complete_natt, initiator_request,
-    initiator_request_natt, responder_respond, responder_respond_natt, CompletedSaInit,
+    initiator_request_natt, initiator_request_natt_with, responder_respond, responder_respond_natt, CompletedSaInit,
     CookiePolicy, LocalSecret, NatStatus, SaInitResult,
 };
 pub use ikev2::natt::{

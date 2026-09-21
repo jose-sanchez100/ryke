@@ -11,6 +11,12 @@
 //! touched — they are inherited by the new IKE SA, which the consumer installs.
 //! Without this, a native client (iOS refreshes its IKE SA on its ~1h lifetime)
 //! fails the rekey and tears the whole tunnel down.
+//!
+//! Both halves live here: [`build_ike_rekey_request`] /
+//! [`initiator_complete_ike_rekey`] for the side that starts the rekey (a
+//! client keeping ahead of its own lifetime), [`responder_process_ike_rekey`]
+//! for the side that answers it (a gateway's timer firing first, or a
+//! native client rekeying against ryke acting as a server).
 
 use crate::crypto::{self, DhGroup};
 use crate::error::IkeError;
@@ -19,7 +25,7 @@ use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
 };
 use crate::ikev2::negotiate;
-use crate::ikev2::payload::{protocol_id, KeyExchange, SecurityAssociation};
+use crate::ikev2::payload::{notify_type_name, protocol_id, KeyExchange, Notify, SecurityAssociation};
 use crate::ikev2::sk::{build_encrypted, open_encrypted};
 use crate::role::Role;
 
@@ -57,6 +63,126 @@ pub fn is_ike_sa_rekey(inner: &[(PayloadType, Vec<u8>)]) -> bool {
         .iter()
         .any(|(t, _)| *t == PayloadType::TrafficSelectorInitiator || *t == PayloadType::TrafficSelectorResponder);
     has_ke && !has_ts
+}
+
+/// Initiator: build the request that rekeys `old_sa` (RFC 7296 §1.3.2):
+/// `SK { SA(IKE, new SPIi), Ni, KEi }`, protected by the *old* IKE SA. It
+/// proposes exactly the suite `old_sa` already runs -- a rekey never
+/// renegotiates the algorithms -- with a fresh ephemeral DH share from
+/// `dh_private`, for the group that suite names. `message_id` is the next one
+/// of the old SA; the new SA's own Message IDs start again at 0.
+pub fn build_ike_rekey_request(
+    old_sa: &CompletedSaInit,
+    message_id: u32,
+    new_spi_i: u64,
+    ni: &[u8],
+    dh_private: &[u8],
+    iv: &[u8; 8],
+) -> Result<Vec<u8>, IkeError> {
+    let group = DhGroup::from_transform_id(old_sa.suite.dh_id).ok_or(IkeError::NoProposalChosen)?;
+    let mut prop = old_sa.suite.to_proposal();
+    prop.num = 1; // a single-proposal offer: numbered from 1 whatever number the first handshake's pick had
+    prop.protocol_id = protocol_id::IKE;
+    prop.spi = new_spi_i.to_be_bytes().to_vec();
+    let ke = KeyExchange { dh_group: old_sa.suite.dh_id, data: group.public(dh_private) };
+    let inner = vec![
+        (PayloadType::SecurityAssociation, SecurityAssociation { proposals: vec![prop] }.to_bytes()),
+        (PayloadType::Nonce, ni.to_vec()),
+        (PayloadType::KeyExchange, ke.to_bytes()),
+    ];
+    let header = IkeHeader {
+        initiator_spi: old_sa.spi_i,
+        responder_spi: old_sa.spi_r,
+        next_payload: PayloadType::NoNext,
+        major_version: 2,
+        minor_version: 0,
+        exchange_type: ExchangeType::CreateChildSa,
+        flags: Flags { initiator: old_sa.role == Role::Initiator, version: false, response: false },
+        message_id,
+        length: 0,
+    };
+    let first = first_payload_type(&inner);
+    let bytes = encode_payload_chain(&inner);
+    build_encrypted(old_sa.suite.sk_cipher(), header, first, &bytes, our_sk_e(old_sa), our_sk_a(old_sa), iv)
+}
+
+/// Initiator: finish the rekey from the peer's `response`, deriving the new IKE
+/// SA (we are its initiator: `spi_i` is `new_spi_i`, `spi_r` the one the peer
+/// put in its SA payload). `ni`, `new_spi_i` and `dh_private` are what
+/// [`build_ike_rekey_request`] was given. A response carrying an error notify
+/// (`NO_ADDITIONAL_SAS`, `NO_PROPOSAL_CHOSEN`, `INVALID_KE_PAYLOAD`, ...) is
+/// [`IkeError::PeerRejected`]; one that picks a different suite than the one
+/// offered, or answers with another DH group, is refused rather than trusted.
+pub fn initiator_complete_ike_rekey(
+    old_sa: &CompletedSaInit,
+    ni: &[u8],
+    new_spi_i: u64,
+    dh_private: &[u8],
+    response: &[u8],
+) -> Result<CompletedSaInit, IkeError> {
+    let (first, inner) = open_encrypted(old_sa.suite.sk_cipher(), response, peer_sk_e(old_sa), peer_sk_a(old_sa))?;
+    let (mut sa_bytes, mut nr, mut ke_bytes) = (None, None, None);
+    for p in payloads(first, &inner) {
+        let p = p?;
+        match p.payload_type {
+            PayloadType::Notify => {
+                if let Ok(n) = Notify::parse(p.data) {
+                    if n.is_error() {
+                        return Err(IkeError::PeerRejected { notify_type: n.notify_type, name: notify_type_name(n.notify_type) });
+                    }
+                }
+            }
+            PayloadType::SecurityAssociation => sa_bytes = Some(p.data.to_vec()),
+            PayloadType::Nonce => nr = Some(p.data.to_vec()),
+            PayloadType::KeyExchange => ke_bytes = Some(p.data.to_vec()),
+            _ => {}
+        }
+    }
+    let sa = SecurityAssociation::parse(&sa_bytes.ok_or(IkeError::MissingPayload("SA"))?)?;
+    let nr = nr.ok_or(IkeError::MissingPayload("Nonce"))?;
+    let ke = KeyExchange::parse(&ke_bytes.ok_or(IkeError::MissingPayload("KE"))?)?;
+
+    let proposal = sa.proposals.first().ok_or(IkeError::NoProposalChosen)?;
+    if proposal.spi.len() != 8 {
+        return Err(IkeError::Crypto("expected an 8-byte IKE SPI"));
+    }
+    let new_spi_r = u64::from_be_bytes(proposal.spi[..8].try_into().unwrap());
+    let suite = negotiate::select(&sa).ok_or(IkeError::NoProposalChosen)?;
+    let old = &old_sa.suite;
+    if (suite.encr_id, suite.encr_key_bits, suite.prf_id, suite.integ_id, suite.dh_id)
+        != (old.encr_id, old.encr_key_bits, old.prf_id, old.integ_id, old.dh_id)
+    {
+        return Err(IkeError::NoProposalChosen);
+    }
+    let group = DhGroup::from_transform_id(suite.dh_id).ok_or(IkeError::NoProposalChosen)?;
+    if ke.dh_group != group.transform_id() {
+        return Err(IkeError::DhGroupMismatch { expected: group.transform_id(), got: ke.dh_group });
+    }
+    let shared = group.shared(dh_private, &ke.data)?;
+    let keys = crypto::derive_rekey_session_keys(
+        suite.prf_algorithm(),
+        &old_sa.keys.sk_d,
+        &shared,
+        ni,
+        &nr,
+        new_spi_i,
+        new_spi_r,
+        suite.key_lengths(),
+    );
+    Ok(CompletedSaInit {
+        role: Role::Initiator,
+        spi_i: new_spi_i,
+        spi_r: new_spi_r,
+        suite,
+        keys,
+        ni: ni.to_vec(),
+        nr,
+        // Not an IKE_SA_INIT and AUTH is not re-run for a rekeyed IKE SA.
+        init_message: Vec::new(),
+        resp_message: Vec::new(),
+        peer_signature_hashes: old_sa.peer_signature_hashes.clone(),
+        peer_supports_fragmentation: old_sa.peer_supports_fragmentation,
+    })
 }
 
 /// Responder: process an IKE-SA rekey request (SK-wrapped under the *old* IKE SA),
@@ -261,5 +387,104 @@ mod tests {
         assert_eq!(init_keys.sk_d, new_resp.keys.sk_d, "SK_d must match");
         assert_eq!(init_keys.sk_ei, new_resp.keys.sk_ei, "SK_ei must match");
         assert_eq!(init_keys.sk_er, new_resp.keys.sk_er, "SK_er must match");
+    }
+
+    #[test]
+    fn the_initiator_side_interoperates_with_the_responder_and_the_new_sa_works_both_ways() {
+        use crate::ikev2::informational::{build_informational, open_informational};
+
+        let (init_sa, resp_sa) = sa_pair();
+        let ni = vec![0x55u8; 32];
+        let dh = [3u8; 32];
+        let new_spi_i: u64 = 0xAABB_CCDD_1122_3344;
+        let request = build_ike_rekey_request(&init_sa, 5, new_spi_i, &ni, &dh, &[1u8; 8]).unwrap();
+        assert_eq!(IkeHeader::parse(&request).unwrap().message_id, 5);
+
+        // What the responder decrypts is routed as an IKE rekey, not a CHILD one.
+        let (first, inner) =
+            open_encrypted(resp_sa.suite.sk_cipher(), &request, peer_sk_e(&resp_sa), peer_sk_a(&resp_sa)).unwrap();
+        let seen: Vec<_> = payloads(first, &inner)
+            .map(|p| {
+                let p = p.unwrap();
+                (p.payload_type, p.data.to_vec())
+            })
+            .collect();
+        assert!(is_ike_sa_rekey(&seen));
+
+        let new_spi_r: u64 = 0x9988_7766_5544_3322;
+        let (response, new_resp) =
+            responder_process_ike_rekey(&resp_sa, &request, new_spi_r, &[9u8; 32], &[0x66u8; 32], &[2u8; 8]).unwrap();
+        let new_init = initiator_complete_ike_rekey(&init_sa, &ni, new_spi_i, &dh, &response).unwrap();
+
+        assert_eq!((new_init.role, new_init.spi_i, new_init.spi_r), (Role::Initiator, new_spi_i, new_spi_r));
+        assert_eq!(new_init.keys.sk_d, new_resp.keys.sk_d);
+        assert_eq!(new_init.keys.sk_ei, new_resp.keys.sk_ei);
+        assert_eq!(new_init.keys.sk_er, new_resp.keys.sk_er);
+        assert_eq!(new_init.keys.sk_ai, new_resp.keys.sk_ai);
+        assert_eq!(new_init.keys.sk_ar, new_resp.keys.sk_ar);
+        assert_ne!(new_init.keys.sk_d, init_sa.keys.sk_d, "a rekey must yield fresh keys");
+
+        // The new SA carries traffic both ways; the old keys no longer open it.
+        let ping = build_informational(&new_init, 0, false, &[], &[3u8; 8]).unwrap();
+        open_informational(&new_resp, &ping).unwrap();
+        let pong = build_informational(&new_resp, 0, true, &[], &[4u8; 8]).unwrap();
+        open_informational(&new_init, &pong).unwrap();
+        assert!(open_informational(&resp_sa, &ping).is_err());
+    }
+
+    #[test]
+    fn a_peer_refusal_is_peer_rejected() {
+        use crate::ikev2::payload::notify_type;
+
+        let (init_sa, resp_sa) = sa_pair();
+        let refusal = crate::ikev2::rekey::build_child_refusal(&resp_sa, 5, &[2u8; 8]).unwrap();
+        match initiator_complete_ike_rekey(&init_sa, &[0x55u8; 32], 1, &[3u8; 32], &refusal) {
+            Err(IkeError::PeerRejected { notify_type: t, .. }) => assert_eq!(t, notify_type::NO_ADDITIONAL_SAS),
+            other => panic!("expected PeerRejected(NO_ADDITIONAL_SAS), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_answer_that_switches_the_suite_is_not_trusted() {
+        use crate::ikev2::payload::{transform_type, Transform};
+
+        let (init_sa, resp_sa) = sa_pair();
+        // The peer picks another DH group than the one we offered.
+        let mut prop = init_sa.suite.to_proposal();
+        prop.protocol_id = protocol_id::IKE;
+        prop.spi = 7u64.to_be_bytes().to_vec();
+        for t in prop.transforms.iter_mut().filter(|t: &&mut Transform| t.transform_type == transform_type::DH) {
+            t.transform_id = DhGroup::Modp2048.transform_id();
+        }
+        let inner = vec![
+            (PayloadType::SecurityAssociation, SecurityAssociation { proposals: vec![prop] }.to_bytes()),
+            (PayloadType::Nonce, vec![0x66u8; 32]),
+            (PayloadType::KeyExchange, KeyExchange { dh_group: DhGroup::Modp2048.transform_id(), data: vec![1u8; 256] }.to_bytes()),
+        ];
+        let header = IkeHeader {
+            initiator_spi: resp_sa.spi_i,
+            responder_spi: resp_sa.spi_r,
+            next_payload: PayloadType::NoNext,
+            major_version: 2,
+            minor_version: 0,
+            exchange_type: ExchangeType::CreateChildSa,
+            flags: Flags { initiator: false, version: false, response: true },
+            message_id: 5,
+            length: 0,
+        };
+        let response = build_encrypted(
+            resp_sa.suite.sk_cipher(),
+            header,
+            first_payload_type(&inner),
+            &encode_payload_chain(&inner),
+            our_sk_e(&resp_sa),
+            our_sk_a(&resp_sa),
+            &[2u8; 8],
+        )
+        .unwrap();
+        assert!(matches!(
+            initiator_complete_ike_rekey(&init_sa, &[0x55u8; 32], 1, &[3u8; 32], &response),
+            Err(IkeError::NoProposalChosen)
+        ));
     }
 }

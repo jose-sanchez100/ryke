@@ -24,7 +24,7 @@ use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
 };
 use crate::ikev2::payload::{
-    auth_method, notify_type, protocol_id, sighash, transform_id, transform_type, Authentication,
+    auth_method, notify_type, notify_type_name, protocol_id, sighash, transform_id, transform_type, Authentication,
     CertRequest, Certificate, Configuration, Identification, Notify, Proposal, SecurityAssociation,
     TrafficSelector, TrafficSelectors, Transform,
 };
@@ -190,6 +190,17 @@ struct AuthPayloads {
     /// IKE SA we hold for the same peer identity is stale and should be torn
     /// down once this one authenticates.
     initial_contact: bool,
+    /// The first CHILD-SA error notify the peer sent (see
+    /// [`notify_type::is_child_sa_error`]) -- RFC 7296 §1.2: the IKE SA is
+    /// still established when the CHILD SA of `IKE_AUTH` fails, so the response
+    /// then carries a valid ID/AUTH and this notify but no SA/TS payloads.
+    child_error: Option<u16>,
+}
+
+/// The type of `body` (a Notify payload body) if it is a CHILD-SA error
+/// notify -- one RFC 7296 §1.2 allows in an otherwise successful `IKE_AUTH`.
+pub(crate) fn child_sa_error_of(body: &[u8]) -> Option<u16> {
+    Notify::parse(body).ok().map(|n| n.notify_type).filter(|t| notify_type::is_child_sa_error(*t))
 }
 
 /// The ESP CHILD SA SPI carried by an IKE_AUTH SA payload — the 4-byte SPI of the
@@ -213,6 +224,7 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
     let mut assigned_ip4 = None;
     let mut tsr = None;
     let mut initial_contact = false;
+    let mut child_error = None;
     for payload in payloads(first, inner) {
         let payload = payload?;
         match payload.payload_type {
@@ -241,6 +253,8 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
                 if let Ok(n) = Notify::parse(payload.data) {
                     if n.notify_type == notify_type::INITIAL_CONTACT {
                         initial_contact = true;
+                    } else if child_error.is_none() && notify_type::is_child_sa_error(n.notify_type) {
+                        child_error = Some(n.notify_type);
                     }
                 }
             }
@@ -256,6 +270,7 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
         assigned_ip4,
         tsr,
         initial_contact,
+        child_error,
     })
 }
 
@@ -637,6 +652,12 @@ pub fn initiator_verify_auth(
 
     let octets = responder_signed_octets(sa.suite.prf_algorithm(), &sa.resp_message, &sa.ni, &sa.keys.sk_pr, &got.id_body);
     verify_peer_auth(sa.suite.prf_algorithm(), cfg, &got, &octets)?;
+    // Only once the AUTH has verified: a peer that authenticated but refused
+    // the CHILD SA (RFC 7296 §1.2) is a rejection with a stated reason, not a
+    // "missing SA payload".
+    if let (None, Some(t)) = (got.child_spi, got.child_error) {
+        return Err(IkeError::PeerRejected { notify_type: t, name: notify_type_name(t) });
+    }
     let peer_child_spi = got.child_spi.ok_or(IkeError::MissingPayload("SA"))?;
     Ok((Identification::parse(&got.id_body)?, peer_child_spi, got.esp_suite, got.assigned_ip4, got.tsr))
 }
@@ -760,6 +781,71 @@ mod tests {
         let (resp, _, _, _ic) = responder_process_auth(&resp_sa, &req, &rcfg, 2, &[2u8; 8], None).unwrap();
         let (_, _, _esp_suite, got_ip, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg).unwrap();
         assert_eq!(got_ip, None);
+    }
+
+    /// An `IKE_AUTH` response the way a responder sends it when only the CHILD
+    /// SA fails (RFC 7296 §1.2): a valid IDr + AUTH and the error notify, with
+    /// no SA/TS payloads.
+    fn child_rejected_response(resp_sa: &CompletedSaInit, rcfg: &AuthConfig, error: u16) -> Vec<u8> {
+        let idr_body = rcfg.id.to_bytes();
+        let octets = responder_signed_octets(resp_sa.suite.prf_algorithm(), &resp_sa.resp_message, &resp_sa.ni, &resp_sa.keys.sk_pr, &idr_body);
+        let (auth, certs) = build_local_auth(rcfg, resp_sa, &octets).unwrap();
+        let mut inner = vec![(PayloadType::IdResponder, idr_body)];
+        inner.extend(certs);
+        inner.push((PayloadType::Authentication, auth.to_bytes()));
+        inner.push((PayloadType::Notify, Notify::status(error, Vec::new()).to_bytes()));
+        let first = first_payload_type(&inner);
+        let bytes = encode_payload_chain(&inner);
+        build_encrypted(resp_sa.suite.sk_cipher(), ike_auth_header(resp_sa, true), first, &bytes, &resp_sa.keys.sk_er, &resp_sa.keys.sk_ar, &[2u8; 8]).unwrap()
+    }
+
+    #[test]
+    fn a_child_sa_error_after_a_good_auth_is_a_named_rejection_not_a_missing_sa() {
+        // RFC 7296 §1.2: the IKE SA is still created when the CHILD SA of
+        // IKE_AUTH fails, so the response is authentic and carries the reason.
+        // Surfacing it as PeerRejected (instead of MissingPayload("SA")) is
+        // what lets a caller tell "the gateway refused our selectors" from a
+        // broken exchange.
+        for error in [
+            notify_type::NO_PROPOSAL_CHOSEN,
+            notify_type::TS_UNACCEPTABLE,
+            notify_type::SINGLE_PAIR_REQUIRED,
+            notify_type::INTERNAL_ADDRESS_FAILURE,
+            notify_type::FAILED_CP_REQUIRED,
+        ] {
+            let (init_sa, resp_sa) = run_sa_init();
+            let psk = b"pw".to_vec();
+            let icfg = AuthConfig::psk(Identification::fqdn("client.example"), psk.clone());
+            let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), psk);
+            let resp = child_rejected_response(&resp_sa, &rcfg, error);
+            assert_eq!(
+                initiator_verify_auth(&init_sa, &resp, &icfg).unwrap_err(),
+                IkeError::PeerRejected { notify_type: error, name: notify_type_name(error) },
+            );
+        }
+    }
+
+    #[test]
+    fn a_child_sa_error_is_not_believed_before_the_auth_verifies() {
+        // The notify must not let a peer that failed AUTH pass as merely
+        // "rejected the CHILD SA": AUTH is checked first.
+        let (init_sa, resp_sa) = run_sa_init();
+        let icfg = AuthConfig::psk(Identification::fqdn("client.example"), b"right".to_vec());
+        let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), b"wrong".to_vec());
+        let resp = child_rejected_response(&resp_sa, &rcfg, notify_type::TS_UNACCEPTABLE);
+        assert_eq!(initiator_verify_auth(&init_sa, &resp, &icfg).unwrap_err(), IkeError::AuthFailed);
+    }
+
+    #[test]
+    fn a_missing_sa_without_a_child_sa_error_is_still_a_missing_payload() {
+        // Only the RFC 7296 §1.2 CHILD SA errors are reinterpreted; any other
+        // notify (here AUTHENTICATION_FAILED) leaves the old behavior alone.
+        let (init_sa, resp_sa) = run_sa_init();
+        let psk = b"pw".to_vec();
+        let icfg = AuthConfig::psk(Identification::fqdn("client.example"), psk.clone());
+        let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), psk);
+        let resp = child_rejected_response(&resp_sa, &rcfg, notify_type::AUTHENTICATION_FAILED);
+        assert_eq!(initiator_verify_auth(&init_sa, &resp, &icfg).unwrap_err(), IkeError::MissingPayload("SA"));
     }
 
     #[test]

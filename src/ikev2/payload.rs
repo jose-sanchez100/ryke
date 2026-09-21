@@ -774,9 +774,19 @@ pub mod notify_type {
     pub const INVALID_KE_PAYLOAD: u16 = 17;
     pub const NO_PROPOSAL_CHOSEN: u16 = 14;
     pub const AUTHENTICATION_FAILED: u16 = 24;
+    /// The responder will only accept a single address pair (one TSi range, one
+    /// TSr range) for the CHILD SA -- it can't take a multi-selector offer.
+    pub const SINGLE_PAIR_REQUIRED: u16 = 34;
+    pub const NO_ADDITIONAL_SAS: u16 = 35;
+    pub const INTERNAL_ADDRESS_FAILURE: u16 = 36;
+    pub const FAILED_CP_REQUIRED: u16 = 37;
     pub const TS_UNACCEPTABLE: u16 = 38;
+    pub const INVALID_SELECTORS: u16 = 39;
     // Status
     pub const INITIAL_CONTACT: u16 = 16384;
+    /// The responder narrowed the offered traffic selectors but would accept
+    /// the remainder in a further CHILD SA (RFC 7296 §2.9).
+    pub const ADDITIONAL_TS_POSSIBLE: u16 = 16386;
     pub const NAT_DETECTION_SOURCE_IP: u16 = 16388;
     pub const NAT_DETECTION_DESTINATION_IP: u16 = 16389;
     pub const COOKIE: u16 = 16390;
@@ -793,6 +803,18 @@ pub mod notify_type {
     /// The initiator lists the signature hashes it supports (RFC 7427 §4); a
     /// responder doing Digital Signature auth must answer with a matching one.
     pub const SIGNATURE_HASH_ALGORITHMS: u16 = 16431;
+
+    /// Whether `t` is one of the errors RFC 7296 §1.2 lets a responder return
+    /// for the CHILD SA of `IKE_AUTH` *without* failing the IKE SA itself
+    /// ("if creating the Child SA during the IKE_AUTH exchange fails for some
+    /// reason, the IKE SA is still created as usual"): a rejected CHILD SA
+    /// after a successful authentication, as opposed to a failed authentication.
+    pub fn is_child_sa_error(t: u16) -> bool {
+        matches!(
+            t,
+            NO_PROPOSAL_CHOSEN | TS_UNACCEPTABLE | SINGLE_PAIR_REQUIRED | INTERNAL_ADDRESS_FAILURE | FAILED_CP_REQUIRED
+        )
+    }
 }
 
 /// Hash Algorithm identifiers for `SIGNATURE_HASH_ALGORITHMS` (RFC 7427 §4).
@@ -865,7 +887,13 @@ pub fn notify_type_name(t: u16) -> &'static str {
         notify_type::INVALID_KE_PAYLOAD => "INVALID_KE_PAYLOAD",
         notify_type::NO_PROPOSAL_CHOSEN => "NO_PROPOSAL_CHOSEN",
         notify_type::AUTHENTICATION_FAILED => "AUTHENTICATION_FAILED",
+        notify_type::SINGLE_PAIR_REQUIRED => "SINGLE_PAIR_REQUIRED",
+        notify_type::NO_ADDITIONAL_SAS => "NO_ADDITIONAL_SAS",
+        notify_type::INTERNAL_ADDRESS_FAILURE => "INTERNAL_ADDRESS_FAILURE",
+        notify_type::FAILED_CP_REQUIRED => "FAILED_CP_REQUIRED",
         notify_type::TS_UNACCEPTABLE => "TS_UNACCEPTABLE",
+        notify_type::INVALID_SELECTORS => "INVALID_SELECTORS",
+        notify_type::ADDITIONAL_TS_POSSIBLE => "ADDITIONAL_TS_POSSIBLE",
         _ => "UNKNOWN",
     }
 }
@@ -1225,6 +1253,43 @@ mod tests {
         // With a CHILD-SA SPI attached (e.g. a REKEY_SA notify).
         let with_spi = Notify { protocol_id: protocol_id::ESP, spi: vec![1, 2, 3, 4], notify_type: notify_type::REKEY_SA, data: vec![] };
         assert_eq!(Notify::parse(&with_spi.to_bytes()).unwrap(), with_spi);
+    }
+
+    #[test]
+    fn child_sa_notify_values_match_the_iana_registry() {
+        // IANA "IKEv2 Notify Message Types" (checked against the registry, not
+        // from memory): errors 14/34-39, status 16386.
+        assert_eq!(notify_type::NO_PROPOSAL_CHOSEN, 14);
+        assert_eq!(notify_type::SINGLE_PAIR_REQUIRED, 34);
+        assert_eq!(notify_type::NO_ADDITIONAL_SAS, 35);
+        assert_eq!(notify_type::INTERNAL_ADDRESS_FAILURE, 36);
+        assert_eq!(notify_type::FAILED_CP_REQUIRED, 37);
+        assert_eq!(notify_type::TS_UNACCEPTABLE, 38);
+        assert_eq!(notify_type::INVALID_SELECTORS, 39);
+        assert_eq!(notify_type::ADDITIONAL_TS_POSSIBLE, 16386);
+        // ...and they read as errors/status by the < 16384 rule.
+        assert!(Notify::status(notify_type::SINGLE_PAIR_REQUIRED, vec![]).is_error());
+        assert!(!Notify::status(notify_type::ADDITIONAL_TS_POSSIBLE, vec![]).is_error());
+        assert_eq!(notify_type_name(notify_type::SINGLE_PAIR_REQUIRED), "SINGLE_PAIR_REQUIRED");
+        assert_eq!(notify_type_name(notify_type::ADDITIONAL_TS_POSSIBLE), "ADDITIONAL_TS_POSSIBLE");
+    }
+
+    #[test]
+    fn only_the_rfc_7296_child_sa_errors_leave_the_ike_sa_standing() {
+        // RFC 7296 §1.2's list for a CHILD SA that fails inside IKE_AUTH.
+        for t in [
+            notify_type::NO_PROPOSAL_CHOSEN,
+            notify_type::TS_UNACCEPTABLE,
+            notify_type::SINGLE_PAIR_REQUIRED,
+            notify_type::INTERNAL_ADDRESS_FAILURE,
+            notify_type::FAILED_CP_REQUIRED,
+        ] {
+            assert!(notify_type::is_child_sa_error(t), "{} should be a CHILD SA error", notify_type_name(t));
+        }
+        // An authentication failure, or a status notify, is not.
+        assert!(!notify_type::is_child_sa_error(notify_type::AUTHENTICATION_FAILED));
+        assert!(!notify_type::is_child_sa_error(notify_type::INITIAL_CONTACT));
+        assert!(!notify_type::is_child_sa_error(notify_type::ADDITIONAL_TS_POSSIBLE));
     }
 
     #[test]

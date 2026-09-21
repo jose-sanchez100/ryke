@@ -811,13 +811,13 @@ fn unwrap(dgram: &[u8], float: bool) -> Result<Vec<u8>, IkeError> {
 /// computation). Every failure mode here (entropy, encoding, I/O) is
 /// swallowed: this call is purely a courtesy to the peer, never something
 /// the caller's own error should wait on or be replaced by.
-fn notify_ike_sa_delete_on_failed_auth(sock: &UdpSocket, sa: &CompletedSaInit, dest: SocketAddr, float: bool, last_received: &[u8]) {
+fn notify_ike_sa_delete_on_failed_auth(sock: &UdpSocket, sa: &CompletedSaInit, dest: SocketAddr, float: bool, last_received: &[u8], reason: &str) {
     let Ok(mid) = IkeHeader::parse(last_received).map(|h| h.message_id + 1) else { return };
     let mut iv = [0u8; 8];
     let Ok(mut entropy) = OsEntropy::new() else { return };
     entropy.fill(&mut iv);
     let Ok(del) = build_informational(sa, mid, false, &[(PayloadType::Delete, Delete::ike_sa().to_bytes())], &iv) else { return };
-    ike_debug!("INFORMATIONAL: sending IKE_SA Delete to {dest} (authentication failed)");
+    ike_debug!("INFORMATIONAL: sending IKE_SA Delete to {dest} ({reason})");
     let wire = wrap(&del, float);
     crate::debug::dump(">>>", dest, &wire);
     if sock.send_to(&wire, dest).is_err() {
@@ -1103,8 +1103,18 @@ impl<E: Entropy> Ikev2Session<E> {
         let (_peer_id, peer_spi, esp_suite, assigned_ip4, tsr) = match ike_auth::initiator_verify_auth(&sa, &response, cfg) {
             Ok(v) => v,
             Err(e) => {
-                ike_debug!("IKE_AUTH: peer authentication failed: {e}");
-                notify_ike_sa_delete_on_failed_auth(&sock, &sa, dest, float, &response);
+                // RFC 7296 §1.2: an authenticated peer that refused only the
+                // CHILD SA keeps the IKE SA standing -- but with nothing to
+                // carry traffic on it this connect can't go on, so it is closed
+                // (rather than left for the gateway to time out) either way.
+                let reason = if matches!(e, IkeError::PeerRejected { .. }) {
+                    ike_debug!("IKE_AUTH: authenticated, but the peer rejected the CHILD SA: {e}");
+                    "CHILD SA rejected"
+                } else {
+                    ike_debug!("IKE_AUTH: peer authentication failed: {e}");
+                    "authentication failed"
+                };
+                notify_ike_sa_delete_on_failed_auth(&sock, &sa, dest, float, &response, reason);
                 return Err(e.into());
             }
         };
@@ -1336,7 +1346,18 @@ impl<E: Entropy> Ikev2Session<E> {
             let ike_msg =
                 send_and_retry_reassembling(&sock, dest, &wire, float, cipher, &sa.keys.sk_er, &sa.keys.sk_ar)?;
             last_message = ike_msg.clone();
-            match initiator.handle(&ike_msg, &mut self.entropy)? {
+            let event = match initiator.handle(&ike_msg, &mut self.entropy) {
+                Ok(event) => event,
+                // EAP finished and the AUTH verified, but the gateway refused
+                // the CHILD SA (RFC 7296 §1.2) -- see `EapInitiator::handle`.
+                Err(e @ IkeError::PeerRejected { .. }) => {
+                    ike_debug!("IKE_AUTH (EAP-MSCHAPv2): authenticated, but the peer rejected the CHILD SA: {e}");
+                    notify_ike_sa_delete_on_failed_auth(&sock, initiator.ike_sa(), dest, float, &ike_msg, "CHILD SA rejected");
+                    return Err(e.into());
+                }
+                Err(e) => return Err(e.into()),
+            };
+            match event {
                 EapEvent::Reply(next) => {
                     ike_debug!("IKE_AUTH (EAP-MSCHAPv2): round {round} -- continuing");
                     msg = next
@@ -1352,7 +1373,7 @@ impl<E: Entropy> Ikev2Session<E> {
                 }
                 EapEvent::Failed(reason) => {
                     ike_debug!("IKE_AUTH (EAP-MSCHAPv2): authentication failed after {round} round(s)");
-                    notify_ike_sa_delete_on_failed_auth(&sock, initiator.ike_sa(), dest, float, &last_message);
+                    notify_ike_sa_delete_on_failed_auth(&sock, initiator.ike_sa(), dest, float, &last_message, "authentication failed");
                     let err = match reason {
                         Some(r) if r.credentials_rejected => IkeError::EapCredentialsRejected(r.raw),
                         _ => IkeError::AuthFailed,
@@ -1915,6 +1936,92 @@ mod tests {
         let (resp, _peer_id, _spi, _ic) =
             responder_process_auth(&sa, &buf[..n], &rcfg, 0xC0FFEE, &[9u8; 8], None).unwrap();
         sock.send_to(&resp, from).unwrap();
+    }
+
+    /// Same as [`run_psk_responder`], but the CHILD SA of `IKE_AUTH` fails the
+    /// way RFC 7296 §1.2 allows: the response keeps its valid IDr + AUTH and
+    /// carries the `error` notify instead of SA/TS. Returns whether the client
+    /// then closed the IKE SA with a Delete.
+    fn run_psk_responder_rejecting_child(bind: SocketAddr, psk: Vec<u8>, error: u16) -> bool {
+        use crate::ikev2::message::{encode_payload_chain, first_payload_type};
+        use crate::ikev2::payload::Notify;
+
+        let sock = UdpSocket::bind(bind).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 4096];
+        let (n, from) = sock.recv_from(&mut buf).unwrap();
+        let resp_secret = LocalSecret::generate(&mut OsEntropy::new().unwrap(), 32);
+        let result = responder_respond_natt(&buf[..n], &resp_secret, bind, from, None).unwrap();
+        let (response, sa) = match result {
+            crate::ikev2::exchange::SaInitResult::Established { response, sa } => (response, sa),
+            _ => panic!("expected Established"),
+        };
+        sock.send_to(&response, from).unwrap();
+
+        let (n, from) = sock.recv_from(&mut buf).unwrap();
+        let rcfg = AuthConfig::psk(Identification::fqdn("responder.test"), psk);
+        let (resp, _peer_id, _spi, _ic) = responder_process_auth(&sa, &buf[..n], &rcfg, 0xC0FFEE, &[9u8; 8], None).unwrap();
+
+        // Reseal the honest response without its SA/TS/... payloads, plus the error.
+        let cipher = sa.suite.sk_cipher();
+        let (first, inner) = open_encrypted(cipher, &resp, &sa.keys.sk_er, &sa.keys.sk_ar).unwrap();
+        let mut kept: Vec<(PayloadType, Vec<u8>)> = payloads(first, &inner)
+            .map(|p| p.unwrap())
+            .filter(|p| matches!(p.payload_type, PayloadType::IdResponder | PayloadType::Authentication))
+            .map(|p| (p.payload_type, p.data.to_vec()))
+            .collect();
+        kept.push((PayloadType::Notify, Notify::status(error, Vec::new()).to_bytes()));
+        let header = IkeHeader::parse(&resp).unwrap();
+        let rejected = sk::build_encrypted(
+            cipher,
+            header,
+            first_payload_type(&kept),
+            &encode_payload_chain(&kept),
+            &sa.keys.sk_er,
+            &sa.keys.sk_ar,
+            &[8u8; 8],
+        )
+        .unwrap();
+        sock.send_to(&rejected, from).unwrap();
+
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        match sock.recv_from(&mut buf) {
+            Ok((n, _)) => open_informational(&sa, &buf[..n])
+                .map(|ps| ps.iter().any(|(t, _)| *t == PayloadType::Delete))
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    #[test]
+    fn connect_direct_reports_a_child_sa_rejection_and_closes_the_ike_sa() {
+        // A responder that authenticates us but refuses the CHILD SA (RFC 7296
+        // §1.2) used to surface as `MissingPayload("SA")`, with the IKE SA left
+        // for the gateway to time out.
+        for error in [notify_type::TS_UNACCEPTABLE, notify_type::SINGLE_PAIR_REQUIRED, notify_type::NO_PROPOSAL_CHOSEN] {
+            let bind = next_addr();
+            let psk = b"shared-secret".to_vec();
+            let responder = thread::spawn({
+                let psk = psk.clone();
+                move || run_psk_responder_rejecting_child(bind, psk, error)
+            });
+            thread::sleep(Duration::from_millis(50));
+
+            let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+            let cfg = AuthConfig::psk(Identification::fqdn("client.test"), psk);
+            let err = session
+                .connect_direct_on_port(bind, &default_ike_offer(), &cfg, false, &default_esp_offer(), next_addr().port())
+                .err()
+                .expect("a rejected CHILD SA must fail the connect");
+            match err {
+                DriverError::Ike(IkeError::PeerRejected { notify_type: got, name }) => {
+                    assert_eq!(got, error);
+                    assert_eq!(name, notify_type_name(error));
+                }
+                other => panic!("expected PeerRejected({}), got {other:?}", notify_type_name(error)),
+            }
+            assert!(responder.join().unwrap(), "the client must close the IKE SA with a Delete ({})", notify_type_name(error));
+        }
     }
 
     /// Same as [`run_psk_responder`], but sends its `IKE_AUTH` response as

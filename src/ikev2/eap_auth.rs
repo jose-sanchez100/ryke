@@ -26,7 +26,7 @@ use crate::entropy::Entropy;
 use crate::error::IkeError;
 use crate::ikev2::exchange::CompletedSaInit;
 use crate::ikev2::ike_auth::{
-    esp_offer, esp_spi_from_sa, initiator_eap_request, initiator_eap_request_with_certreq,
+    child_sa_error_of, esp_offer, esp_spi_from_sa, initiator_eap_request, initiator_eap_request_with_certreq,
     initiator_eap_request_with_certs, AssignedConfig,
 };
 use crate::ikev2::message::{
@@ -35,8 +35,8 @@ use crate::ikev2::message::{
 use crate::ikev2::mschapv2;
 use crate::ikev2::negotiate::{self, ChosenEspSuite};
 use crate::ikev2::payload::{
-    auth_method, Authentication, Certificate, Configuration, Identification, SecurityAssociation,
-    TrafficSelector, TrafficSelectors,
+    auth_method, notify_type_name, Authentication, Certificate, Configuration, Identification,
+    SecurityAssociation, TrafficSelector, TrafficSelectors,
 };
 use crate::role::Role;
 use crate::ikev2::sign::SigningKey;
@@ -471,9 +471,7 @@ impl EapInitiator {
             // No EAP → the responder's final message. Key-confirm its MSK-keyed
             // AUTH (mirroring what the responder does to us); presence alone is
             // not enough — it must prove it derived the same EAP MSK.
-            let (Some(auth_bytes), Some(sar2)) =
-                (find(&ps, PayloadType::Authentication), find(&ps, PayloadType::SecurityAssociation))
-            else {
+            let Some(auth_bytes) = find(&ps, PayloadType::Authentication) else {
                 return Ok(EapEvent::Failed(None));
             };
             let idr = find(&ps, PayloadType::IdResponder).unwrap_or(&[]);
@@ -481,6 +479,23 @@ impl EapInitiator {
             let algo = self.sa.suite.prf_algorithm();
             let expect = psk_auth(algo, &msk, &responder_signed_octets(algo, &self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, idr));
             let got = Authentication::parse(auth_bytes)?;
+            let Some(sar2) = find(&ps, PayloadType::SecurityAssociation) else {
+                // RFC 7296 §1.2: a CHILD SA that fails inside IKE_AUTH leaves the
+                // IKE SA established, so this final message is a valid AUTH plus
+                // an error notify and no SA/TS. Once the MSK-keyed AUTH has
+                // verified, that is a rejection with a stated reason -- not the
+                // failed authentication it used to be reported as.
+                if got.method == auth_method::SHARED_KEY && got.data == expect {
+                    let rejected = ps
+                        .iter()
+                        .filter(|(t, _)| *t == PayloadType::Notify)
+                        .find_map(|(_, body)| child_sa_error_of(body));
+                    if let Some(t) = rejected {
+                        return Err(IkeError::PeerRejected { notify_type: t, name: notify_type_name(t) });
+                    }
+                }
+                return Ok(EapEvent::Failed(None));
+            };
             if got.method == auth_method::SHARED_KEY && got.data == expect {
                 self.peer_child_spi = esp_spi_from_sa(sar2);
                 self.peer_esp_suite = SecurityAssociation::parse(sar2).ok().and_then(|sa| negotiate::select_esp(&sa));
@@ -776,6 +791,7 @@ mod tests {
     use super::*;
     use crate::entropy::SeedEntropy;
     use crate::ikev2::exchange::{default_offer, initiator_complete, initiator_request, responder_respond, LocalSecret};
+    use crate::ikev2::payload::{notify_type, Notify};
     use crate::test_certs::{CA_CERT_DER, LEAF_CERT_DER, LEAF_SCALAR, RSA_KEY_PK8};
 
     #[derive(PartialEq, Eq, Debug)]
@@ -868,6 +884,77 @@ mod tests {
         let initiator = EapInitiator::new(init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111, ServerVerify::Insecure);
         let responder = EapResponder::new(resp_sa, Identification::fqdn("gw"), ServerAuth::Psk(b"psk".to_vec()), b"alice".to_vec(), "s3cret".into(), 0x2222);
         assert_eq!(drive(initiator, responder), Outcome::Established);
+    }
+
+    /// Run the EAP exchange up to the responder's final message (the one with
+    /// its MSK-keyed AUTH + SA/TS), and return it with both endpoints.
+    fn run_to_final_message() -> (EapInitiator, EapResponder, Vec<u8>) {
+        let (init_sa, resp_sa) = sa_pair();
+        let mut initiator = EapInitiator::new(init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111, ServerVerify::Insecure);
+        let mut responder = EapResponder::new(resp_sa, Identification::fqdn("gw"), ServerAuth::Psk(b"psk".to_vec()), b"alice".to_vec(), "s3cret".into(), 0x2222);
+        let mut ie = SeedEntropy::new(1);
+        let mut re = SeedEntropy::new(2);
+        let mut in_flight = initiator.start(&mut ie).unwrap();
+        let final_msg = loop {
+            match responder.handle(&in_flight, &mut re).unwrap() {
+                EapEvent::Reply(m) => match initiator.handle(&m, &mut ie).unwrap() {
+                    EapEvent::Reply(m2) => in_flight = m2,
+                    other => panic!("the initiator ended early: {other:?}"),
+                },
+                EapEvent::Established(Some(f)) => break f,
+                other => panic!("unexpected responder event: {other:?}"),
+            }
+        };
+        (initiator, responder, final_msg)
+    }
+
+    /// `final_msg` as a responder sends it when only the CHILD SA failed (RFC
+    /// 7296 §1.2): the same IDr + AUTH, then `error` instead of SA/TS/CFG.
+    /// `tamper_auth` corrupts the AUTH to model a peer that did not authenticate.
+    fn child_rejected_final(initiator: &EapInitiator, responder: &EapResponder, final_msg: &[u8], error: u16, tamper_auth: bool) -> Vec<u8> {
+        let (msg_id, ps) = decrypt(&initiator.sa, final_msg).unwrap();
+        let mut inner: Payloads = ps
+            .into_iter()
+            .filter(|(t, _)| matches!(t, PayloadType::IdResponder | PayloadType::Authentication))
+            .collect();
+        if tamper_auth {
+            for (t, body) in &mut inner {
+                if *t == PayloadType::Authentication {
+                    let last = body.len() - 1;
+                    body[last] ^= 1;
+                }
+            }
+        }
+        inner.push((PayloadType::Notify, Notify::status(error, Vec::new()).to_bytes()));
+        build_sk(&responder.sa, msg_id, true, &inner, &[3u8; 8]).unwrap()
+    }
+
+    #[test]
+    fn eap_child_sa_error_after_a_good_auth_is_a_named_rejection() {
+        // The FortiGate path: EAP succeeds and AUTH verifies, but the gateway
+        // refuses the CHILD SA in that last IKE_AUTH message. That used to be
+        // reported as a failed authentication.
+        for error in [notify_type::TS_UNACCEPTABLE, notify_type::NO_PROPOSAL_CHOSEN, notify_type::SINGLE_PAIR_REQUIRED] {
+            let (mut initiator, responder, final_msg) = run_to_final_message();
+            let rejected = child_rejected_final(&initiator, &responder, &final_msg, error, false);
+            let err = initiator.handle(&rejected, &mut SeedEntropy::new(1)).unwrap_err();
+            assert_eq!(err, IkeError::PeerRejected { notify_type: error, name: notify_type_name(error) });
+        }
+    }
+
+    #[test]
+    fn eap_child_sa_error_is_not_believed_when_the_auth_does_not_verify() {
+        let (mut initiator, responder, final_msg) = run_to_final_message();
+        let rejected = child_rejected_final(&initiator, &responder, &final_msg, notify_type::TS_UNACCEPTABLE, true);
+        assert!(matches!(initiator.handle(&rejected, &mut SeedEntropy::new(1)), Ok(EapEvent::Failed(None))));
+    }
+
+    #[test]
+    fn eap_final_message_without_sa_and_without_a_child_error_is_still_a_failure() {
+        // Unchanged: no SA and no CHILD SA error notify means we can't say why.
+        let (mut initiator, responder, final_msg) = run_to_final_message();
+        let rejected = child_rejected_final(&initiator, &responder, &final_msg, notify_type::AUTHENTICATION_FAILED, false);
+        assert!(matches!(initiator.handle(&rejected, &mut SeedEntropy::new(1)), Ok(EapEvent::Failed(None))));
     }
 
     #[test]

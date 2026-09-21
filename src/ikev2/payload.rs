@@ -796,6 +796,7 @@ impl Configuration {
 /// ≥ 16384 are status.
 pub mod notify_type {
     // Errors
+    pub const INVALID_SYNTAX: u16 = 7;
     pub const INVALID_KE_PAYLOAD: u16 = 17;
     pub const NO_PROPOSAL_CHOSEN: u16 = 14;
     pub const AUTHENTICATION_FAILED: u16 = 24;
@@ -807,6 +808,9 @@ pub mod notify_type {
     pub const FAILED_CP_REQUIRED: u16 = 37;
     pub const TS_UNACCEPTABLE: u16 = 38;
     pub const INVALID_SELECTORS: u16 = 39;
+    /// A request named a CHILD SA (a `REKEY_SA` notify, say) this side has no
+    /// record of (RFC 7296 §3.10.1).
+    pub const CHILD_SA_NOT_FOUND: u16 = 44;
     // Status
     pub const INITIAL_CONTACT: u16 = 16384;
     /// The responder narrowed the offered traffic selectors but would accept
@@ -908,7 +912,7 @@ impl Notify {
 pub fn notify_type_name(t: u16) -> &'static str {
     match t {
         1 => "UNSUPPORTED_CRITICAL_PAYLOAD",
-        7 => "INVALID_SYNTAX",
+        notify_type::INVALID_SYNTAX => "INVALID_SYNTAX",
         notify_type::INVALID_KE_PAYLOAD => "INVALID_KE_PAYLOAD",
         notify_type::NO_PROPOSAL_CHOSEN => "NO_PROPOSAL_CHOSEN",
         notify_type::AUTHENTICATION_FAILED => "AUTHENTICATION_FAILED",
@@ -918,6 +922,7 @@ pub fn notify_type_name(t: u16) -> &'static str {
         notify_type::FAILED_CP_REQUIRED => "FAILED_CP_REQUIRED",
         notify_type::TS_UNACCEPTABLE => "TS_UNACCEPTABLE",
         notify_type::INVALID_SELECTORS => "INVALID_SELECTORS",
+        notify_type::CHILD_SA_NOT_FOUND => "CHILD_SA_NOT_FOUND",
         notify_type::ADDITIONAL_TS_POSSIBLE => "ADDITIONAL_TS_POSSIBLE",
         _ => "UNKNOWN",
     }

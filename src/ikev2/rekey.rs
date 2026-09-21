@@ -23,6 +23,7 @@
 use std::net::Ipv4Addr;
 
 use crate::crypto::DhGroup;
+use crate::debug::ike_debug;
 use crate::error::IkeError;
 use crate::esp::ChildSa;
 use crate::ikev2::exchange::CompletedSaInit;
@@ -31,7 +32,7 @@ use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
 };
 use crate::ikev2::payload::{
-    notify_type, protocol_id, transform_type, KeyExchange, Notify, SecurityAssociation, Transform, TrafficSelector,
+    notify_type, protocol_id, transform_type, KeyExchange, Notify, Proposal, SecurityAssociation, Transform, TrafficSelector,
     TrafficSelectors,
 };
 use crate::role::Role;
@@ -222,7 +223,14 @@ pub fn build_child_request(
 /// such as strongSwan answers by destroying the whole IKE SA, where a plain
 /// refusal leaves it standing. `message_id` is the request's own.
 pub fn build_child_refusal(sa: &CompletedSaInit, message_id: u32, iv: &[u8; 8]) -> Result<Vec<u8>, IkeError> {
-    let inner = vec![(PayloadType::Notify, Notify::status(notify_type::NO_ADDITIONAL_SAS, Vec::new()).to_bytes())];
+    build_child_error(sa, message_id, notify_type::NO_ADDITIONAL_SAS, iv)
+}
+
+/// [`build_child_refusal`] with a reason of the caller's choosing -- a peer's
+/// rekey this side *would* take on but can't (`NO_PROPOSAL_CHOSEN`,
+/// `CHILD_SA_NOT_FOUND`, ...), still answered as a `CREATE_CHILD_SA`.
+pub fn build_child_error(sa: &CompletedSaInit, message_id: u32, error: u16, iv: &[u8; 8]) -> Result<Vec<u8>, IkeError> {
+    let inner = vec![(PayloadType::Notify, Notify::status(error, Vec::new()).to_bytes())];
     let header = create_child_header(sa, message_id, true);
     let first = first_payload_type(&inner);
     let bytes = encode_payload_chain(&inner);
@@ -230,10 +238,10 @@ pub fn build_child_refusal(sa: &CompletedSaInit, message_id: u32, iv: &[u8; 8]) 
 }
 
 /// The SPI a CHILD SA rekey request names in its `REKEY_SA` notify -- what a
-/// responder looks the old SA up by. Test-only: [`responder_process_rekey`]
-/// itself does not act on it.
-#[cfg(test)]
-pub(crate) fn rekey_sa_spi(sa: &CompletedSaInit, request: &[u8]) -> Option<u32> {
+/// responder looks the old SA up by: the SPI the *sender* expects on inbound
+/// ESP (RFC 7296 §1.3.3), so for the receiver the SA's outbound SPI. `None`
+/// when the request carries no such notify (a brand-new CHILD SA) or can't be opened.
+pub fn rekey_sa_spi(sa: &CompletedSaInit, request: &[u8]) -> Option<u32> {
     let (first, inner) = open_encrypted(sa.suite.sk_cipher(), request, peer_sk_e(sa), peer_sk_a(sa)).ok()?;
     payloads(first, &inner)
         .filter_map(Result::ok)
@@ -353,6 +361,131 @@ pub fn responder_process_rekey_with_pfs(
     Ok((response, child))
 }
 
+/// Pick the proposal to answer a CHILD SA rekey the peer started with (RFC 7296
+/// §2.7): the first one that offers the algorithms of the SA being rekeyed --
+/// a rekey keeps the running `cipher` -- and, when the request carries a KE
+/// payload (`ke_group`), that KE's DH group among its alternatives, or no
+/// mandatory DH when it doesn't (a proposal with no DH transform at all takes
+/// either, and is then answered without PFS). Returns the proposal to send back (the
+/// chosen one's number, our `new_spi`, one transform per type), the peer's
+/// SPI from it, and the DH group PFS runs on, if any.
+fn choose_child_proposal(
+    peer_sa: &SecurityAssociation,
+    cipher: SkCipher,
+    new_spi: u32,
+    ke_group: Option<u16>,
+) -> Result<(Proposal, u32, Option<DhGroup>), IkeError> {
+    let ours = esp_offer_for_cipher(new_spi, cipher).proposals.remove(0);
+    for p in &peer_sa.proposals {
+        if p.protocol_id != protocol_id::ESP || p.spi.len() != 4 {
+            continue;
+        }
+        let of_type = |ty: u8| p.transforms.iter().filter(move |t| t.transform_type == ty);
+        // Everything we'd use has to be among what it offers -- but a proposal
+        // that leaves ESN out altogether is taken as "no ESN".
+        let offers_all = ours.transforms.iter().all(|t| {
+            (t.transform_type == transform_type::ESN && of_type(transform_type::ESN).next().is_none())
+                || of_type(t.transform_type).any(|o| o.transform_id == t.transform_id && o.key_length == t.key_length)
+        });
+        // An AEAD cipher takes no integrity algorithm: a proposal that insists on one is another algorithm.
+        let integ_forced = !ours.transforms.iter().any(|t| t.transform_type == transform_type::INTEG)
+            && of_type(transform_type::INTEG).next().is_some()
+            && !of_type(transform_type::INTEG).any(|t| t.transform_id == 0);
+        if !offers_all || integ_forced {
+            continue;
+        }
+        let dh_offered: Vec<u16> = of_type(transform_type::DH).map(|t| t.transform_id).collect();
+        let group = match ke_group {
+            Some(g) if dh_offered.contains(&g) => match DhGroup::from_transform_id(g) {
+                Some(group) => Some(group),
+                None => continue,
+            },
+            // A proposal with no DH of its own answers a rekey without PFS: the KE is
+            // there for the proposals that do list its group (strongSwan sends
+            // both kinds side by side, so a peer that can't do PFS still fits).
+            _ if dh_offered.is_empty() || dh_offered.contains(&0) => None,
+            _ => continue,
+        };
+        let mut reply = ours.clone();
+        reply.num = p.num;
+        if let Some(group) = group {
+            reply.transforms.push(Transform { transform_type: transform_type::DH, transform_id: group.transform_id(), key_length: None });
+        }
+        let peer_spi = u32::from_be_bytes(p.spi[..4].try_into().unwrap());
+        return Ok((reply, peer_spi, group));
+    }
+    ike_debug!(
+        "CREATE_CHILD_SA: none of the peer's ESP proposals fits the running cipher {cipher:?} (KE group {ke_group:?}); offered: {:?}",
+        peer_sa.proposals
+    );
+    Err(IkeError::NoProposalChosen)
+}
+
+/// Responder side of a CHILD SA rekey the *peer* started (RFC 7296 §1.3.3): a
+/// `CREATE_CHILD_SA` request `SK { N(REKEY_SA), SA, Ni, [KEi,] TSi, TSr }`.
+/// Selects a proposal ([`choose_child_proposal`] -- the peer may offer several
+/// and, for PFS, name a DH group), derives the new CHILD SA from the peer's
+/// nonce, ours (`nr`) and, with PFS, a fresh DH secret from `dh_private` (only
+/// used when the request carries a KE payload), and builds the response, which
+/// accepts the traffic selectors exactly as the peer proposed them: that is
+/// what its SA being replaced already carries. `new_spi` is the inbound SPI we
+/// choose for the new SA; `cipher` the one running on the SA being rekeyed.
+///
+/// Which SA is being rekeyed is the caller's to check first ([`rekey_sa_spi`]):
+/// this only builds the new one. Returns `(response_bytes, ChildSa)`.
+pub fn responder_answer_child_rekey(
+    sa: &CompletedSaInit,
+    request: &[u8],
+    new_spi: u32,
+    nr: &[u8],
+    cipher: SkCipher,
+    dh_private: &[u8],
+    iv: &[u8; 8],
+) -> Result<(Vec<u8>, ChildSa), IkeError> {
+    let message_id = IkeHeader::parse(request)?.message_id;
+    let (first, inner) = open_encrypted(sa.suite.sk_cipher(), request, peer_sk_e(sa), peer_sk_a(sa))?;
+    let (sa_bytes, ni) = find_sa_and_nonce(first, &inner)?;
+    let peer_sa = SecurityAssociation::parse(&sa_bytes)?;
+    let peer_ke = find_ke(first, &inner)?;
+    let (mut tsi, mut tsr) = (None, None);
+    for payload in payloads(first, &inner) {
+        let p = payload?;
+        match p.payload_type {
+            PayloadType::TrafficSelectorInitiator => tsi = Some(p.data.to_vec()),
+            PayloadType::TrafficSelectorResponder => tsr = Some(p.data.to_vec()),
+            _ => {}
+        }
+    }
+    let tsi = tsi.ok_or(IkeError::MissingPayload("TSi"))?;
+    let tsr = tsr.ok_or(IkeError::MissingPayload("TSr"))?;
+
+    let (proposal, peer_spi, group) = choose_child_proposal(&peer_sa, cipher, new_spi, peer_ke.as_ref().map(|k| k.dh_group))?;
+    let prf = sa.suite.prf_algorithm();
+    let (child, ke_out) = match (group, &peer_ke) {
+        (Some(group), Some(ke)) => {
+            let secret = group.shared(dh_private, &ke.data)?;
+            let child = ChildSa::derive_with_cipher_pfs(prf, cipher, &secret, &sa.keys.sk_d, &ni, nr, Role::Responder, new_spi, peer_spi);
+            (child, Some(KeyExchange { dh_group: group.transform_id(), data: group.public(dh_private) }))
+        }
+        _ => (ChildSa::derive_with_cipher(prf, cipher, &sa.keys.sk_d, &ni, nr, Role::Responder, new_spi, peer_spi), None),
+    };
+
+    let mut inner_out = vec![
+        (PayloadType::SecurityAssociation, SecurityAssociation { proposals: vec![proposal] }.to_bytes()),
+        (PayloadType::Nonce, nr.to_vec()),
+    ];
+    if let Some(ke) = ke_out {
+        inner_out.push((PayloadType::KeyExchange, ke.to_bytes()));
+    }
+    inner_out.push((PayloadType::TrafficSelectorInitiator, tsi));
+    inner_out.push((PayloadType::TrafficSelectorResponder, tsr));
+    let header = create_child_header(sa, message_id, true);
+    let first_out = first_payload_type(&inner_out);
+    let bytes = encode_payload_chain(&inner_out);
+    let response = build_encrypted(sa.suite.sk_cipher(), header, first_out, &bytes, our_sk_e(sa), our_sk_a(sa), iv)?;
+    Ok((response, child))
+}
+
 /// Initiator: complete the rekey from the response, deriving the new CHILD SA.
 /// `ni` and `new_spi` are the values used in [`build_rekey_request`].
 pub fn initiator_complete_rekey(
@@ -441,7 +574,9 @@ pub fn initiator_complete_child(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::IntegAlgorithm;
     use crate::esp::next_header;
+    use crate::ikev2::payload::transform_id;
     use crate::ikev2::exchange::{default_offer, initiator_complete, initiator_request, responder_respond, LocalSecret};
     use crate::ikev2::sk::{build_encrypted_gcm, open_encrypted_gcm};
 
@@ -611,6 +746,204 @@ mod tests {
 
         let pkt = init_child.outbound.seal(b"v6 child A->B", next_header::IPV6).unwrap();
         assert_eq!(resp_child.inbound.open(&pkt).unwrap().0, b"v6 child A->B");
+    }
+
+    /// An ESP proposal as a peer would offer it: `encr`, an optional integrity
+    /// algorithm, the DH alternatives (PFS) and ESN off.
+    fn esp_proposal(num: u8, spi: u32, encr: (u16, Option<u16>), integ: Option<u16>, dh: &[u16]) -> Proposal {
+        let mut transforms = vec![Transform { transform_type: transform_type::ENCR, transform_id: encr.0, key_length: encr.1 }];
+        transforms.extend(integ.map(|id| Transform { transform_type: transform_type::INTEG, transform_id: id, key_length: None }));
+        transforms.extend(dh.iter().map(|&id| Transform { transform_type: transform_type::DH, transform_id: id, key_length: None }));
+        transforms.push(Transform { transform_type: transform_type::ESN, transform_id: transform_id::ESN_NONE, key_length: None });
+        Proposal { num, protocol_id: protocol_id::ESP, spi: spi.to_be_bytes().to_vec(), transforms }
+    }
+
+    /// A peer's CHILD SA rekey request naming `rekeyed_spi`, offering `proposals`
+    /// (with a KE for `ke` when given).
+    fn peer_rekey_request(
+        peer_sa: &CompletedSaInit,
+        proposals: Vec<Proposal>,
+        ke: Option<(DhGroup, &[u8])>,
+        ts: &TrafficSelectors,
+    ) -> Vec<u8> {
+        let notify = Notify {
+            protocol_id: protocol_id::ESP,
+            spi: 0xAAAA_AAAAu32.to_be_bytes().to_vec(),
+            notify_type: notify_type::REKEY_SA,
+            data: Vec::new(),
+        };
+        let mut inner = vec![
+            (PayloadType::Notify, notify.to_bytes()),
+            (PayloadType::SecurityAssociation, SecurityAssociation { proposals }.to_bytes()),
+            (PayloadType::Nonce, vec![0x33; 32]),
+        ];
+        if let Some((group, private)) = ke {
+            inner.push((PayloadType::KeyExchange, KeyExchange { dh_group: group.transform_id(), data: group.public(private) }.to_bytes()));
+        }
+        inner.push((PayloadType::TrafficSelectorInitiator, ts.to_bytes()));
+        inner.push((PayloadType::TrafficSelectorResponder, ts.to_bytes()));
+        let first = first_payload_type(&inner);
+        build_encrypted(
+            peer_sa.suite.sk_cipher(),
+            create_child_header(peer_sa, 7, false),
+            first,
+            &encode_payload_chain(&inner),
+            our_sk_e(peer_sa),
+            our_sk_a(peer_sa),
+            &[1u8; 8],
+        )
+        .unwrap()
+    }
+
+    /// The `(proposal, spi, TSi, TSr)` of a rekey response a peer gets back.
+    fn read_rekey_response(response: &[u8], peer_sa: &CompletedSaInit) -> (Proposal, TrafficSelectors, TrafficSelectors, bool) {
+        let (first, inner) = open_encrypted(peer_sa.suite.sk_cipher(), response, peer_sk_e(peer_sa), peer_sk_a(peer_sa)).unwrap();
+        let (mut proposal, mut tsi, mut tsr, mut ke) = (None, None, None, false);
+        for p in payloads(first, &inner) {
+            let p = p.unwrap();
+            match p.payload_type {
+                PayloadType::SecurityAssociation => proposal = SecurityAssociation::parse(p.data).unwrap().proposals.into_iter().next(),
+                PayloadType::TrafficSelectorInitiator => tsi = Some(TrafficSelectors::parse(p.data).unwrap()),
+                PayloadType::TrafficSelectorResponder => tsr = Some(TrafficSelectors::parse(p.data).unwrap()),
+                PayloadType::KeyExchange => ke = true,
+                _ => {}
+            }
+        }
+        (proposal.unwrap(), tsi.unwrap(), tsr.unwrap(), ke)
+    }
+
+    /// The peer (a gateway whose own lifetime timer fired) rekeys, this side
+    /// answers, and the two end up with SAs that interoperate -- with and
+    /// without PFS.
+    #[test]
+    fn a_peer_started_child_rekey_is_answered_and_both_sides_derive_the_same_keys() {
+        for pfs in [None, Some(DhGroup::Modp2048)] {
+            let (our_sa, peer_sa) = sa_pair(); // `our_sa` answers, `peer_sa` asks
+            let peer_dh = [5u8; 32];
+            let mut offer = esp_offer_for_cipher(0x2222_2222, SkCipher::Aes256Gcm).proposals.remove(0);
+            if let Some(group) = pfs {
+                offer.transforms.push(Transform { transform_type: transform_type::DH, transform_id: group.transform_id(), key_length: None });
+            }
+            let ts = TrafficSelectors::ipv4_full_tunnel();
+            let req = peer_rekey_request(&peer_sa, vec![offer], pfs.map(|g| (g, &peer_dh[..])), &ts);
+
+            let (resp, mut our_child) =
+                responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &[6u8; 32], &[2u8; 8]).unwrap();
+            let (mut peer_child, granted) =
+                initiator_complete_child(&peer_sa, &[0x33u8; 32], 0x2222_2222, SkCipher::Aes256Gcm, pfs.map(|_| &peer_dh[..]), &resp).unwrap();
+            assert_eq!(granted, Some(ts), "the peer's selectors are accepted as proposed");
+
+            let pkt = peer_child.outbound.seal(b"peer -> us", next_header::IPV4).unwrap();
+            assert_eq!(our_child.inbound.open(&pkt).unwrap().0, b"peer -> us");
+            let pkt = our_child.outbound.seal(b"us -> peer", next_header::IPV4).unwrap();
+            assert_eq!(peer_child.inbound.open(&pkt).unwrap().0, b"us -> peer");
+            assert_eq!((our_child.inbound.spi(), our_child.outbound.spi()), (0x1111_1111, 0x2222_2222));
+        }
+    }
+
+    /// A gateway offers every proposal it has configured, best first, and PFS
+    /// as a DH transform on each: the answer takes the first one that fits the
+    /// running cipher and the KE the peer sent, and echoes *its* number.
+    #[test]
+    fn the_answer_picks_the_offered_proposal_matching_the_running_cipher_and_the_ke_group() {
+        let (our_sa, peer_sa) = sa_pair();
+        let peer_dh = [5u8; 32];
+        let gcm256 = (transform_id::AES_GCM_16, Some(256));
+        let offers = vec![
+            // Another cipher, another integrity algorithm, and a DH group we weren't sent a KE for.
+            esp_proposal(1, 0x2222_2222, (transform_id::AES_CBC, Some(128)), Some(transform_id::AUTH_HMAC_SHA1_96), &[transform_id::MODP_2048]),
+            esp_proposal(2, 0x2222_2222, gcm256, None, &[transform_id::ECP256]),
+            // The one: GCM-256 with the group of the KE payload among several.
+            esp_proposal(3, 0x2222_2222, gcm256, None, &[transform_id::ECP256, transform_id::MODP_2048]),
+        ];
+        let req = peer_rekey_request(&peer_sa, offers, Some((DhGroup::Modp2048, &peer_dh)), &TrafficSelectors::ipv4_full_tunnel());
+        let (resp, _child) =
+            responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &[6u8; 32], &[2u8; 8]).unwrap();
+        let (proposal, _, _, ke) = read_rekey_response(&resp, &peer_sa);
+        assert_eq!(proposal.num, 3);
+        assert_eq!(proposal.spi, 0x1111_1111u32.to_be_bytes());
+        assert!(ke, "PFS is answered with our KE");
+        let ids = |ty| proposal.transforms.iter().filter(|t| t.transform_type == ty).map(|t| t.transform_id).collect::<Vec<_>>();
+        assert_eq!(ids(transform_type::ENCR), [transform_id::AES_GCM_16]);
+        assert_eq!(ids(transform_type::DH), [transform_id::MODP_2048], "exactly the group of the KE, not the alternatives");
+    }
+
+    /// What strongSwan actually sends (dumped off a live gateway): a KE for its
+    /// first DH group, and proposals of every configured cipher -- those with
+    /// PFS carry the group, the AEAD ones (no PFS configured for them) carry
+    /// none. A tunnel running GCM-256 takes the DH-less GCM proposal and answers
+    /// without a KE: no PFS, but the SA is replaced and the peer's keys match.
+    #[test]
+    fn a_peer_started_rekey_takes_a_dhless_proposal_next_to_a_ke_it_cannot_use() {
+        let (our_sa, peer_sa) = sa_pair();
+        let peer_dh = [5u8; 32];
+        let (cbc, gcm) = ((transform_id::AES_CBC, Some(256)), (transform_id::AES_GCM_16, Some(256)));
+        let sha256 = Some(transform_id::AUTH_HMAC_SHA2_256_128);
+        let offers = vec![
+            esp_proposal(1, 0x2222_2222, cbc, sha256, &[transform_id::MODP_2048]),
+            esp_proposal(2, 0x2222_2222, cbc, sha256, &[]),
+            esp_proposal(3, 0x2222_2222, gcm, None, &[]),
+            esp_proposal(4, 0x2222_2222, (transform_id::AES_GCM_16, Some(128)), None, &[]),
+            esp_proposal(5, 0x2222_2222, cbc, sha256, &[transform_id::ECP256]),
+        ];
+        let req = peer_rekey_request(&peer_sa, offers, Some((DhGroup::Modp2048, &peer_dh)), &TrafficSelectors::ipv4_full_tunnel());
+        let (resp, mut our_child) =
+            responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &[6u8; 32], &[2u8; 8]).unwrap();
+        let (proposal, _, _, ke) = read_rekey_response(&resp, &peer_sa);
+        assert_eq!(proposal.num, 3);
+        assert!(!ke, "the chosen proposal has no DH, so no KE in the answer");
+        assert!(proposal.transforms.iter().all(|t| t.transform_type != transform_type::DH));
+
+        let (mut peer_child, _) =
+            initiator_complete_child(&peer_sa, &[0x33u8; 32], 0x2222_2222, SkCipher::Aes256Gcm, None, &resp).unwrap();
+        let pkt = peer_child.outbound.seal(b"peer -> us", next_header::IPV4).unwrap();
+        assert_eq!(our_child.inbound.open(&pkt).unwrap().0, b"peer -> us");
+    }
+
+    /// A rekey of a tunnel running AES-CBC/SHA-256 keeps that pair, even when the
+    /// peer lists a stronger-looking one first.
+    #[test]
+    fn a_peer_started_rekey_keeps_the_running_cipher() {
+        let (our_sa, peer_sa) = sa_pair();
+        let cbc = SkCipher::Aes256Cbc(IntegAlgorithm::HmacSha2_256_128);
+        let offers = vec![
+            esp_proposal(1, 0x2222_2222, (transform_id::AES_GCM_16, Some(256)), None, &[]),
+            esp_proposal(2, 0x2222_2222, (transform_id::AES_CBC, Some(256)), Some(transform_id::AUTH_HMAC_SHA2_256_128), &[]),
+        ];
+        let req = peer_rekey_request(&peer_sa, offers, None, &TrafficSelectors::ipv4_full_tunnel());
+        let (resp, child) = responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], cbc, &[6u8; 32], &[2u8; 8]).unwrap();
+        let (proposal, _, _, ke) = read_rekey_response(&resp, &peer_sa);
+        assert_eq!(proposal.num, 2);
+        assert!(!ke);
+        assert_eq!(child.inbound.cipher(), cbc);
+    }
+
+    /// Nothing offered fits (no proposal with our cipher; or PFS asked for with a
+    /// KE group no proposal lists): `NoProposalChosen`, not a guess.
+    #[test]
+    fn a_peer_started_rekey_that_offers_nothing_usable_is_refused() {
+        let (our_sa, peer_sa) = sa_pair();
+        let ts = TrafficSelectors::ipv4_full_tunnel();
+        let peer_dh = [5u8; 32];
+        let answer = |req: &[u8]| {
+            responder_answer_child_rekey(&our_sa, req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &[6u8; 32], &[2u8; 8]).err()
+        };
+        let other_cipher = esp_proposal(1, 0x2222_2222, (transform_id::AES_CBC, Some(128)), Some(transform_id::AUTH_HMAC_SHA1_96), &[]);
+        let req = peer_rekey_request(&peer_sa, vec![other_cipher], None, &ts);
+        assert!(matches!(answer(&req), Some(IkeError::NoProposalChosen)));
+
+        let gcm_ecp = esp_proposal(1, 0x2222_2222, (transform_id::AES_GCM_16, Some(256)), None, &[transform_id::ECP256]);
+        let req = peer_rekey_request(&peer_sa, vec![gcm_ecp], Some((DhGroup::Modp2048, &peer_dh)), &ts);
+        assert!(matches!(answer(&req), Some(IkeError::NoProposalChosen)), "the KE's group isn't among the proposal's");
+    }
+
+    /// The `REKEY_SA` notify names the SA the sender expects inbound ESP on.
+    #[test]
+    fn the_rekeyed_sa_is_read_from_the_request() {
+        let (our_sa, peer_sa) = sa_pair();
+        let gcm = esp_proposal(1, 0x2222_2222, (transform_id::AES_GCM_16, Some(256)), None, &[]);
+        let req = peer_rekey_request(&peer_sa, vec![gcm], None, &TrafficSelectors::ipv4_full_tunnel());
+        assert_eq!(rekey_sa_spi(&our_sa, &req), Some(0xAAAA_AAAA));
     }
 
     /// A gateway with no IPv6 Phase 2 answers the CHILD SA request with an

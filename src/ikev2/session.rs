@@ -1367,7 +1367,7 @@ impl<E: Entropy> Ikev2Session<E> {
         let info = CfgInfo::from_reply(cfg_reply.as_ref());
         ike_debug!("IKE_AUTH: CFG_REPLY IPv6 -- assigned_ipv6={:?} assigned_ipv6_subnets={:?}", info.assigned_ip6, info.subnets6);
         let child_subnets6 = if grant == ChildGrant::Both { granted_subnets_v6(tsr.as_ref(), &info.subnets6) } else { Vec::new() };
-        ike_debug!("IKE_AUTH: granted {grant:?} (TSr={tsr:?})");
+        ike_debug!("IKE_AUTH: offered {ts_offer:?}, granted {grant:?} (TSr={tsr:?})");
 
         let cipher = resolve_esp_cipher(esp_suite)?;
         let (key_out, key_in) = Self::derive_keys(&sa, cipher);
@@ -1650,7 +1650,7 @@ impl<E: Entropy> Ikev2Session<E> {
         let info = CfgInfo::from_reply(cfg_reply.as_ref());
         ike_debug!("IKE_AUTH (EAP): CFG_REPLY IPv6 -- assigned_ipv6={:?} assigned_ipv6_subnets={:?}", info.assigned_ip6, info.subnets6);
         let child_subnets6 = if grant == ChildGrant::Both { granted_subnets_v6(tsr.as_ref(), &info.subnets6) } else { Vec::new() };
-        ike_debug!("IKE_AUTH (EAP): granted {grant:?} (TSr={tsr:?})");
+        ike_debug!("IKE_AUTH (EAP): offered {ts_offer:?}, granted {grant:?} (TSr={tsr:?})");
         let (key_out, key_in) = Self::derive_keys(sa, cipher);
         // The next message ID we may originate is one past the last request
         // the peer sent us (its own EAP-round message IDs) -- our own

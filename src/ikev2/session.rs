@@ -500,13 +500,15 @@ impl LivenessSession {
         let mut iv = [0u8; 8];
         entropy.fill(&mut iv);
         ike_debug!(
-            "CREATE_CHILD_SA ({what}): initiating{} -- old_spi_out={:?}, new_local_spi={new_local_spi:08x}",
-            if pfs.is_some() { " with PFS" } else { "" }, replaces.map(|c| format!("{:08x}", c.peer))
+            "CREATE_CHILD_SA ({what}): initiating{} -- rekeyed_spi_in={:?}, new_local_spi={new_local_spi:08x}",
+            if pfs.is_some() { " with PFS" } else { "" }, replaces.map(|c| format!("{:08x}", c.local))
         );
         let req = rekey::build_child_request(
             &self.sa,
             mid,
-            replaces.map(|c| c.peer),
+            // RFC 7296 §1.3.3: REKEY_SA names the SA by the SPI *we* expect on
+            // inbound ESP, not the one the peer chose (our outbound SPI).
+            replaces.map(|c| c.local),
             new_local_spi,
             &ni,
             self.cipher,
@@ -2518,11 +2520,16 @@ mod tests {
 
         let (n, from) = sock.recv_from(&mut buf).unwrap();
         let rcfg = AuthConfig::psk(Identification::fqdn("responder.test"), psk);
-        let (resp, _peer_id, _spi, _ic) =
+        let (resp, _peer_id, client_spi, _ic) =
             responder_process_auth(&sa, &buf[..n], &rcfg, 0xC0FFEE, &[9u8; 8], None).unwrap();
         sock.send_to(&resp, from).unwrap();
 
         let (n, from) = sock.recv_from(&mut buf).unwrap();
+        // RFC 7296 §1.3.3: the REKEY_SA notify carries the SPI the initiator
+        // expects on inbound ESP -- the one it put in its own SA payload at
+        // IKE_AUTH -- which a responder such as strongSwan looks the old CHILD
+        // SA up by (it answers CHILD_SA_NOT_FOUND for the other one).
+        assert_eq!(rekey::rekey_sa_spi(&sa, &buf[..n]), Some(client_spi), "REKEY_SA must name the initiator's inbound SPI");
         let dh_private = pfs_group.map(|_| [6u8; 32]);
         let (resp2, child) = rekey::responder_process_rekey_with_pfs(
             &sa,

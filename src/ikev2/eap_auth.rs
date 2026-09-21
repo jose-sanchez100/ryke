@@ -204,6 +204,13 @@ pub struct EapInitiator {
     nt_response: [u8; 24],
     verify: ServerVerify,
     server_verified: bool,
+    /// The responder's IDr as its first IKE_AUTH response carried it (payload
+    /// body, no generic header), or empty until then. RFC 7296 §2.16 has the
+    /// responder send IDr only once: the final message holds just AUTH (+ SA/
+    /// TS/CP), yet that AUTH is signed over the same IDr (§2.15), so the final
+    /// check must use this remembered value, not whatever the last message
+    /// happens to repeat -- a gateway such as strongSwan does not repeat it.
+    server_idr: Vec<u8>,
     send_certreq: bool,
     /// The responder's own CHILD SA SPI (from SAr2 in the final message) —
     /// the SPI we must stamp on outbound ESP so the peer's inbound SA accepts
@@ -270,6 +277,7 @@ impl EapInitiator {
             nt_response: [0u8; 24],
             verify,
             server_verified: false,
+            server_idr: Vec::new(),
             send_certreq: false,
             peer_child_spi: None,
             peer_esp_suite: None,
@@ -457,6 +465,12 @@ impl EapInitiator {
         let (msg_id, ps) = decrypt(&self.sa, message)?;
         let next_id = msg_id + 1;
 
+        if self.server_idr.is_empty() {
+            if let Some(idr) = find(&ps, PayloadType::IdResponder) {
+                self.server_idr = idr.to_vec();
+            }
+        }
+
         // The server authenticates itself in its first response (the one that
         // also carries IDr). Verify it once, before answering any EAP request —
         // so we never send our EAP credentials to an unauthenticated server.
@@ -486,10 +500,10 @@ impl EapInitiator {
             let Some(auth_bytes) = find(&ps, PayloadType::Authentication) else {
                 return Ok(EapEvent::Failed(None));
             };
-            let idr = find(&ps, PayloadType::IdResponder).unwrap_or(&[]);
             let msk = mschapv2::derive_msk(&self.password, &self.nt_response);
             let algo = self.sa.suite.prf_algorithm();
-            let expect = psk_auth(algo, &msk, &responder_signed_octets(algo, &self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, idr));
+            let expect =
+                psk_auth(algo, &msk, &responder_signed_octets(algo, &self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, &self.server_idr));
             let got = Authentication::parse(auth_bytes)?;
             let Some(sar2) = find(&ps, PayloadType::SecurityAssociation) else {
                 // RFC 7296 §1.2: a CHILD SA that fails inside IKE_AUTH leaves the
@@ -939,6 +953,19 @@ mod tests {
         }
         inner.push((PayloadType::Notify, Notify::status(error, Vec::new()).to_bytes()));
         build_sk(&responder.sa, msg_id, true, &inner, &[3u8; 8]).unwrap()
+    }
+
+    #[test]
+    fn eap_final_message_that_does_not_repeat_idr_still_verifies() {
+        // RFC 7296 §2.16: IDr travels in the first IKE_AUTH response only; the
+        // final one is AUTH + SA + TS (+ CP), and its AUTH is still signed over
+        // that first IDr. strongSwan sends it this way; the FortiGate repeats it.
+        let (mut initiator, responder, final_msg) = run_to_final_message();
+        let (msg_id, ps) = decrypt(&initiator.sa, &final_msg).unwrap();
+        assert!(find(&ps, PayloadType::IdResponder).is_some(), "the test responder repeats IDr");
+        let inner: Payloads = ps.into_iter().filter(|(t, _)| *t != PayloadType::IdResponder).collect();
+        let without_idr = build_sk(&responder.sa, msg_id, true, &inner, &[3u8; 8]).unwrap();
+        assert!(matches!(initiator.handle(&without_idr, &mut SeedEntropy::new(1)), Ok(EapEvent::Established(None))));
     }
 
     #[test]

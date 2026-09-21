@@ -128,7 +128,8 @@ pub fn dh_transform_id(sa: &SecurityAssociation) -> Option<u16> {
 /// KE payload.
 pub type PfsKeyExchange<'a> = (DhGroup, &'a [u8]);
 
-/// Initiator: build a CHILD-SA rekey request for the CHILD SA `rekeyed_spi`,
+/// Initiator: build a CHILD-SA rekey request for the CHILD SA `rekeyed_spi`
+/// (the SPI we expect on inbound ESP for it, RFC 7296 §1.3.3),
 /// proposing a new SA on `new_spi` with fresh nonce `ni`.
 pub fn build_rekey_request(
     sa: &CompletedSaInit,
@@ -165,8 +166,8 @@ pub fn build_rekey_request_with_pfs(
 
 /// The `CREATE_CHILD_SA` request behind both a CHILD SA rekey and the
 /// creation of an *additional* CHILD SA next to the one `IKE_AUTH` made
-/// (RFC 7296 §1.3.1): `rekeyed_spi` is `Some(peer's SPI of the SA being
-/// replaced)` for a rekey (adds the `REKEY_SA` notify) and `None` for a
+/// (RFC 7296 §1.3.1): `rekeyed_spi` is `Some(our inbound SPI of the SA being
+/// replaced)` (§1.3.3: the SPI the initiator expects in inbound ESP) for a rekey (adds the `REKEY_SA` notify) and `None` for a
 /// brand-new CHILD SA. `ts` is proposed as both TSi and TSr, so a caller
 /// negotiating a separate IPv6 CHILD SA passes `::/0` here. Some gateways
 /// (FortiGate) keep IPv4 and IPv6 as separate Phase 2 selectors and only ever
@@ -210,6 +211,21 @@ pub fn build_child_request(
     let first = first_payload_type(&inner);
     let bytes = encode_payload_chain(&inner);
     build_encrypted(sa.suite.sk_cipher(), header, first, &bytes, our_sk_e(sa), our_sk_a(sa), iv)
+}
+
+/// The SPI a CHILD SA rekey request names in its `REKEY_SA` notify -- what a
+/// responder looks the old SA up by. Test-only: [`responder_process_rekey`]
+/// itself does not act on it.
+#[cfg(test)]
+pub(crate) fn rekey_sa_spi(sa: &CompletedSaInit, request: &[u8]) -> Option<u32> {
+    let (first, inner) = open_encrypted(sa.suite.sk_cipher(), request, peer_sk_e(sa), peer_sk_a(sa)).ok()?;
+    payloads(first, &inner)
+        .filter_map(Result::ok)
+        .filter(|p| p.payload_type == PayloadType::Notify)
+        .filter_map(|p| Notify::parse(p.data).ok())
+        .find(|n| n.notify_type == notify_type::REKEY_SA)
+        .and_then(|n| <[u8; 4]>::try_from(n.spi).ok())
+        .map(u32::from_be_bytes)
 }
 
 /// Responder: process a rekey request, derive the new CHILD SA, and build the

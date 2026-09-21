@@ -509,6 +509,31 @@ impl TrafficSelectors {
         TrafficSelectors { selectors: vec![TrafficSelector::ipv6_any()] }
     }
 
+    /// Everything IPv4 (`0.0.0.0/0`), and nothing else -- the initiator's
+    /// long-standing IKE_AUTH offer, and what a per-family peer grants.
+    pub fn ipv4_full_tunnel() -> TrafficSelectors {
+        TrafficSelectors { selectors: vec![TrafficSelector::ipv4_any()] }
+    }
+
+    /// Everything IPv4 *and* everything IPv6 in one payload: the RFC 7296
+    /// §2.9 way to ask for a single CHILD SA that carries both families
+    /// (`TS_IPV4_ADDR_RANGE` and `TS_IPV6_ADDR_RANGE` may share a payload).
+    /// Peers that keep one selector family per policy (FortiGate) answer with
+    /// a narrowed reply or reject it; see `Ikev2Session::with_unified_ts`.
+    pub fn unified_full_tunnel() -> TrafficSelectors {
+        TrafficSelectors { selectors: vec![TrafficSelector::ipv4_any(), TrafficSelector::ipv6_any()] }
+    }
+
+    /// Whether any selector is an IPv4 address range.
+    pub fn has_ipv4(&self) -> bool {
+        self.selectors.iter().any(|s| s.ts_type == ts_type::IPV4_ADDR_RANGE)
+    }
+
+    /// Whether any selector is an IPv6 address range.
+    pub fn has_ipv6(&self) -> bool {
+        self.selectors.iter().any(|s| s.ts_type == ts_type::IPV6_ADDR_RANGE)
+    }
+
     pub fn parse(body: &[u8]) -> Result<TrafficSelectors, IkeError> {
         if body.len() < 4 {
             return Err(IkeError::Truncated { need: 4, have: body.len() });
@@ -1344,6 +1369,19 @@ mod tests {
         let ts = TrafficSelectors::ipv6_full_tunnel();
         assert_eq!(ts.selectors, vec![TrafficSelector::ipv6_any()]);
         assert_eq!(TrafficSelectors::parse(&ts.to_bytes()).unwrap(), ts);
+    }
+
+    #[test]
+    fn unified_full_tunnel_mixes_both_families_in_one_payload() {
+        let ts = TrafficSelectors::unified_full_tunnel();
+        assert_eq!(ts.selectors, vec![TrafficSelector::ipv4_any(), TrafficSelector::ipv6_any()]);
+        assert!(ts.has_ipv4() && ts.has_ipv6());
+        assert_eq!(TrafficSelectors::parse(&ts.to_bytes()).unwrap(), ts);
+
+        let v4 = TrafficSelectors::ipv4_full_tunnel();
+        assert!(v4.has_ipv4() && !v4.has_ipv6());
+        let v6 = TrafficSelectors::ipv6_full_tunnel();
+        assert!(!v6.has_ipv4() && v6.has_ipv6());
     }
 
     #[test]

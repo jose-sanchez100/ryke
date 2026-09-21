@@ -134,6 +134,38 @@ fn full_tunnel_ts() -> Vec<u8> {
     TrafficSelectors { selectors: vec![TrafficSelector::ipv4_any()] }.to_bytes()
 }
 
+/// What the initiator puts in TSi/TSr of the IKE_AUTH CHILD SA (IKEv2 only:
+/// IKEv1 negotiates each address family in its own Quick Mode).
+///
+/// [`Self::Ipv4`] is the conservative default: a CHILD SA for IPv4 only, with
+/// IPv6 (if wanted) added afterwards as a CHILD SA of its own -- the shape
+/// FortiGate-style peers, which keep one selector family per policy, accept.
+/// [`Self::Unified`] is what RFC 7296 §2.9 describes: one payload offering
+/// `0.0.0.0/0` and `::/0` together, so a single CHILD SA covers both families
+/// when the peer supports it (strongSwan does). A peer that can't answers by
+/// narrowing the reply or by rejecting the CHILD SA; the session layer follows
+/// either (see `Ikev2Session::with_unified_ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChildTsOffer {
+    #[default]
+    Ipv4,
+    Unified,
+}
+
+impl ChildTsOffer {
+    /// The selectors this offer puts in both TSi and TSr.
+    pub fn selectors(self) -> TrafficSelectors {
+        match self {
+            ChildTsOffer::Ipv4 => TrafficSelectors::ipv4_full_tunnel(),
+            ChildTsOffer::Unified => TrafficSelectors::unified_full_tunnel(),
+        }
+    }
+
+    fn to_bytes(self) -> Vec<u8> {
+        self.selectors().to_bytes()
+    }
+}
+
 /// Stamp `spi` onto every proposal in `offer` — the SPI is ours to choose
 /// per-connection, so a caller-supplied `esp_offer` template's own SPI value
 /// (if any) is always overwritten here rather than sent as-is.
@@ -382,7 +414,7 @@ pub fn initiator_auth_request(
     esp_offer: &SecurityAssociation,
     iv: &[u8; 8],
 ) -> Result<Vec<u8>, IkeError> {
-    initiator_auth_request_with_cfg(sa, cfg, child_spi, false, esp_offer, iv)
+    initiator_auth_request_with_cfg(sa, cfg, child_spi, false, esp_offer, ChildTsOffer::Ipv4, iv)
 }
 
 /// Like [`initiator_auth_request`], but also carries a CFG_REQUEST
@@ -392,13 +424,16 @@ pub fn initiator_auth_request(
 /// after IDi, matching [`initiator_eap_request`]'s payload order. `esp_offer`
 /// is the CHILD SA proposal template (see [`self::esp_offer`] for the
 /// default AES-GCM-256 one) — its own SPI field is ignored; [`with_spi`]
-/// always overwrites it with `child_spi`.
+/// always overwrites it with `child_spi`. `ts_offer` picks the TSi/TSr this
+/// CHILD SA is offered with (see [`ChildTsOffer`]); every other builder below
+/// takes it the same way.
 pub fn initiator_auth_request_with_cfg(
     sa: &CompletedSaInit,
     cfg: &AuthConfig,
     child_spi: u32,
     want_cfg: bool,
     esp_offer: &SecurityAssociation,
+    ts_offer: ChildTsOffer,
     iv: &[u8; 8],
 ) -> Result<Vec<u8>, IkeError> {
     let idi_body = cfg.id.to_bytes();
@@ -421,8 +456,8 @@ pub fn initiator_auth_request_with_cfg(
     }
     inner.push((PayloadType::Authentication, auth.to_bytes()));
     inner.push((PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()));
-    inner.push((PayloadType::TrafficSelectorInitiator, full_tunnel_ts()));
-    inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+    inner.push((PayloadType::TrafficSelectorInitiator, ts_offer.to_bytes()));
+    inner.push((PayloadType::TrafficSelectorResponder, ts_offer.to_bytes()));
     let first = first_payload_type(&inner);
     let inner_bytes = encode_payload_chain(&inner);
     build_encrypted(sa.suite.sk_cipher(), ike_auth_header(sa, false), first, &inner_bytes, &sa.keys.sk_ei, &sa.keys.sk_ai, iv)
@@ -443,6 +478,7 @@ pub fn initiator_eap_request(
     child_spi: u32,
     want_cfg: bool,
     esp_offer: &SecurityAssociation,
+    ts_offer: ChildTsOffer,
     iv: &[u8; 8],
 ) -> Result<Vec<u8>, IkeError> {
     let mut inner = vec![(PayloadType::IdInitiator, id.to_bytes())];
@@ -450,8 +486,8 @@ pub fn initiator_eap_request(
         inner.push((PayloadType::Configuration, Configuration::request_ipv4().to_bytes()));
     }
     inner.push((PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()));
-    inner.push((PayloadType::TrafficSelectorInitiator, full_tunnel_ts()));
-    inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+    inner.push((PayloadType::TrafficSelectorInitiator, ts_offer.to_bytes()));
+    inner.push((PayloadType::TrafficSelectorResponder, ts_offer.to_bytes()));
     inner.push((PayloadType::Notify, Notify::status(notify_type::INITIAL_CONTACT, Vec::new()).to_bytes()));
     let first = first_payload_type(&inner);
     let inner_bytes = encode_payload_chain(&inner);
@@ -468,6 +504,7 @@ pub fn initiator_eap_request_with_certreq(
     child_spi: u32,
     want_cfg: bool,
     esp_offer: &SecurityAssociation,
+    ts_offer: ChildTsOffer,
     ca_hashes: Vec<[u8; 20]>,
     iv: &[u8; 8],
 ) -> Result<Vec<u8>, IkeError> {
@@ -476,8 +513,8 @@ pub fn initiator_eap_request_with_certreq(
         inner.push((PayloadType::Configuration, Configuration::request_ipv4().to_bytes()));
     }
     inner.push((PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()));
-    inner.push((PayloadType::TrafficSelectorInitiator, full_tunnel_ts()));
-    inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+    inner.push((PayloadType::TrafficSelectorInitiator, ts_offer.to_bytes()));
+    inner.push((PayloadType::TrafficSelectorResponder, ts_offer.to_bytes()));
     inner.push((PayloadType::CertRequest, CertRequest::x509(ca_hashes).to_bytes()));
     inner.push((PayloadType::Notify, Notify::status(notify_type::INITIAL_CONTACT, Vec::new()).to_bytes()));
     let first = first_payload_type(&inner);
@@ -505,6 +542,7 @@ pub fn initiator_eap_request_with_certs(
     child_spi: u32,
     want_cfg: bool,
     esp_offer: &SecurityAssociation,
+    ts_offer: ChildTsOffer,
     certs: &[Vec<u8>],
     ca_hashes: Option<Vec<[u8; 20]>>,
     iv: &[u8; 8],
@@ -518,8 +556,8 @@ pub fn initiator_eap_request_with_certs(
         inner.push((PayloadType::CertRequest, CertRequest::x509(hashes).to_bytes()));
     }
     inner.push((PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()));
-    inner.push((PayloadType::TrafficSelectorInitiator, full_tunnel_ts()));
-    inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+    inner.push((PayloadType::TrafficSelectorInitiator, ts_offer.to_bytes()));
+    inner.push((PayloadType::TrafficSelectorResponder, ts_offer.to_bytes()));
     inner.push((PayloadType::Notify, Notify::status(notify_type::INITIAL_CONTACT, Vec::new()).to_bytes()));
     let first = first_payload_type(&inner);
     let inner_bytes = encode_payload_chain(&inner);
@@ -736,7 +774,7 @@ mod tests {
     fn eap_request_variants_also_carry_initial_contact() {
         let (init_sa, resp_sa) = run_sa_init();
         let id = Identification::fqdn("eap.example");
-        let req = initiator_eap_request(&init_sa, &id, 1, false, &esp_offer(0), &[1u8; 8]).unwrap();
+        let req = initiator_eap_request(&init_sa, &id, 1, false, &esp_offer(0), ChildTsOffer::Ipv4, &[1u8; 8]).unwrap();
         let (first, inner) = crate::ikev2::sk::open_encrypted(resp_sa.suite.sk_cipher(), &req, &resp_sa.keys.sk_ei, &resp_sa.keys.sk_ai).unwrap();
         let got = parse_auth_inner(first, &inner);
         // EAP-mode has no AUTH payload yet, so parse_auth_inner errors on the
@@ -935,7 +973,7 @@ mod tests {
         let id = Identification::fqdn("client.example");
         let chain = vec![LEAF_CERT_DER.to_vec()];
         let ca_hashes = vec![crate::ikev2::sign::ca_key_hash(CA_CERT_DER).unwrap()];
-        let req = initiator_eap_request_with_certs(&init_sa, &id, 0xC0FFEE, true, &esp_offer(0), &chain, Some(ca_hashes.clone()), &[3u8; 8])
+        let req = initiator_eap_request_with_certs(&init_sa, &id, 0xC0FFEE, true, &esp_offer(0), ChildTsOffer::Ipv4, &chain, Some(ca_hashes.clone()), &[3u8; 8])
             .unwrap();
 
         let (first, inner) = open_encrypted(init_sa.suite.sk_cipher(), &req, &init_sa.keys.sk_ei, &init_sa.keys.sk_ai).unwrap();

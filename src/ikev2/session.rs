@@ -35,15 +35,14 @@ use crate::ikev2::exchange::{
     NatStatus,
 };
 use crate::ikev2::fragment;
-use crate::ikev2::ike_auth::{self, AuthConfig};
+use crate::ikev2::ike_auth::{self, AuthConfig, ChildTsOffer};
 use crate::ikev2::informational::{build_informational, dpd_request, open_informational};
 use crate::ikev2::message::{payloads, IkeHeader, PayloadType};
 use crate::ikev1::quick::{ChildKeyMaterial, RekeyedChild};
 use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
-use crate::ikev2::negotiate::ChosenEspSuite;
+use crate::ikev2::negotiate::{self, ChosenEspSuite};
 use crate::ikev2::payload::{
-    notify_type, notify_type_name, protocol_id, Configuration, Delete, Identification, SecurityAssociation, TrafficSelector,
-    TrafficSelectors,
+    notify_type, notify_type_name, protocol_id, Configuration, Delete, Identification, SecurityAssociation, TrafficSelectors,
 };
 use crate::ikev2::rekey::{self, dh_transform_id, PfsKeyExchange};
 use crate::ikev2::sk::{self, open_encrypted, SkCipher};
@@ -97,6 +96,14 @@ pub struct ConnectedTunnel {
     /// [`LivenessSession::create_child_ipv6`] negotiates afterwards, whose
     /// result carries the final ranges to route.
     pub cfg_subnets6: Vec<(Ipv6Addr, u8)>,
+    /// The IPv6 ranges the primary CHILD SA itself carries -- non-empty only
+    /// when a unified IPv4+IPv6 offer ([`Ikev2Session::with_unified_ts`]) was
+    /// granted with both families (same precedence as
+    /// [`Ipv6Child::granted_subnets6`]: CFG's split ranges, else the granted
+    /// `TSr`). Empty on every other connect, where IPv6 (if the gateway does
+    /// it at all) comes from a CHILD SA of its own,
+    /// [`LivenessSession::create_child_ipv6`].
+    pub child_subnets6: Vec<(Ipv6Addr, u8)>,
     /// The *first* `INTERNAL_IP4_SUBNET` attribute from CFG_REPLY, if the
     /// responder sent at least one -- kept for backward compat / diagnostics
     /// only. A responder that hands back several (one per split-tunnel
@@ -200,6 +207,12 @@ pub struct LivenessSession {
     /// ([`ConnectedTunnel::cfg_subnets6`]), kept to combine with the IPv6
     /// CHILD SA's granted `TSr` when it is created.
     cfg_subnets6: Vec<(Ipv6Addr, u8)>,
+    /// Whether the (primary) CHILD SA carries IPv6 as well as IPv4 -- true
+    /// only when a unified `0.0.0.0/0` + `::/0` offer
+    /// ([`Ikev2Session::with_unified_ts`]) was granted with both families.
+    /// [`Self::rekey_child`] then keeps proposing both, and
+    /// [`Self::create_child_ipv6`] has nothing to add.
+    child_carries_ipv6: bool,
 }
 
 /// Result of one [`LivenessSession::probe`] call.
@@ -374,8 +387,13 @@ impl LivenessSession {
     /// PFS on top of what's running, never silently changes algorithm.
     pub fn rekey_child(&mut self, timeout: Duration) -> Result<RekeyedChild, DriverError> {
         let old = ChildSpis { local: self.child_local_spi, peer: self.child_peer_spi };
-        let ts = TrafficSelectors { selectors: vec![TrafficSelector::ipv4_any()] };
-        let (rekeyed, _tsr) = self.child_exchange(Some(old), &ts, "rekey", timeout)?;
+        // A unified SA keeps being proposed as one: rekeying it IPv4-only would
+        // silently drop IPv6 at the first rekey.
+        let ts = if self.child_carries_ipv6 { TrafficSelectors::unified_full_tunnel() } else { TrafficSelectors::ipv4_full_tunnel() };
+        let (rekeyed, tsr) = self.child_exchange(Some(old), &ts, "rekey", timeout)?;
+        if self.child_carries_ipv6 && !tsr.as_ref().is_some_and(|t| t.has_ipv6()) {
+            ike_debug!("CREATE_CHILD_SA (rekey): the unified CHILD SA's rekey came back without IPv6 (TSr={tsr:?})");
+        }
         self.child_local_spi = rekeyed.local_spi;
         self.child_peer_spi = rekeyed.peer_spi;
         Ok(rekeyed)
@@ -400,6 +418,9 @@ impl LivenessSession {
         if self.child6.is_some() {
             return Err(IkeError::Crypto("an IPv6 CHILD SA already exists on this tunnel").into());
         }
+        if self.child_carries_ipv6 {
+            return Err(IkeError::Crypto("the tunnel's CHILD SA already carries IPv6").into());
+        }
         let (child, tsr) = self.child_exchange(None, &TrafficSelectors::ipv6_full_tunnel(), "new IPv6 CHILD SA", timeout)?;
         let granted_subnets6 = granted_subnets_v6(tsr.as_ref(), &self.cfg_subnets6);
         // The CFG ranges alone don't prove the gateway granted this SA any
@@ -419,6 +440,13 @@ impl LivenessSession {
         ike_debug!("CREATE_CHILD_SA (new IPv6 CHILD SA): granted TSr={tsr:?} -> routing {granted_subnets6:?}");
         self.child6 = Some(ChildSpis { local: child.local_spi, peer: child.peer_spi });
         Ok(Ipv6Child { child, granted_subnets6 })
+    }
+
+    /// Whether the tunnel's primary CHILD SA carries IPv6 too (a unified
+    /// IPv4+IPv6 offer that the gateway granted in full) -- if so no separate
+    /// IPv6 CHILD SA is needed, or possible.
+    pub fn child_carries_ipv6(&self) -> bool {
+        self.child_carries_ipv6
     }
 
     /// Whether [`Self::create_child_ipv6`] has negotiated an IPv6 CHILD SA
@@ -651,6 +679,8 @@ pub struct Ikev2Session<E> {
     entropy: E,
     /// Force NAT-T whatever NAT detection says -- see [`Self::with_forced_natt`].
     force_natt: bool,
+    /// Offer IPv4 and IPv6 together in IKE_AUTH -- see [`Self::with_unified_ts`].
+    unified_ts: bool,
 }
 
 /// The local IP our packets actually carry as their source when reaching
@@ -875,9 +905,84 @@ fn granted_subnets_v6(tsr: Option<&TrafficSelectors>, cfg_subnets6: &[(Ipv6Addr,
     tsr.map(|ts| ts.selectors.iter().filter_map(|s| s.to_ipv6_cidr()).collect()).unwrap_or_default()
 }
 
+/// What a CFG_REPLY tells [`ConnectedTunnel`], read the same way after every
+/// flavour of `IKE_AUTH`.
+#[derive(Default)]
+struct CfgInfo {
+    dns: Vec<Ipv4Addr>,
+    dns6: Vec<Ipv6Addr>,
+    subnets: Vec<(Ipv4Addr, u8)>,
+    assigned_ip6: Option<(Ipv6Addr, u8)>,
+    subnets6: Vec<(Ipv6Addr, u8)>,
+}
+
+impl CfgInfo {
+    fn from_reply(reply: Option<&Configuration>) -> Self {
+        let Some(cp) = reply else { return Self::default() };
+        CfgInfo {
+            dns: cp.assigned_dns(),
+            dns6: cp.assigned_ipv6_dns(),
+            subnets: cp.assigned_subnets(),
+            assigned_ip6: cp.assigned_ipv6(),
+            subnets6: cp.assigned_ipv6_subnets(),
+        }
+    }
+}
+
+/// How the responder answered the CHILD SA offer of `IKE_AUTH`, family-wise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildGrant {
+    /// An IPv4 CHILD SA -- what was offered, or what a unified offer was
+    /// narrowed to (RFC 7296 §2.9), or all a missing/unreadable `TSr` allows
+    /// us to assume.
+    Ipv4Only,
+    /// A unified offer granted with both families.
+    Both,
+    /// A unified offer answered with IPv6 alone -- nothing carries IPv4.
+    Ipv6Only,
+}
+
+impl ChildGrant {
+    fn classify(offered: ChildTsOffer, tsr: Option<&TrafficSelectors>) -> Self {
+        let Some(tsr) = tsr.filter(|_| offered == ChildTsOffer::Unified) else { return ChildGrant::Ipv4Only };
+        match (tsr.has_ipv4(), tsr.has_ipv6()) {
+            (true, true) => ChildGrant::Both,
+            (false, true) => ChildGrant::Ipv6Only,
+            _ => ChildGrant::Ipv4Only,
+        }
+    }
+}
+
+/// The IKE SA an `IKE_AUTH` exchange left standing, before any CHILD SA of
+/// its own exists -- everything [`Ikev2Session::recover_child_after_rejection`]
+/// needs to carry on with it.
+struct EstablishedIke {
+    sock: UdpSocket,
+    sa: CompletedSaInit,
+    dest: SocketAddr,
+    float: bool,
+    /// The next Message ID we may originate.
+    next_message_id: u32,
+    our_addr: SocketAddr,
+    nat: NatStatus,
+}
+
+/// Best-effort close of an IKE SA whose `IKE_AUTH` gave a CHILD SA we can't
+/// use (an IPv6-only grant of a unified offer): the error to hand the caller,
+/// which reads as the gateway having refused our TS.
+fn reject_unusable_grant(sock: &UdpSocket, sa: &CompletedSaInit, dest: SocketAddr, float: bool, last_received: &[u8]) -> DriverError {
+    ike_debug!("IKE_AUTH: the unified offer was granted IPv6 only -- nothing would carry IPv4");
+    notify_ike_sa_delete_on_failed_auth(sock, sa, dest, float, last_received, "CHILD SA grants no IPv4");
+    IkeError::PeerRejected {
+        notify_type: notify_type::TS_UNACCEPTABLE,
+        name: notify_type_name(notify_type::TS_UNACCEPTABLE),
+    }
+    .into()
+}
+
 impl<E: Entropy> Ikev2Session<E> {
     pub fn new(entropy: E) -> Self {
-        Self { entropy, force_natt: false }
+        Self { entropy, force_natt: false, unified_ts: false }
     }
 
     /// Makes every `IKE_SA_INIT` this session runs **force** NAT-T (what strongSwan
@@ -890,6 +995,35 @@ impl<E: Entropy> Ikev2Session<E> {
     pub fn with_forced_natt(mut self) -> Self {
         self.force_natt = true;
         self
+    }
+
+    /// Offer `0.0.0.0/0` and `::/0` together in the `IKE_AUTH` CHILD SA
+    /// (RFC 7296 §2.9), so one CHILD SA can carry both families -- what a
+    /// conforming responder (strongSwan) grants outright. Off by default: the
+    /// IPv4-only offer is the one every gateway this has met accepts, and how
+    /// FortiGate reacts to a mixed one is not known. What follows is decided
+    /// by the answer:
+    ///
+    /// * both families granted -> one CHILD SA carries both
+    ///   ([`ConnectedTunnel::child_subnets6`], [`LivenessSession::child_carries_ipv6`]);
+    /// * narrowed to IPv4 (or no `TSr` to read) -> the usual IPv4 tunnel;
+    ///   IPv6, if wanted, is added as a CHILD SA of its own afterwards
+    ///   ([`LivenessSession::create_child_ipv6`]);
+    /// * the CHILD SA refused (RFC 7296 §1.2: an authenticated peer keeps the
+    ///   IKE SA) -> the IPv4 CHILD SA is created on that same IKE SA with
+    ///   `CREATE_CHILD_SA`, provided any requested CFG came with the refusal;
+    ///   otherwise the IKE SA is closed and the refusal is returned
+    ///   ([`IkeError::PeerRejected`]) for the caller to retry without this flag;
+    /// * granted IPv6 only -> treated as a refusal, the IKE SA is closed.
+    ///
+    /// IKEv2 only: IKEv1 negotiates each family in its own Quick Mode.
+    pub fn with_unified_ts(mut self) -> Self {
+        self.unified_ts = true;
+        self
+    }
+
+    fn ts_offer(&self) -> ChildTsOffer {
+        if self.unified_ts { ChildTsOffer::Unified } else { ChildTsOffer::Ipv4 }
     }
 
     /// Bind a socket on `local_port` (like every other real-world IKE
@@ -1014,6 +1148,103 @@ impl<E: Entropy> Ikev2Session<E> {
         (key_out, key_in)
     }
 
+    /// RFC 7296 §1.2 recovery for a unified offer ([`Self::with_unified_ts`])
+    /// the gateway refused at `IKE_AUTH`: the IKE SA is standing (its AUTH
+    /// verified), only the CHILD SA failed -- typically because the peer keeps
+    /// one selector family per policy (FortiGate). So the IPv4 CHILD SA is
+    /// created on that same IKE SA with `CREATE_CHILD_SA`, and IPv6 is left to
+    /// the usual CHILD SA of its own ([`LivenessSession::create_child_ipv6`]).
+    ///
+    /// Needs the inner address to have arrived with the refusal when CFG was
+    /// requested (`cfg_reply`): mode-config only travels in `IKE_AUTH`, so
+    /// without it nothing could configure the tunnel. Whenever the recovery
+    /// can't be completed the IKE SA is closed and an error returned -- the
+    /// original `rejection` where the recovery never got going, so a caller
+    /// can retry the whole connect without the unified offer.
+    fn recover_child_after_rejection(
+        &mut self,
+        ike: EstablishedIke,
+        want_cfg: bool,
+        cfg_reply: Option<Configuration>,
+        esp_offer: &SecurityAssociation,
+        rejection: IkeError,
+    ) -> Result<ConnectedTunnel, DriverError> {
+        const CHILD_TIMEOUT: Duration = Duration::from_secs(10);
+        let EstablishedIke { sock, sa, dest, float, next_message_id, our_addr, nat } = ike;
+        let info = CfgInfo::from_reply(cfg_reply.as_ref());
+        let assigned_ip4 = cfg_reply.as_ref().and_then(Configuration::assigned_ipv4);
+        let cipher = negotiate::select_esp(esp_offer).and_then(|s| s.sk_cipher());
+        let mut liveness = LivenessSession {
+            sock,
+            sa,
+            dest,
+            float,
+            next_message_id,
+            cipher: cipher.unwrap_or(SkCipher::Aes256Gcm),
+            pfs_group: dh_transform_id(esp_offer).and_then(DhGroup::from_transform_id),
+            child_local_spi: 0,
+            child_peer_spi: 0,
+            external_rx: None,
+            child6: None,
+            cfg_subnets6: info.subnets6.clone(),
+            child_carries_ipv6: false,
+        };
+        if want_cfg && assigned_ip4.is_none() {
+            ike_debug!("IKE_AUTH: CHILD SA refused ({rejection}) and no CFG_REPLY came with it -- no inner address to build on, closing");
+            let _ = liveness.close();
+            return Err(rejection.into());
+        }
+        if cipher.is_none() {
+            ike_debug!("IKE_AUTH: CHILD SA refused ({rejection}), and the ESP offer names no cipher this crate implements -- closing");
+            let _ = liveness.close();
+            return Err(rejection.into());
+        }
+        ike_debug!("IKE_AUTH: CHILD SA refused ({rejection}) -- keeping the IKE SA, creating the IPv4 CHILD SA with CREATE_CHILD_SA");
+        let (child, tsr) = match liveness.child_exchange(
+            None,
+            &TrafficSelectors::ipv4_full_tunnel(),
+            "IPv4 CHILD SA after a refused IKE_AUTH offer",
+            CHILD_TIMEOUT,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                ike_debug!("IKE_AUTH: creating the IPv4 CHILD SA on the surviving IKE SA failed: {e}");
+                let _ = liveness.close();
+                return Err(e);
+            }
+        };
+        if !tsr.as_ref().is_some_and(|t| t.has_ipv4()) {
+            ike_debug!("CREATE_CHILD_SA (IPv4 after a refused IKE_AUTH offer): reply granted no IPv4 traffic selector (TSr={tsr:?}) -- closing");
+            let _ = liveness.delete_child_sa(child.local_spi);
+            let _ = liveness.close();
+            return Err(IkeError::PeerRejected {
+                notify_type: notify_type::TS_UNACCEPTABLE,
+                name: notify_type_name(notify_type::TS_UNACCEPTABLE),
+            }
+            .into());
+        }
+        liveness.child_local_spi = child.local_spi;
+        liveness.child_peer_spi = child.peer_spi;
+        Ok(ConnectedTunnel {
+            local_spi: child.local_spi,
+            peer_spi: child.peer_spi,
+            key_out: child.key_out,
+            key_in: child.key_in,
+            assigned_ip4,
+            dns: info.dns,
+            dns6: info.dns6,
+            assigned_ip6: info.assigned_ip6,
+            cfg_subnets6: info.subnets6,
+            child_subnets6: Vec::new(),
+            subnet: info.subnets.first().copied(),
+            granted_subnets: granted_subnets(tsr.as_ref(), &info.subnets),
+            local_addr: our_addr,
+            peer_addr: dest,
+            nat,
+            liveness,
+        })
+    }
+
     /// Direct (non-EAP) `IKE_AUTH` — PSK or certificate, per `cfg` (reused
     /// as-is from [`ike_auth::AuthConfig`]). Set `want_cfg` to also send a
     /// CFG_REQUEST (e.g. a certificate profile with mode-config enabled).
@@ -1091,11 +1322,12 @@ impl<E: Entropy> Ikev2Session<E> {
         let float = nat.float_to_4500();
         let dest = if float { SocketAddr::new(peer.ip(), crate::natt_port()) } else { peer };
         let local_spi = self.child_spi();
+        let ts_offer = self.ts_offer();
 
         let mut iv = [0u8; 8];
         self.entropy.fill(&mut iv);
-        let req = ike_auth::initiator_auth_request_with_cfg(&sa, cfg, local_spi, want_cfg, esp_offer, &iv)?;
-        ike_debug!("IKE_AUTH: sending to {dest} (local_spi={local_spi:08x}, floated={float})");
+        let req = ike_auth::initiator_auth_request_with_cfg(&sa, cfg, local_spi, want_cfg, esp_offer, ts_offer, &iv)?;
+        ike_debug!("IKE_AUTH: sending to {dest} (local_spi={local_spi:08x}, floated={float}, ts={ts_offer:?})");
         let wire = wrap(&req, float);
         let response =
             send_and_retry_reassembling(&sock, dest, &wire, float, sa.suite.sk_cipher(), &sa.keys.sk_er, &sa.keys.sk_ar)?;
@@ -1104,11 +1336,19 @@ impl<E: Entropy> Ikev2Session<E> {
             Ok(v) => v,
             Err(e) => {
                 // RFC 7296 §1.2: an authenticated peer that refused only the
-                // CHILD SA keeps the IKE SA standing -- but with nothing to
-                // carry traffic on it this connect can't go on, so it is closed
-                // (rather than left for the gateway to time out) either way.
+                // CHILD SA keeps the IKE SA standing. When the refused offer
+                // was a unified one that IKE SA is put to use (see
+                // `recover_child_after_rejection`); otherwise there is nothing
+                // to carry traffic on it, so it is closed (rather than left
+                // for the gateway to time out) either way.
                 let reason = if matches!(e, IkeError::PeerRejected { .. }) {
                     ike_debug!("IKE_AUTH: authenticated, but the peer rejected the CHILD SA: {e}");
+                    if ts_offer == ChildTsOffer::Unified {
+                        let cfg_reply = want_cfg.then(|| scan_cfg_reply(&response, &sa)).flatten();
+                        let next_message_id = IkeHeader::parse(&response)?.message_id + 1;
+                        let ike = EstablishedIke { sock, sa, dest, float, next_message_id, our_addr, nat };
+                        return self.recover_child_after_rejection(ike, want_cfg, cfg_reply, esp_offer, e);
+                    }
                     "CHILD SA rejected"
                 } else {
                     ike_debug!("IKE_AUTH: peer authentication failed: {e}");
@@ -1119,14 +1359,15 @@ impl<E: Entropy> Ikev2Session<E> {
             }
         };
         ike_debug!("IKE_AUTH: authenticated -- peer_spi={peer_spi:08x} assigned_ip={assigned_ip4:?}");
+        let grant = ChildGrant::classify(ts_offer, tsr.as_ref());
+        if grant == ChildGrant::Ipv6Only {
+            return Err(reject_unusable_grant(&sock, &sa, dest, float, &response));
+        }
         let cfg_reply = want_cfg.then(|| scan_cfg_reply(&response, &sa)).flatten();
-        let dns = cfg_reply.as_ref().map(Configuration::assigned_dns).unwrap_or_default();
-        let dns6 = cfg_reply.as_ref().map(Configuration::assigned_ipv6_dns).unwrap_or_default();
-        let cfg_subnets = cfg_reply.as_ref().map(Configuration::assigned_subnets).unwrap_or_default();
-        let subnet = cfg_subnets.first().copied();
-        let assigned_ip6 = cfg_reply.as_ref().and_then(Configuration::assigned_ipv6);
-        let cfg_subnets6 = cfg_reply.as_ref().map(Configuration::assigned_ipv6_subnets).unwrap_or_default();
-        ike_debug!("IKE_AUTH: CFG_REPLY IPv6 -- assigned_ipv6={assigned_ip6:?} assigned_ipv6_subnets={cfg_subnets6:?}");
+        let info = CfgInfo::from_reply(cfg_reply.as_ref());
+        ike_debug!("IKE_AUTH: CFG_REPLY IPv6 -- assigned_ipv6={:?} assigned_ipv6_subnets={:?}", info.assigned_ip6, info.subnets6);
+        let child_subnets6 = if grant == ChildGrant::Both { granted_subnets_v6(tsr.as_ref(), &info.subnets6) } else { Vec::new() };
+        ike_debug!("IKE_AUTH: granted {grant:?} (TSr={tsr:?})");
 
         let cipher = resolve_esp_cipher(esp_suite)?;
         let (key_out, key_in) = Self::derive_keys(&sa, cipher);
@@ -1143,7 +1384,8 @@ impl<E: Entropy> Ikev2Session<E> {
             child_peer_spi: peer_spi,
             external_rx: None,
             child6: None,
-            cfg_subnets6: cfg_subnets6.clone(),
+            cfg_subnets6: info.subnets6.clone(),
+            child_carries_ipv6: !child_subnets6.is_empty(),
         };
         Ok(ConnectedTunnel {
             local_spi,
@@ -1151,12 +1393,13 @@ impl<E: Entropy> Ikev2Session<E> {
             key_out,
             key_in,
             assigned_ip4,
-            dns,
-            dns6,
-            assigned_ip6,
-            cfg_subnets6,
-            subnet,
-            granted_subnets: granted_subnets(tsr.as_ref(), &cfg_subnets),
+            dns: info.dns,
+            dns6: info.dns6,
+            assigned_ip6: info.assigned_ip6,
+            cfg_subnets6: info.subnets6,
+            child_subnets6,
+            subnet: info.subnets.first().copied(),
+            granted_subnets: granted_subnets(tsr.as_ref(), &info.subnets),
             local_addr: our_addr,
             peer_addr: dest,
             nat,
@@ -1313,8 +1556,9 @@ impl<E: Entropy> Ikev2Session<E> {
         let float = nat.float_to_4500();
         let dest = if float { SocketAddr::new(peer.ip(), crate::natt_port()) } else { peer };
         let local_spi = self.child_spi();
+        let ts_offer = self.ts_offer();
 
-        ike_debug!("IKE_AUTH (EAP-MSCHAPv2): starting as user '{}' against {dest}", String::from_utf8_lossy(&creds.user));
+        ike_debug!("IKE_AUTH (EAP-MSCHAPv2): starting as user '{}' against {dest} (ts={ts_offer:?})", String::from_utf8_lossy(&creds.user));
         let mut initiator =
             EapInitiator::new_with_esp_offer(sa, local_id, creds.user, creds.password, local_spi, esp_offer.clone(), verify);
         // want_cfg: whether this peer is configured for mode-config -- a real
@@ -1324,6 +1568,7 @@ impl<E: Entropy> Ikev2Session<E> {
         // the flag stays caller-driven rather than always-on so the wire
         // behavior matches what the profile actually negotiated.
         initiator.set_want_cfg(want_cfg);
+        initiator.set_ts_offer(ts_offer);
         if !client_certs.is_empty() {
             initiator.set_client_certs(client_certs.to_vec());
             // Deliberately no set_send_certreq() here: `verify`'s trusted-CA
@@ -1352,6 +1597,15 @@ impl<E: Entropy> Ikev2Session<E> {
                 // the CHILD SA (RFC 7296 §1.2) -- see `EapInitiator::handle`.
                 Err(e @ IkeError::PeerRejected { .. }) => {
                     ike_debug!("IKE_AUTH (EAP-MSCHAPv2): authenticated, but the peer rejected the CHILD SA: {e}");
+                    // A refused unified offer keeps the IKE SA in use -- see
+                    // `recover_child_after_rejection`.
+                    if ts_offer == ChildTsOffer::Unified {
+                        let sa = initiator.ike_sa().clone();
+                        let cfg_reply = want_cfg.then(|| scan_cfg_reply(&ike_msg, &sa)).flatten();
+                        let next_message_id = IkeHeader::parse(&ike_msg)?.message_id + 1;
+                        let ike = EstablishedIke { sock, sa, dest, float, next_message_id, our_addr, nat };
+                        return self.recover_child_after_rejection(ike, want_cfg, cfg_reply, esp_offer, e);
+                    }
                     notify_ike_sa_delete_on_failed_auth(&sock, initiator.ike_sa(), dest, float, &ike_msg, "CHILD SA rejected");
                     return Err(e.into());
                 }
@@ -1388,15 +1642,15 @@ impl<E: Entropy> Ikev2Session<E> {
         let assigned_ip4 = initiator.assigned_ip4();
         let tsr = initiator.granted_ts().cloned();
         let sa = initiator.ike_sa();
+        let grant = ChildGrant::classify(ts_offer, tsr.as_ref());
+        if grant == ChildGrant::Ipv6Only {
+            return Err(reject_unusable_grant(&sock, sa, dest, float, &last_message));
+        }
         let cfg_reply = scan_cfg_reply(&last_message, sa);
-        let dns = cfg_reply.as_ref().map(Configuration::assigned_dns).unwrap_or_default();
-        let dns6 = cfg_reply.as_ref().map(Configuration::assigned_ipv6_dns).unwrap_or_default();
-        let cfg_subnets = cfg_reply.as_ref().map(Configuration::assigned_subnets).unwrap_or_default();
-        let subnet = cfg_subnets.first().copied();
-        // See the identical block in the non-EAP IKE_AUTH path above.
-        let assigned_ip6 = cfg_reply.as_ref().and_then(Configuration::assigned_ipv6);
-        let cfg_subnets6 = cfg_reply.as_ref().map(Configuration::assigned_ipv6_subnets).unwrap_or_default();
-        ike_debug!("IKE_AUTH (EAP): CFG_REPLY IPv6 -- assigned_ipv6={assigned_ip6:?} assigned_ipv6_subnets={cfg_subnets6:?}");
+        let info = CfgInfo::from_reply(cfg_reply.as_ref());
+        ike_debug!("IKE_AUTH (EAP): CFG_REPLY IPv6 -- assigned_ipv6={:?} assigned_ipv6_subnets={:?}", info.assigned_ip6, info.subnets6);
+        let child_subnets6 = if grant == ChildGrant::Both { granted_subnets_v6(tsr.as_ref(), &info.subnets6) } else { Vec::new() };
+        ike_debug!("IKE_AUTH (EAP): granted {grant:?} (TSr={tsr:?})");
         let (key_out, key_in) = Self::derive_keys(sa, cipher);
         // The next message ID we may originate is one past the last request
         // the peer sent us (its own EAP-round message IDs) -- our own
@@ -1415,7 +1669,8 @@ impl<E: Entropy> Ikev2Session<E> {
             child_peer_spi: peer_spi,
             external_rx: None,
             child6: None,
-            cfg_subnets6: cfg_subnets6.clone(),
+            cfg_subnets6: info.subnets6.clone(),
+            child_carries_ipv6: !child_subnets6.is_empty(),
         };
 
         Ok(ConnectedTunnel {
@@ -1424,12 +1679,13 @@ impl<E: Entropy> Ikev2Session<E> {
             key_out,
             key_in,
             assigned_ip4,
-            dns,
-            dns6,
-            assigned_ip6,
-            cfg_subnets6,
-            subnet,
-            granted_subnets: granted_subnets(tsr.as_ref(), &cfg_subnets),
+            dns: info.dns,
+            dns6: info.dns6,
+            assigned_ip6: info.assigned_ip6,
+            cfg_subnets6: info.subnets6,
+            child_subnets6,
+            subnet: info.subnets.first().copied(),
+            granted_subnets: granted_subnets(tsr.as_ref(), &info.subnets),
             local_addr: our_addr,
             peer_addr: dest,
             nat,
@@ -1468,7 +1724,8 @@ mod tests {
     use crate::ikev2::exchange::{
         initiator_complete, initiator_request, responder_respond, responder_respond_natt,
     };
-    use crate::ikev2::ike_auth::responder_process_auth;
+    use crate::ikev2::ike_auth::{responder_process_auth, AssignedConfig};
+    use crate::ikev2::message::Flags;
     use crate::ikev2::payload::Delete;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::thread;
@@ -1527,7 +1784,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
@@ -1556,7 +1813,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false };
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
@@ -1586,7 +1843,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -1613,7 +1870,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false };
         liveness.close().unwrap();
         responder.join().unwrap();
     }
@@ -1627,7 +1884,7 @@ mod tests {
         let (init_sa, _resp_sa) = liveness_sa_pair();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false };
         liveness.close().unwrap();
     }
 
@@ -1642,7 +1899,7 @@ mod tests {
         let unreachable: SocketAddr = silent_peer.local_addr().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false };
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::NoReply);
     }
 
@@ -1652,7 +1909,7 @@ mod tests {
         let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false };
         // Unlike probe(), silence on a peek is Alive (nothing new to
         // report), not NoReply -- peek never asked anything.
         assert_eq!(liveness.peek(Duration::from_millis(50)).unwrap(), Liveness::Alive);
@@ -1686,7 +1943,7 @@ mod tests {
         probe_sock.send_to(b"hello", bind).unwrap();
 
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -1732,6 +1989,7 @@ mod tests {
             external_rx: None,
             child6: None,
             cfg_subnets6: Vec::new(),
+            child_carries_ipv6: false,
         };
         // The stale Delete is ignored and the wait times out -- silence
         // (nothing new to report) is Alive, exactly as if nothing had
@@ -1773,6 +2031,7 @@ mod tests {
             external_rx: None,
             child6: None,
             cfg_subnets6: Vec::new(),
+            child_carries_ipv6: false,
         };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
@@ -2421,7 +2680,7 @@ mod tests {
         let (init_sa, _resp_sa) = liveness_sa_pair();
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let dest = sock.local_addr().unwrap();
-        LivenessSession { sock, sa: init_sa, dest, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx, child6: None, cfg_subnets6: Vec::new() }
+        LivenessSession { sock, sa: init_sa, dest, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false }
     }
 
     #[test]
@@ -2551,6 +2810,455 @@ mod tests {
             EspSa::new_with_cipher(rekeyed.peer_spi, rekeyed.key_out.cipher, &rekeyed.key_out.enc, &rekeyed.key_out.integ).unwrap();
         let pkt = client_out.seal(b"after ipv6 rekey", next_header::IPV6).unwrap();
         assert_eq!(second.inbound.open(&pkt).unwrap().0, b"after ipv6 rekey");
+    }
+
+    /// How [`run_psk_responder_unified`] answers the CHILD SA of `IKE_AUTH`.
+    #[derive(Clone, Copy)]
+    enum UnifiedReply {
+        /// Grants exactly the selectors offered (what strongSwan does).
+        GrantBoth,
+        /// [`Self::GrantBoth`], then answers one rekey of that CHILD SA.
+        GrantBothThenRekey,
+        /// Narrows the reply to IPv4 (RFC 7296 §2.9), as a per-family peer might.
+        NarrowToIpv4,
+        /// Grants IPv6 alone.
+        Ipv6Only,
+        /// Refuses the CHILD SA with `error` but keeps the IKE SA (RFC 7296
+        /// §1.2), the CFG_REPLY still attached; then answers the one
+        /// `CREATE_CHILD_SA` that follows -- granting what it asks for (as a
+        /// per-family gateway would for the family it keeps) if `serve_child`,
+        /// refusing it with `NO_PROPOSAL_CHOSEN` otherwise.
+        Refuse { error: u16, serve_child: bool },
+    }
+
+    /// What [`run_psk_responder_unified`] saw the client do.
+    struct UnifiedObserved {
+        /// TSi of the client's `IKE_AUTH` request.
+        offered_tsi: TrafficSelectors,
+        /// TSi of the `CREATE_CHILD_SA` the client sent after a refusal, if any.
+        created_child_tsi: Option<TrafficSelectors>,
+        /// Whether the client then sent an IKE SA Delete.
+        client_deleted_ike_sa: bool,
+    }
+
+    /// Rewrites an honest `IKE_AUTH` response (`resp`, from `responder_process_auth`
+    /// or an `EapResponder`'s final message) into what `reply` says the gateway
+    /// answers -- see [`UnifiedReply`].
+    fn reseal_for_unified(sa: &CompletedSaInit, resp: &[u8], reply: UnifiedReply, offered_tsi: &TrafficSelectors) -> Vec<u8> {
+        use crate::ikev2::message::{encode_payload_chain, first_payload_type};
+        use crate::ikev2::payload::Notify;
+
+        let cipher = sa.suite.sk_cipher();
+        let (first, inner) = open_encrypted(cipher, resp, &sa.keys.sk_er, &sa.keys.sk_ar).unwrap();
+        let honest: Vec<(PayloadType, Vec<u8>)> =
+            payloads(first, &inner).map(|p| p.unwrap()).map(|p| (p.payload_type, p.data.to_vec())).collect();
+        let is_ts = |t: PayloadType| matches!(t, PayloadType::TrafficSelectorInitiator | PayloadType::TrafficSelectorResponder);
+        let answer: Vec<(PayloadType, Vec<u8>)> = match reply {
+            UnifiedReply::NarrowToIpv4 => honest,
+            UnifiedReply::GrantBoth | UnifiedReply::GrantBothThenRekey | UnifiedReply::Ipv6Only => {
+                let ts = if !matches!(reply, UnifiedReply::Ipv6Only) {
+                    offered_tsi.clone()
+                } else {
+                    TrafficSelectors::ipv6_full_tunnel()
+                };
+                honest.into_iter().map(|(t, d)| if is_ts(t) { (t, ts.to_bytes()) } else { (t, d) }).collect()
+            }
+            UnifiedReply::Refuse { error, .. } => {
+                let mut kept: Vec<_> = honest
+                    .into_iter()
+                    .filter(|(t, _)| {
+                        matches!(t, PayloadType::IdResponder | PayloadType::Authentication | PayloadType::Configuration)
+                    })
+                    .collect();
+                kept.push((PayloadType::Notify, Notify::status(error, Vec::new()).to_bytes()));
+                kept
+            }
+        };
+        sk::build_encrypted(
+            cipher,
+            IkeHeader::parse(resp).unwrap(),
+            first_payload_type(&answer),
+            &encode_payload_chain(&answer),
+            &sa.keys.sk_er,
+            &sa.keys.sk_ar,
+            &[8u8; 8],
+        )
+        .unwrap()
+    }
+
+    /// The `CREATE_CHILD_SA` step of a [`UnifiedReply::Refuse`] responder:
+    /// reads the client's request, answers it per `serve_child`, and returns
+    /// the TSi it asked for.
+    fn answer_recovery_child(sock: &UdpSocket, sa: &CompletedSaInit, serve_child: bool) -> Option<TrafficSelectors> {
+        use crate::ikev2::message::{encode_payload_chain, first_payload_type};
+        use crate::ikev2::payload::Notify;
+
+        let cipher = sa.suite.sk_cipher();
+        let mut buf = [0u8; 4096];
+        let (n, from) = sock.recv_from(&mut buf).unwrap();
+        let (first, inner) = open_encrypted(cipher, &buf[..n], &sa.keys.sk_ei, &sa.keys.sk_ai).unwrap();
+        let asked = payloads(first, &inner)
+            .map(|p| p.unwrap())
+            .find(|p| p.payload_type == PayloadType::TrafficSelectorInitiator)
+            .map(|p| TrafficSelectors::parse(p.data).unwrap());
+        let resp = if serve_child {
+            rekey::responder_process_rekey_with_pfs(sa, &buf[..n], 0xFEED_FACE, &[0x77u8; 32], SkCipher::Aes256Gcm, None, &[8u8; 8], None)
+                .unwrap()
+                .0
+        } else {
+            let mut header = IkeHeader::parse(&buf[..n]).unwrap();
+            header.flags = Flags { initiator: false, version: false, response: true };
+            let error = vec![(PayloadType::Notify, Notify::status(notify_type::NO_PROPOSAL_CHOSEN, Vec::new()).to_bytes())];
+            sk::build_encrypted(
+                cipher,
+                header,
+                first_payload_type(&error),
+                &encode_payload_chain(&error),
+                &sa.keys.sk_er,
+                &sa.keys.sk_ar,
+                &[8u8; 8],
+            )
+            .unwrap()
+        };
+        sock.send_to(&resp, from).unwrap();
+        asked
+    }
+
+    /// Whether the next datagram on `sock` is an IKE SA Delete from the client.
+    fn client_closes_ike_sa(sock: &UdpSocket, sa: &CompletedSaInit) -> bool {
+        let mut buf = [0u8; 4096];
+        match sock.recv_from(&mut buf) {
+            Ok((n, _)) => open_informational(sa, &buf[..n])
+                .map(|ps| ps.iter().any(|(t, _)| *t == PayloadType::Delete))
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    /// A PSK loopback responder for the unified-TS flows: assigns an inner
+    /// address (CFG_REPLY) and answers `IKE_AUTH` per `reply`.
+    fn run_psk_responder_unified(bind: SocketAddr, psk: Vec<u8>, reply: UnifiedReply) -> UnifiedObserved {
+        let sock = UdpSocket::bind(bind).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 4096];
+        let (n, from) = sock.recv_from(&mut buf).unwrap();
+        let resp_secret = LocalSecret::generate(&mut OsEntropy::new().unwrap(), 32);
+        let result = responder_respond_natt(&buf[..n], &resp_secret, bind, from, None).unwrap();
+        let (response, sa) = match result {
+            crate::ikev2::exchange::SaInitResult::Established { response, sa } => (response, sa),
+            _ => panic!("expected Established"),
+        };
+        sock.send_to(&response, from).unwrap();
+
+        let (n, from) = sock.recv_from(&mut buf).unwrap();
+        let cipher = sa.suite.sk_cipher();
+        let request = buf[..n].to_vec();
+        let (first, inner) = open_encrypted(cipher, &request, &sa.keys.sk_ei, &sa.keys.sk_ai).unwrap();
+        let offered_tsi = payloads(first, &inner)
+            .map(|p| p.unwrap())
+            .find(|p| p.payload_type == PayloadType::TrafficSelectorInitiator)
+            .map(|p| TrafficSelectors::parse(p.data).unwrap())
+            .expect("IKE_AUTH carries TSi");
+
+        let rcfg = AuthConfig::psk(Identification::fqdn("responder.test"), psk);
+        let assigned = AssignedConfig { ip: Ipv4Addr::new(10, 9, 8, 7), dns: vec![Ipv4Addr::new(10, 9, 8, 1)] };
+        let (resp, _peer_id, _spi, _ic) =
+            responder_process_auth(&sa, &request, &rcfg, 0xC0FFEE, &[9u8; 8], Some(&assigned)).unwrap();
+
+        let rebuilt = reseal_for_unified(&sa, &resp, reply, &offered_tsi);
+        sock.send_to(&rebuilt, from).unwrap();
+
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let created_child_tsi = match reply {
+            UnifiedReply::Refuse { serve_child, .. } => answer_recovery_child(&sock, &sa, serve_child),
+            UnifiedReply::GrantBothThenRekey => answer_recovery_child(&sock, &sa, true),
+            _ => None,
+        };
+        // Whatever comes next is either the client closing the IKE SA or nothing.
+        let client_deleted_ike_sa = client_closes_ike_sa(&sock, &sa);
+        UnifiedObserved { offered_tsi, created_child_tsi, client_deleted_ike_sa }
+    }
+
+    fn connect_unified_direct(bind: SocketAddr, psk: &[u8]) -> Result<ConnectedTunnel, DriverError> {
+        let mut session = Ikev2Session::new(OsEntropy::new().unwrap()).with_unified_ts();
+        let cfg = AuthConfig::psk(Identification::fqdn("client.test"), psk.to_vec());
+        session.connect_direct_on_port(bind, &default_ike_offer(), &cfg, true, &default_esp_offer(), next_addr().port())
+    }
+
+    fn spawn_unified_responder(reply: UnifiedReply, psk: &[u8]) -> (SocketAddr, thread::JoinHandle<UnifiedObserved>) {
+        let bind = next_addr();
+        let psk = psk.to_vec();
+        let responder = thread::spawn(move || run_psk_responder_unified(bind, psk, reply));
+        thread::sleep(Duration::from_millis(50));
+        (bind, responder)
+    }
+
+    #[test]
+    fn unified_offer_granted_in_full_makes_one_child_sa_carry_both_families() {
+        let (bind, responder) = spawn_unified_responder(UnifiedReply::GrantBoth, b"shared-secret");
+        let mut tunnel = connect_unified_direct(bind, b"shared-secret").unwrap();
+        assert!(tunnel.liveness.child_carries_ipv6());
+        assert_eq!(tunnel.child_subnets6, vec![(Ipv6Addr::UNSPECIFIED, 0)]);
+        assert_eq!(tunnel.granted_subnets, vec![(Ipv4Addr::UNSPECIFIED, 0)]);
+        assert_eq!(tunnel.peer_spi, 0xC0FFEE);
+        assert!(
+            tunnel.liveness.create_child_ipv6(Duration::from_millis(200)).is_err(),
+            "no separate IPv6 CHILD SA next to one that already carries it"
+        );
+        let observed = responder.join().unwrap();
+        assert_eq!(observed.offered_tsi, TrafficSelectors::unified_full_tunnel());
+    }
+
+    #[test]
+    fn rekeying_a_unified_child_sa_proposes_both_families_again() {
+        let (bind, responder) = spawn_unified_responder(UnifiedReply::GrantBothThenRekey, b"shared-secret");
+        let mut tunnel = connect_unified_direct(bind, b"shared-secret").unwrap();
+        let rekeyed = tunnel.liveness.rekey_child(Duration::from_secs(5)).unwrap();
+        assert_ne!(rekeyed.local_spi, tunnel.local_spi);
+        assert!(tunnel.liveness.child_carries_ipv6(), "still one SA for both families");
+        assert_eq!(
+            responder.join().unwrap().created_child_tsi,
+            Some(TrafficSelectors::unified_full_tunnel()),
+            "an IPv4-only rekey would silently drop IPv6"
+        );
+    }
+
+    #[test]
+    fn unified_offer_narrowed_to_ipv4_leaves_ipv6_to_a_child_sa_of_its_own() {
+        let (bind, responder) = spawn_unified_responder(UnifiedReply::NarrowToIpv4, b"shared-secret");
+        let tunnel = connect_unified_direct(bind, b"shared-secret").unwrap();
+        assert!(!tunnel.liveness.child_carries_ipv6());
+        assert!(tunnel.child_subnets6.is_empty());
+        assert_eq!(tunnel.assigned_ip4, Some(Ipv4Addr::new(10, 9, 8, 7)));
+        assert_eq!(tunnel.granted_subnets, vec![(Ipv4Addr::UNSPECIFIED, 0)]);
+        assert_eq!(responder.join().unwrap().offered_tsi, TrafficSelectors::unified_full_tunnel());
+    }
+
+    #[test]
+    fn unified_offer_is_off_unless_asked_for() {
+        let bind = next_addr();
+        let responder = thread::spawn(move || run_psk_responder_unified(bind, b"shared-secret".to_vec(), UnifiedReply::NarrowToIpv4));
+        thread::sleep(Duration::from_millis(50));
+        let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+        let cfg = AuthConfig::psk(Identification::fqdn("client.test"), b"shared-secret".to_vec());
+        session.connect_direct_on_port(bind, &default_ike_offer(), &cfg, true, &default_esp_offer(), next_addr().port()).unwrap();
+        assert_eq!(responder.join().unwrap().offered_tsi, TrafficSelectors::ipv4_full_tunnel());
+    }
+
+    #[test]
+    fn unified_offer_granted_ipv6_only_is_a_refusal_and_closes_the_ike_sa() {
+        let (bind, responder) = spawn_unified_responder(UnifiedReply::Ipv6Only, b"shared-secret");
+        let err = connect_unified_direct(bind, b"shared-secret").err().expect("an IPv6-only grant cannot carry the tunnel");
+        assert!(matches!(err, DriverError::Ike(IkeError::PeerRejected { .. })), "{err:?}");
+        assert!(responder.join().unwrap().client_deleted_ike_sa);
+    }
+
+    #[test]
+    fn refused_unified_offer_keeps_the_ike_sa_and_creates_the_ipv4_child_sa_on_it() {
+        for error in [notify_type::TS_UNACCEPTABLE, notify_type::SINGLE_PAIR_REQUIRED, notify_type::NO_PROPOSAL_CHOSEN] {
+            let (bind, responder) = spawn_unified_responder(UnifiedReply::Refuse { error, serve_child: true }, b"shared-secret");
+            let tunnel = connect_unified_direct(bind, b"shared-secret").unwrap();
+            // Tunnel data comes from the CREATE_CHILD_SA, the inner address from the refusal's CFG_REPLY.
+            assert_eq!(tunnel.local_spi, tunnel.liveness.child_local_spi);
+            assert_eq!(tunnel.peer_spi, tunnel.liveness.child_peer_spi);
+            assert_ne!(tunnel.peer_spi, 0xC0FFEE, "the IKE_AUTH SPI belongs to a CHILD SA that never existed");
+            assert_eq!(tunnel.assigned_ip4, Some(Ipv4Addr::new(10, 9, 8, 7)));
+            assert_eq!(tunnel.dns, vec![Ipv4Addr::new(10, 9, 8, 1)]);
+            assert_eq!(tunnel.granted_subnets, vec![(Ipv4Addr::UNSPECIFIED, 0)]);
+            assert!(!tunnel.liveness.child_carries_ipv6() && tunnel.child_subnets6.is_empty());
+            let observed = responder.join().unwrap();
+            assert_eq!(observed.offered_tsi, TrafficSelectors::unified_full_tunnel());
+            assert_eq!(
+                observed.created_child_tsi,
+                Some(TrafficSelectors::ipv4_full_tunnel()),
+                "the recovery must ask for the family the gateway keeps, alone"
+            );
+        }
+    }
+
+    #[test]
+    fn refused_unified_offer_with_no_child_sa_to_fall_back_on_closes_the_ike_sa_and_reports_the_refusal() {
+        let refuse = UnifiedReply::Refuse { error: notify_type::TS_UNACCEPTABLE, serve_child: false };
+        let (bind, responder) = spawn_unified_responder(refuse, b"shared-secret");
+        let err = connect_unified_direct(bind, b"shared-secret").err().expect("no CHILD SA, no tunnel");
+        assert!(matches!(err, DriverError::Ike(IkeError::PeerRejected { .. })), "{err:?}");
+        let observed = responder.join().unwrap();
+        assert!(observed.created_child_tsi.is_some(), "the recovery was attempted");
+        assert!(observed.client_deleted_ike_sa, "the IKE SA is closed, not left for the gateway to time out");
+    }
+
+    /// The `mode-config` half of the recovery: when CFG was requested but the
+    /// refusal carried no CFG_REPLY, no inner address exists to build the
+    /// tunnel on, so the IKE SA is closed and the original refusal returned.
+    #[test]
+    fn refused_unified_offer_without_a_cfg_reply_is_reported_as_the_refusal() {
+        use crate::ikev2::message::{encode_payload_chain, first_payload_type};
+        use crate::ikev2::payload::Notify;
+
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let responder = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let sock = UdpSocket::bind(bind).unwrap();
+                sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut buf = [0u8; 4096];
+                let (n, from) = sock.recv_from(&mut buf).unwrap();
+                let resp_secret = LocalSecret::generate(&mut OsEntropy::new().unwrap(), 32);
+                let (response, sa) = match responder_respond_natt(&buf[..n], &resp_secret, bind, from, None).unwrap() {
+                    crate::ikev2::exchange::SaInitResult::Established { response, sa } => (response, sa),
+                    _ => panic!("expected Established"),
+                };
+                sock.send_to(&response, from).unwrap();
+                let (n, from) = sock.recv_from(&mut buf).unwrap();
+                let rcfg = AuthConfig::psk(Identification::fqdn("responder.test"), psk);
+                let (resp, ..) = responder_process_auth(&sa, &buf[..n], &rcfg, 0xC0FFEE, &[9u8; 8], None).unwrap();
+                let cipher = sa.suite.sk_cipher();
+                let (first, inner) = open_encrypted(cipher, &resp, &sa.keys.sk_er, &sa.keys.sk_ar).unwrap();
+                let mut kept: Vec<_> = payloads(first, &inner)
+                    .map(|p| p.unwrap())
+                    .filter(|p| matches!(p.payload_type, PayloadType::IdResponder | PayloadType::Authentication))
+                    .map(|p| (p.payload_type, p.data.to_vec()))
+                    .collect();
+                kept.push((PayloadType::Notify, Notify::status(notify_type::TS_UNACCEPTABLE, Vec::new()).to_bytes()));
+                let rejected = sk::build_encrypted(
+                    cipher,
+                    IkeHeader::parse(&resp).unwrap(),
+                    first_payload_type(&kept),
+                    &encode_payload_chain(&kept),
+                    &sa.keys.sk_er,
+                    &sa.keys.sk_ar,
+                    &[8u8; 8],
+                )
+                .unwrap();
+                sock.send_to(&rejected, from).unwrap();
+                sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                match sock.recv_from(&mut buf) {
+                    Ok((n, _)) => open_informational(&sa, &buf[..n])
+                        .map(|ps| ps.iter().any(|(t, _)| *t == PayloadType::Delete))
+                        .unwrap_or(false),
+                    Err(_) => false,
+                }
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+        let err = connect_unified_direct(bind, &psk).err().expect("nothing to configure the tunnel with");
+        assert!(
+            matches!(err, DriverError::Ike(IkeError::PeerRejected { notify_type: notify_type::TS_UNACCEPTABLE, .. })),
+            "{err:?}"
+        );
+        assert!(responder.join().unwrap(), "the IKE SA must be closed, not left for the gateway to time out");
+    }
+
+    /// [`run_psk_responder_unified`]'s EAP-MSCHAPv2 twin: the gateway answers the
+    /// final EAP message per `reply`.
+    fn run_eap_responder_unified(bind: SocketAddr, group_psk: Vec<u8>, user: Vec<u8>, password: String, reply: UnifiedReply) -> UnifiedObserved {
+        let sock = UdpSocket::bind(bind).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut entropy = OsEntropy::new().unwrap();
+        let mut buf = [0u8; 4096];
+
+        let (n, from) = sock.recv_from(&mut buf).unwrap();
+        let resp_secret = LocalSecret::generate(&mut OsEntropy::new().unwrap(), 32);
+        let (response, sa) = match responder_respond_natt(&buf[..n], &resp_secret, bind, from, None).unwrap() {
+            crate::ikev2::exchange::SaInitResult::Established { response, sa } => (response, sa),
+            _ => panic!("expected Established"),
+        };
+        sock.send_to(&response, from).unwrap();
+
+        let mut responder =
+            EapResponder::new(sa.clone(), Identification::fqdn("gw.test"), ServerAuth::Psk(group_psk), user, password, 0xBEEF);
+        responder.set_assigned(Some(AssignedConfig { ip: Ipv4Addr::new(10, 9, 8, 7), dns: vec![Ipv4Addr::new(10, 9, 8, 1)] }));
+        let mut offered_tsi = None;
+        loop {
+            let (n, from) = sock.recv_from(&mut buf).unwrap();
+            if offered_tsi.is_none() {
+                let (first, inner) = open_encrypted(sa.suite.sk_cipher(), &buf[..n], &sa.keys.sk_ei, &sa.keys.sk_ai).unwrap();
+                offered_tsi = payloads(first, &inner)
+                    .map(|p| p.unwrap())
+                    .find(|p| p.payload_type == PayloadType::TrafficSelectorInitiator)
+                    .map(|p| TrafficSelectors::parse(p.data).unwrap());
+            }
+            match responder.handle(&buf[..n], &mut entropy).unwrap() {
+                EapEvent::Reply(m) => {
+                    sock.send_to(&m, from).unwrap();
+                }
+                EapEvent::Established(Some(m)) => {
+                    let offered = offered_tsi.clone().expect("the first EAP message carries TSi");
+                    sock.send_to(&reseal_for_unified(&sa, &m, reply, &offered), from).unwrap();
+                    break;
+                }
+                EapEvent::Established(None) => panic!("the final EAP message is expected"),
+                EapEvent::Failed(_) => panic!("responder failed the exchange"),
+            }
+        }
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let created_child_tsi = match reply {
+            UnifiedReply::Refuse { serve_child, .. } => answer_recovery_child(&sock, &sa, serve_child),
+            _ => None,
+        };
+        let client_deleted_ike_sa = client_closes_ike_sa(&sock, &sa);
+        UnifiedObserved { offered_tsi: offered_tsi.expect("TSi"), created_child_tsi, client_deleted_ike_sa }
+    }
+
+    fn connect_unified_eap(reply: UnifiedReply) -> (Result<ConnectedTunnel, DriverError>, UnifiedObserved) {
+        let bind = next_addr();
+        let (group_psk, user, password) = (b"group-psk".to_vec(), b"alice".to_vec(), "s3cret".to_string());
+        let responder = thread::spawn({
+            let (group_psk, user, password) = (group_psk.clone(), user.clone(), password.clone());
+            move || run_eap_responder_unified(bind, group_psk, user, password, reply)
+        });
+        thread::sleep(Duration::from_millis(50));
+        let mut session = Ikev2Session::new(OsEntropy::new().unwrap()).with_unified_ts();
+        let result = session.connect_eap_on_port(
+            bind,
+            &default_ike_offer(),
+            Identification::fqdn("client.test"),
+            EapCreds { user, password },
+            ServerVerify::Psk(group_psk),
+            true,
+            &default_esp_offer(),
+            next_addr().port(),
+        );
+        (result, responder.join().unwrap())
+    }
+
+    #[test]
+    fn eap_unified_offer_granted_in_full_makes_one_child_sa_carry_both_families() {
+        let (tunnel, observed) = connect_unified_eap(UnifiedReply::GrantBoth);
+        let tunnel = tunnel.unwrap();
+        assert!(tunnel.liveness.child_carries_ipv6());
+        assert_eq!(tunnel.child_subnets6, vec![(Ipv6Addr::UNSPECIFIED, 0)]);
+        assert_eq!(tunnel.peer_spi, 0xBEEF);
+        assert_eq!(observed.offered_tsi, TrafficSelectors::unified_full_tunnel());
+    }
+
+    #[test]
+    fn eap_unified_offer_narrowed_to_ipv4_stays_an_ipv4_tunnel() {
+        let (tunnel, _observed) = connect_unified_eap(UnifiedReply::NarrowToIpv4);
+        let tunnel = tunnel.unwrap();
+        assert!(!tunnel.liveness.child_carries_ipv6() && tunnel.child_subnets6.is_empty());
+        assert_eq!(tunnel.assigned_ip4, Some(Ipv4Addr::new(10, 9, 8, 7)));
+    }
+
+    #[test]
+    fn eap_refused_unified_offer_keeps_the_ike_sa_and_creates_the_ipv4_child_sa_on_it() {
+        let (tunnel, observed) =
+            connect_unified_eap(UnifiedReply::Refuse { error: notify_type::TS_UNACCEPTABLE, serve_child: true });
+        let tunnel = tunnel.unwrap();
+        assert_ne!(tunnel.peer_spi, 0xBEEF, "the IKE_AUTH SPI belongs to a CHILD SA that never existed");
+        assert_eq!(tunnel.assigned_ip4, Some(Ipv4Addr::new(10, 9, 8, 7)));
+        assert_eq!(tunnel.dns, vec![Ipv4Addr::new(10, 9, 8, 1)]);
+        assert_eq!(observed.created_child_tsi, Some(TrafficSelectors::ipv4_full_tunnel()));
+    }
+
+    #[test]
+    fn eap_refused_unified_offer_that_the_child_sa_recovery_cannot_fix_closes_the_ike_sa() {
+        let (tunnel, observed) =
+            connect_unified_eap(UnifiedReply::Refuse { error: notify_type::NO_PROPOSAL_CHOSEN, serve_child: false });
+        let err = tunnel.err().expect("no CHILD SA, no tunnel");
+        assert!(matches!(err, DriverError::Ike(IkeError::PeerRejected { .. })), "{err:?}");
+        assert!(observed.client_deleted_ike_sa);
     }
 
     /// A minimal in-process EAP-MSCHAPv2 responder (PSK server auth) over

@@ -27,7 +27,7 @@ use crate::error::IkeError;
 use crate::ikev2::exchange::CompletedSaInit;
 use crate::ikev2::ike_auth::{
     child_sa_error_of, esp_offer, esp_spi_from_sa, initiator_eap_request, initiator_eap_request_with_certreq,
-    initiator_eap_request_with_certs, AssignedConfig,
+    initiator_eap_request_with_certs, AssignedConfig, ChildTsOffer,
 };
 use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
@@ -230,6 +230,9 @@ pub struct EapInitiator {
     /// [`crate::ikev2::ike_auth::initiator_eap_request_with_certs`]'s doc for
     /// why this exists (a FortiGate "Certificate + EAP" combined round).
     client_certs: Vec<Vec<u8>>,
+    /// TSi/TSr offered for the CHILD SA in the first message -- see
+    /// [`Self::set_ts_offer`].
+    ts_offer: ChildTsOffer,
 }
 
 impl EapInitiator {
@@ -275,6 +278,7 @@ impl EapInitiator {
             configuration: None,
             want_cfg: false,
             client_certs: Vec::new(),
+            ts_offer: ChildTsOffer::default(),
         }
     }
 
@@ -311,6 +315,12 @@ impl EapInitiator {
     /// asks for an inner address.
     pub fn set_want_cfg(&mut self, on: bool) {
         self.want_cfg = on;
+    }
+
+    /// Choose the TSi/TSr the CHILD SA is offered with in the first message
+    /// (default [`ChildTsOffer::Ipv4`]) -- see [`ChildTsOffer`].
+    pub fn set_ts_offer(&mut self, offer: ChildTsOffer) {
+        self.ts_offer = offer;
     }
 
     fn certreq_ca_hashes(&self) -> Vec<[u8; 20]> {
@@ -421,6 +431,7 @@ impl EapInitiator {
                 self.child_spi,
                 self.want_cfg,
                 &self.esp_offer,
+                self.ts_offer,
                 &self.client_certs,
                 ca_hashes,
                 &iv(entropy),
@@ -432,11 +443,12 @@ impl EapInitiator {
                 self.child_spi,
                 self.want_cfg,
                 &self.esp_offer,
+                self.ts_offer,
                 self.certreq_ca_hashes(),
                 &iv(entropy),
             )
         } else {
-            initiator_eap_request(&self.sa, &self.id, self.child_spi, self.want_cfg, &self.esp_offer, &iv(entropy))
+            initiator_eap_request(&self.sa, &self.id, self.child_spi, self.want_cfg, &self.esp_offer, self.ts_offer, &iv(entropy))
         }
     }
 

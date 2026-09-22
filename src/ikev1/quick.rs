@@ -565,6 +565,7 @@ impl QuickInitiator {
 // ---- responder ----
 
 /// Post-message-1 Quick-Mode responder state.
+#[derive(Clone)]
 pub struct QuickResponder {
     prf: Prf,
     skeyid_a: Vec<u8>,

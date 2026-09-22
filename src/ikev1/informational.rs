@@ -111,7 +111,7 @@ fn notify_body(protocol_id: u8, spi: &[u8], msg_type: u16, data: &[u8]) -> Vec<u
 /// The inverse of [`notify_body`]: pull `(msg_type, notification_data)` back
 /// out of a parsed Notify payload's body. `None` on anything too short to be
 /// well-formed.
-fn parse_notify(body: &[u8]) -> Option<(u16, &[u8])> {
+pub(crate) fn parse_notify(body: &[u8]) -> Option<(u16, &[u8])> {
     let spi_size = *body.get(5)? as usize;
     let msg_type = u16::from_be_bytes([*body.get(6)?, *body.get(7)?]);
     let data = body.get(8 + spi_size..)?;
@@ -129,7 +129,7 @@ pub(crate) fn parse_delete(body: &[u8]) -> Option<(u8, &[u8])> {
 }
 
 /// RFC 3706 §2 Notify Message Types.
-mod notify_type {
+pub(crate) mod notify_type {
     pub const R_U_THERE: u16 = 36136;
     pub const R_U_THERE_ACK: u16 = 36137;
 }

@@ -1439,6 +1439,7 @@ pub fn respond_main(cfg: &Phase1Config, msg1: &[u8], entropy: &mut impl Entropy,
 }
 
 /// Post-message-2 Main-Mode responder state.
+#[derive(Clone)]
 pub struct MainRespSaSent {
     prf: Prf,
     group: DhGroup,
@@ -1526,6 +1527,7 @@ impl MainRespSaSent {
 }
 
 /// Post-message-4 Main-Mode responder state.
+#[derive(Clone)]
 pub struct MainRespKeSent {
     prf: Prf,
     group: DhGroup,

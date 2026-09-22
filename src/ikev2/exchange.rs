@@ -153,6 +153,7 @@ fn parse_sa_init(header: &IkeHeader, body: &[u8]) -> Result<SaInitPayloads, IkeE
     let mut nonce = None;
     let mut signature_hashes = Vec::new();
     let mut cookie = None;
+    let mut invalid_ke_group = None;
     let mut nat_dest = None;
     let mut nat_source = None;
     let mut fragmentation_supported = false;
@@ -164,20 +165,29 @@ fn parse_sa_init(header: &IkeHeader, body: &[u8]) -> Result<SaInitPayloads, IkeE
             PayloadType::Nonce => nonce = Some(Nonce::parse(payload.data)?),
             PayloadType::Notify => {
                 if let Ok(n) = Notify::parse(payload.data) {
-                    if n.is_error() {
-                        // A rejection response carries only this Notify --
-                        // no SA/KE/Nonce ever follow -- so surface it now
-                        // rather than falling through to a confusing
+                    // COOKIE (RFC 7296 §2.6) and INVALID_KE_PAYLOAD (§2.7) are
+                    // both in the error-type range (< 16384, §3.10.1) but are
+                    // not rejections: a responder that sends either kept NO
+                    // state and expects the initiator to retry, not give up.
+                    // Handled before the generic `is_error()` catch-all below
+                    // so a bare challenge response doesn't get surfaced as
+                    // `PeerRejected` -- the caller needs to be able to tell
+                    // "retry with this" apart from "stop, the peer refused".
+                    if n.notify_type == notify_type::COOKIE {
+                        cookie = Some(n.data);
+                    } else if n.notify_type == notify_type::INVALID_KE_PAYLOAD {
+                        invalid_ke_group = (n.data.len() == 2).then(|| u16::from_be_bytes([n.data[0], n.data[1]]));
+                    } else if n.is_error() {
+                        // A genuine rejection response carries only this
+                        // Notify -- no SA/KE/Nonce ever follow -- so surface
+                        // it now rather than falling through to a confusing
                         // "missing SA payload" once those checks run below.
                         return Err(IkeError::PeerRejected {
                             notify_type: n.notify_type,
                             name: crate::ikev2::payload::notify_type_name(n.notify_type),
                         });
-                    }
-                    if n.notify_type == notify_type::SIGNATURE_HASH_ALGORITHMS {
+                    } else if n.notify_type == notify_type::SIGNATURE_HASH_ALGORITHMS {
                         signature_hashes = parse_signature_hashes(&n.data);
-                    } else if n.notify_type == notify_type::COOKIE {
-                        cookie = Some(n.data);
                     } else if n.notify_type == notify_type::NAT_DETECTION_DESTINATION_IP {
                         nat_dest = Some(n.data);
                     } else if n.notify_type == notify_type::NAT_DETECTION_SOURCE_IP {
@@ -191,8 +201,25 @@ fn parse_sa_init(header: &IkeHeader, body: &[u8]) -> Result<SaInitPayloads, IkeE
             _ => {}
         }
     }
+    let sa = match sa {
+        Some(sa) => sa,
+        // No SA payload: either a genuine malformed message, or a bare
+        // challenge response (RFC 7296 §2.6/§2.7 -- neither ever carries an
+        // SA/KE/Nonce). Surface the challenge distinctly so a caller like
+        // `Ikev2Session::sa_init_with_sockets` can retry instead of treating
+        // this as `MissingPayload`.
+        None => {
+            if let Some(group) = invalid_ke_group {
+                return Err(IkeError::InvalidKeGroup(group));
+            }
+            if let Some(cookie) = cookie {
+                return Err(IkeError::CookieRequired { cookie });
+            }
+            return Err(IkeError::MissingPayload("SA"));
+        }
+    };
     Ok(SaInitPayloads {
-        sa: sa.ok_or(IkeError::MissingPayload("SA"))?,
+        sa,
         ke: ke.ok_or(IkeError::MissingPayload("KE"))?,
         nonce: nonce.ok_or(IkeError::MissingPayload("Nonce"))?,
         signature_hashes,
@@ -308,7 +335,35 @@ pub fn initiator_request_natt_with(
     peer_addr: std::net::SocketAddr,
     force_natt: bool,
 ) -> Vec<u8> {
-    let group = offer_dh_group(offer);
+    initiator_request_natt_retry(local, offer, our_addr, peer_addr, force_natt, None, None)
+}
+
+/// [`initiator_request_natt_with`], for a **retry** after the responder
+/// challenged the previous `IKE_SA_INIT` attempt and kept no state (RFC 7296
+/// §2.6 COOKIE / §1.2, §2.7 INVALID_KE_PAYLOAD -- see [`IkeError::CookieRequired`]
+/// / [`IkeError::InvalidKeGroup`]):
+///
+/// * `cookie`, when `Some`, is echoed back as a COOKIE notify, so the
+///   responder recognizes this as the same return-routability check passing
+///   rather than a fresh, unrelated request.
+/// * `group`, when `Some`, replaces the offer's own preferred group in the
+///   Key Exchange payload only -- the responder already chose it out of what
+///   the offer's SA already proposed (that's the only way it could have named
+///   it), so the SA payload itself doesn't need to change.
+///
+/// The two are independent, so a chain of COOKIE then INVALID_KE_PAYLOAD (or
+/// the reverse) is answered by setting both at once on the exchange's final
+/// retry.
+pub fn initiator_request_natt_retry(
+    local: &LocalSecret,
+    offer: &SecurityAssociation,
+    our_addr: std::net::SocketAddr,
+    peer_addr: std::net::SocketAddr,
+    force_natt: bool,
+    cookie: Option<&[u8]>,
+    group: Option<DhGroup>,
+) -> Vec<u8> {
+    let group = group.unwrap_or_else(|| offer_dh_group(offer));
     let public = group.public(&local.dh_private);
     let header = base_header(local.spi, 0, Flags { initiator: true, version: false, response: false });
     // The wildcard address on port 0: no packet is ever sourced from it, so its
@@ -323,10 +378,13 @@ pub fn initiator_request_natt_with(
     // `responder_respond_inner`, which hashes with its own real spi_r once it
     // has one -- symmetric only once we re-hash with the real spi_r to check
     // *its* response, done in `initiator_complete_natt`).
-    let extra_notifies = [
+    let mut extra_notifies = vec![
         natt::source_ip_notify(local.spi, 0, claimed.ip(), claimed.port()),
         natt::destination_ip_notify(local.spi, 0, peer_addr.ip(), peer_addr.port()),
     ];
+    if let Some(cookie) = cookie {
+        extra_notifies.push(Notify::status(notify_type::COOKIE, cookie.to_vec()));
+    }
     build_sa_init(header, offer, group.transform_id(), &public, &local.nonce, &extra_notifies)
 }
 
@@ -966,5 +1024,41 @@ mod tests {
             .build();
         let err = responder_respond(&request, &resp_secret()).unwrap_err();
         assert_eq!(err, IkeError::DhGroupMismatch { expected: transform_id::X25519, got: transform_id::MODP_2048 });
+    }
+
+    /// Finding #5 of the ChatGPT6 Astra ryke audit: a responder under load
+    /// answers `IKE_SA_INIT` with only a COOKIE notify and keeps no
+    /// half-open state at all (RFC 7296 §2.6) -- this used to fall through
+    /// `parse_sa_init`'s normal payload checks and surface as a generic
+    /// `MissingPayload("SA")`, indistinguishable from a malformed message,
+    /// so a caller had nothing to retry on. It must come back as the
+    /// specific challenge instead.
+    #[test]
+    fn initiator_complete_treats_a_bare_cookie_response_as_a_retryable_challenge() {
+        let init = init_secret();
+        let request = initiator_request(&init, &default_offer());
+        let header = base_header(init.spi, 0, Flags { initiator: false, version: false, response: true });
+        let notify = Notify::status(notify_type::COOKIE, vec![0xAA; 32]);
+        let response = MessageBuilder::new(header).push(PayloadType::Notify, notify.to_bytes()).build();
+
+        let err = initiator_complete(&init, &request, &response).unwrap_err();
+        assert_eq!(err, IkeError::CookieRequired { cookie: vec![0xAA; 32] });
+    }
+
+    /// Finding #5's other half: INVALID_KE_PAYLOAD (RFC 7296 §1.2/§2.7) is
+    /// also in the error-notify range and also carries no other payloads --
+    /// it used to be caught by the generic `is_error()` check and surfaced as
+    /// `PeerRejected`, exactly as if the responder had refused the exchange
+    /// outright, instead of the retryable DH-group correction it actually is.
+    #[test]
+    fn initiator_complete_treats_a_bare_invalid_ke_response_as_a_retryable_challenge() {
+        let init = init_secret();
+        let request = initiator_request(&init, &default_offer());
+        let header = base_header(init.spi, 0, Flags { initiator: false, version: false, response: true });
+        let notify = Notify::status(notify_type::INVALID_KE_PAYLOAD, transform_id::MODP_2048.to_be_bytes().to_vec());
+        let response = MessageBuilder::new(header).push(PayloadType::Notify, notify.to_bytes()).build();
+
+        let err = initiator_complete(&init, &request, &response).unwrap_err();
+        assert_eq!(err, IkeError::InvalidKeGroup(transform_id::MODP_2048));
     }
 }

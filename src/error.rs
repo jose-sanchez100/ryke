@@ -51,6 +51,20 @@ pub enum IkeError {
     #[error("DH group mismatch: expected {expected}, got {got}")]
     DhGroupMismatch { expected: u16, got: u16 },
 
+    /// The `IKE_SA_INIT` responder answered with a bare COOKIE notify (RFC
+    /// 7296 §2.6, anti-DoS return-routability check): it kept no half-open
+    /// state, so the initiator must resend the identical request with this
+    /// cookie echoed back rather than treat the exchange as failed.
+    #[error("the responder requires a return-routability cookie before committing state")]
+    CookieRequired { cookie: Vec<u8> },
+
+    /// The `IKE_SA_INIT` responder answered with a bare INVALID_KE_PAYLOAD
+    /// notify (RFC 7296 §1.2/§2.7): our Key Exchange payload guessed a DH
+    /// group the responder didn't select, and it kept no half-open state.
+    /// The notify's data names the group the initiator must retry with.
+    #[error("the responder wants Diffie-Hellman group {0} instead of our guess")]
+    InvalidKeGroup(u16),
+
     /// The Key Exchange data length is wrong for its DH group.
     #[error("key exchange data for group {group} has wrong length {len}")]
     BadKeyExchange { group: u16, len: usize },

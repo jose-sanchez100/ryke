@@ -32,7 +32,7 @@ use crate::error::IkeError;
 use crate::esp::ChildSa;
 use crate::ikev2::eap_auth::{EapEvent, EapInitiator, ServerVerify};
 use crate::ikev2::exchange::{
-    default_offer, initiator_complete_natt, initiator_request_natt_with, CompletedSaInit, LocalSecret,
+    default_offer, initiator_complete_natt, initiator_request_natt_retry, CompletedSaInit, LocalSecret,
     NatStatus,
 };
 use crate::ikev2::fragment;
@@ -1656,6 +1656,53 @@ impl<E: Entropy> Ikev2Session<E> {
     /// already-[`crate::transport::enable_udp_encap`]'d `natt_sock` if it
     /// was -- plus the address that socket's traffic actually carries as its
     /// source from now on.
+    /// Run `IKE_SA_INIT` to completion over `sock`, transparently retrying
+    /// through a `COOKIE` challenge and/or an `INVALID_KE_PAYLOAD` correction
+    /// (RFC 7296 §2.6, §1.2/§2.7): a responder under load, or one that just
+    /// doesn't support our guessed DH group, answers with a bare Notify and
+    /// keeps no state at all -- the previous behavior surfaced that as a
+    /// generic parse failure (`MissingPayload("SA")` or `PeerRejected`),
+    /// which is indistinguishable from an outright refusal, so this crate
+    /// gave up against a perfectly healthy gateway. Bounded to
+    /// `MAX_SA_INIT_CHALLENGES` extra round trips -- enough for either
+    /// challenge alone or a COOKIE-then-INVALID_KE chain -- so a responder
+    /// that keeps challenging forever (buggy or hostile) can't hang this.
+    fn sa_init_round_trip(
+        &mut self,
+        local: &LocalSecret,
+        offer: &SecurityAssociation,
+        our_addr: SocketAddr,
+        peer: SocketAddr,
+        sock: &UdpSocket,
+    ) -> Result<(CompletedSaInit, NatStatus), DriverError> {
+        const MAX_SA_INIT_CHALLENGES: u32 = 2;
+        let mut cookie: Option<Vec<u8>> = None;
+        let mut ke_group: Option<DhGroup> = None;
+        let mut challenges = 0u32;
+        loop {
+            let req = initiator_request_natt_retry(local, offer, our_addr, peer, self.force_natt, cookie.as_deref(), ke_group);
+            ike_debug!("IKE_SA_INIT: sending to {peer} (spi_i={:016x})", local.spi);
+            let resp = send_and_retry(sock, peer, &req)?;
+            match initiator_complete_natt(local, &req, &resp, our_addr, peer) {
+                Ok(outcome) => return Ok(outcome),
+                Err(IkeError::CookieRequired { cookie: c }) if challenges < MAX_SA_INIT_CHALLENGES => {
+                    ike_debug!("IKE_SA_INIT: responder requires a return-routability cookie (RFC 7296 §2.6) -- retrying with it echoed back");
+                    cookie = Some(c);
+                    challenges += 1;
+                }
+                Err(IkeError::InvalidKeGroup(group)) if challenges < MAX_SA_INIT_CHALLENGES => {
+                    let Some(group) = DhGroup::from_transform_id(group) else {
+                        return Err(IkeError::InvalidKeGroup(group).into());
+                    };
+                    ike_debug!("IKE_SA_INIT: responder wants a different DH group (RFC 7296 §2.7, INVALID_KE_PAYLOAD) -- retrying");
+                    ke_group = Some(group);
+                    challenges += 1;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     fn sa_init_with_sockets(
         &mut self,
         peer: SocketAddr,
@@ -1670,10 +1717,7 @@ impl<E: Entropy> Ikev2Session<E> {
         natt_sock.set_read_timeout(Some(Duration::from_secs(10)))?;
 
         let local = LocalSecret::generate(&mut self.entropy, NONCE_LEN);
-        let req = initiator_request_natt_with(&local, offer, our_addr, peer, self.force_natt);
-        ike_debug!("IKE_SA_INIT: sending to {peer} (spi_i={:016x})", local.spi);
-        let resp = send_and_retry(&sock, peer, &req)?;
-        let (sa, mut nat) = initiator_complete_natt(&local, &req, &resp, our_addr, peer)?;
+        let (sa, mut nat) = self.sa_init_round_trip(&local, offer, our_addr, peer, &sock)?;
         nat.forced = self.force_natt;
         ike_debug!(
             "IKE_SA_INIT: matched proposal #{} encr={} prf={} integ={:?} dh={}",
@@ -2297,7 +2341,7 @@ mod tests {
     use crate::entropy::OsEntropy;
     use crate::ikev2::eap_auth::{EapResponder, ServerAuth};
     use crate::ikev2::exchange::{
-        initiator_complete, initiator_request, responder_respond, responder_respond_natt,
+        initiator_complete, initiator_request, responder_respond, responder_respond_natt, SaInitResult,
     };
     use crate::ikev2::ike_auth::{responder_process_auth, AssignedConfig};
     use crate::ikev2::message::Flags;
@@ -3041,6 +3085,135 @@ mod tests {
         // indefinitely, matching `sa_init_on_port`'s doc (the unused half of
         // the pair is dropped, not kept open).
         UdpSocket::bind(("0.0.0.0", local_port)).expect("the pre-float port must be released once floated");
+    }
+
+    /// A DH proposal deliberately built so the client's own first guess (RFC
+    /// 7296 §1.2: it sends a `KE` payload for the group it expects to be
+    /// picked before knowing the responder's actual choice) disagrees with
+    /// what `negotiate::select` will actually pick on the other end --
+    /// listing the DH transform this crate ranks *lower* first in the
+    /// `Transform` list (what [`offer_dh_group`] naively reads) while also
+    /// offering the one it ranks highest (what `negotiate::select_from_proposal`
+    /// actually picks, regardless of list order): X25519 always outranks
+    /// MODP_2048 in `DH_CANDIDATES`. A real client with several DH groups it's
+    /// willing to accept genuinely hits this whenever the responder's
+    /// preference isn't the client's first list entry.
+    fn offer_with_a_dh_guess_the_responder_wont_pick() -> SecurityAssociation {
+        SecurityAssociation {
+            proposals: vec![crate::ikev2::payload::Proposal {
+                num: 1,
+                protocol_id: protocol_id::IKE,
+                spi: Vec::new(),
+                transforms: vec![
+                    crate::ikev2::payload::Transform {
+                        transform_type: crate::ikev2::payload::transform_type::DH,
+                        transform_id: crate::ikev2::payload::transform_id::MODP_2048,
+                        key_length: None,
+                    },
+                    crate::ikev2::payload::Transform {
+                        transform_type: crate::ikev2::payload::transform_type::ENCR,
+                        transform_id: crate::ikev2::payload::transform_id::AES_GCM_16,
+                        key_length: Some(256),
+                    },
+                    crate::ikev2::payload::Transform {
+                        transform_type: crate::ikev2::payload::transform_type::PRF,
+                        transform_id: crate::ikev2::payload::transform_id::PRF_HMAC_SHA2_256,
+                        key_length: None,
+                    },
+                    crate::ikev2::payload::Transform {
+                        transform_type: crate::ikev2::payload::transform_type::DH,
+                        transform_id: crate::ikev2::payload::transform_id::X25519,
+                        key_length: None,
+                    },
+                ],
+            }],
+        }
+    }
+
+    /// Finding #5 of the ChatGPT6 Astra ryke audit: `sa_init_with_sockets` used
+    /// to send one `IKE_SA_INIT` and hand back whatever `initiator_complete_natt`
+    /// made of the reply -- a responder that named a different DH group via a
+    /// bare `INVALID_KE_PAYLOAD` notify (RFC 7296 §1.2/§2.7, no state kept)
+    /// surfaced as a plain parse failure, not something the client retried.
+    /// This drives a real two-sided exchange: the responder genuinely prefers
+    /// X25519 over the client's guessed MODP_2048 (see
+    /// `offer_with_a_dh_guess_the_responder_wont_pick`) and answers the first
+    /// request with `InvalidKe`; if the fix didn't retry with the corrected
+    /// group, this would time out waiting for a second request that never
+    /// comes, rather than complete.
+    #[test]
+    fn sa_init_retries_after_the_responder_names_a_different_dh_group() {
+        let bind = next_addr();
+        let responder = thread::spawn(move || {
+            let sock = UdpSocket::bind(bind).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let resp_secret = LocalSecret::generate(&mut OsEntropy::new().unwrap(), 32);
+            let mut buf = [0u8; 2048];
+            loop {
+                let (n, from) = sock.recv_from(&mut buf).unwrap();
+                let result = responder_respond_natt(&buf[..n], &resp_secret, bind, from, None).unwrap();
+                match result {
+                    SaInitResult::Established { response, .. } => {
+                        sock.send_to(&response, from).unwrap();
+                        break;
+                    }
+                    SaInitResult::InvalidKe { response, group } => {
+                        assert_eq!(group, crate::ikev2::payload::transform_id::X25519, "the responder must name the group it actually prefers");
+                        sock.send_to(&response, from).unwrap();
+                    }
+                    SaInitResult::CookieRequired { .. } => panic!("no cookie policy is in effect"),
+                }
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+        let local_port = next_addr().port();
+        let (_sock, _our_addr, sa, _nat) =
+            session.sa_init_on_port(bind, &offer_with_a_dh_guess_the_responder_wont_pick(), local_port).unwrap();
+        responder.join().unwrap();
+
+        assert_eq!(sa.suite.dh_id, crate::ikev2::payload::transform_id::X25519, "must have completed with the corrected group");
+    }
+
+    /// Finding #5, the other half: a responder demanding a return-routability
+    /// cookie (RFC 7296 §2.6, anti-DoS) also keeps no state and answers with a
+    /// bare `COOKIE` notify -- previously surfaced the same way as a malformed
+    /// message instead of driving a retry that echoes the cookie back. Runs a
+    /// real cookie-requiring responder end to end; without the fix this hangs
+    /// waiting for a retry that never comes.
+    #[test]
+    fn sa_init_retries_after_the_responder_requires_a_cookie() {
+        let bind = next_addr();
+        let responder = thread::spawn(move || {
+            let sock = UdpSocket::bind(bind).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let resp_secret = LocalSecret::generate(&mut OsEntropy::new().unwrap(), 32);
+            let secret = [0x5Au8; 32];
+            let mut buf = [0u8; 2048];
+            loop {
+                let (n, from) = sock.recv_from(&mut buf).unwrap();
+                let peer_bytes = from.ip().to_string().into_bytes();
+                let policy = crate::ikev2::exchange::CookiePolicy { secret: &secret, peer: &peer_bytes, required: true };
+                let result = responder_respond_natt(&buf[..n], &resp_secret, bind, from, Some(policy)).unwrap();
+                match result {
+                    SaInitResult::Established { response, .. } => {
+                        sock.send_to(&response, from).unwrap();
+                        break;
+                    }
+                    SaInitResult::CookieRequired { response } => {
+                        sock.send_to(&response, from).unwrap();
+                    }
+                    SaInitResult::InvalidKe { .. } => panic!("the offer's own group must be acceptable"),
+                }
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+        let local_port = next_addr().port();
+        let (_sock, _our_addr, _sa, _nat) = session.sa_init_on_port(bind, &default_ike_offer(), local_port).unwrap();
+        responder.join().unwrap();
     }
 
     /// `with_forced_natt` over a path with **no** NAT: the responder tells

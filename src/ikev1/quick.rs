@@ -822,6 +822,20 @@ fn quick_exchange(
             ike_debug!("Quick Mode ({what}): gateway rejected the proposal with {name} (notify type {notify_type})");
             return Err(IkeError::PeerRejected { notify_type, name }.into());
         }
+        // A full-teardown Delete for the ISAKMP SA itself can legitimately
+        // arrive while this exchange is in flight -- e.g. the peer tearing
+        // down the whole tunnel sends the CHILD SA's Delete first (which is
+        // what started this from-scratch recreate) and the ISAKMP SA's
+        // Delete a moment later. Without this check it would just fail the
+        // cookie/exchange-type/message-id match below and be silently
+        // discarded like any other unrelated datagram, leaving the caller to
+        // time out and retry against a peer that no longer has any Phase 1
+        // SA to answer under -- confirmed live against a real FortiGate (see
+        // `IkeError::PeerTornDown`'s doc).
+        if informational::is_isakmp_sa_delete(st, &msg) {
+            ike_debug!("Quick Mode ({what}): the peer deleted the ISAKMP SA while this exchange was in flight -- tunnel torn down");
+            return Err(IkeError::PeerTornDown.into());
+        }
         if hdr.init_cookie != st.cky_i || hdr.resp_cookie != st.cky_r || hdr.exchange_type != exchange::QUICK || hdr.message_id != msgid {
             continue;
         }
@@ -1551,6 +1565,33 @@ mod tests {
         responder.join().unwrap();
         assert_eq!(err, IkeError::PeerRejected { notify_type: 18, name: "INVALID_ID_INFORMATION" });
         assert!(started.elapsed() < Duration::from_secs(3), "must not wait out the timeout");
+    }
+
+    /// A real full-tunnel teardown: the gateway deletes the Quick Mode SA
+    /// first (which is what starts a from-scratch recreate through
+    /// `rekey_child` in the worker's `check_liveness_ikev1`) and the ISAKMP
+    /// SA a moment later, which can race in while that recreate's own
+    /// exchange is still waiting for its Quick Mode reply. Confirmed live
+    /// against a real FortiGate that this used to be silently discarded as
+    /// "not the message we're waiting for", leaving the recreate to time out
+    /// and retry forever against a peer with no Phase 1 SA left at all --
+    /// this must surface as `IkeError::PeerTornDown` instead, immediately.
+    #[test]
+    fn rekey_child_reports_peer_torn_down_when_the_isakmp_sa_is_deleted_mid_exchange() {
+        let (isock, rsock, iaddr, raddr) = loopback_pair();
+        let (istate, rstate, mut ie, mut re) = phase1_pair(0x9511, 0x9512, iaddr, raddr);
+        let old_local_spi = 0x0bad_f00d;
+        let responder = std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            rsock.recv(&mut buf).unwrap(); // the recreate's Quick Mode msg1
+            let isakmp_delete = informational::build_isakmp_delete(&rstate, &mut re).unwrap();
+            rsock.send_to(&isakmp_delete, iaddr).unwrap();
+        });
+
+        let ts = ([10, 212, 134, 202], [255, 255, 255, 255]);
+        let err = rekey_child(&isock, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, ts, ([0; 4], [0; 4]), 3600, Duration::from_secs(4), old_local_spi);
+        responder.join().unwrap();
+        assert!(matches!(err, Err(DriverError::Ike(IkeError::PeerTornDown))), "got {:?}", err.map(|_| ()));
     }
 
     /// Anything else the peer sends is skipped and the timeout still applies.

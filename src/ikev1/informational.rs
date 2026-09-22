@@ -440,6 +440,34 @@ fn watch(
     }
 }
 
+/// Whether `datagram` (already stripped of the UDP-4500 non-ESP marker, if
+/// any) is an encrypted Informational for `st`'s ISAKMP SA carrying a Delete
+/// naming Protocol-Id ISAKMP -- i.e. the peer tearing down the whole tunnel,
+/// not just one Quick Mode SA. Factored out of [`watch`]'s per-datagram
+/// classification so [`super::quick::quick_exchange`] can run the same check
+/// on a datagram that doesn't match the Quick Mode response it's waiting for,
+/// instead of silently discarding it the way a message for some other
+/// exchange normally would be: an ISAKMP SA Delete arriving mid-exchange
+/// still means the tunnel is gone, and losing that notification here left
+/// [`super::quick::rekey_child`] retrying a from-scratch recreate forever
+/// against a peer that no longer has any Phase 1 SA to answer under
+/// (confirmed live against a real FortiGate -- see [`crate::error::IkeError::PeerTornDown`]'s doc).
+/// Anything else (a different SA, a message that doesn't decrypt or fails
+/// HASH(1), a Notify, an ESP Delete) is `false`, same best-effort stance
+/// [`watch`] takes.
+pub(crate) fn is_isakmp_sa_delete(st: &Phase1State, datagram: &[u8]) -> bool {
+    let Ok(header) = IsakmpHeader::parse(datagram) else { return false };
+    if header.exchange_type != exchange::INFORMATIONAL || header.init_cookie != st.cky_i || header.resp_cookie != st.cky_r {
+        return false;
+    }
+    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, header.message_id, AES_BLOCK);
+    let Ok((_h, payloads, _next)) = phase2::parse_encrypted(datagram, st.prf, &st.skeyid_a, &st.enc_key, &iv0) else {
+        return false;
+    };
+    let Some(del) = payloads.iter().find(|p| p.payload_type == payload::DELETE) else { return false };
+    matches!(parse_delete(&del.data), Some((proto, _spi)) if proto == protocol::ISAKMP)
+}
+
 /// If `msg` is an encrypted Informational for `st`'s ISAKMP SA carrying an
 /// **error** Notify (RFC 2408 §3.14.1: types 1..=16383), its type and name.
 /// A responder that rejects a Quick Mode proposal it cannot accept answers with

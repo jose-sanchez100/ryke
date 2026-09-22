@@ -664,14 +664,49 @@ impl LivenessSession {
             ts,
             &iv,
         )?;
-        self.sock.set_read_timeout(Some(timeout))?;
         let wire = wrap(&req, self.float);
         crate::debug::dump(">>>", self.dest, &wire);
         self.sock.send_to(&wire, self.dest)?;
-        let mut buf = [0u8; 4096];
-        let n = self.recv_datagram(&mut buf, timeout)?;
-        crate::debug::dump("<<<", self.dest, &buf[..n]);
-        let response = unwrap(&buf[..n], self.float)?;
+
+        // A plain single read here used to assume whatever came back next
+        // had to be the CREATE_CHILD_SA response -- but the peer tearing
+        // down the whole tunnel sends the CHILD SA's own Delete first (which
+        // is what starts a from-scratch recreate through this very function,
+        // see `create_child_primary`/`create_child_ipv6`) and the IKE SA's
+        // Delete a moment later, which can arrive while this exchange is
+        // still waiting. That Delete would fail to parse as a CREATE_CHILD_SA
+        // response and this call would just error out, leaving the caller to
+        // retry the recreate forever against a peer with no IKE SA left to
+        // answer under -- confirmed live against a real FortiGate (see
+        // `IkeError::PeerTornDown`'s doc). So, same shape as
+        // `recv_and_classify`: loop until the real response (matching this
+        // exchange's message id) arrives, answering (and checking for a
+        // teardown in) anything else the peer sends meanwhile.
+        let deadline = Instant::now() + timeout;
+        let response = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::from(io::ErrorKind::TimedOut).into());
+            }
+            self.sock.set_read_timeout(Some(remaining))?;
+            let mut buf = [0u8; 4096];
+            let n = self.recv_datagram(&mut buf, remaining)?;
+            crate::debug::dump("<<<", self.dest, &buf[..n]);
+            let msg = unwrap(&buf[..n], self.float)?;
+            let header = IkeHeader::parse(&msg)?;
+            if header.flags.response {
+                if header.message_id == mid {
+                    break msg;
+                }
+                continue; // a stale/unrelated response -- keep waiting
+            }
+            // may_rekey_ike: false -- a genuine peer-started IKE SA rekey
+            // colliding with this exchange is rare enough to just let this
+            // attempt fail (and retry) rather than take it on mid-exchange.
+            if self.answer_peer_request(&header, &msg, false)? {
+                return Err(IkeError::PeerTornDown.into());
+            }
+        };
         let (child, tsr) = rekey::initiator_complete_child(
             &self.sa,
             &ni,
@@ -3353,6 +3388,45 @@ mod tests {
             EspSa::new_with_cipher(rekeyed.peer_spi, rekeyed.key_out.cipher, &rekeyed.key_out.enc, &rekeyed.key_out.integ).unwrap();
         let pkt = client_out.seal(b"after ikev2 pfs rekey", next_header::IPV4).unwrap();
         assert_eq!(resp_child.inbound.open(&pkt).unwrap().0, b"after ikev2 pfs rekey");
+    }
+
+    /// A real full-tunnel teardown racing the client's own `rekey_child`: the
+    /// gateway deletes the CHILD SA first (which is what starts a
+    /// `rekey_child`/`create_child_primary` recreate through `child_exchange`
+    /// in the worker's liveness check) and the IKE SA a moment later, which
+    /// can arrive while `child_exchange` is still waiting for its own
+    /// CREATE_CHILD_SA response. Confirmed live against a real FortiGate that
+    /// this used to fail to parse as that response and error out generically,
+    /// leaving the caller to retry the recreate forever against a peer with
+    /// no IKE SA left to answer under -- this must surface as
+    /// `IkeError::PeerTornDown` instead, immediately.
+    #[test]
+    fn rekey_child_reports_peer_torn_down_when_the_ike_sa_is_deleted_mid_exchange() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let responder = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from) = responder_through_auth(bind, psk);
+                let mut buf = [0u8; 4096];
+                sock.recv_from(&mut buf).unwrap(); // the client's CREATE_CHILD_SA rekey request
+                let delete = build_informational(&sa, 0, false, &[(PayloadType::Delete, Delete::ike_sa().to_bytes())], &[9u8; 8]).unwrap();
+                sock.send_to(&delete, from).unwrap();
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+        let cfg = AuthConfig::psk(Identification::fqdn("client.test"), psk);
+        let mut tunnel = session
+            .connect_direct_on_port(bind, &default_ike_offer(), &cfg, false, &default_esp_offer(), next_addr().port())
+            .unwrap();
+        let err = match tunnel.liveness.rekey_child(Duration::from_secs(5)) {
+            Err(DriverError::Ike(e)) => e,
+            other => panic!("expected an IKE error, got {:?}", other.map(|_| ())),
+        };
+        responder.join().unwrap();
+        assert_eq!(err, IkeError::PeerTornDown);
     }
 
     /// The responder half of a handshake, shared by the IKE SA rekey tests:

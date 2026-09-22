@@ -77,4 +77,21 @@ pub enum IkeError {
     /// A cryptographic precondition was violated (e.g. bad key length).
     #[error("crypto error: {0}")]
     Crypto(&'static str),
+
+    /// The peer deleted the whole IKE/ISAKMP SA while this side was in the
+    /// middle of a request/response exchange that expected something else
+    /// back (a CHILD SA rekey, or a from-scratch recreate after the peer
+    /// deleted just one family's CHILD SA -- see
+    /// `crate::ikev2::session::LivenessSession::create_child_primary` and
+    /// `crate::ikev1::quick::rekey_child`). Confirmed live against a real
+    /// FortiGate: tearing down the whole tunnel sends the CHILD/Quick-Mode
+    /// SA's Delete first and the IKE/ISAKMP SA's Delete a moment later, which
+    /// used to arrive while a from-scratch recreate (started off the first
+    /// Delete) was blocked waiting for its own response -- silently discarded
+    /// as "not the message we're waiting for", so the whole-tunnel teardown
+    /// went unnoticed and the recreate just kept retrying forever. Kept
+    /// distinct from a plain timeout/`Crypto` error so a caller can declare
+    /// the tunnel dead immediately instead of scheduling a retry.
+    #[error("the peer deleted the IKE SA while this exchange was in flight")]
+    PeerTornDown,
 }

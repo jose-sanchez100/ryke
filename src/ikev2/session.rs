@@ -340,6 +340,18 @@ pub struct LivenessSession {
     /// [`Self::answer_peer_request`] tears the whole tunnel down instead of
     /// clearing this.
     primary_child_alive: bool,
+    /// The last INFORMATIONAL request from the peer this session answered
+    /// (its raw bytes, the response wire bytes, and whether that response
+    /// tore the tunnel down), to resend verbatim if the peer retransmits it
+    /// because our answer was lost -- RFC 7296 §2.1 requires a retransmitted
+    /// request to get the identical response. Without this, re-processing a
+    /// retransmitted Delete could answer differently the second time (e.g.
+    /// state already updated by the first pass, like `peer_child.superseded`
+    /// having the matching entry removed) even though it's the same request,
+    /// leaving the peer without confirmation of the SPI it's still waiting
+    /// to hear deleted. Mirrors [`PeerChildState::last`]'s same trick for
+    /// `CREATE_CHILD_SA`.
+    last_informational_ack: Option<(Vec<u8>, Vec<u8>, bool)>,
 }
 
 /// Result of one [`LivenessSession::probe`] call.
@@ -856,6 +868,11 @@ impl LivenessSession {
             }
             _ => return Ok(false),
         }
+        if let Some((_, response, tears_down)) = self.last_informational_ack.as_ref().filter(|(request, _, _)| request == msg) {
+            ike_debug!("INFORMATIONAL: peer retransmitted its request -- resending our answer");
+            let _ = self.sock.send_to(response, self.dest);
+            return Ok(*tears_down);
+        }
         // An INFORMATIONAL request -- ack it regardless of content, then
         // decide what it means. After a peer-started IKE SA rekey the peer
         // deletes the SA it replaced under *that* SA's keys, so those are
@@ -892,7 +909,11 @@ impl LivenessSession {
             }
         }
         if let Ok(ack) = build_informational(ack_sa, header.message_id, true, &ack_payloads, &ack_iv) {
-            let _ = self.sock.send_to(&wrap(&ack, self.float), self.dest);
+            let wire = wrap(&ack, self.float);
+            let _ = self.sock.send_to(&wire, self.dest);
+            // `tears_down` isn't known yet (computed below, only reachable
+            // when `!on_retired`) -- placeholder `false` until then.
+            self.last_informational_ack = Some((msg.to_vec(), wire, false));
         }
         if on_retired {
             // The peer retiring the IKE SA its own rekey replaced: routine.
@@ -942,6 +963,9 @@ impl LivenessSession {
             }
             _ => false,
         };
+        if let Some(cached) = self.last_informational_ack.as_mut().filter(|(request, _, _)| request == msg) {
+            cached.2 = tears_down;
+        }
         if tears_down {
             ike_debug!("INFORMATIONAL: peer sent Delete -- tunnel torn down by the gateway");
         }
@@ -1113,6 +1137,7 @@ impl LivenessSession {
         self.ike.since = Instant::now();
         // Message IDs start over, so an old request's bytes can't be told apart from a new one's by ID.
         self.peer_child.last = None;
+        self.last_informational_ack = None;
         std::mem::replace(&mut self.sa, new_sa)
     }
 
@@ -1733,7 +1758,7 @@ impl<E: Entropy> Ikev2Session<E> {
             cfg_subnets6: info.subnets6.clone(),
             child_carries_ipv6: false,
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true,
+            peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None,
         };
         if want_cfg && assigned_ip4.is_none() {
             ike_debug!("IKE_AUTH: CHILD SA refused ({rejection}) and no CFG_REPLY came with it -- no inner address to build on, closing");
@@ -1933,7 +1958,7 @@ impl<E: Entropy> Ikev2Session<E> {
             cfg_subnets6: info.subnets6.clone(),
             child_carries_ipv6: !child_subnets6.is_empty(),
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true,
+            peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None,
         };
         Ok(ConnectedTunnel {
             local_spi,
@@ -2220,7 +2245,7 @@ impl<E: Entropy> Ikev2Session<E> {
             cfg_subnets6: info.subnets6.clone(),
             child_carries_ipv6: !child_subnets6.is_empty(),
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true,
+            peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None,
         };
 
         Ok(ConnectedTunnel {
@@ -2334,7 +2359,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
@@ -2368,7 +2393,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         // Must NOT report Alive on the forged datagram -- with no genuine
         // reply arriving, the probe times out instead.
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::NoReply);
@@ -2399,7 +2424,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
@@ -2429,7 +2454,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -2456,7 +2481,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         liveness.close().unwrap();
         responder.join().unwrap();
     }
@@ -2470,7 +2495,7 @@ mod tests {
         let (init_sa, _resp_sa) = liveness_sa_pair();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         liveness.close().unwrap();
     }
 
@@ -2485,7 +2510,7 @@ mod tests {
         let unreachable: SocketAddr = silent_peer.local_addr().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::NoReply);
     }
 
@@ -2495,7 +2520,7 @@ mod tests {
         let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         // Unlike probe(), silence on a peek is Alive (nothing new to
         // report), not NoReply -- peek never asked anything.
         assert_eq!(liveness.peek(Duration::from_millis(50)).unwrap(), Liveness::Alive);
@@ -2529,7 +2554,7 @@ mod tests {
         probe_sock.send_to(b"hello", bind).unwrap();
 
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -2581,7 +2606,7 @@ mod tests {
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true,
+            peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None,
         };
         // Whatever the answer, the request is not a teardown: the IKE SA stands.
         assert_eq!(liveness.peek(Duration::from_millis(1500)).unwrap(), Liveness::Alive);
@@ -2706,7 +2731,7 @@ mod tests {
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true,
+            peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None,
         };
         // The stale Delete is ignored and the wait times out -- silence
         // (nothing new to report) is Alive, exactly as if nothing had
@@ -2750,7 +2775,7 @@ mod tests {
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true,
+            peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None,
         };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
@@ -2800,7 +2825,7 @@ mod tests {
             child_carries_ipv6: false,
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(),
-            primary_child_alive: true,
+            primary_child_alive: true, last_informational_ack: None,
         };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::Alive, "the IKE SA and the IPv6 CHILD SA are still good");
         assert_eq!(liveness.take_peer_deleted_children(), vec![ChildKind::Primary]);
@@ -2850,13 +2875,80 @@ mod tests {
             child_carries_ipv6: false,
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(),
-            primary_child_alive: true,
+            primary_child_alive: true, last_informational_ack: None,
         };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::Alive, "the IKE SA and the primary CHILD SA are still good");
         assert_eq!(liveness.take_peer_deleted_children(), vec![ChildKind::Ipv6]);
         assert!(liveness.child6.is_none(), "gone until create_child_ipv6 recreates it");
         assert_eq!((liveness.child_local_spi, liveness.child_peer_spi), (0xBBBB, 0xAAAA), "untouched");
         assert!(liveness.primary_child_alive);
+        responder.join().unwrap();
+    }
+
+    /// RFC 7296 §2.1: a retransmitted request must get the identical
+    /// response, not a freshly reprocessed one. Without a cache, this
+    /// specific case regresses: the first Delete for a superseded CHILD SA's
+    /// peer SPI drains the matching entry from `peer_child.superseded` and
+    /// echoes our own SPI for it; a retransmission of that exact same
+    /// request (peer never saw our first ack) would find nothing left to
+    /// echo on a second pass and answer empty instead -- leaving the peer
+    /// without the SPI it's still waiting to hear deleted on its side.
+    #[test]
+    fn a_retransmitted_informational_gets_the_identical_ack() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let responder_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind = responder_sock.local_addr().unwrap();
+        let responder = thread::spawn(move || {
+            responder_sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let del = Delete::esp(vec![0x7777]);
+            let msg = build_informational(&resp_sa, 100, false, &[(PayloadType::Delete, del.to_bytes())], &[7u8; 8]).unwrap();
+            let mut buf = [0u8; 2048];
+            let (_n, from) = responder_sock.recv_from(&mut buf).unwrap();
+            // The identical bytes, twice -- a genuine retransmission (our
+            // first ack was "lost"), not a freshly rebuilt request.
+            responder_sock.send_to(&msg, from).unwrap();
+            responder_sock.send_to(&msg, from).unwrap();
+            let (n1, _) = responder_sock.recv_from(&mut buf).unwrap();
+            let ack1 = buf[..n1].to_vec();
+            let (n2, _) = responder_sock.recv_from(&mut buf).unwrap();
+            let ack2 = buf[..n2].to_vec();
+            assert_eq!(ack1, ack2, "a retransmitted request must get the byte-identical response");
+            let opened = open_informational(&resp_sa, &ack1).unwrap();
+            let echoed = opened
+                .into_iter()
+                .find(|(t, _)| *t == PayloadType::Delete)
+                .and_then(|(_, body)| Delete::parse(&body).ok())
+                .expect("the real ack echoes our SPI for the superseded CHILD SA, not a blank one");
+            assert_eq!(echoed.spis, vec![0x9999]);
+        });
+
+        let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        probe_sock.send_to(b"hello", bind).unwrap();
+
+        let mut liveness = LivenessSession {
+            sock: probe_sock,
+            sa: init_sa,
+            dest: bind,
+            float: false,
+            next_message_id: 2,
+            cipher: SkCipher::Aes256Gcm,
+            pfs_group: None,
+            child_local_spi: 0,
+            child_peer_spi: 0xAAAA,
+            external_rx: None,
+            child6: None,
+            cfg_subnets6: Vec::new(),
+            child_carries_ipv6: false,
+            ike: IkeSaState::new(),
+            peer_child: PeerChildState {
+                superseded: vec![SupersededChild { local_spi: 0x9999, peer_spi: 0x7777, since: Instant::now() }],
+                ..Default::default()
+            },
+            primary_child_alive: true,
+            last_informational_ack: None,
+        };
+        assert_eq!(liveness.peek(Duration::from_millis(600)).unwrap(), Liveness::Alive);
+        assert!(liveness.peer_child.superseded.is_empty(), "drained exactly once, not once per retransmission");
         responder.join().unwrap();
     }
 
@@ -3813,7 +3905,7 @@ mod tests {
         let (init_sa, _resp_sa) = liveness_sa_pair();
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let dest = sock.local_addr().unwrap();
-        LivenessSession { sock, sa: init_sa, dest, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true }
+        LivenessSession { sock, sa: init_sa, dest, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None }
     }
 
     #[test]

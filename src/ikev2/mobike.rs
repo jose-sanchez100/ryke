@@ -14,8 +14,8 @@
 //! [`crate::ikev2::ike_auth::responder_process_auth_with_mobike`] or
 //! [`crate::ikev2::eap_auth::EapResponder::set_mobike`], and even then the
 //! notify is echoed only to an initiator that sent it (RFC 4555 §3.1).
-//! [`crate::ikev2::server::Server`] handles no INFORMATIONAL exchange, so it
-//! does not opt in.
+//! [`crate::ikev2::server::Server`] answers INFORMATIONAL requests but never
+//! follows an address change, so it does not opt in.
 
 use crate::error::IkeError;
 use crate::ikev2::exchange::CompletedSaInit;

@@ -883,6 +883,7 @@ mod tests {
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
+            force_natt: false,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(psk.clone()),
@@ -938,6 +939,7 @@ mod tests {
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
+            force_natt: false,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(psk.clone()),
@@ -998,6 +1000,7 @@ mod tests {
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
+            force_natt: false,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(psk.clone()),
@@ -1053,6 +1056,7 @@ mod tests {
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
+            force_natt: false,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(psk.clone()),
@@ -1110,6 +1114,7 @@ mod tests {
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
+            force_natt: false,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(psk.clone()),
@@ -1157,6 +1162,7 @@ mod tests {
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
+            force_natt: false,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(b"wrong".to_vec()),
@@ -1241,6 +1247,7 @@ mod tests {
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
+            force_natt: false,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(psk.clone()),
@@ -1358,6 +1365,7 @@ mod tests {
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
+            force_natt: false,
         };
         let rcfg = Phase1Config { local_auth: Ikev1LocalAuth::Psk(psk), trusted_cas: Vec::new(), now_unix: 0, our_id: Id::ipv4([192, 168, 0, 1]) };
         let mut ie = SeedEntropy::new(seed_i);

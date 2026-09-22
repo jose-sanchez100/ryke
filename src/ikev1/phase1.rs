@@ -98,6 +98,25 @@ fn natd_payloads(prf: Prf, cky_i: [u8; 8], cky_r: [u8; 8], dst: SocketAddr, src:
     ]
 }
 
+/// The source address our NAT-D claims: `our_addr`, or -- when NAT-T is being
+/// forced -- the wildcard address on port 0, from which no packet is ever sent,
+/// so the responder's own hash of the source it observed can't match it. (The
+/// same trick as `ikev2::exchange::initiator_request_natt_with`.)
+fn natd_claimed(our_addr: SocketAddr, force_natt: bool) -> SocketAddr {
+    if force_natt {
+        SocketAddr::new(crate::transport::wildcard_for(our_addr), 0)
+    } else {
+        our_addr
+    }
+}
+
+/// [`natd_float_needed`]'s verdict, or -- with `force_natt` -- "float" as long as
+/// the peer offers NAT-T at all: the responder floats because of the address we
+/// claimed, so this side must too, whatever the (correct) hashes it sent say.
+fn float_decision(detected: bool, force_natt: bool, peer_offers_natt: bool) -> bool {
+    detected || (force_natt && peer_offers_natt)
+}
+
 fn peer_offers_natt(ps: &[isakmp::Payload]) -> bool {
     ps.iter().any(|p| p.payload_type == payload::VENDOR_ID && p.data == NATT_RFC_VENDOR_ID)
 }
@@ -628,6 +647,14 @@ pub struct InitiatorConfig {
     /// CHILD SA (Quick Mode) lifetime to offer, in seconds -- same
     /// responder-may-shorten caveat, see [`crate::ikev1::quick::negotiated_p2_lifetime`].
     pub p2_lifetime_secs: u32,
+    /// Force NAT-T whatever NAT detection says: our NAT-D pair then carries the
+    /// hash of an address we can't have (see [`natd_claimed`]), so the responder
+    /// concludes we sit behind a NAT and floats to UDP 4500 -- and sends its ESP
+    /// as ESP-in-UDP instead of raw IP protocol 50 -- and this side floats with
+    /// it (once the peer has advertised RFC 3947 at all, else there is nothing to
+    /// float to). FortiGate's `nat-traversal forced`, strongSwan's `forceencaps`.
+    /// Needed by a data plane that can only receive ESP inside UDP.
+    pub force_natt: bool,
 }
 
 /// Which IKEv1 Phase-1 exchange the initiator runs: [`initiate_aggressive`]
@@ -691,6 +718,7 @@ pub struct AggressiveInitiator {
     sai_b: Vec<u8>,
     key_len: usize,
     offered_p1_lifetime: u32,
+    force_natt: bool,
 }
 
 /// Build Aggressive-Mode message 1 (`HDR, SA, KE, Ni, IDi`) as the initiator.
@@ -732,7 +760,7 @@ pub fn initiate_aggressive(cfg: &InitiatorConfig, entropy: &mut impl Entropy, ou
         (payload::VENDOR_ID, DPD_VENDOR_ID.to_vec()),
         (payload::VENDOR_ID, NATT_RFC_VENDOR_ID.to_vec()),
     ];
-    payloads.extend(natd_payloads(prf, cky_i, [0; 8], peer_addr, our_addr));
+    payloads.extend(natd_payloads(prf, cky_i, [0; 8], peer_addr, natd_claimed(our_addr, cfg.force_natt)));
     let msg1 = isakmp::build_message(hdr, &payloads);
 
     let state = AggressiveInitiator {
@@ -747,6 +775,7 @@ pub fn initiate_aggressive(cfg: &InitiatorConfig, entropy: &mut impl Entropy, ou
         sai_b,
         key_len: cfg.key_len,
         offered_p1_lifetime: cfg.p1_lifetime_secs,
+        force_natt: cfg.force_natt,
     };
     (msg1, state)
 }
@@ -779,7 +808,12 @@ impl AggressiveInitiator {
         // By message 2, both cookies are genuinely known, so this uses the
         // real `cky_r` (unlike message 1's own NAT-D, necessarily hashed
         // with CKY-R all-zero -- see `initiate_aggressive`'s doc).
-        let floated = natd_float_needed(&ps, peer_offers_natt(&ps), self.prf, self.cky_i, cky_r, our_addr, peer_addr);
+        let peer_offers = peer_offers_natt(&ps);
+        let floated = float_decision(
+            natd_float_needed(&ps, peer_offers, self.prf, self.cky_i, cky_r, our_addr, peer_addr),
+            self.force_natt,
+            peer_offers,
+        );
 
         if gxr.len() != self.group.public_len() {
             return Err(IkeError::BadKeyExchange { group: self.group.transform_id(), len: gxr.len() });
@@ -911,6 +945,7 @@ pub fn initiate_main(cfg: &InitiatorConfig, entropy: &mut impl Entropy) -> (Vec<
         cky_i,
         sai_b,
         offered_p1_lifetime: cfg.p1_lifetime_secs,
+        force_natt: cfg.force_natt,
     };
     (msg1, state)
 }
@@ -926,6 +961,7 @@ pub struct MainSaSent {
     cky_i: [u8; 8],
     sai_b: Vec<u8>,
     offered_p1_lifetime: u32,
+    force_natt: bool,
 }
 
 impl MainSaSent {
@@ -969,7 +1005,7 @@ impl MainSaSent {
             (payload::VENDOR_ID, DPD_VENDOR_ID.to_vec()),
         ];
         if peer_supports_natt {
-            payloads3.extend(natd_payloads(Prf::Sha256, self.cky_i, cky_r, peer_addr, our_addr));
+            payloads3.extend(natd_payloads(Prf::Sha256, self.cky_i, cky_r, peer_addr, natd_claimed(our_addr, self.force_natt)));
         }
         let msg3 = isakmp::build_message(hdr3, &payloads3);
 
@@ -990,6 +1026,7 @@ impl MainSaSent {
             our_addr,
             peer_addr,
             negotiated_p1_lifetime_secs,
+            force_natt: self.force_natt,
         };
         Ok((msg3, state))
     }
@@ -1018,6 +1055,7 @@ pub struct MainKeSent {
     our_addr: SocketAddr,
     peer_addr: SocketAddr,
     negotiated_p1_lifetime_secs: u32,
+    force_natt: bool,
 }
 
 impl MainKeSent {
@@ -1039,7 +1077,11 @@ impl MainKeSent {
         let nr = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
         isakmp::check_nonce_len(&nr)?;
         let peer_supports_dpd = ps.iter().any(|p| p.payload_type == payload::VENDOR_ID && p.data == DPD_VENDOR_ID);
-        let floated = natd_float_needed(&ps, self.peer_supports_natt, Prf::Sha256, self.cky_i, self.cky_r, self.our_addr, self.peer_addr);
+        let floated = float_decision(
+            natd_float_needed(&ps, self.peer_supports_natt, Prf::Sha256, self.cky_i, self.cky_r, self.our_addr, self.peer_addr),
+            self.force_natt,
+            self.peer_supports_natt,
+        );
 
         if gxr.len() != self.group.public_len() {
             return Err(IkeError::BadKeyExchange { group: self.group.transform_id(), len: gxr.len() });
@@ -1796,6 +1838,7 @@ mod tests {
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
+            force_natt: false,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(psk),
@@ -1833,6 +1876,7 @@ mod tests {
             mode: Ikev1ExchangeMode::Main,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
+            force_natt: false,
         }
     }
 
@@ -2020,6 +2064,7 @@ mod tests {
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
+            force_natt: false,
         };
         let rcfg = Phase1Config { local_auth: Ikev1LocalAuth::Psk(psk), trusted_cas: Vec::new(), now_unix: 0, our_id: Id::ipv4([192, 168, 0, 1]) };
         let mut ie = SeedEntropy::new(0xC7C7);
@@ -2035,6 +2080,63 @@ mod tests {
         let (_msg3, istate) = ai.complete(&msg2, initiator_claimed_addr, gateway_addr).unwrap();
         assert!(istate.floated, "initiator must detect the same NAT from message 2's NAT-D (real CKY-R now)");
         assert_eq!(istate.skeyid_e, rstate.skeyid_e);
+    }
+
+    /// `force_natt` with **no** NAT on the path (both sides see the same
+    /// addresses): the responder still concludes there is one -- our NAT-D
+    /// claims an address that can't be ours -- and floats, and this side floats
+    /// with it. Main Mode; the handshake still agrees on keys.
+    #[test]
+    fn forced_natt_floats_both_sides_in_main_mode_without_any_nat() {
+        let psk = b"correct horse battery staple".to_vec();
+        let mut icfg = main_mode_icfg(psk.clone());
+        icfg.force_natt = true;
+        let rcfg = Phase1Config { local_auth: Ikev1LocalAuth::Psk(psk), trusted_cas: Vec::new(), now_unix: 0, our_id: Id::ipv4([192, 168, 0, 1]) };
+        let mut ie = SeedEntropy::new(0x1357);
+        let mut re = SeedEntropy::new(0x2468);
+        let (gateway, initiator): (SocketAddr, SocketAddr) = ("192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap());
+
+        let (msg1, sa_sent) = initiate_main(&icfg, &mut ie);
+        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re, gateway, initiator).unwrap();
+        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie, initiator, gateway).unwrap();
+        let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
+        let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
+        assert!(id_sent.floated, "the initiator floats although its own detection saw no NAT");
+        let (msg6, rstate) = r2.complete_id(&msg5).unwrap();
+        let istate = id_sent.complete_id(&msg6, &mut ie).unwrap();
+        assert!(rstate.floated, "the responder floats because of the address we claimed");
+        assert!(istate.floated);
+        assert_eq!(istate.skeyid_e, rstate.skeyid_e);
+    }
+
+    /// The same for Aggressive Mode, whose message 1 carries the NAT-D pair.
+    #[test]
+    fn forced_natt_floats_both_sides_in_aggressive_mode_without_any_nat() {
+        let psk = b"correct horse battery staple".to_vec();
+        let mut icfg = main_mode_icfg(psk.clone());
+        icfg.mode = Ikev1ExchangeMode::Aggressive;
+        icfg.force_natt = true;
+        let rcfg = Phase1Config { local_auth: Ikev1LocalAuth::Psk(psk), trusted_cas: Vec::new(), now_unix: 0, our_id: Id::ipv4([192, 168, 0, 1]) };
+        let mut ie = SeedEntropy::new(0x3579);
+        let mut re = SeedEntropy::new(0x468A);
+        let (gateway, initiator): (SocketAddr, SocketAddr) = ("192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap());
+
+        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie, initiator, gateway);
+        let (msg2, rstate) = respond_aggressive(&rcfg, &msg1, &mut re, gateway, initiator).unwrap();
+        assert!(rstate.floated, "the responder floats because of the address we claimed");
+        let (_msg3, istate) = ai.complete(&msg2, initiator, gateway).unwrap();
+        assert!(istate.floated);
+        assert_eq!(istate.skeyid_e, rstate.skeyid_e);
+    }
+
+    /// Forcing only ever adds a float, and only towards a peer that offers NAT-T
+    /// (a floated exchange to one that doesn't would just go unanswered).
+    #[test]
+    fn forcing_natt_needs_a_peer_that_offers_it() {
+        assert!(float_decision(true, false, true), "a detected NAT floats as always");
+        assert!(!float_decision(false, false, true), "no NAT, not forced: stays on port 500");
+        assert!(float_decision(false, true, true), "forced and offered: floats");
+        assert!(!float_decision(false, true, false), "forced, but the peer never offered NAT-T: nothing to float to");
     }
 
     /// A profile configured for AES-192 (`InitiatorConfig::key_len: 24`) must
@@ -2201,6 +2303,7 @@ mod tests {
             mode: Ikev1ExchangeMode::Main,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
+            force_natt: false,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Sig { key: rkey, chain: vec![cert_der.clone()] },
@@ -2261,6 +2364,7 @@ mod tests {
             mode: Ikev1ExchangeMode::Main,
             p1_lifetime_secs: 28800,
             p2_lifetime_secs: 3600,
+            force_natt: false,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Sig { key: rkey, chain: vec![good_cert_r] },
@@ -2429,6 +2533,7 @@ mod tests {
             mode: Ikev1ExchangeMode::Aggressive,
             p1_lifetime_secs: 1200,
             p2_lifetime_secs: 3600,
+            force_natt: false,
         };
         let rcfg = Phase1Config {
             local_auth: Ikev1LocalAuth::Psk(psk.clone()),

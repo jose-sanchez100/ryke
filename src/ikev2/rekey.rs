@@ -253,6 +253,16 @@ pub fn rekey_sa_spi(sa: &CompletedSaInit, request: &[u8]) -> Option<u32> {
         .map(u32::from_be_bytes)
 }
 
+/// The Nonce payload of a `CREATE_CHILD_SA` message the *peer* sent -- its
+/// `Ni` in a request, its `Nr` in a response. Two nodes that rekeyed the same
+/// CHILD SA at once settle which new SA survives by comparing the four nonces
+/// of the two exchanges (RFC 7296 §2.8.1). `None` when the message can't be
+/// opened or carries no Nonce.
+pub fn peer_child_nonce(sa: &CompletedSaInit, msg: &[u8]) -> Option<Vec<u8>> {
+    let (first, inner) = open_encrypted(sa.suite.sk_cipher(), msg, peer_sk_e(sa), peer_sk_a(sa)).ok()?;
+    payloads(first, &inner).filter_map(Result::ok).find(|p| p.payload_type == PayloadType::Nonce).map(|p| p.data.to_vec())
+}
+
 /// Responder: process a rekey request, derive the new CHILD SA, and build the
 /// response. Returns `(response_bytes, ChildSa)`.
 pub fn responder_process_rekey(

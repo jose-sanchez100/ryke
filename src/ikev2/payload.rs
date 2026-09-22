@@ -808,6 +808,9 @@ pub mod notify_type {
     pub const FAILED_CP_REQUIRED: u16 = 37;
     pub const TS_UNACCEPTABLE: u16 = 38;
     pub const INVALID_SELECTORS: u16 = 39;
+    /// The request collided with an exchange still in progress (a rekey, say)
+    /// and may be retried once that is done -- not right away (RFC 7296 §2.25).
+    pub const TEMPORARY_FAILURE: u16 = 43;
     /// A request named a CHILD SA (a `REKEY_SA` notify, say) this side has no
     /// record of (RFC 7296 §3.10.1).
     pub const CHILD_SA_NOT_FOUND: u16 = 44;
@@ -922,6 +925,7 @@ pub fn notify_type_name(t: u16) -> &'static str {
         notify_type::FAILED_CP_REQUIRED => "FAILED_CP_REQUIRED",
         notify_type::TS_UNACCEPTABLE => "TS_UNACCEPTABLE",
         notify_type::INVALID_SELECTORS => "INVALID_SELECTORS",
+        notify_type::TEMPORARY_FAILURE => "TEMPORARY_FAILURE",
         notify_type::CHILD_SA_NOT_FOUND => "CHILD_SA_NOT_FOUND",
         notify_type::ADDITIONAL_TS_POSSIBLE => "ADDITIONAL_TS_POSSIBLE",
         _ => "UNKNOWN",

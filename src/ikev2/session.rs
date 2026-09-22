@@ -139,11 +139,17 @@ pub struct ConnectedTunnel {
 /// One CHILD SA's inbound SPI (the one *we* expect on ESP packets), tracked
 /// per SA: both a rekey's `REKEY_SA` notify (RFC 7296 §1.3.3) and the
 /// post-rekey Delete name that value, not the peer's.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChildSpis {
     local: u32,
     /// What the peer expects on the ESP we send it: the `REKEY_SA` a *peer*-started rekey names.
     peer: u32,
+}
+
+impl ChildSpis {
+    fn of(child: &RekeyedChild) -> Self {
+        ChildSpis { local: child.local_spi, peer: child.peer_spi }
+    }
 }
 
 /// What [`LivenessSession::create_child_ipv6`] negotiated: the new SA's SPIs
@@ -237,6 +243,38 @@ struct PeerChildState {
     /// about this beyond "it's gone"; auto-recovering is this project's own
     /// policy, not a spec requirement -- see that method's doc).
     deleted: Vec<ChildKind>,
+    /// The CHILD SA exchange of our own still waiting for its answer, which
+    /// a request of the peer's can collide with (RFC 7296 §2.25.1).
+    in_flight: Option<OwnChildOp>,
+}
+
+/// A CHILD SA exchange this session started and the peer has not answered yet.
+#[derive(Clone, Copy)]
+enum ChildOp {
+    /// Creating a CHILD SA from scratch.
+    Create,
+    /// Rekeying this CHILD SA.
+    Rekey(ChildSpis),
+    /// Deleting this CHILD SA.
+    Close(ChildSpis),
+}
+
+/// [`ChildOp`], and what the peer did meanwhile to the CHILD SA it is about.
+struct OwnChildOp {
+    op: ChildOp,
+    /// The peer rekeyed the same CHILD SA at the same time.
+    crossed: Option<CrossedRekey>,
+    /// The peer deleted the CHILD SA this rekey replaces.
+    old_deleted: bool,
+}
+
+/// The peer's own rekey of the CHILD SA we are rekeying, answered as usual
+/// (RFC 7296 §2.8.1): the SA it made, and the lower of that exchange's two
+/// nonces -- which of the two new SAs is redundant is only known once our own
+/// exchange's nonces are in too.
+struct CrossedRekey {
+    child: RekeyedChild,
+    lowest_nonce: Vec<u8>,
 }
 
 /// The key material of `child`'s two directions, as a caller installs it.
@@ -524,17 +562,20 @@ impl LivenessSession {
     /// exchange. Preserves the tunnel's already-negotiated ESP cipher (see
     /// `ike_auth::esp_offer_for_cipher`'s own doc) -- a rekey only ever adds
     /// PFS on top of what's running, never silently changes algorithm.
+    ///
+    /// When the peer rekeys the same SA at the same time, the SA returned is
+    /// whichever of the two new ones survives (RFC 7296 §2.8.1) -- possibly
+    /// the peer's -- and is what the caller installs; see
+    /// [`Self::settle_rekey`].
     pub fn rekey_child(&mut self, timeout: Duration) -> Result<RekeyedChild, DriverError> {
         let old = ChildSpis { local: self.child_local_spi, peer: self.child_peer_spi };
         // A unified SA keeps being proposed as one: rekeying it IPv4-only would
         // silently drop IPv6 at the first rekey.
         let ts = if self.child_carries_ipv6 { TrafficSelectors::unified_full_tunnel() } else { TrafficSelectors::ipv4_full_tunnel() };
-        let (rekeyed, tsr) = self.child_exchange(Some(old), &ts, "rekey", timeout)?;
+        let (rekeyed, tsr) = self.child_exchange(Some((ChildKind::Primary, old)), &ts, "rekey", timeout)?;
         if self.child_carries_ipv6 && !tsr.as_ref().is_some_and(|t| t.has_ipv6()) {
             ike_debug!("CREATE_CHILD_SA (rekey): the unified CHILD SA's rekey came back without IPv6 (TSr={tsr:?})");
         }
-        self.child_local_spi = rekeyed.local_spi;
-        self.child_peer_spi = rekeyed.peer_spi;
         Ok(rekeyed)
     }
 
@@ -567,7 +608,7 @@ impl LivenessSession {
         let granted_ipv6_ts = tsr.as_ref().is_some_and(|ts| ts.selectors.iter().any(|s| s.to_ipv6_cidr().is_some()));
         if granted_subnets6.is_empty() || !granted_ipv6_ts {
             ike_debug!("CREATE_CHILD_SA (new IPv6 CHILD SA): reply granted no IPv6 traffic selector (TSr={tsr:?}) -- deleting it");
-            if let Err(e) = self.delete_child_sa(child.local_spi) {
+            if let Err(e) = self.delete_child_sa(ChildSpis::of(&child)) {
                 ike_debug!("CREATE_CHILD_SA (new IPv6 CHILD SA): failed to delete the unwanted CHILD SA: {e}");
             }
             return Err(IkeError::PeerRejected {
@@ -620,24 +661,170 @@ impl LivenessSession {
     /// Errors if there is no IPv6 CHILD SA.
     pub fn rekey_child_ipv6(&mut self, timeout: Duration) -> Result<RekeyedChild, DriverError> {
         let old = self.child6.ok_or(IkeError::Crypto("no IPv6 CHILD SA to rekey"))?;
-        let (rekeyed, _tsr) = self.child_exchange(Some(old), &TrafficSelectors::ipv6_full_tunnel(), "rekey IPv6", timeout)?;
-        self.child6 = Some(ChildSpis { local: rekeyed.local_spi, peer: rekeyed.peer_spi });
+        let (rekeyed, _tsr) = self.child_exchange(Some((ChildKind::Ipv6, old)), &TrafficSelectors::ipv6_full_tunnel(), "rekey IPv6", timeout)?;
         Ok(rekeyed)
     }
 
     /// One `CREATE_CHILD_SA` exchange creating a CHILD SA proposing `ts` as
-    /// both TSi and TSr: a rekey of `replaces` when given (which also
-    /// deletes the SA it superseded), a brand-new CHILD SA otherwise. Returns
-    /// the new SA and the `TSr` the gateway granted. `what` only labels the
-    /// debug output. Doesn't update any of `self`'s recorded SPIs -- the
-    /// public callers own which SA that is.
+    /// both TSi and TSr: a rekey of `kind`'s CHILD SA `old` when `replaces` is
+    /// `Some((kind, old))`, a brand-new CHILD SA otherwise. Returns the new SA
+    /// and the `TSr` the gateway granted. `what` only labels the debug output.
+    /// A rekey is settled by [`Self::settle_rekey`], which records the SA that
+    /// ends up replacing `old` as `kind`'s; a brand-new CHILD SA isn't recorded
+    /// anywhere -- the callers own which SA that is.
     fn child_exchange(
+        &mut self,
+        replaces: Option<(ChildKind, ChildSpis)>,
+        ts: &TrafficSelectors,
+        what: &str,
+        timeout: Duration,
+    ) -> Result<(RekeyedChild, Option<TrafficSelectors>), DriverError> {
+        let op = replaces.map_or(ChildOp::Create, |(_, old)| ChildOp::Rekey(old));
+        self.peer_child.in_flight = Some(OwnChildOp { op, crossed: None, old_deleted: false });
+        let exchanged = self.child_request(replaces.map(|(_, old)| old), ts, what, timeout);
+        let own = self.peer_child.in_flight.take();
+        match (replaces, own) {
+            (Some((kind, old)), Some(own)) => self.settle_rekey(kind, old, own, exchanged, what),
+            _ => exchanged.map(|(child, tsr, _)| (rekeyed_child(&child), tsr)),
+        }
+    }
+
+    /// Where a rekey of `kind`'s CHILD SA `old` leaves things, once our own
+    /// `CREATE_CHILD_SA` exchange for it (`exchanged`: the new SA, the `TSr`
+    /// granted and the lower of the exchange's two nonces) is over. Records the
+    /// SA replacing `old` as `kind`'s, deletes what is left over, and returns
+    /// the SA the caller installs.
+    ///
+    /// The peer may have rekeyed `old` too while ours was in flight
+    /// (RFC 7296 §2.8.1): both exchanges were answered, so three SAs now
+    /// exist. The one created with the lowest of the four nonces is redundant
+    /// and is deleted by whoever created it, and whoever created the survivor
+    /// deletes `old`. If ours is the redundant one the peer's is returned
+    /// instead; if theirs is, the peer deletes it, and that Delete is
+    /// answered with ours. If our exchange failed instead -- our request was
+    /// lost, or the peer answered `CHILD_SA_NOT_FOUND` because its own rekey
+    /// had already replaced `old` -- the peer's SA stands and the error means
+    /// nothing. Only the survivor is ever handed to the caller, which holds
+    /// one CHILD SA per family: the redundant SA's inbound traffic is not
+    /// accepted in the moment before its Delete, although RFC 7296 §2.8.1
+    /// asks for both.
+    ///
+    /// The peer may also have deleted `old` meanwhile (§2.25.1: answered as
+    /// usual, with our Delete for it). Then a rekey that stood has nothing
+    /// left to delete, and one that failed leaves `kind` without a CHILD SA,
+    /// exactly as if the Delete had arrived outside the exchange.
+    fn settle_rekey(
+        &mut self,
+        kind: ChildKind,
+        old: ChildSpis,
+        own: OwnChildOp,
+        exchanged: Result<(ChildSa, Option<TrafficSelectors>, Vec<u8>), DriverError>,
+        what: &str,
+    ) -> Result<(RekeyedChild, Option<TrafficSelectors>), DriverError> {
+        let (child, tsr) = match (exchanged, own.crossed) {
+            (Ok((child, tsr, _)), None) => (child, tsr),
+            (Ok((child, tsr, our_lowest)), Some(crossed)) => {
+                let ours = rekeyed_child(&child);
+                if our_lowest < crossed.lowest_nonce {
+                    ike_debug!(
+                        "CREATE_CHILD_SA ({what}): the peer rekeyed the same CHILD SA -- ours (spi_in={:08x}) holds the lowest nonce, deleting it and keeping the peer's (spi_in={:08x})",
+                        ours.local_spi, crossed.child.local_spi
+                    );
+                    if let Err(e) = self.delete_child_sa(ChildSpis::of(&ours)) {
+                        ike_debug!("CREATE_CHILD_SA ({what}): failed to send Delete for the redundant CHILD SA spi_in={:08x}: {e}", ours.local_spi);
+                    }
+                    return Ok((crossed.child, tsr));
+                }
+                ike_debug!(
+                    "CREATE_CHILD_SA ({what}): the peer rekeyed the same CHILD SA -- its SA (spi_in={:08x}) holds the lowest nonce, the peer deletes it; keeping ours (spi_in={:08x})",
+                    crossed.child.local_spi, ours.local_spi
+                );
+                let theirs = ChildSpis::of(&crossed.child);
+                self.peer_child.superseded.push(SupersededChild { local_spi: theirs.local, peer_spi: theirs.peer, since: Instant::now() });
+                // `old` went into `superseded` when the peer's rekey was answered,
+                // for the peer to delete; now it's ours to delete.
+                self.peer_child.superseded.retain(|s| s.peer_spi != old.peer);
+                (child, tsr)
+            }
+            (Err(DriverError::Ike(IkeError::PeerTornDown)), _) => return Err(IkeError::PeerTornDown.into()),
+            (Err(e), Some(crossed)) => {
+                ike_debug!(
+                    "CREATE_CHILD_SA ({what}): failed ({e}), but the peer rekeyed the same CHILD SA meanwhile -- keeping its SA (spi_in={:08x})",
+                    crossed.child.local_spi
+                );
+                return Ok((crossed.child, None));
+            }
+            (Err(e), None) if own.old_deleted => return Err(self.lost_child(kind, e)),
+            (Err(e), None) => return Err(e),
+        };
+        let rekeyed = rekeyed_child(&child);
+        self.set_child_spis(kind, &rekeyed);
+        // RFC 7296 §2.8's own worked example ends a rekey with the initiator
+        // explicitly deleting the SA it just replaced -- without this, a real
+        // gateway (confirmed live against a FortiGate) has no way to know the
+        // old CHILD SA is no longer wanted and keeps it (and its kernel
+        // state) around until its own lifetime eventually expires it, which
+        // with a short-lived P2 profile means old, unused SAs pile up.
+        // Best-effort: the new CHILD SA above is already valid and in use
+        // regardless of whether the peer sees or acks this.
+        if !own.old_deleted {
+            if let Err(e) = self.delete_child_sa(old) {
+                ike_debug!(
+                    "CREATE_CHILD_SA ({what}): failed to send Delete for superseded CHILD SA spi_in={:08x} (new CHILD SA unaffected): {e}",
+                    old.local
+                );
+            }
+        }
+        Ok((rekeyed, tsr))
+    }
+
+    /// Record `child` as `kind`'s CHILD SA.
+    fn set_child_spis(&mut self, kind: ChildKind, child: &RekeyedChild) {
+        match kind {
+            ChildKind::Primary => {
+                self.child_local_spi = child.local_spi;
+                self.child_peer_spi = child.peer_spi;
+            }
+            ChildKind::Ipv6 => self.child6 = Some(ChildSpis::of(child)),
+        }
+    }
+
+    /// `kind`'s CHILD SA is gone -- the peer deleted it while our rekey of it
+    /// was in flight, and that rekey came to nothing (`e`). Handled as
+    /// [`Self::answer_peer_request`] handles that Delete outside an exchange:
+    /// queued for renegotiation while the other family keeps the tunnel up,
+    /// the tunnel's end otherwise. Returns the error to surface.
+    fn lost_child(&mut self, kind: ChildKind, e: DriverError) -> DriverError {
+        match kind {
+            ChildKind::Primary if self.child6.is_some() => {
+                ike_debug!("CREATE_CHILD_SA: the peer deleted the primary CHILD SA while we rekeyed it -- IPv6 CHILD SA and IKE SA are still up, renegotiating it");
+                self.primary_child_alive = false;
+                self.peer_child.deleted.push(ChildKind::Primary);
+                e
+            }
+            ChildKind::Primary => {
+                ike_debug!("CREATE_CHILD_SA: the peer deleted the tunnel's only CHILD SA while we rekeyed it -- tunnel torn down by the gateway");
+                IkeError::PeerTornDown.into()
+            }
+            ChildKind::Ipv6 => {
+                ike_debug!("CREATE_CHILD_SA: the peer deleted the IPv6 CHILD SA while we rekeyed it -- primary CHILD SA and IKE SA are still up, renegotiating it");
+                self.child6 = None;
+                self.peer_child.deleted.push(ChildKind::Ipv6);
+                e
+            }
+        }
+    }
+
+    /// The `CREATE_CHILD_SA` exchange itself, for [`Self::child_exchange`]:
+    /// the new SA, the `TSr` granted, and the lower of the exchange's two
+    /// nonces (for [`Self::settle_rekey`]).
+    fn child_request(
         &mut self,
         replaces: Option<ChildSpis>,
         ts: &TrafficSelectors,
         what: &str,
         timeout: Duration,
-    ) -> Result<(RekeyedChild, Option<TrafficSelectors>), DriverError> {
+    ) -> Result<(ChildSa, Option<TrafficSelectors>, Vec<u8>), DriverError> {
         let mut entropy = OsEntropy::new()?;
         let mut ni = vec![0u8; NONCE_LEN];
         entropy.fill(&mut ni);
@@ -712,9 +899,9 @@ impl LivenessSession {
                 }
                 continue; // a stale/unrelated response -- keep waiting
             }
-            // may_rekey_ike: false -- a genuine peer-started IKE SA rekey
-            // colliding with this exchange is rare enough to just let this
-            // attempt fail (and retry) rather than take it on mid-exchange.
+            // may_rekey_ike: false -- a peer-started IKE SA rekey colliding
+            // with this exchange is refused with TEMPORARY_FAILURE (RFC 7296
+            // §2.25.1), for the peer to retry once this is over.
             if self.answer_peer_request(&header, &msg, false)? {
                 return Err(IkeError::PeerTornDown.into());
             }
@@ -731,23 +918,8 @@ impl LivenessSession {
             "CREATE_CHILD_SA ({what}): complete -- new spi_in={:08x} spi_out={:08x}",
             child.inbound.spi(), child.outbound.spi()
         );
-        // RFC 7296 §2.8's own worked example ends a rekey with the initiator
-        // explicitly deleting the SA it just replaced -- without this, a real
-        // gateway (confirmed live against a FortiGate) has no way to know the
-        // old CHILD SA is no longer wanted and keeps it (and its kernel
-        // state) around until its own lifetime eventually expires it, which
-        // with a short-lived P2 profile means old, unused SAs pile up.
-        // Best-effort: the new CHILD SA above is already valid and in use
-        // regardless of whether the peer sees or acks this.
-        if let Some(old) = replaces {
-            if let Err(e) = self.delete_child_sa(old.local) {
-                ike_debug!(
-                    "CREATE_CHILD_SA ({what}): failed to send Delete for superseded CHILD SA spi_in={:08x} (new CHILD SA unaffected): {e}",
-                    old.local
-                );
-            }
-        }
-        Ok((rekeyed_child(&child), tsr))
+        let nr = rekey::peer_child_nonce(&self.sa, &response).unwrap_or_default();
+        Ok((child, tsr, ni.min(nr)))
     }
 
     /// The next IKE datagram, waiting at most `timeout`: from `external_rx`
@@ -771,25 +943,29 @@ impl LivenessSession {
     }
 
     /// Send an INFORMATIONAL Delete (RFC 7296 §1.4.1/§3.10) for a single ESP
-    /// CHILD SA, and best-effort wait for the ack. `local_spi` is *our own*
-    /// inbound SPI for that SA -- per RFC 7296 §3.10, a Delete names the
-    /// SPI the sender itself expects in inbound packets, i.e. the value the
-    /// peer would use as the destination sending ESP *to* us, not the SPI
-    /// we use sending to them (that's the peer's own value to report, on
-    /// their own Delete, not ours). Used by [`Self::rekey_child`] to
-    /// explicitly retire the CHILD SA a rekey just replaced -- see that
-    /// call site's doc for why this exists.
-    fn delete_child_sa(&mut self, local_spi: u32) -> Result<(), DriverError> {
+    /// CHILD SA, and best-effort wait for the ack. The Delete names
+    /// `child.local`, *our own* inbound SPI for that SA -- per RFC 7296
+    /// §3.10, a Delete names the SPI the sender itself expects in inbound
+    /// packets, i.e. the value the peer would use as the destination sending
+    /// ESP *to* us, not the SPI we use sending to them (that's the peer's own
+    /// value to report, on their own Delete, not ours). Used by
+    /// [`Self::settle_rekey`] to explicitly retire the CHILD SA a rekey just
+    /// replaced -- see that call site's doc for why this exists.
+    fn delete_child_sa(&mut self, child: ChildSpis) -> Result<(), DriverError> {
         let mid = self.alloc_message_id();
         let mut iv = [0u8; 8];
         OsEntropy::new()?.fill(&mut iv);
-        let del = Delete::esp(vec![local_spi]);
+        let del = Delete::esp(vec![child.local]);
         let req = build_informational(&self.sa, mid, false, &[(PayloadType::Delete, del.to_bytes())], &iv)?;
-        ike_debug!("INFORMATIONAL: sending ESP Delete for superseded CHILD SA spi_in={local_spi:08x} to {}", self.dest);
+        ike_debug!("INFORMATIONAL: sending ESP Delete for CHILD SA spi_in={:08x} to {}", child.local, self.dest);
         let wire = wrap(&req, self.float);
+        // Until it's answered, the peer's requests about this SA collide
+        // with it (RFC 7296 §2.25.1).
+        let outer = self.peer_child.in_flight.replace(OwnChildOp { op: ChildOp::Close(child), crossed: None, old_deleted: false });
         // Best-effort ack wait, same reasoning as `close()`: the peer may
         // consider the SA gone immediately either way.
         let _ = self.send_and_await(&wire, mid, Duration::from_millis(500));
+        self.peer_child.in_flight = outer;
         Ok(())
     }
 
@@ -897,13 +1073,35 @@ impl LivenessSession {
         // Delete carries the Delete for the other direction (RFC 7296 §1.4.1),
         // i.e. our inbound SPI of the pair. Anything else is acked empty.
         let mut ack_payloads = Vec::new();
+        // The peer's SPI of a CHILD SA this Delete names that an exchange of
+        // our own in flight is about: that exchange settles what it means.
+        let mut collided = None;
         if let (false, Some(Delete { protocol_id: p, spis })) = (on_retired, &delete) {
             if *p == protocol_id::ESP {
-                let ours: Vec<u32> =
+                let mut ours: Vec<u32> =
                     self.peer_child.superseded.iter().filter(|c| spis.contains(&c.peer_spi)).map(|c| c.local_spi).collect();
                 if !ours.is_empty() {
                     ike_debug!("INFORMATIONAL: peer deleted the CHILD SA its rekey replaced (spi_in={ours:08x?})");
                     self.peer_child.superseded.retain(|c| !spis.contains(&c.peer_spi));
+                }
+                // RFC 7296 §2.25.1: a CHILD SA we are rekeying is answered as
+                // usual, with our Delete for it. (One both sides are deleting
+                // is answered without it, ours being on its way: no SA we
+                // delete is ever left in `superseded`, and nothing else adds
+                // a Delete payload.)
+                if let Some(own) = self.peer_child.in_flight.as_mut() {
+                    if let ChildOp::Rekey(old) = own.op {
+                        if spis.contains(&old.peer) {
+                            ike_debug!("INFORMATIONAL: peer deleted the CHILD SA we are rekeying (spi_in={:08x})", old.local);
+                            if !ours.contains(&old.local) {
+                                ours.push(old.local);
+                            }
+                            own.old_deleted = true;
+                            collided = Some(old.peer);
+                        }
+                    }
+                }
+                if !ours.is_empty() {
                     ack_payloads.push((PayloadType::Delete, Delete::esp(ours).to_bytes()));
                 }
             }
@@ -933,10 +1131,13 @@ impl LivenessSession {
         // under it, never the other way around, so there is an IKE SA worth
         // keeping alive. That case is queued in `peer_child.deleted` for the
         // caller to collect and renegotiate a replacement for (see
-        // [`Self::take_peer_deleted_children`]) -- not a teardown.
+        // [`Self::take_peer_deleted_children`]) -- not a teardown. Nor is the
+        // SA an exchange of our own is about (`collided`): that exchange
+        // settles it -- see [`Self::settle_rekey`].
         let tears_down = match delete {
             Some(Delete { protocol_id: p, .. }) if p == protocol_id::IKE => true,
-            Some(Delete { protocol_id: p, spis }) if p == protocol_id::ESP => {
+            Some(Delete { protocol_id: p, mut spis }) if p == protocol_id::ESP => {
+                spis.retain(|s| Some(*s) != collided);
                 if spis.contains(&self.child_peer_spi) && self.primary_child_alive {
                     if self.child6.is_some() {
                         ike_debug!(
@@ -973,9 +1174,12 @@ impl LivenessSession {
     }
 
     /// Answer a `CREATE_CHILD_SA` the peer started: an IKE SA rekey (RFC 7296
-    /// §2.18, when `may_rekey_ike`), otherwise one of a CHILD SA -- see
+    /// §2.18), otherwise one of a CHILD SA -- see
     /// [`Self::answer_peer_child_request`]. What can't be taken on is refused,
-    /// still as a `CREATE_CHILD_SA` response.
+    /// still as a `CREATE_CHILD_SA` response. An IKE SA rekey colliding with
+    /// a request of our own (`!may_rekey_ike`), or with a CHILD SA being
+    /// created, rekeyed or deleted, is refused with `TEMPORARY_FAILURE`
+    /// (RFC 7296 §2.25.1) -- the peer retries it later.
     fn answer_peer_create_child_sa(&mut self, header: &IkeHeader, msg: &[u8], may_rekey_ike: bool) -> Result<(), DriverError> {
         let mut entropy = OsEntropy::new()?;
         let mut iv = [0u8; 8];
@@ -993,7 +1197,15 @@ impl LivenessSession {
             }
             return Ok(());
         };
-        if may_rekey_ike && ike_rekey::is_ike_sa_rekey(&inner) {
+        if ike_rekey::is_ike_sa_rekey(&inner) && (!may_rekey_ike || self.peer_child.in_flight.is_some()) {
+            return self.refuse_peer_child_request(
+                header,
+                &iv,
+                notify_type::TEMPORARY_FAILURE,
+                "an IKE SA rekey collides with an exchange of ours in flight",
+            );
+        }
+        if ike_rekey::is_ike_sa_rekey(&inner) {
             let mut dh_private = [0u8; 32];
             entropy.fill(&mut dh_private);
             let mut nr = vec![0u8; NONCE_LEN];
@@ -1031,6 +1243,12 @@ impl LivenessSession {
     /// exchange type (an empty INFORMATIONAL, say) is a protocol error a
     /// gateway such as strongSwan answers by destroying the whole IKE SA,
     /// where a plain refusal leaves it standing.
+    ///
+    /// A rekey colliding with an exchange of our own about the same CHILD SA
+    /// follows RFC 7296 §2.25.1: one of an SA we are deleting is refused with
+    /// `TEMPORARY_FAILURE`; one of an SA we are rekeying ourselves is answered
+    /// as usual, but the new SA is only noted for [`Self::settle_rekey`] to
+    /// weigh against ours, not handed to the caller.
     fn answer_peer_child_request(&mut self, header: &IkeHeader, msg: &[u8], iv: &[u8; 8]) -> Result<(), DriverError> {
         if let Some((_, response)) = self.peer_child.last.as_ref().filter(|(request, _)| request == msg) {
             ike_debug!("CREATE_CHILD_SA: the peer retransmitted its CHILD SA rekey -- resending our answer");
@@ -1039,6 +1257,18 @@ impl LivenessSession {
         }
         let Some(rekeyed_spi) = rekey::rekey_sa_spi(&self.sa, msg) else {
             return self.refuse_peer_child_request(header, iv, notify_type::NO_ADDITIONAL_SAS, "a new CHILD SA is not taken on");
+        };
+        let crossed = match self.peer_child.in_flight.as_ref() {
+            Some(OwnChildOp { op: ChildOp::Close(c), .. }) if c.peer == rekeyed_spi => {
+                return self.refuse_peer_child_request(
+                    header,
+                    iv,
+                    notify_type::TEMPORARY_FAILURE,
+                    &format!("we are deleting the CHILD SA with spi {rekeyed_spi:08x}"),
+                );
+            }
+            Some(OwnChildOp { op: ChildOp::Rekey(old), crossed: None, .. }) => old.peer == rekeyed_spi,
+            _ => false,
         };
         let (kind, old) = if self.primary_child_alive && rekeyed_spi == self.child_peer_spi {
             (ChildKind::Primary, ChildSpis { local: self.child_local_spi, peer: self.child_peer_spi })
@@ -1072,15 +1302,16 @@ impl LivenessSession {
                     "CREATE_CHILD_SA: the peer rekeyed the {kind:?} CHILD SA (message id {}) -- new spi_in={:08x} spi_out={:08x}",
                     header.message_id, rekeyed.local_spi, rekeyed.peer_spi
                 );
-                match kind {
-                    ChildKind::Primary => {
-                        self.child_local_spi = rekeyed.local_spi;
-                        self.child_peer_spi = rekeyed.peer_spi;
-                    }
-                    ChildKind::Ipv6 => self.child6 = Some(ChildSpis { local: rekeyed.local_spi, peer: rekeyed.peer_spi }),
-                }
+                self.set_child_spis(kind, &rekeyed);
                 self.peer_child.superseded.push(SupersededChild { local_spi: old.local, peer_spi: old.peer, since: Instant::now() });
-                self.peer_child.pending.push(PeerRekeyedChild { kind, child: rekeyed });
+                match self.peer_child.in_flight.as_mut().filter(|_| crossed) {
+                    Some(own) => {
+                        ike_debug!("CREATE_CHILD_SA: we are rekeying that CHILD SA too -- settled once our own rekey is answered");
+                        let ni = rekey::peer_child_nonce(&self.sa, msg).unwrap_or_default();
+                        own.crossed = Some(CrossedRekey { child: rekeyed, lowest_nonce: ni.min(nr) });
+                    }
+                    None => self.peer_child.pending.push(PeerRekeyedChild { kind, child: rekeyed }),
+                }
                 self.peer_child.last = Some((msg.to_vec(), wire));
                 Ok(())
             }
@@ -1901,7 +2132,7 @@ impl<E: Entropy> Ikev2Session<E> {
         };
         if !tsr.as_ref().is_some_and(|t| t.has_ipv4()) {
             ike_debug!("CREATE_CHILD_SA (IPv4 after a refused IKE_AUTH offer): reply granted no IPv4 traffic selector (TSr={tsr:?}) -- closing");
-            let _ = liveness.delete_child_sa(child.local_spi);
+            let _ = liveness.delete_child_sa(ChildSpis::of(&child));
             let _ = liveness.close();
             return Err(IkeError::PeerRejected {
                 notify_type: notify_type::TS_UNACCEPTABLE,
@@ -4225,6 +4456,359 @@ mod tests {
         assert_eq!((taken[0].kind, taken[0].child.local_spi, taken[0].child.peer_spi), (ChildKind::Primary, new_local_spi, 0xD00D_0001));
         // From now on the SA a Delete must name to end the tunnel is the new one.
         assert_eq!(tunnel.liveness.child_peer_spi, 0xD00D_0001);
+    }
+
+    /// The SPIs the scripted gateway of the collision tests below picks: for the
+    /// SA its own rekey creates, and for the one it creates answering ours.
+    const PEER_P_SPI: u32 = 0xD00D_0002;
+    const PEER_L_SPI: u32 = 0xD00D_0003;
+
+    /// The next datagram the client sends the scripted gateway.
+    fn recv_from_client(sock: &UdpSocket) -> Vec<u8> {
+        let mut buf = [0u8; 4096];
+        let (n, _) = sock.recv_from(&mut buf).unwrap();
+        buf[..n].to_vec()
+    }
+
+    /// The next *response* from the client, skipping retransmissions of a
+    /// request of its own the gateway is holding back an answer to.
+    fn recv_response_from_client(sock: &UdpSocket) -> Vec<u8> {
+        loop {
+            let msg = recv_from_client(sock);
+            if IkeHeader::parse(&msg).unwrap().flags.response {
+                return msg;
+            }
+        }
+    }
+
+    /// The gateway's own rekey of the CHILD SA it knows by `rekeyed` (its inbound SPI).
+    fn gateway_child_rekey(sa: &CompletedSaInit, mid: u32, rekeyed: u32, new_spi: u32, ni: &[u8]) -> Vec<u8> {
+        rekey::build_child_request(sa, mid, Some(rekeyed), new_spi, ni, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), &[1u8; 8])
+            .unwrap()
+    }
+
+    /// The gateway's answer to the client's rekey `request`, with nonce `nr`.
+    fn gateway_answers_rekey(sa: &CompletedSaInit, request: &[u8], nr: &[u8]) -> (Vec<u8>, crate::esp::ChildSa) {
+        rekey::responder_process_rekey_with_pfs(sa, request, PEER_L_SPI, nr, SkCipher::Aes256Gcm, None, &[8u8; 8], None).unwrap()
+    }
+
+    fn esp_delete_request(sa: &CompletedSaInit, mid: u32, spi: u32) -> Vec<u8> {
+        build_informational(sa, mid, false, &[(PayloadType::Delete, Delete::esp(vec![spi]).to_bytes())], &[3u8; 8]).unwrap()
+    }
+
+    /// The gateway's answer to the INFORMATIONAL `request`, carrying `deletes`.
+    fn informational_answer(sa: &CompletedSaInit, request: &[u8], deletes: &[u32]) -> Vec<u8> {
+        let mid = IkeHeader::parse(request).unwrap().message_id;
+        let payloads: Vec<_> =
+            if deletes.is_empty() { Vec::new() } else { vec![(PayloadType::Delete, Delete::esp(deletes.to_vec()).to_bytes())] };
+        build_informational(sa, mid, true, &payloads, &[4u8; 8]).unwrap()
+    }
+
+    /// The Delete payload in a message from the client, if any.
+    fn delete_in(sa: &CompletedSaInit, msg: &[u8]) -> Option<Delete> {
+        open_informational(sa, msg)
+            .unwrap()
+            .into_iter()
+            .find(|(t, _)| *t == PayloadType::Delete)
+            .map(|(_, body)| Delete::parse(&body).unwrap())
+    }
+
+    /// The Notify a client's `CREATE_CHILD_SA` answer carries, if any.
+    fn create_child_notify(sa: &CompletedSaInit, msg: &[u8]) -> Option<u16> {
+        assert_eq!(IkeHeader::parse(msg).unwrap().exchange_type, ExchangeType::CreateChildSa, "a CREATE_CHILD_SA is answered as one");
+        open_informational(sa, msg)
+            .unwrap()
+            .into_iter()
+            .find(|(t, _)| *t == PayloadType::Notify)
+            .map(|(_, body)| crate::ikev2::payload::Notify::parse(&body).unwrap().notify_type)
+    }
+
+    /// Nothing more from the client within a second.
+    fn client_stays_quiet(sock: &UdpSocket) -> bool {
+        sock.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        sock.recv_from(&mut [0u8; 4096]).is_err()
+    }
+
+    fn connect_for_collision_test(bind: SocketAddr, psk: Vec<u8>) -> ConnectedTunnel {
+        let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+        let cfg = AuthConfig::psk(Identification::fqdn("client.test"), psk);
+        session.connect_direct_on_port(bind, &default_ike_offer(), &cfg, false, &default_esp_offer(), next_addr().port()).unwrap()
+    }
+
+    /// Both ends rekey the CHILD SA at once (RFC 7296 §2.8.1) and the lowest of
+    /// the four nonces is in the gateway's exchange: its new SA is the
+    /// redundant one, which the gateway deletes. Ours survives, and having
+    /// initiated the survivor we delete the SA it replaced. The gateway's SA
+    /// never reaches the caller, and its Delete is answered with ours. A
+    /// gateway that deletes the replaced SA too, meanwhile, is answered
+    /// without a Delete payload -- ours is on its way (§2.25.1).
+    #[test]
+    fn simultaneous_child_rekeys_keep_ours_when_the_gateways_holds_the_lowest_nonce() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let ours = recv_from_client(&sock);
+                let ni = [0x00u8; 32]; // the lowest a nonce can be
+                sock.send_to(&gateway_child_rekey(&sa, 0, RESPONDER_CHILD_SPI, PEER_P_SPI, &ni), from).unwrap();
+                let answer = recv_from_client(&sock);
+                let (theirs, _) =
+                    rekey::initiator_complete_child(&sa, &ni, PEER_P_SPI, SkCipher::Aes256Gcm, None, &answer).expect("answered as usual");
+                let (response, ours_sa) = gateway_answers_rekey(&sa, &ours, &[0x80u8; 32]);
+                sock.send_to(&response, from).unwrap();
+
+                let client_delete = recv_from_client(&sock); // answered once ours is
+                sock.send_to(&esp_delete_request(&sa, 1, RESPONDER_CHILD_SPI), from).unwrap();
+                let both_deleting = recv_response_from_client(&sock);
+                sock.send_to(&informational_answer(&sa, &client_delete, &[]), from).unwrap();
+                sock.send_to(&esp_delete_request(&sa, 2, PEER_P_SPI), from).unwrap();
+                let answer = recv_from_client(&sock);
+                (
+                    client_spi,
+                    delete_in(&sa, &client_delete),
+                    delete_in(&sa, &both_deleting),
+                    delete_in(&sa, &answer),
+                    theirs.outbound.spi(),
+                    ours_sa.outbound.spi(),
+                )
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let rekeyed = tunnel.liveness.rekey_child(Duration::from_secs(5)).unwrap();
+        let live = tunnel.liveness.peek(Duration::from_millis(1500)).unwrap();
+        let (old_local_spi, client_deleted, both_deleting, answered, theirs_local_spi, ours_local_spi) = gateway.join().unwrap();
+        assert_eq!((rekeyed.local_spi, rekeyed.peer_spi), (ours_local_spi, PEER_L_SPI), "ours survives");
+        assert_eq!(client_deleted, Some(Delete::esp(vec![old_local_spi])), "the survivor's initiator deletes the SA it replaced");
+        assert_eq!(both_deleting, None, "an SA both sides are deleting is answered without a Delete payload");
+        assert_eq!(answered, Some(Delete::esp(vec![theirs_local_spi])), "the redundant SA's Delete is answered with ours");
+        assert_eq!(live, Liveness::Alive);
+        assert!(tunnel.liveness.take_peer_rekeys().is_empty(), "the redundant SA never reaches the caller");
+        assert_eq!(tunnel.liveness.child_peer_spi, PEER_L_SPI);
+    }
+
+    /// The same collision with the lowest nonce in our own exchange: ours is
+    /// the redundant SA and we delete it, the gateway's survives and is what
+    /// `rekey_child` returns, and the gateway -- its initiator -- deletes the SA
+    /// it replaced, a Delete answered with ours.
+    #[test]
+    fn simultaneous_child_rekeys_keep_the_gateways_when_ours_holds_the_lowest_nonce() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let ours = recv_from_client(&sock);
+                let ni = [0xFFu8; 32];
+                sock.send_to(&gateway_child_rekey(&sa, 0, RESPONDER_CHILD_SPI, PEER_P_SPI, &ni), from).unwrap();
+                let answer = recv_from_client(&sock);
+                let (theirs, _) =
+                    rekey::initiator_complete_child(&sa, &ni, PEER_P_SPI, SkCipher::Aes256Gcm, None, &answer).expect("answered as usual");
+                let (response, ours_sa) = gateway_answers_rekey(&sa, &ours, &[0x00u8; 32]);
+                sock.send_to(&response, from).unwrap();
+
+                let client_delete = recv_from_client(&sock);
+                sock.send_to(&informational_answer(&sa, &client_delete, &[PEER_L_SPI]), from).unwrap();
+                sock.send_to(&esp_delete_request(&sa, 1, RESPONDER_CHILD_SPI), from).unwrap();
+                let answer = recv_from_client(&sock);
+                (client_spi, delete_in(&sa, &client_delete), delete_in(&sa, &answer), theirs.outbound.spi(), ours_sa.outbound.spi())
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let rekeyed = tunnel.liveness.rekey_child(Duration::from_secs(5)).unwrap();
+        let live = tunnel.liveness.peek(Duration::from_millis(1500)).unwrap();
+        let (old_local_spi, client_deleted, answered, theirs_local_spi, ours_local_spi) = gateway.join().unwrap();
+        assert_eq!((rekeyed.local_spi, rekeyed.peer_spi), (theirs_local_spi, PEER_P_SPI), "the gateway's SA survives");
+        assert_eq!(client_deleted, Some(Delete::esp(vec![ours_local_spi])), "we delete our redundant SA, not the one it replaced");
+        assert_eq!(answered, Some(Delete::esp(vec![old_local_spi])), "the gateway's Delete of the replaced SA is answered with ours");
+        assert_eq!(live, Liveness::Alive);
+        assert!(tunnel.liveness.take_peer_rekeys().is_empty(), "the survivor reaches the caller once, from rekey_child");
+        assert_eq!(tunnel.liveness.child_peer_spi, PEER_P_SPI);
+    }
+
+    /// RFC 7296 §2.8.1's second sequence: our rekey request only reaches the
+    /// gateway after its own rekey of the same SA is complete -- the replaced
+    /// SA deleted and all -- so it answers `CHILD_SA_NOT_FOUND`. Having
+    /// answered the gateway's rekey, we already know it collided: the error is
+    /// ignored and the gateway's SA is the rekey's result.
+    #[test]
+    fn a_crossed_rekey_answered_child_sa_not_found_keeps_the_gateways_sa() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let ours = recv_from_client(&sock); // held back, as if delayed
+                let ni = [0x55u8; 32];
+                sock.send_to(&gateway_child_rekey(&sa, 0, RESPONDER_CHILD_SPI, PEER_P_SPI, &ni), from).unwrap();
+                let answer = recv_from_client(&sock);
+                let (theirs, _) =
+                    rekey::initiator_complete_child(&sa, &ni, PEER_P_SPI, SkCipher::Aes256Gcm, None, &answer).expect("answered as usual");
+                sock.send_to(&esp_delete_request(&sa, 1, RESPONDER_CHILD_SPI), from).unwrap();
+                let answer = recv_from_client(&sock);
+                let mid = IkeHeader::parse(&ours).unwrap().message_id;
+                sock.send_to(&rekey::build_child_error(&sa, mid, notify_type::CHILD_SA_NOT_FOUND, &[5u8; 8]).unwrap(), from).unwrap();
+                (client_spi, delete_in(&sa, &answer), theirs.outbound.spi(), client_stays_quiet(&sock))
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let rekeyed = tunnel.liveness.rekey_child(Duration::from_secs(5)).expect("the collision makes the error meaningless");
+        let (old_local_spi, answered, theirs_local_spi, quiet) = gateway.join().unwrap();
+        assert_eq!((rekeyed.local_spi, rekeyed.peer_spi), (theirs_local_spi, PEER_P_SPI));
+        assert_eq!(answered, Some(Delete::esp(vec![old_local_spi])));
+        assert!(quiet, "nothing is left for us to delete");
+        assert!(tunnel.liveness.take_peer_rekeys().is_empty(), "the gateway's SA reaches the caller once, from rekey_child");
+        assert_eq!(tunnel.liveness.child_peer_spi, PEER_P_SPI);
+    }
+
+    /// RFC 7296 §2.25.1: the gateway deleting the CHILD SA we are rekeying is
+    /// answered as usual, with our Delete for it. It is not the tunnel going
+    /// down while the rekey is in flight: the rekey stands, and the replaced SA
+    /// being gone already, we send no Delete of our own for it.
+    #[test]
+    fn the_gateway_deleting_the_child_sa_we_are_rekeying_is_answered_and_the_rekey_stands() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let ours = recv_from_client(&sock);
+                sock.send_to(&esp_delete_request(&sa, 0, RESPONDER_CHILD_SPI), from).unwrap();
+                let answer = recv_from_client(&sock);
+                let (response, ours_sa) = gateway_answers_rekey(&sa, &ours, &[0x80u8; 32]);
+                sock.send_to(&response, from).unwrap();
+                (client_spi, delete_in(&sa, &answer), ours_sa.outbound.spi(), client_stays_quiet(&sock))
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let rekeyed = tunnel.liveness.rekey_child(Duration::from_secs(5)).expect("the rekey stands");
+        let (old_local_spi, answered, ours_local_spi, quiet) = gateway.join().unwrap();
+        assert_eq!((rekeyed.local_spi, rekeyed.peer_spi), (ours_local_spi, PEER_L_SPI));
+        assert_eq!(answered, Some(Delete::esp(vec![old_local_spi])), "answered as usual, with our Delete for it");
+        assert!(quiet, "the replaced SA is gone already");
+        assert!(tunnel.liveness.take_peer_deleted_children().is_empty(), "nothing to renegotiate");
+        assert_eq!(tunnel.liveness.child_peer_spi, PEER_L_SPI);
+    }
+
+    /// ...and when the gateway then refuses the rekey, the tunnel's only CHILD
+    /// SA is gone: the tunnel is down, as that Delete would have made it outside
+    /// the exchange.
+    #[test]
+    fn the_gateway_deleting_the_only_child_sa_we_are_rekeying_then_refusing_the_rekey_is_a_teardown() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let ours = recv_from_client(&sock);
+                sock.send_to(&esp_delete_request(&sa, 0, RESPONDER_CHILD_SPI), from).unwrap();
+                let answer = recv_from_client(&sock);
+                let mid = IkeHeader::parse(&ours).unwrap().message_id;
+                sock.send_to(&rekey::build_child_error(&sa, mid, notify_type::CHILD_SA_NOT_FOUND, &[5u8; 8]).unwrap(), from).unwrap();
+                (client_spi, delete_in(&sa, &answer))
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let err = match tunnel.liveness.rekey_child(Duration::from_secs(5)) {
+            Err(DriverError::Ike(e)) => e,
+            other => panic!("expected an IKE error, got {:?}", other.map(|_| ())),
+        };
+        let (old_local_spi, answered) = gateway.join().unwrap();
+        assert_eq!(answered, Some(Delete::esp(vec![old_local_spi])));
+        assert_eq!(err, IkeError::PeerTornDown);
+    }
+
+    /// RFC 7296 §2.25.1, the SA we are deleting after a rekey: the gateway's
+    /// rekey of it is refused with `TEMPORARY_FAILURE`, and its own Delete of
+    /// it is answered without a Delete payload (ours is on its way) -- neither
+    /// touching the SA that replaced it.
+    #[test]
+    fn the_gateway_rekeying_or_deleting_the_child_sa_we_are_deleting_collides_cleanly() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let ours = recv_from_client(&sock);
+                let (response, _) = gateway_answers_rekey(&sa, &ours, &[0x80u8; 32]);
+                sock.send_to(&response, from).unwrap();
+                let client_delete = recv_from_client(&sock); // answered only at the end
+                sock.send_to(&gateway_child_rekey(&sa, 0, RESPONDER_CHILD_SPI, PEER_P_SPI, &[0x55u8; 32]), from).unwrap();
+                let refusal = recv_response_from_client(&sock);
+                sock.send_to(&esp_delete_request(&sa, 1, RESPONDER_CHILD_SPI), from).unwrap();
+                let answer = recv_response_from_client(&sock);
+                sock.send_to(&informational_answer(&sa, &client_delete, &[]), from).unwrap();
+                (client_spi, delete_in(&sa, &client_delete), create_child_notify(&sa, &refusal), delete_in(&sa, &answer))
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let rekeyed = tunnel.liveness.rekey_child(Duration::from_secs(5)).unwrap();
+        let (old_local_spi, client_deleted, refused_with, answered) = gateway.join().unwrap();
+        assert_eq!(client_deleted, Some(Delete::esp(vec![old_local_spi])));
+        assert_eq!(refused_with, Some(notify_type::TEMPORARY_FAILURE), "a rekey of an SA being deleted waits");
+        assert_eq!(answered, None, "a Delete of an SA both sides are deleting is answered without one");
+        assert!(tunnel.liveness.take_peer_rekeys().is_empty());
+        assert!(tunnel.liveness.take_peer_deleted_children().is_empty());
+        assert_eq!((tunnel.liveness.child_local_spi, tunnel.liveness.child_peer_spi), (rekeyed.local_spi, PEER_L_SPI));
+    }
+
+    /// RFC 7296 §2.25.1: a gateway's IKE SA rekey arriving while we rekey a
+    /// CHILD SA, or while we delete the one it replaced, is refused with
+    /// `TEMPORARY_FAILURE` -- the gateway retries it later -- and the session
+    /// stays on the IKE SA it had.
+    #[test]
+    fn an_ike_sa_rekey_colliding_with_a_child_sa_exchange_of_ours_is_refused_temporary_failure() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, _client_spi) = responder_through_auth_spis(bind, psk);
+                let gateway_ike_rekey = |mid| ike_rekey::build_ike_rekey_request(&sa, mid, 0x1122_3344_5566_7788, &[0x55u8; 32], &[3u8; 32], &[1u8; 8]).unwrap();
+                let ours = recv_from_client(&sock);
+                sock.send_to(&gateway_ike_rekey(0), from).unwrap();
+                let while_rekeying = recv_response_from_client(&sock);
+                let (response, _) = gateway_answers_rekey(&sa, &ours, &[0x80u8; 32]);
+                sock.send_to(&response, from).unwrap();
+                let client_delete = recv_from_client(&sock);
+                sock.send_to(&gateway_ike_rekey(1), from).unwrap();
+                let while_deleting = recv_response_from_client(&sock);
+                sock.send_to(&informational_answer(&sa, &client_delete, &[RESPONDER_CHILD_SPI]), from).unwrap();
+
+                // Still the same IKE SA: a DPD probe under its keys is answered.
+                let probe = recv_from_client(&sock);
+                let probe_ok = open_informational(&sa, &probe).is_ok();
+                sock.send_to(&informational_answer(&sa, &probe, &[]), from).unwrap();
+                (create_child_notify(&sa, &while_rekeying), create_child_notify(&sa, &while_deleting), probe_ok)
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        tunnel.liveness.rekey_child(Duration::from_secs(5)).unwrap();
+        assert_eq!(tunnel.liveness.probe(Duration::from_secs(2)).unwrap(), Liveness::Alive);
+        let (while_rekeying, while_deleting, probe_ok) = gateway.join().unwrap();
+        assert_eq!(while_rekeying, Some(notify_type::TEMPORARY_FAILURE));
+        assert_eq!(while_deleting, Some(notify_type::TEMPORARY_FAILURE));
+        assert!(probe_ok, "the refused IKE SA rekey left the IKE SA as it was");
     }
 
     /// Windows' arrangement: a background thread (the ESP pump's reader) is

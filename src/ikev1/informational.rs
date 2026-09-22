@@ -232,10 +232,24 @@ fn send_ike(sock: &dyn IkeSocket, st: &Phase1State, peer: SocketAddr, msg: &[u8]
     Ok(())
 }
 
+/// Which of the tunnel's Quick Mode (Phase 2) SAs an ESP Delete named --
+/// IKEv1 has no `IKE_AUTH`-time "unified" CHILD SA the way IKEv2 can: a
+/// dual-stack tunnel is the primary (IPv4) Quick Mode SA plus, if the
+/// gateway assigned an IPv6 address, a second independent IPv6 Quick Mode SA
+/// negotiated separately (`ryke::ikev1::quick::create_child_ipv6`), both
+/// under the same Phase 1. Mirrors [`crate::ikev2::session::ChildKind`]'s
+/// shape, kept as its own type since this module doesn't otherwise depend on
+/// ikev2's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildFamily {
+    Primary,
+    Ipv6,
+}
+
 /// Result of [`peek`]/[`probe`] — mirrors
-/// [`crate::ikev2::session::Liveness`]'s three-variant shape, kept as its own
-/// local type rather than shared across the ikev1/ikev2 modules (they don't
-/// otherwise depend on each other).
+/// [`crate::ikev2::session::Liveness`]'s shape, kept as its own local type
+/// rather than shared across the ikev1/ikev2 modules (they don't otherwise
+/// depend on each other).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Liveness {
     /// [`probe`]: the peer answered with a matching R-U-THERE-ACK. [`peek`]:
@@ -247,12 +261,26 @@ pub enum Liveness {
     /// The peer sent an unsolicited Informational carrying a Delete payload
     /// that actually tears this tunnel down — either a Delete for the whole
     /// ISAKMP SA (e.g. an admin disconnected the dialup session on the
-    /// gateway), or an ESP Delete naming the CHILD SA's SPI *currently* in
-    /// use (`current_peer_spi`, as passed to [`peek`]/[`probe`]). A Delete
-    /// for some other ESP SPI — most commonly the just-superseded SPI from a
-    /// CHILD SA rekey the peer initiated — does not tear anything down and
-    /// is silently ignored; see [`watch`]'s doc.
+    /// gateway), or an ESP Delete naming the primary CHILD SA's SPI while
+    /// there is no separate IPv6 Quick Mode SA to fall back on (so there is
+    /// nothing left to keep the tunnel usable). A Delete for some other ESP
+    /// SPI — most commonly the just-superseded SPI from a CHILD SA rekey the
+    /// peer initiated — does not tear anything down and is silently ignored;
+    /// see [`watch`]'s doc.
     PeerTornDown,
+    /// The peer deleted just one Quick Mode SA outright (no rekey, no
+    /// replacement offered) while the ISAKMP SA -- and, for
+    /// [`ChildFamily::Primary`], the separate IPv6 Quick Mode SA -- stayed
+    /// up. RFC 2408 treats Phase 2 SAs as independent of Phase 1 and of each
+    /// other (only a Delete naming Protocol-ID ISAKMP takes down the parent
+    /// and everything under it, never the reverse), so this does not tear
+    /// down the tunnel: the caller drops its own local state for that family
+    /// and renegotiates a replacement from scratch. Only possible when the
+    /// caller passed a `current_peer_spi_ipv6` to [`peek`]/[`probe`] (i.e.
+    /// the tunnel actually has a separate IPv6 Quick Mode SA) -- a
+    /// single-stack tunnel's primary Delete is [`Liveness::PeerTornDown`],
+    /// unchanged.
+    ChildDeleted(ChildFamily),
     /// [`probe`] only: no R-U-THERE-ACK arrived within the timeout. Could be
     /// transient packet loss rather than a dead peer — callers should
     /// require a few consecutive misses before concluding the tunnel is
@@ -266,6 +294,8 @@ enum Seen {
     /// auto-acking one or more incoming R-U-THERE probes along the way).
     Nothing,
     PeerTornDown,
+    /// See [`Liveness::ChildDeleted`].
+    ChildDeleted(ChildFamily),
     /// An R-U-THERE-ACK matching the sequence number `watch` was told to
     /// expect (only possible when called from [`probe`]).
     AckMatched,
@@ -276,15 +306,21 @@ enum Seen {
 /// (`expect_ack_seq: None`) and [`probe`] (`Some(seq)` for the sequence
 /// number it just sent), mirroring
 /// [`crate::ikev2::session::LivenessSession::recv_and_classify`]'s shape.
-/// Three-way classification: a Delete for the whole ISAKMP SA, or an ESP
-/// Delete naming `current_peer_spi` (the CHILD SA currently in use), ends
-/// the wait immediately as [`Seen::PeerTornDown`] — but an ESP Delete naming
-/// any other SPI (most commonly one just superseded by a CHILD SA rekey the
-/// peer initiated) does *not* tear anything down and the wait continues,
-/// same as an unrelated message; an incoming R-U-THERE from the peer is
-/// always auto-ack'd via [`build_r_u_there_ack`] (RFC 3706 requires
-/// answering one whenever seen, regardless of whether this call is a
-/// passive `peek` or an active `probe`) and the wait continues; an
+/// Classification: a Delete for the whole ISAKMP SA ends the wait
+/// immediately as [`Seen::PeerTornDown`], always. An ESP Delete naming
+/// `current_peer_spi` (the primary CHILD SA currently in use) ends the wait
+/// as [`Seen::PeerTornDown`] when `current_peer_spi_ipv6` is `None` (a
+/// single-stack tunnel has nothing left to fall back on), or as
+/// [`Seen::ChildDeleted(ChildFamily::Primary)`](Seen::ChildDeleted) when the
+/// tunnel also has a separate IPv6 Quick Mode SA still up. An ESP Delete
+/// naming `current_peer_spi_ipv6` (when `Some`) ends the wait as
+/// [`Seen::ChildDeleted(ChildFamily::Ipv6)`](Seen::ChildDeleted). An ESP
+/// Delete naming any other SPI (most commonly one just superseded by a
+/// CHILD SA rekey the peer initiated) does *not* tear anything down and the
+/// wait continues, same as an unrelated message; an incoming R-U-THERE from
+/// the peer is always auto-ack'd via [`build_r_u_there_ack`] (RFC 3706
+/// requires answering one whenever seen, regardless of whether this call is
+/// a passive `peek` or an active `probe`) and the wait continues; an
 /// R-U-THERE-ACK matching `expect_ack_seq` ends the wait as
 /// [`Seen::AckMatched`]; anything else (garbage, a message for a different
 /// exchange/SA, a decrypt/HASH failure, a stale/mismatched ack, a failed
@@ -301,6 +337,7 @@ fn watch(
     timeout: Duration,
     expect_ack_seq: Option<u32>,
     current_peer_spi: u32,
+    current_peer_spi_ipv6: Option<u32>,
 ) -> std::io::Result<Seen> {
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 8192];
@@ -337,28 +374,37 @@ fn watch(
             continue;
         };
         if let Some(del) = payloads.iter().find(|p| p.payload_type == payload::DELETE) {
-            let tears_down = match parse_delete(&del.data) {
+            let outcome = match parse_delete(&del.data) {
                 Some((proto, _spi)) if proto == protocol::ISAKMP => {
                     ike_debug!("INFORMATIONAL: peer sent an ISAKMP SA Delete -- tunnel torn down by the gateway");
-                    true
+                    Some(Seen::PeerTornDown)
                 }
                 Some((proto, spi)) if proto == protocol::ESP => {
                     let named = <[u8; 4]>::try_from(spi).ok().map(u32::from_be_bytes);
                     if named == Some(current_peer_spi) {
-                        ike_debug!("INFORMATIONAL: peer sent an ESP Delete for the CHILD SA in use (spi_in={current_peer_spi:08x}) -- tunnel torn down by the gateway");
-                        true
+                        if current_peer_spi_ipv6.is_some() {
+                            ike_debug!("INFORMATIONAL: peer deleted the primary CHILD SA (spi_in={current_peer_spi:08x}) while the IPv6 one is still up -- renegotiating it instead of tearing down");
+                            Some(Seen::ChildDeleted(ChildFamily::Primary))
+                        } else {
+                            ike_debug!("INFORMATIONAL: peer sent an ESP Delete for the CHILD SA in use (spi_in={current_peer_spi:08x}) -- tunnel torn down by the gateway");
+                            Some(Seen::PeerTornDown)
+                        }
+                    } else if current_peer_spi_ipv6.is_some() && named == current_peer_spi_ipv6 {
+                        ike_debug!("INFORMATIONAL: peer deleted the IPv6 CHILD SA (spi_in={:08x}) while the primary is still up -- renegotiating it instead of tearing down", named.unwrap());
+                        Some(Seen::ChildDeleted(ChildFamily::Ipv6))
                     } else {
                         ike_debug!(
-                            "INFORMATIONAL: ignoring peer ESP Delete for spi={} (the CHILD SA in use is spi_in={current_peer_spi:08x})",
-                            named.map_or_else(|| "<malformed>".to_string(), |v| format!("{v:08x}"))
+                            "INFORMATIONAL: ignoring peer ESP Delete for spi={} (the CHILD SA(s) in use are spi_in={current_peer_spi:08x}{})",
+                            named.map_or_else(|| "<malformed>".to_string(), |v| format!("{v:08x}")),
+                            current_peer_spi_ipv6.map_or_else(String::new, |v| format!("/{v:08x}"))
                         );
-                        false
+                        None
                     }
                 }
-                _ => false,
+                _ => None,
             };
-            if tears_down {
-                return Ok(Seen::PeerTornDown);
+            if let Some(seen) = outcome {
+                return Ok(seen);
             }
             continue;
         }
@@ -441,13 +487,27 @@ fn error_notify_name(t: u16) -> &'static str {
 /// call on every routine status poll instead of [`probe`]'s full round trip
 /// — see [`watch`]'s doc for the shared classification and
 /// [`Liveness::Alive`]'s doc for why silence here means alive, not unknown.
-/// `current_peer_spi` is our CHILD SA's currently-in-use inbound SPI — an
-/// ESP Delete naming any other SPI (e.g. one just superseded by a rekey) is
-/// ignored rather than misread as a full teardown.
-pub fn peek(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, timeout: Duration, current_peer_spi: u32) -> Result<Liveness, DriverError> {
-    match watch(sock, st, entropy, peer, timeout, None, current_peer_spi)? {
+/// `current_peer_spi` is the primary CHILD SA's currently-in-use inbound
+/// SPI; `current_peer_spi_ipv6` is the same for the separate IPv6 Quick Mode
+/// SA, when the tunnel has one (`None` for a single-stack tunnel) — an ESP
+/// Delete naming any other SPI (e.g. one just superseded by a rekey) is
+/// ignored rather than misread as a full teardown, and one naming a family
+/// on its own is [`Liveness::ChildDeleted`] rather than
+/// [`Liveness::PeerTornDown`] whenever the other family (or, for the
+/// primary, none at all) is still up.
+pub fn peek(
+    sock: &dyn IkeSocket,
+    st: &Phase1State,
+    entropy: &mut impl Entropy,
+    peer: SocketAddr,
+    timeout: Duration,
+    current_peer_spi: u32,
+    current_peer_spi_ipv6: Option<u32>,
+) -> Result<Liveness, DriverError> {
+    match watch(sock, st, entropy, peer, timeout, None, current_peer_spi, current_peer_spi_ipv6)? {
         Seen::Nothing | Seen::AckMatched => Ok(Liveness::Alive),
         Seen::PeerTornDown => Ok(Liveness::PeerTornDown),
+        Seen::ChildDeleted(fam) => Ok(Liveness::ChildDeleted(fam)),
     }
 }
 
@@ -456,18 +516,27 @@ pub fn peek(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl Entropy, 
 /// [`Phase1State::peer_supports_dpd`] is `true` — RFC 3706 requires the peer
 /// to have advertised support first; a caller that never confirmed that
 /// should keep using [`peek`] only, exactly as before this function existed.
-/// `current_peer_spi` is our CHILD SA's currently-in-use inbound SPI — see
-/// [`peek`]'s doc.
-pub fn probe(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, seq: u32, timeout: Duration, current_peer_spi: u32) -> Result<Liveness, DriverError> {
+/// `current_peer_spi`/`current_peer_spi_ipv6` are the same as [`peek`]'s.
+pub fn probe(
+    sock: &dyn IkeSocket,
+    st: &Phase1State,
+    entropy: &mut impl Entropy,
+    peer: SocketAddr,
+    seq: u32,
+    timeout: Duration,
+    current_peer_spi: u32,
+    current_peer_spi_ipv6: Option<u32>,
+) -> Result<Liveness, DriverError> {
     let msg = build_r_u_there(st, entropy, seq)?;
     ike_debug!("DPD: sending R-U-THERE seq={seq} to {peer}");
     send_ike(sock, st, peer, &msg)?;
-    match watch(sock, st, entropy, peer, timeout, Some(seq), current_peer_spi)? {
+    match watch(sock, st, entropy, peer, timeout, Some(seq), current_peer_spi, current_peer_spi_ipv6)? {
         Seen::Nothing => {
             ike_debug!("DPD: no R-U-THERE-ACK for seq={seq} within {timeout:?}");
             Ok(Liveness::NoReply)
         }
         Seen::PeerTornDown => Ok(Liveness::PeerTornDown),
+        Seen::ChildDeleted(fam) => Ok(Liveness::ChildDeleted(fam)),
         Seen::AckMatched => Ok(Liveness::Alive),
     }
 }
@@ -575,7 +644,7 @@ mod tests {
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let peer: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
         let mut e = SeedEntropy::new(0x1);
-        let got = peek(&sock, &client_st, &mut e, peer, std::time::Duration::from_millis(20), 0).unwrap();
+        let got = peek(&sock, &client_st, &mut e, peer, std::time::Duration::from_millis(20), 0, None).unwrap();
         assert_eq!(got, Liveness::Alive);
     }
 
@@ -591,7 +660,7 @@ mod tests {
         let (esp_msg, _isakmp_msg) = build_delete(&gw_st, &mut e, 0xAAAA_BBBB).unwrap();
         gw_sock.send_to(&esp_msg, client_addr).unwrap();
 
-        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(200), 0xAAAA_BBBB).unwrap();
+        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(200), 0xAAAA_BBBB, None).unwrap();
         assert_eq!(got, Liveness::PeerTornDown);
     }
 
@@ -619,7 +688,7 @@ mod tests {
         gw_sock.send_to(&msg, client_addr).unwrap();
 
         let mut e = SeedEntropy::new(0x2);
-        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(100), 0).unwrap();
+        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(100), 0, None).unwrap();
         assert_eq!(got, Liveness::Alive);
     }
 
@@ -638,7 +707,7 @@ mod tests {
         gw_sock.send_to(&probe_msg, client_addr).unwrap();
 
         let mut ce = SeedEntropy::new(0x4);
-        let got = peek(&client_sock, &client_st, &mut ce, gw_addr, std::time::Duration::from_millis(200), 0).unwrap();
+        let got = peek(&client_sock, &client_st, &mut ce, gw_addr, std::time::Duration::from_millis(200), 0, None).unwrap();
         assert_eq!(got, Liveness::Alive);
 
         // The gateway should now have our ACK sitting on its own socket.
@@ -682,7 +751,7 @@ mod tests {
         });
 
         let mut ce = SeedEntropy::new(0x6);
-        let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 42, std::time::Duration::from_secs(2), 0).unwrap();
+        let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 42, std::time::Duration::from_secs(2), 0, None).unwrap();
         assert_eq!(got, Liveness::Alive);
         responder.join().unwrap();
     }
@@ -697,7 +766,7 @@ mod tests {
         let silent_peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let dead_peer = silent_peer.local_addr().unwrap();
         let mut e = SeedEntropy::new(0x7);
-        let got = probe(&client_sock, &client_st, &mut e, dead_peer, 1, std::time::Duration::from_millis(50), 0).unwrap();
+        let got = probe(&client_sock, &client_st, &mut e, dead_peer, 1, std::time::Duration::from_millis(50), 0, None).unwrap();
         assert_eq!(got, Liveness::NoReply);
     }
 
@@ -719,7 +788,7 @@ mod tests {
         });
 
         let mut ce = SeedEntropy::new(0x9);
-        let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 99, std::time::Duration::from_secs(2), 0x1234).unwrap();
+        let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 99, std::time::Duration::from_secs(2), 0x1234, None).unwrap();
         assert_eq!(got, Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -744,8 +813,75 @@ mod tests {
         let (esp_msg, _isakmp_msg) = build_delete(&gw_st, &mut e, 0x1111_1111).unwrap();
         gw_sock.send_to(&esp_msg, client_addr).unwrap();
 
-        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(100), 0x2222_2222).unwrap();
+        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(100), 0x2222_2222, None).unwrap();
         assert_eq!(got, Liveness::Alive);
+    }
+
+    /// Regression test for a real bug found live against a FortiGate: the
+    /// gateway deleted just the IPv6 Quick Mode SA (the primary IPv4 one and
+    /// the ISAKMP SA both stayed up), and this side used to silently ignore
+    /// it entirely -- `current_peer_spi` only ever compared against the
+    /// primary's SPI, so an ESP Delete naming the IPv6 one matched nothing
+    /// and IPv6 stayed permanently dead with no recovery. RFC 2408 treats
+    /// Phase 2 SAs as independent (deleting one never implies deleting the
+    /// ISAKMP SA or any other Phase 2 SA under it), so this must be
+    /// [`Liveness::ChildDeleted`], not ignored and not a full teardown.
+    #[test]
+    fn peek_reports_child_deleted_when_only_the_ipv6_sa_is_deleted() {
+        let (client_st, gw_st) = phase1_pair();
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        let gw_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gw_addr = gw_sock.local_addr().unwrap();
+
+        let mut e = SeedEntropy::new(0xFEED3);
+        let (esp_msg, _isakmp_msg) = build_delete(&gw_st, &mut e, 0x6666_6666).unwrap();
+        gw_sock.send_to(&esp_msg, client_addr).unwrap();
+
+        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(100), 0x4444_4444, Some(0x6666_6666)).unwrap();
+        assert_eq!(got, Liveness::ChildDeleted(ChildFamily::Ipv6));
+    }
+
+    /// Same real bug, the other family: the gateway deleted just the primary
+    /// (IPv4) Quick Mode SA while the IPv6 one and the ISAKMP SA both stayed
+    /// up. This side used to misread `current_peer_spi` matching as "the
+    /// tunnel is down" and tore down everything, including the still-good
+    /// IPv6 CHILD SA and the ISAKMP SA itself -- wrong per RFC 2408, and
+    /// worse than the IPv6 case since it killed a working tunnel instead of
+    /// just leaving one family dead.
+    #[test]
+    fn peek_reports_child_deleted_when_only_the_primary_sa_is_deleted_and_ipv6_survives() {
+        let (client_st, gw_st) = phase1_pair();
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        let gw_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gw_addr = gw_sock.local_addr().unwrap();
+
+        let mut e = SeedEntropy::new(0xFEED4);
+        let (esp_msg, _isakmp_msg) = build_delete(&gw_st, &mut e, 0x4444_4444).unwrap();
+        gw_sock.send_to(&esp_msg, client_addr).unwrap();
+
+        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(100), 0x4444_4444, Some(0x6666_6666)).unwrap();
+        assert_eq!(got, Liveness::ChildDeleted(ChildFamily::Primary));
+    }
+
+    /// A single-stack tunnel (no IPv6 Quick Mode SA, `current_peer_spi_ipv6:
+    /// None`) has nothing to fall back on: deleting the only CHILD SA still
+    /// tears down the whole tunnel, unchanged from before this fix.
+    #[test]
+    fn peek_still_tears_down_a_single_stack_tunnel_on_its_only_child_sa_delete() {
+        let (client_st, gw_st) = phase1_pair();
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        let gw_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gw_addr = gw_sock.local_addr().unwrap();
+
+        let mut e = SeedEntropy::new(0xFEED5);
+        let (esp_msg, _isakmp_msg) = build_delete(&gw_st, &mut e, 0x4444_4444).unwrap();
+        gw_sock.send_to(&esp_msg, client_addr).unwrap();
+
+        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(100), 0x4444_4444, None).unwrap();
+        assert_eq!(got, Liveness::PeerTornDown);
     }
 
     /// Same non-teardown expectation as
@@ -771,7 +907,7 @@ mod tests {
         });
 
         let mut ce = SeedEntropy::new(0xB);
-        let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 100, std::time::Duration::from_millis(200), 0x2222_2222).unwrap();
+        let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 100, std::time::Duration::from_millis(200), 0x2222_2222, None).unwrap();
         assert_eq!(got, Liveness::NoReply);
         responder.join().unwrap();
     }
@@ -814,7 +950,7 @@ mod tests {
         gw_sock.send_to(&crate::ikev2::natt::wrap_ike_4500(&probe_msg), client_addr).unwrap();
 
         let mut ce = SeedEntropy::new(0x32);
-        let got = peek(&client_sock, &client_st, &mut ce, gw_addr, std::time::Duration::from_millis(200), 0).unwrap();
+        let got = peek(&client_sock, &client_st, &mut ce, gw_addr, std::time::Duration::from_millis(200), 0, None).unwrap();
         assert_eq!(got, Liveness::Alive);
 
         gw_sock.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
@@ -837,7 +973,7 @@ mod tests {
         let (_esp_msg, isakmp_msg) = build_delete(&gw_st, &mut e, 0xAAAA_BBBB).unwrap();
         gw_sock.send_to(&crate::ikev2::natt::wrap_ike_4500(&isakmp_msg), client_addr).unwrap();
 
-        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(200), 0).unwrap();
+        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(200), 0, None).unwrap();
         assert_eq!(got, Liveness::PeerTornDown);
     }
 
@@ -856,7 +992,7 @@ mod tests {
         gw_sock.send_to(&isakmp_msg, client_addr).unwrap(); // a Delete, but no marker
         gw_sock.send_to(&[0xFF], client_addr).unwrap(); // NAT keepalive
 
-        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(100), 0).unwrap();
+        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(100), 0, None).unwrap();
         assert_eq!(got, Liveness::Alive);
     }
 
@@ -881,7 +1017,7 @@ mod tests {
         });
 
         let mut ce = SeedEntropy::new(0x36);
-        let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 42, std::time::Duration::from_secs(2), 0).unwrap();
+        let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 42, std::time::Duration::from_secs(2), 0, None).unwrap();
         assert_eq!(got, Liveness::Alive);
         responder.join().unwrap();
     }
@@ -914,7 +1050,7 @@ mod tests {
         });
 
         let mut ce = SeedEntropy::new(0x38);
-        let got = probe(&io, &client_st, &mut ce, gw_addr, 43, std::time::Duration::from_secs(2), 0).unwrap();
+        let got = probe(&io, &client_st, &mut ce, gw_addr, 43, std::time::Duration::from_secs(2), 0, None).unwrap();
         assert_eq!(got, Liveness::Alive);
         responder.join().unwrap();
     }
@@ -933,9 +1069,9 @@ mod tests {
         let io = ChannelIo::new(client_sock, rx, gw_addr);
 
         let mut e = SeedEntropy::new(0x39);
-        assert_eq!(peek(&io, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(50), 0x77).unwrap(), Liveness::Alive);
+        assert_eq!(peek(&io, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(50), 0x77, None).unwrap(), Liveness::Alive);
         let (esp_msg, _isakmp_msg) = build_delete(&gw_st, &mut e, 0x77).unwrap();
         gw_sock.send_to(&crate::ikev2::natt::wrap_ike_4500(&esp_msg), client_addr).unwrap();
-        assert_eq!(peek(&io, &client_st, &mut e, gw_addr, std::time::Duration::from_secs(2), 0x77).unwrap(), Liveness::PeerTornDown);
+        assert_eq!(peek(&io, &client_st, &mut e, gw_addr, std::time::Duration::from_secs(2), 0x77, None).unwrap(), Liveness::PeerTornDown);
     }
 }

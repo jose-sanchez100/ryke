@@ -230,6 +230,13 @@ struct PeerChildState {
     /// peer retransmits the request because that answer was lost -- the
     /// request itself no longer names an SA this side knows.
     last: Option<(Vec<u8>, Vec<u8>)>,
+    /// A CHILD SA the peer deleted outright (not superseding it with a rekey)
+    /// while the other family was still up -- not yet collected
+    /// ([`LivenessSession::take_peer_deleted_children`]). The caller
+    /// renegotiates a brand-new CHILD SA for it (RFC 7296 has nothing to say
+    /// about this beyond "it's gone"; auto-recovering is this project's own
+    /// policy, not a spec requirement -- see that method's doc).
+    deleted: Vec<ChildKind>,
 }
 
 /// The key material of `child`'s two directions, as a caller installs it.
@@ -320,6 +327,19 @@ pub struct LivenessSession {
     ike: IkeSaState,
     /// CHILD SA rekeys the peer started -- see [`Self::take_peer_rekeys`].
     peer_child: PeerChildState,
+    /// Whether `child_local_spi`/`child_peer_spi` still name a CHILD SA the
+    /// peer actually has. Set to `false` the moment an unsolicited ESP
+    /// Delete names `child_peer_spi` while `child6` is still up (RFC 7296
+    /// §1.4.1: deleting one CHILD SA never implies deleting the IKE SA or any
+    /// other CHILD SA under it, so there is an IKE SA worth keeping alive)
+    /// -- see [`Self::take_peer_deleted_children`]. `child_local_spi`/
+    /// `child_peer_spi` are stale while this is `false`; nothing reads them
+    /// until [`Self::create_child_primary`] replaces both and sets this back
+    /// to `true`. Always `true` when there is no separate `child6` at all,
+    /// since then losing the primary CHILD SA leaves nothing to salvage and
+    /// [`Self::answer_peer_request`] tears the whole tunnel down instead of
+    /// clearing this.
+    primary_child_alive: bool,
 }
 
 /// Result of one [`LivenessSession::probe`] call.
@@ -547,6 +567,27 @@ impl LivenessSession {
         ike_debug!("CREATE_CHILD_SA (new IPv6 CHILD SA): granted TSr={tsr:?} -> routing {granted_subnets6:?}");
         self.child6 = Some(ChildSpis { local: child.local_spi, peer: child.peer_spi });
         Ok(Ipv6Child { child, granted_subnets6 })
+    }
+
+    /// Negotiate a brand-new primary (IPv4) CHILD SA from scratch, replacing
+    /// one the peer deleted outright while the separate IPv6 CHILD SA was
+    /// still up (see [`Self::take_peer_deleted_children`]) -- [`Self::rekey_child`]'s
+    /// counterpart for when there is no existing SPI left to reference with
+    /// `REKEY_SA` (the peer already forgot it), same shape as
+    /// [`Self::create_child_ipv6`] just for the IPv4 side. Only ever called
+    /// while `child6.is_some()`: if there were no separate IPv6 CHILD SA to
+    /// preserve, losing the primary left nothing to salvage and
+    /// [`Self::answer_peer_request`] tore the whole tunnel down instead of
+    /// queuing this. An error leaves the primary CHILD SA absent for the
+    /// caller to retry on the next liveness tick, same interop stance
+    /// [`Self::create_child_ipv6`] already takes towards a gateway that
+    /// momentarily refuses.
+    pub fn create_child_primary(&mut self, timeout: Duration) -> Result<RekeyedChild, DriverError> {
+        let (child, _tsr) = self.child_exchange(None, &TrafficSelectors::ipv4_full_tunnel(), "new primary CHILD SA", timeout)?;
+        self.child_local_spi = child.local_spi;
+        self.child_peer_spi = child.peer_spi;
+        self.primary_child_alive = true;
+        Ok(child)
     }
 
     /// Whether the tunnel's primary CHILD SA carries IPv6 too (a unified
@@ -818,12 +859,44 @@ impl LivenessSession {
             }
             return Ok(false);
         }
-        // See `recv_and_classify`'s own doc for why only these two cases end
-        // the tunnel -- an ESP Delete for any other SPI is routine
-        // post-rekey cleanup of a superseded CHILD SA, not a teardown.
+        // See `recv_and_classify`'s own doc for why only an IKE SA Delete
+        // (or a primary CHILD SA Delete with no other family left standing)
+        // ends the tunnel -- an ESP Delete for any other SPI is either
+        // routine post-rekey cleanup of a superseded CHILD SA (handled
+        // above), or one family's CHILD SA going away on its own while the
+        // IKE SA and the other family are still perfectly good: RFC 7296
+        // §1.4.1 only makes deleting the IKE SA imply deleting every CHILD SA
+        // under it, never the other way around, so there is an IKE SA worth
+        // keeping alive. That case is queued in `peer_child.deleted` for the
+        // caller to collect and renegotiate a replacement for (see
+        // [`Self::take_peer_deleted_children`]) -- not a teardown.
         let tears_down = match delete {
             Some(Delete { protocol_id: p, .. }) if p == protocol_id::IKE => true,
-            Some(Delete { protocol_id: p, spis }) if p == protocol_id::ESP => spis.contains(&self.child_peer_spi),
+            Some(Delete { protocol_id: p, spis }) if p == protocol_id::ESP => {
+                if spis.contains(&self.child_peer_spi) && self.primary_child_alive {
+                    if self.child6.is_some() {
+                        ike_debug!(
+                            "INFORMATIONAL: peer deleted the primary CHILD SA (spi_out={:08x}) -- IPv6 CHILD SA and IKE SA are still up, renegotiating it",
+                            self.child_peer_spi
+                        );
+                        self.primary_child_alive = false;
+                        self.peer_child.deleted.push(ChildKind::Primary);
+                        false
+                    } else {
+                        true
+                    }
+                } else if let Some(c6) = self.child6.filter(|c| spis.contains(&c.peer)) {
+                    ike_debug!(
+                        "INFORMATIONAL: peer deleted the IPv6 CHILD SA (spi_out={:08x}) -- primary CHILD SA and IKE SA are still up, renegotiating it",
+                        c6.peer
+                    );
+                    self.child6 = None;
+                    self.peer_child.deleted.push(ChildKind::Ipv6);
+                    false
+                } else {
+                    false
+                }
+            }
             _ => false,
         };
         if tears_down {
@@ -900,7 +973,7 @@ impl LivenessSession {
         let Some(rekeyed_spi) = rekey::rekey_sa_spi(&self.sa, msg) else {
             return self.refuse_peer_child_request(header, iv, notify_type::NO_ADDITIONAL_SAS, "a new CHILD SA is not taken on");
         };
-        let (kind, old) = if rekeyed_spi == self.child_peer_spi {
+        let (kind, old) = if self.primary_child_alive && rekeyed_spi == self.child_peer_spi {
             (ChildKind::Primary, ChildSpis { local: self.child_local_spi, peer: self.child_peer_spi })
         } else if let Some(child6) = self.child6.filter(|c| c.peer == rekeyed_spi) {
             (ChildKind::Ipv6, child6)
@@ -973,6 +1046,20 @@ impl LivenessSession {
     /// tracked here; only the data plane is the caller's.
     pub fn take_peer_rekeys(&mut self) -> Vec<PeerRekeyedChild> {
         std::mem::take(&mut self.peer_child.pending)
+    }
+
+    /// Which families the peer deleted outright (an unsolicited ESP Delete,
+    /// not a rekey) since the last call, while the IKE SA and the other
+    /// family were still up -- queued by [`Self::answer_peer_request`],
+    /// mirroring [`Self::take_peer_rekeys`]'s shape. Unlike a rekey there is
+    /// no new SA already on the wire to install: the caller renegotiates one
+    /// from scratch, [`Self::create_child_primary`] or
+    /// [`Self::create_child_ipv6`] depending on `kind`. RFC 7296 says nothing
+    /// about doing this at all (a Delete just means the SA is gone); trying
+    /// to bring the family back automatically instead of leaving it down
+    /// until the user reconnects is this project's own policy choice.
+    pub fn take_peer_deleted_children(&mut self) -> Vec<ChildKind> {
+        std::mem::take(&mut self.peer_child.deleted)
     }
 
     /// Move to `new_sa` as the IKE SA (Message IDs start again at 0, RFC 7296
@@ -1603,7 +1690,7 @@ impl<E: Entropy> Ikev2Session<E> {
             cfg_subnets6: info.subnets6.clone(),
             child_carries_ipv6: false,
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(),
+            peer_child: PeerChildState::default(), primary_child_alive: true,
         };
         if want_cfg && assigned_ip4.is_none() {
             ike_debug!("IKE_AUTH: CHILD SA refused ({rejection}) and no CFG_REPLY came with it -- no inner address to build on, closing");
@@ -1803,7 +1890,7 @@ impl<E: Entropy> Ikev2Session<E> {
             cfg_subnets6: info.subnets6.clone(),
             child_carries_ipv6: !child_subnets6.is_empty(),
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(),
+            peer_child: PeerChildState::default(), primary_child_alive: true,
         };
         Ok(ConnectedTunnel {
             local_spi,
@@ -2090,7 +2177,7 @@ impl<E: Entropy> Ikev2Session<E> {
             cfg_subnets6: info.subnets6.clone(),
             child_carries_ipv6: !child_subnets6.is_empty(),
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(),
+            peer_child: PeerChildState::default(), primary_child_alive: true,
         };
 
         Ok(ConnectedTunnel {
@@ -2204,7 +2291,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
@@ -2233,7 +2320,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
@@ -2263,7 +2350,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -2290,7 +2377,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
         liveness.close().unwrap();
         responder.join().unwrap();
     }
@@ -2304,7 +2391,7 @@ mod tests {
         let (init_sa, _resp_sa) = liveness_sa_pair();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
         liveness.close().unwrap();
     }
 
@@ -2319,7 +2406,7 @@ mod tests {
         let unreachable: SocketAddr = silent_peer.local_addr().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::NoReply);
     }
 
@@ -2329,7 +2416,7 @@ mod tests {
         let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
         // Unlike probe(), silence on a peek is Alive (nothing new to
         // report), not NoReply -- peek never asked anything.
         assert_eq!(liveness.peek(Duration::from_millis(50)).unwrap(), Liveness::Alive);
@@ -2363,7 +2450,7 @@ mod tests {
         probe_sock.send_to(b"hello", bind).unwrap();
 
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -2415,7 +2502,7 @@ mod tests {
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(),
+            peer_child: PeerChildState::default(), primary_child_alive: true,
         };
         // Whatever the answer, the request is not a teardown: the IKE SA stands.
         assert_eq!(liveness.peek(Duration::from_millis(1500)).unwrap(), Liveness::Alive);
@@ -2540,7 +2627,7 @@ mod tests {
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(),
+            peer_child: PeerChildState::default(), primary_child_alive: true,
         };
         // The stale Delete is ignored and the wait times out -- silence
         // (nothing new to report) is Alive, exactly as if nothing had
@@ -2584,9 +2671,113 @@ mod tests {
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(),
+            peer_child: PeerChildState::default(), primary_child_alive: true,
         };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
+        responder.join().unwrap();
+    }
+
+    /// RFC 7296 §1.4.1: deleting one CHILD SA never implies deleting the IKE
+    /// SA or any other CHILD SA under it -- only the reverse holds. So an ESP
+    /// Delete naming the primary CHILD SA while a separate IPv6 CHILD SA is
+    /// still up must not tear anything down: it queues `ChildKind::Primary`
+    /// for the caller to renegotiate ([`LivenessSession::create_child_primary`]),
+    /// same as this project already does for a peer-started rekey.
+    #[test]
+    fn peek_does_not_tear_down_on_a_primary_delete_while_ipv6_is_still_up() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let responder_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind = responder_sock.local_addr().unwrap();
+        let responder = thread::spawn(move || {
+            responder_sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = [0u8; 2048];
+            let (_n, from) = responder_sock.recv_from(&mut buf).unwrap();
+            let del = Delete::esp(vec![0xAAAA]);
+            let msg = build_informational(&resp_sa, 100, false, &[(PayloadType::Delete, del.to_bytes())], &[7u8; 8]).unwrap();
+            responder_sock.send_to(&msg, from).unwrap();
+            // Still owed an ack, exactly as any other Delete.
+            let (n, _) = responder_sock.recv_from(&mut buf).unwrap();
+            let ack_header = IkeHeader::parse(&buf[..n]).unwrap();
+            assert_eq!(ack_header.message_id, 100);
+            assert!(ack_header.flags.response);
+        });
+
+        let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        probe_sock.send_to(b"hello", bind).unwrap();
+
+        let mut liveness = LivenessSession {
+            sock: probe_sock,
+            sa: init_sa,
+            dest: bind,
+            float: false,
+            next_message_id: 2,
+            cipher: SkCipher::Aes256Gcm,
+            pfs_group: None,
+            child_local_spi: 0,
+            child_peer_spi: 0xAAAA,
+            external_rx: None,
+            child6: Some(ChildSpis { local: 0x6666, peer: 0x7777 }),
+            cfg_subnets6: Vec::new(),
+            child_carries_ipv6: false,
+            ike: IkeSaState::new(),
+            peer_child: PeerChildState::default(),
+            primary_child_alive: true,
+        };
+        assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::Alive, "the IKE SA and the IPv6 CHILD SA are still good");
+        assert_eq!(liveness.take_peer_deleted_children(), vec![ChildKind::Primary]);
+        assert!(liveness.take_peer_deleted_children().is_empty(), "handed over once");
+        assert!(!liveness.primary_child_alive, "the stale SPIs must not be mistaken for a live SA until recreated");
+        assert_eq!(liveness.child6.map(|c| (c.local, c.peer)), Some((0x6666, 0x7777)), "untouched");
+        responder.join().unwrap();
+    }
+
+    /// The mirror image: an ESP Delete naming the separate IPv6 CHILD SA
+    /// while the primary is still up doesn't tear anything down either, and
+    /// queues `ChildKind::Ipv6` instead.
+    #[test]
+    fn peek_does_not_tear_down_on_an_ipv6_delete_while_the_primary_is_still_up() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let responder_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind = responder_sock.local_addr().unwrap();
+        let responder = thread::spawn(move || {
+            responder_sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = [0u8; 2048];
+            let (_n, from) = responder_sock.recv_from(&mut buf).unwrap();
+            let del = Delete::esp(vec![0x7777]);
+            let msg = build_informational(&resp_sa, 100, false, &[(PayloadType::Delete, del.to_bytes())], &[7u8; 8]).unwrap();
+            responder_sock.send_to(&msg, from).unwrap();
+            let (n, _) = responder_sock.recv_from(&mut buf).unwrap();
+            let ack_header = IkeHeader::parse(&buf[..n]).unwrap();
+            assert_eq!(ack_header.message_id, 100);
+            assert!(ack_header.flags.response);
+        });
+
+        let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        probe_sock.send_to(b"hello", bind).unwrap();
+
+        let mut liveness = LivenessSession {
+            sock: probe_sock,
+            sa: init_sa,
+            dest: bind,
+            float: false,
+            next_message_id: 2,
+            cipher: SkCipher::Aes256Gcm,
+            pfs_group: None,
+            child_local_spi: 0xBBBB,
+            child_peer_spi: 0xAAAA,
+            external_rx: None,
+            child6: Some(ChildSpis { local: 0x6666, peer: 0x7777 }),
+            cfg_subnets6: Vec::new(),
+            child_carries_ipv6: false,
+            ike: IkeSaState::new(),
+            peer_child: PeerChildState::default(),
+            primary_child_alive: true,
+        };
+        assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::Alive, "the IKE SA and the primary CHILD SA are still good");
+        assert_eq!(liveness.take_peer_deleted_children(), vec![ChildKind::Ipv6]);
+        assert!(liveness.child6.is_none(), "gone until create_child_ipv6 recreates it");
+        assert_eq!((liveness.child_local_spi, liveness.child_peer_spi), (0xBBBB, 0xAAAA), "untouched");
+        assert!(liveness.primary_child_alive);
         responder.join().unwrap();
     }
 
@@ -3504,7 +3695,7 @@ mod tests {
         let (init_sa, _resp_sa) = liveness_sa_pair();
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let dest = sock.local_addr().unwrap();
-        LivenessSession { sock, sa: init_sa, dest, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default() }
+        LivenessSession { sock, sa: init_sa, dest, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true }
     }
 
     #[test]
@@ -3634,6 +3825,111 @@ mod tests {
             EspSa::new_with_cipher(rekeyed.peer_spi, rekeyed.key_out.cipher, &rekeyed.key_out.enc, &rekeyed.key_out.integ).unwrap();
         let pkt = client_out.seal(b"after ipv6 rekey", next_header::IPV6).unwrap();
         assert_eq!(second.inbound.open(&pkt).unwrap().0, b"after ipv6 rekey");
+    }
+
+    /// Responder for the "gateway deletes the primary CHILD SA outright"
+    /// flow: the usual handshake (its own inbound SPI for the primary fixed
+    /// at `PRIMARY_SPI` so the test can build a real Delete for it), a
+    /// `CREATE_CHILD_SA` for the IPv6 CHILD SA, an unsolicited Delete for the
+    /// primary (no rekey involved -- this is what a real gateway revoking
+    /// just that SA looks like), and finally the client's from-scratch
+    /// `CREATE_CHILD_SA` renegotiating a replacement.
+    const PRIMARY_SPI: u32 = 0xC0FFEE;
+    fn run_psk_responder_then_primary_deleted(bind: SocketAddr, psk: Vec<u8>) -> crate::esp::ChildSa {
+        let sock = UdpSocket::bind(bind).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 4096];
+        let (n, from) = sock.recv_from(&mut buf).unwrap();
+        let resp_secret = LocalSecret::generate(&mut OsEntropy::new().unwrap(), 32);
+        let result = responder_respond_natt(&buf[..n], &resp_secret, bind, from, None).unwrap();
+        let (response, sa) = match result {
+            crate::ikev2::exchange::SaInitResult::Established { response, sa } => (response, sa),
+            _ => panic!("expected Established"),
+        };
+        sock.send_to(&response, from).unwrap();
+
+        let (n, from) = sock.recv_from(&mut buf).unwrap();
+        let rcfg = AuthConfig::psk(Identification::fqdn("responder.test"), psk);
+        let (resp, _peer_id, _spi, _ic) = responder_process_auth(&sa, &buf[..n], &rcfg, PRIMARY_SPI, &[9u8; 8], None).unwrap();
+        sock.send_to(&resp, from).unwrap();
+
+        // The IPv6 CHILD SA, same as `run_psk_responder_then_ipv6_child`.
+        let (n, from) = sock.recv_from(&mut buf).unwrap();
+        let (resp, _v6_child) =
+            rekey::responder_process_rekey_with_pfs(&sa, &buf[..n], 0xFEED_FACE, &[0x77u8; 32], SkCipher::Aes256Gcm, None, &[6u8; 8], None).unwrap();
+        sock.send_to(&resp, from).unwrap();
+
+        // The gateway revokes the primary on its own initiative -- naming
+        // the SPI it originally assigned itself (`PRIMARY_SPI`), which is
+        // what the client tracks as `child_peer_spi`.
+        let del = Delete::esp(vec![PRIMARY_SPI]);
+        let msg = build_informational(&sa, 100, false, &[(PayloadType::Delete, del.to_bytes())], &[5u8; 8]).unwrap();
+        sock.send_to(&msg, from).unwrap();
+        let (n, _) = sock.recv_from(&mut buf).unwrap();
+        let ack_header = IkeHeader::parse(&buf[..n]).unwrap();
+        assert_eq!(ack_header.message_id, 100, "the client must still ack the Delete");
+
+        // The client renegotiates a brand-new primary CHILD SA from scratch
+        // (no REKEY_SA -- the old SPI is already gone on this side too).
+        let (n, from) = sock.recv_from(&mut buf).unwrap();
+        let (resp, new_primary) =
+            rekey::responder_process_rekey_with_pfs(&sa, &buf[..n], 0xF00D_0001, &[0x99u8; 32], SkCipher::Aes256Gcm, None, &[4u8; 8], None).unwrap();
+        sock.send_to(&resp, from).unwrap();
+        new_primary
+    }
+
+    /// The regression test for the bug this fixes: a real gateway can delete
+    /// just the primary CHILD SA (not the whole IKE SA) while a separate
+    /// IPv6 CHILD SA is still up. Before this fix that either tore the whole
+    /// tunnel down (losing the still-good IPv6 CHILD SA and the IKE SA for
+    /// no reason -- RFC 7296 §1.4.1 doesn't ask for that) or, depending on
+    /// which SPI comparison happened to fire, silently dropped the request
+    /// and left the primary black-holed forever. Now: `peek` stays `Alive`,
+    /// the deletion is queued, and `create_child_primary` brings a working
+    /// replacement up while the IPv6 CHILD SA never moves.
+    #[test]
+    fn peer_deleting_the_primary_child_sa_is_survived_and_renegotiated() {
+        use crate::esp::{next_header, EspSa};
+
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let responder = thread::spawn({
+            let psk = psk.clone();
+            move || run_psk_responder_then_primary_deleted(bind, psk)
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+        let cfg = AuthConfig::psk(Identification::fqdn("client.test"), psk);
+        let mut tunnel = session
+            .connect_direct_on_port(bind, &default_ike_offer(), &cfg, false, &default_esp_offer(), next_addr().port())
+            .unwrap();
+        assert_eq!(tunnel.liveness.child_peer_spi, PRIMARY_SPI);
+        let old_local_spi = tunnel.liveness.child_local_spi;
+
+        tunnel.liveness.create_child_ipv6(Duration::from_secs(5)).unwrap();
+        assert!(tunnel.liveness.has_ipv6_child());
+
+        // A short timeout: the Delete already arrived (see `peek`'s own doc
+        // on why this reliably catches it), and `recv_and_classify` keeps
+        // waiting out its full timeout after handling a non-teardown event
+        // looking for anything else -- a long one here would just race the
+        // responder thread's own wait for the renegotiation request below.
+        assert_eq!(tunnel.liveness.peek(Duration::from_millis(300)).unwrap(), Liveness::Alive, "the IKE SA and the IPv6 CHILD SA are still good");
+        assert_eq!(tunnel.liveness.take_peer_deleted_children(), vec![ChildKind::Primary]);
+
+        let new_primary = tunnel.liveness.create_child_primary(Duration::from_secs(5)).unwrap();
+        assert_ne!(new_primary.local_spi, old_local_spi, "a fresh SA, not the deleted one somehow reused");
+        assert_eq!((tunnel.liveness.child_local_spi, tunnel.liveness.child_peer_spi), (new_primary.local_spi, new_primary.peer_spi));
+        assert!(tunnel.liveness.has_ipv6_child(), "the IPv6 CHILD SA never moved");
+
+        let mut new_primary_responder = responder.join().unwrap();
+        let mut client_out = EspSa::new_with_cipher(
+            new_primary.peer_spi, new_primary.key_out.cipher, &new_primary.key_out.enc, &new_primary.key_out.integ,
+        )
+        .unwrap();
+        let pkt = client_out.seal(b"through the renegotiated primary", next_header::IPV4).unwrap();
+        assert_eq!(new_primary_responder.inbound.open(&pkt).unwrap().0, b"through the renegotiated primary");
     }
 
     /// How [`run_psk_responder_unified`] answers the CHILD SA of `IKE_AUTH`.

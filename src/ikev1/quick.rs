@@ -370,6 +370,13 @@ pub struct QuickInitiator {
     /// to read back what the responder actually negotiated (RFC 2407 §4.5;
     /// see `negotiated_p2_lifetime`'s doc).
     life_duration: u32,
+    /// The IDci/IDcr payload bodies we offered -- [`QuickInitiator::complete`]
+    /// checks the responder echoed exactly these back (RFC 2409 §5.5: when
+    /// the initiator sends client identities, the responder's message 2
+    /// carries them too). An authentic HASH(2) only proves the response
+    /// wasn't tampered with, not that it actually named what we offered.
+    id_local: Vec<u8>,
+    id_remote: Vec<u8>,
 }
 
 /// Build Quick-Mode message 1 (`HASH(1), SA, Ni, IDci, IDcr`) as the initiator,
@@ -471,8 +478,8 @@ fn initiate_quick_with_ids(
     if let Some((group, dh_private)) = &pfs {
         after.push((payload::KE, group.public(dh_private)));
     }
-    after.push((payload::ID, id_local));
-    after.push((payload::ID, id_remote));
+    after.push((payload::ID, id_local.clone()));
+    after.push((payload::ID, id_remote.clone()));
     let (msg1, iv1) = phase2::build_encrypted(qm_header(st.cky_i, st.cky_r, msgid), st.prf, &st.skeyid_a, &st.enc_key, &iv0, &after)?;
     Ok((msg1, QuickInitiator {
         prf: st.prf,
@@ -488,6 +495,8 @@ fn initiate_quick_with_ids(
         cipher,
         pfs,
         life_duration,
+        id_local,
+        id_remote,
     }))
 }
 
@@ -515,6 +524,25 @@ impl QuickInitiator {
         hi.extend_from_slice(&body);
         if got != self.prf.mac(&self.skeyid_a, &hi) {
             return Err(IkeError::AuthFailed);
+        }
+
+        // An authentic HASH(2) only proves message 2 wasn't tampered with in
+        // transit -- it doesn't prove the responder actually chose the one
+        // ESP transform and traffic selectors we offered, rather than
+        // something it merely also supports (see `id_local`'s doc, and
+        // `ikev2::negotiate::ChosenSuite::matches_offer`'s identical
+        // rationale on the IKEv2 side). `peer_esp_cipher`/`peer_pfs_group`
+        // are the same helpers `respond_quick` uses to read an initiator's
+        // own proposal -- reused here to read the responder's chosen one.
+        if peer_esp_cipher(&ps)? != self.cipher {
+            return Err(IkeError::NoProposalChosen);
+        }
+        if peer_pfs_group(&ps)? != self.pfs.as_ref().map(|(group, _)| *group) {
+            return Err(IkeError::NoProposalChosen);
+        }
+        let peer_ids: Vec<Vec<u8>> = ps.iter().filter(|p| p.payload_type == payload::ID).map(|p| p.data.clone()).collect();
+        if peer_ids.len() != 2 || peer_ids[0] != self.id_local || peer_ids[1] != self.id_remote {
+            return Err(IkeError::NoProposalChosen);
         }
 
         let h3 = hash3(self.prf, &self.skeyid_a, self.msgid, &self.ni, &nr);
@@ -983,6 +1011,71 @@ mod tests {
         match respond_quick(&rstate, &tampered, &mut re) {
             Err(IkeError::Crypto(_)) => {}
             other => panic!("expected a Crypto error, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// Build a Quick-Mode message 2 the way [`respond_quick`] does, but let
+    /// the caller substitute the SA and ID payloads actually sent instead of
+    /// deriving them from the initiator's own message 1 -- simulating a
+    /// responder that answers with an ESP transform or traffic selectors it
+    /// was never offered. HASH(2) is still computed correctly over whatever
+    /// is substituted, exactly as a genuinely different (or malicious) peer's
+    /// authentic-but-unoffered answer would look.
+    fn respond_quick_forging_answer(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy, sa: &SaPayload, id_payloads: &[Vec<u8>]) -> Vec<u8> {
+        let hdr = IsakmpHeader::parse(msg1).unwrap();
+        let msgid = hdr.message_id;
+        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
+        let (_h, ps, iv1) = phase2::parse_encrypted(msg1, st.prf, &st.skeyid_a, &st.enc_key, &iv0).unwrap();
+        let ni = find(&ps, payload::NONCE).unwrap().data.clone();
+        let mut nr = vec![0u8; 16];
+        entropy.fill(&mut nr);
+        let mut after: Vec<(u8, Vec<u8>)> = vec![(payload::SA, sa.to_bytes()), (payload::NONCE, nr)];
+        for id in id_payloads {
+            after.push((payload::ID, id.clone()));
+        }
+        let (msg2, _iv2) = phase2::build_encrypted_prefixed(qm_header(st.cky_i, st.cky_r, msgid), st.prf, &st.skeyid_a, &st.enc_key, &iv1, &ni, &after).unwrap();
+        msg2
+    }
+
+    #[test]
+    fn quick_mode_complete_rejects_a_cipher_the_initiator_never_offered() {
+        // Finding #9 of the ChatGPT6 Astra ryke audit: `QuickInitiator::complete`
+        // never checked message 2's actual ESP transform against what was
+        // offered -- it just trusted `self.cipher` (its own proposal)
+        // regardless of what the responder's SA payload actually named.
+        let (istate, rstate, mut ie, mut re) = phase1_pair(0x1111, 0x2222, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let ts = ([10, 0, 99, 0], [255, 255, 255, 0]);
+        let (qm1, qi) = initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, ts, ts, 3600).unwrap();
+
+        let forged_sa = esp_sa(0xAAAA_BBBB, SkCipher::Aes256Cbc(IntegAlgorithm::HmacSha2_256_128), None, rstate.floated, 3600);
+        let id = ts_id(ts.0, ts.1);
+        let msg2 = respond_quick_forging_answer(&rstate, &qm1, &mut re, &forged_sa, &[id.clone(), id]);
+
+        match qi.complete(&msg2) {
+            Err(IkeError::NoProposalChosen) => {}
+            other => panic!("expected NoProposalChosen, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn quick_mode_complete_rejects_traffic_selectors_the_initiator_never_offered() {
+        // Same finding, the traffic-selector half: `QuickInitiator::complete`
+        // never read the ID payloads (IDci/IDcr) back out of message 2 at
+        // all, even though `respond_quick` (this crate's own responder) both
+        // echoes them (RFC 2409 §5.5) and the peer offer they're checked
+        // against here matches that same echo shape.
+        let (istate, rstate, mut ie, mut re) = phase1_pair(0x3333, 0x4444, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let ts_local = ([10, 0, 99, 0], [255, 255, 255, 0]);
+        let ts_remote = ([10, 0, 100, 0], [255, 255, 255, 0]);
+        let (qm1, qi) = initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, ts_local, ts_remote, 3600).unwrap();
+
+        let sa = esp_sa(0xAAAA_BBBB, SkCipher::Aes256Gcm, None, rstate.floated, 3600);
+        let wrong_remote = ts_id([0, 0, 0, 0], [0, 0, 0, 0]);
+        let msg2 = respond_quick_forging_answer(&rstate, &qm1, &mut re, &sa, &[ts_id(ts_local.0, ts_local.1), wrong_remote]);
+
+        match qi.complete(&msg2) {
+            Err(IkeError::NoProposalChosen) => {}
+            other => panic!("expected NoProposalChosen, got {:?}", other.map(|_| ())),
         }
     }
 

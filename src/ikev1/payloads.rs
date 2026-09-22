@@ -243,6 +243,28 @@ impl Transform {
     pub fn attr_u32(&self, attr_type: u16) -> Option<u32> {
         self.attributes.iter().find(|a| a.attr_type == attr_type).and_then(|a| a.as_u32())
     }
+
+    /// Whether `self` (a transform a peer claims to have chosen) is exactly
+    /// the one `offered` proposed -- same `transform_id` and every attribute
+    /// equal, except the types listed in `ignore` (typically `LIFE_TYPE`/
+    /// `LIFE_DURATION`, which RFC 2407 §4.5 lets a responder unilaterally
+    /// shorten). This crate's IKEv1 initiator always proposes a single
+    /// transform, so there is exactly one legitimate answer -- mirrors
+    /// `ikev2::negotiate::ChosenSuite::matches_offer`'s exact rationale:
+    /// without this check, a misbehaving or on-path responder could echo
+    /// back a different cipher, DH group or auth method than the one
+    /// actually offered, and this side would silently proceed using its own
+    /// local parameters as if they'd been agreed, rather than rejecting the
+    /// exchange.
+    pub fn matches_offer(&self, offered: &Transform, ignore: &[u16]) -> bool {
+        if self.transform_id != offered.transform_id {
+            return false;
+        }
+        let subset = |a: &[Attribute], b: &[Attribute]| {
+            a.iter().all(|x| ignore.contains(&x.attr_type) || b.iter().any(|y| y.attr_type == x.attr_type && y.value == x.value))
+        };
+        subset(&offered.attributes, &self.attributes) && subset(&self.attributes, &offered.attributes)
+    }
 }
 
 /// A Proposal (one protocol) carrying its Transforms.

@@ -798,6 +798,20 @@ impl AggressiveInitiator {
         }
         let cky_r = hdr.resp_cookie;
         let ps = isakmp::parse_payloads(hdr.next_payload, &msg2[IsakmpHeader::LEN..])?;
+
+        // The responder must have echoed back exactly the one transform we
+        // offered (see `Transform::matches_offer`'s doc) -- HASH_R only
+        // covers SAi_b (our own offer, RFC 2409 §5.4), not the responder's
+        // chosen SA payload here, so nothing else authenticates it.
+        let sa_p = find(&ps, payload::SA).ok_or(IkeError::MissingPayload("SA"))?;
+        let chosen_sa = SaPayload::parse(&sa_p.data)?;
+        let chosen = chosen_sa.proposals.first().and_then(|p| p.transforms.first()).ok_or(IkeError::NoProposalChosen)?;
+        let offered_sa = SaPayload::parse(&self.sai_b)?;
+        let offered = offered_sa.proposals.first().and_then(|p| p.transforms.first()).ok_or(IkeError::NoProposalChosen)?;
+        if !chosen.matches_offer(offered, &[attr::LIFE_TYPE, attr::LIFE_DURATION]) {
+            return Err(IkeError::NoProposalChosen);
+        }
+
         let gxr = find(&ps, payload::KE).ok_or(IkeError::MissingPayload("KE"))?.data.clone();
         let nr = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
         isakmp::check_nonce_len(&nr)?;
@@ -980,7 +994,19 @@ impl MainSaSent {
         }
         let cky_r = hdr.resp_cookie;
         let ps = isakmp::parse_payloads(hdr.next_payload, &msg2[IsakmpHeader::LEN..])?;
-        find(&ps, payload::SA).ok_or(IkeError::MissingPayload("SA"))?;
+
+        // Same check as `AggressiveInitiator::complete`: the responder must
+        // have echoed back exactly the one transform we offered, not merely
+        // something this crate would also be capable of.
+        let sa_p = find(&ps, payload::SA).ok_or(IkeError::MissingPayload("SA"))?;
+        let chosen_sa = SaPayload::parse(&sa_p.data)?;
+        let chosen = chosen_sa.proposals.first().and_then(|p| p.transforms.first()).ok_or(IkeError::NoProposalChosen)?;
+        let offered_sa = SaPayload::parse(&self.sai_b)?;
+        let offered = offered_sa.proposals.first().and_then(|p| p.transforms.first()).ok_or(IkeError::NoProposalChosen)?;
+        if !chosen.matches_offer(offered, &[attr::LIFE_TYPE, attr::LIFE_DURATION]) {
+            return Err(IkeError::NoProposalChosen);
+        }
+
         let peer_supports_natt = peer_offers_natt(&ps);
         let negotiated_p1_lifetime_secs = negotiated_p1_lifetime(&ps, self.offered_p1_lifetime);
 
@@ -1590,7 +1616,7 @@ impl MainRespKeSent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::payloads::id_type;
+    use super::super::payloads::{id_type, AttrValue};
     use crate::entropy::SeedEntropy;
 
     #[test]
@@ -1981,6 +2007,77 @@ mod tests {
         match sa_sent.complete_sa(&tampered, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()) {
             Err(IkeError::Crypto(_)) => {}
             other => panic!("expected a Crypto error, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// Rebuild `msg` with its SA payload's sole transform's GROUP_DESC
+    /// attribute switched to a different (still generally valid) DH group --
+    /// simulating a responder that answers with a transform it was never
+    /// actually offered. Every other payload, and the header, are left
+    /// untouched.
+    fn retarget_sa_group(msg: &[u8], new_group: DhGroup) -> Vec<u8> {
+        let hdr = IsakmpHeader::parse(msg).unwrap();
+        let ps = isakmp::parse_payloads(hdr.next_payload, &msg[IsakmpHeader::LEN..]).unwrap();
+        let mut sa = SaPayload::parse(&find(&ps, payload::SA).unwrap().data).unwrap();
+        for a in &mut sa.proposals[0].transforms[0].attributes {
+            if a.attr_type == attr::GROUP_DESC {
+                a.value = AttrValue::Short(new_group.transform_id());
+            }
+        }
+        let rebuilt: Vec<(u8, Vec<u8>)> = ps
+            .iter()
+            .map(|p| if p.payload_type == payload::SA { (payload::SA, sa.to_bytes()) } else { (p.payload_type, p.data.clone()) })
+            .collect();
+        isakmp::build_message(hdr, &rebuilt)
+    }
+
+    #[test]
+    fn main_mode_complete_sa_rejects_a_transform_the_initiator_never_offered() {
+        // Finding #9 of the ChatGPT6 Astra ryke audit: `complete_sa` only
+        // checked an SA payload was present, never that its chosen
+        // transform was the one actually offered -- a responder (or an
+        // on-path attacker able to alter an unauthenticated field, since
+        // HASH_R never covers message 2's SA payload, only our own offered
+        // SAi_b) could switch the DH group, cipher or auth method and this
+        // side would silently keep deriving keys from its *own* local
+        // parameters as if the swap had been agreed.
+        let psk = b"correct horse battery staple".to_vec();
+        let mut icfg = main_mode_icfg(psk.clone());
+        icfg.group = DhGroup::Modp1024;
+        let rcfg = Phase1Config { local_auth: Ikev1LocalAuth::Psk(psk), trusted_cas: Vec::new(), now_unix: 0, our_id: Id::ipv4([192, 168, 0, 1]) };
+        let mut ie = SeedEntropy::new(0x3333);
+        let mut re = SeedEntropy::new(0x4444);
+        let (msg1, sa_sent) = initiate_main(&icfg, &mut ie);
+        let (msg2, _r1) = respond_main(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+
+        let tampered = retarget_sa_group(&msg2, DhGroup::Modp2048);
+
+        match sa_sent.complete_sa(&tampered, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()) {
+            Err(IkeError::NoProposalChosen) => {}
+            other => panic!("expected NoProposalChosen, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn aggressive_mode_complete_rejects_a_transform_the_initiator_never_offered() {
+        // Same defect as `main_mode_complete_sa_rejects_a_transform_the_initiator_never_offered`,
+        // on the Aggressive Mode initiator path -- `AggressiveInitiator::complete`
+        // never even looked at message 2's SA payload before this fix.
+        let psk = b"correct horse battery staple".to_vec();
+        let mut icfg = main_mode_icfg(psk.clone());
+        icfg.mode = Ikev1ExchangeMode::Aggressive;
+        icfg.group = DhGroup::Modp1024;
+        let rcfg = Phase1Config { local_auth: Ikev1LocalAuth::Psk(psk), trusted_cas: Vec::new(), now_unix: 0, our_id: Id::ipv4([192, 168, 0, 1]) };
+        let mut ie = SeedEntropy::new(0x3333);
+        let mut re = SeedEntropy::new(0x4444);
+        let (msg1, ai) = initiate_aggressive(&icfg, &mut ie, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let (msg2, _rstate) = respond_aggressive(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
+
+        let tampered = retarget_sa_group(&msg2, DhGroup::Modp2048);
+
+        match ai.complete(&tampered, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap()) {
+            Err(IkeError::NoProposalChosen) => {}
+            other => panic!("expected NoProposalChosen, got {:?}", other.map(|_| ())),
         }
     }
 

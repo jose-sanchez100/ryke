@@ -285,6 +285,51 @@ impl<E: Entropy> Client<E> {
         }
     }
 
+    /// How many times to resend a request (unchanged: same message-id and
+    /// cookies, exactly what a retransmission must be) after its answer
+    /// times out, before [`Self::send_and_await`] gives up and surfaces the
+    /// read timeout as a real error. RFC 2408 leaves retransmission timing
+    /// to the implementation; this crate doesn't run a full backoff timer,
+    /// just enough resends to ride out one lost UDP datagram without failing
+    /// the whole handshake over it.
+    const MAX_RETRANSMITS: u32 = 2;
+
+    /// Send `msg` and wait for its matching reply via [`Self::recv_matching`],
+    /// resending `msg` up to [`Self::MAX_RETRANSMITS`] more times if the wait
+    /// times out before a match arrives. Every request/response round trip in
+    /// [`Self::connect`] used to be a bare `send_step` + `recv_matching`: a
+    /// single, unacknowledged UDP send with no recovery if that one datagram
+    /// (or its reply) is dropped -- the whole handshake just times out. This
+    /// covers exactly that case; it does not attempt duplicate-response
+    /// suppression on the responder side, which is a separate concern.
+    fn send_and_await(
+        &self,
+        msg: &[u8],
+        server: SocketAddr,
+        floated: bool,
+        cky_i: [u8; 8],
+        cky_r: Option<[u8; 8]>,
+        exchange_type: u8,
+    ) -> Result<Vec<u8>, DriverError> {
+        self.send_step(msg, server, floated)?;
+        let mut retransmits_left = Self::MAX_RETRANSMITS;
+        loop {
+            match self.recv_matching(cky_i, cky_r, exchange_type, floated) {
+                Ok(reply) => return Ok(reply),
+                Err(DriverError::Io(e))
+                    if retransmits_left > 0 && matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
+                {
+                    retransmits_left -= 1;
+                    ike_debug!(
+                        "retransmitting exchange={exchange_type} after a read timeout ({retransmits_left} retransmit(s) left)"
+                    );
+                    self.send_step(msg, server, floated)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Run the full handshake — Phase 1 (Aggressive or Main Mode, see
     /// [`InitiatorConfig::mode`]) then Quick Mode (msg1/msg2/msg3) — against
     /// `server`, returning the established SA.
@@ -303,8 +348,7 @@ impl<E: Entropy> Client<E> {
                 ike_debug!("Aggressive Mode: sending msg1 to {server}");
                 let (msg1, ai) = initiate_aggressive(cfg, &mut self.entropy, our_addr, server);
                 let cky_i: [u8; 8] = msg1[..8].try_into().unwrap();
-                self.transport.send_to(&msg1, server)?;
-                let msg2 = self.recv_matching(cky_i, None, exchange::AGGRESSIVE, false)?;
+                let msg2 = self.send_and_await(&msg1, server, false, cky_i, None, exchange::AGGRESSIVE)?;
                 let (msg3, phase1) = ai.complete(&msg2, our_addr, server)?;
                 ike_debug!("Aggressive Mode: complete, sending msg3 (floated={})", phase1.floated);
                 self.enable_natt_encap(phase1.floated)?;
@@ -321,19 +365,16 @@ impl<E: Entropy> Client<E> {
                 ike_debug!("Main Mode: sending msg1 to {server}");
                 let (msg1, sa_sent) = initiate_main(cfg, &mut self.entropy);
                 let cky_i: [u8; 8] = msg1[..8].try_into().unwrap();
-                self.transport.send_to(&msg1, server)?;
-                let msg2 = self.recv_matching(cky_i, None, exchange::MAIN, false)?;
+                let msg2 = self.send_and_await(&msg1, server, false, cky_i, None, exchange::MAIN)?;
                 let cky_r: [u8; 8] = msg2[8..16].try_into().unwrap();
                 let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut self.entropy, our_addr, server)?;
                 // Still unfloated: NAT-D isn't verified until message 4
                 // arrives (below), so whether to float is still unknown.
-                self.transport.send_to(&msg3, server)?;
-                let msg4 = self.recv_matching(cky_i, Some(cky_r), exchange::MAIN, false)?;
+                let msg4 = self.send_and_await(&msg3, server, false, cky_i, Some(cky_r), exchange::MAIN)?;
                 let (msg5, id_sent) = ke_sent.complete_ke(&msg4)?;
                 ike_debug!("Main Mode: NAT-T floated={}", id_sent.floated);
                 self.enable_natt_encap(id_sent.floated)?;
-                self.send_step(&msg5, server, id_sent.floated)?;
-                let msg6 = self.recv_matching(cky_i, Some(cky_r), exchange::MAIN, id_sent.floated)?;
+                let msg6 = self.send_and_await(&msg5, server, id_sent.floated, cky_i, Some(cky_r), exchange::MAIN)?;
                 let msg6_len = msg6.len();
                 let floated = id_sent.floated;
                 let phase1 = match id_sent.complete_id(&msg6, &mut self.entropy) {
@@ -380,8 +421,7 @@ impl<E: Entropy> Client<E> {
             ike_debug!("XAUTH: waiting for the gateway's request");
             let request = self.recv_matching(phase1.cky_i, Some(phase1.cky_r), exchange::TRANSACTION, phase1.floated)?;
             let reply = xauth::build_xauth_reply(&phase1, &request, user, password)?;
-            self.send_step(&reply, server, phase1.floated)?;
-            let set_msg = self.recv_matching(phase1.cky_i, Some(phase1.cky_r), exchange::TRANSACTION, phase1.floated)?;
+            let set_msg = self.send_and_await(&reply, server, phase1.floated, phase1.cky_i, Some(phase1.cky_r), exchange::TRANSACTION)?;
             let (ack, ok) = xauth::build_xauth_ack(&phase1, &set_msg)?;
             self.send_step(&ack, server, phase1.floated)?;
             ike_debug!("XAUTH: {}", if ok { "succeeded" } else { "failed" });
@@ -402,8 +442,7 @@ impl<E: Entropy> Client<E> {
             self.entropy.fill(&mut mid_b);
             let msgid = u32::from_be_bytes(mid_b) | 1; // non-zero
             let (request, next_iv) = modecfg::build_cfg_request_with(&phase1, msgid, cfg.ipv6)?;
-            self.send_step(&request, server, phase1.floated)?;
-            let reply = self.recv_matching(phase1.cky_i, Some(phase1.cky_r), exchange::TRANSACTION, phase1.floated)?;
+            let reply = self.send_and_await(&request, server, phase1.floated, phase1.cky_i, Some(phase1.cky_r), exchange::TRANSACTION)?;
             let got = modecfg::parse_cfg_reply(&phase1, &reply, &next_iv)?;
             assigned_ip4 = got.assigned_ipv4();
             netmask = got.assigned_netmask();
@@ -442,8 +481,7 @@ impl<E: Entropy> Client<E> {
         );
         let (qm1, qi) =
             initiate_quick_with_pfs(&phase1, &mut self.entropy, cfg.esp_cipher, ts_local, cfg.ts_remote, cfg.pfs_group, cfg.p2_lifetime_secs)?;
-        self.send_step(&qm1, server, phase1.floated)?;
-        let qm2 = self.recv_matching(phase1.cky_i, Some(phase1.cky_r), exchange::QUICK, phase1.floated)?;
+        let qm2 = self.send_and_await(&qm1, server, phase1.floated, phase1.cky_i, Some(phase1.cky_r), exchange::QUICK)?;
         let (qm3, child, p2_lifetime_secs) = qi.complete(&qm2)?;
         self.send_step(&qm3, server, phase1.floated)?;
         ike_debug!(
@@ -470,6 +508,18 @@ mod tests {
     use crate::entropy::SeedEntropy;
     use std::net::UdpSocket;
 
+    /// A minimal (no payloads) but wire-valid ISAKMP header buffer --
+    /// version and length set correctly, since `IsakmpHeader::parse` now
+    /// validates both -- with the exchange type set and cookies left zeroed
+    /// for the caller to patch via slicing.
+    fn blank_header(exchange_type: u8) -> Vec<u8> {
+        let mut buf = vec![0u8; IsakmpHeader::LEN];
+        buf[17] = IsakmpHeader::VERSION_1_0;
+        buf[18] = exchange_type;
+        buf[24..28].copy_from_slice(&(IsakmpHeader::LEN as u32).to_be_bytes());
+        buf
+    }
+
     /// A stray datagram carrying a *different* session's cookies (e.g. a
     /// gateway's retransmission of an earlier, abandoned connection attempt,
     /// still arriving on this long-held socket) must be silently dropped by
@@ -487,16 +537,15 @@ mod tests {
 
         // A stray message: correct wire shape, but cookies from an unrelated
         // session -- must not satisfy `recv_matching`.
-        let mut stray = vec![0u8; IsakmpHeader::LEN];
+        let mut stray = blank_header(exchange::MAIN);
         stray[..8].copy_from_slice(&[0x11; 8]);
         stray[8..16].copy_from_slice(&[0x22; 8]);
         sender.send_to(&stray, client_addr).unwrap();
 
         // The real message, sent right after -- must be the one returned.
-        let mut real = vec![0u8; IsakmpHeader::LEN];
+        let mut real = blank_header(exchange::MAIN);
         real[..8].copy_from_slice(&cky_i);
         real[8..16].copy_from_slice(&cky_r);
-        real[18] = exchange::MAIN;
         sender.send_to(&real, client_addr).unwrap();
 
         client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -514,10 +563,9 @@ mod tests {
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
 
         let cky_i = [0xAA; 8];
-        let mut real = vec![0u8; IsakmpHeader::LEN];
+        let mut real = blank_header(exchange::MAIN);
         real[..8].copy_from_slice(&cky_i);
         real[8..16].copy_from_slice(&[0xCC; 8]); // responder's freshly-chosen cookie
-        real[18] = exchange::MAIN;
         sender.send_to(&real, client_addr).unwrap();
 
         client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -543,20 +591,88 @@ mod tests {
 
         // A same-SA, same-cookies datagram, but for the Transaction (XAUTH)
         // exchange, not the Main Mode message 6 this call awaits.
-        let mut wrong_exchange = vec![0u8; IsakmpHeader::LEN];
+        let mut wrong_exchange = blank_header(exchange::TRANSACTION);
         wrong_exchange[..8].copy_from_slice(&cky_i);
         wrong_exchange[8..16].copy_from_slice(&cky_r);
-        wrong_exchange[18] = exchange::TRANSACTION;
         sender.send_to(&wrong_exchange, client_addr).unwrap();
 
-        let mut real = vec![0u8; IsakmpHeader::LEN];
+        let mut real = blank_header(exchange::MAIN);
         real[..8].copy_from_slice(&cky_i);
         real[8..16].copy_from_slice(&cky_r);
-        real[18] = exchange::MAIN;
         sender.send_to(&real, client_addr).unwrap();
 
         client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let got = client.recv_matching(cky_i, Some(cky_r), exchange::MAIN, false).unwrap();
         assert_eq!(got, real, "must skip the Transaction-exchange datagram and return the Main-Mode one");
+    }
+
+    /// A request whose reply is lost must be resent, not just give up on the
+    /// first read timeout -- every real round trip in [`Client::connect`]
+    /// goes through [`Client::send_and_await`]. The fake responder here
+    /// discards the first delivery entirely and only answers the
+    /// retransmission, mirroring
+    /// `ikev2::session::tests::send_and_retry_recovers_from_one_dropped_request`.
+    #[test]
+    fn send_and_await_retransmits_after_one_dropped_reply() {
+        let client = Client { transport: UdpTransport::bind("127.0.0.1:0").unwrap(), natt_transport: None, entropy: SeedEntropy::new(1) };
+        client.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+
+        let responder_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let responder_addr = responder_sock.local_addr().unwrap();
+
+        let cky_i = [0xAA; 8];
+        let cky_r = [0xBB; 8];
+        let mut req = blank_header(exchange::MAIN);
+        req[..8].copy_from_slice(&cky_i);
+        let mut reply = blank_header(exchange::MAIN);
+        reply[..8].copy_from_slice(&cky_i);
+        reply[8..16].copy_from_slice(&cky_r);
+
+        let (req_check, reply_send) = (req.clone(), reply.clone());
+        let responder = std::thread::spawn(move || {
+            let mut buf = [0u8; 128];
+            // First delivery: simulate a dropped datagram -- read and discard it.
+            let (n, _from) = responder_sock.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], req_check);
+            // The retransmission (identical bytes): answer this one.
+            let (n, from) = responder_sock.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], req_check);
+            responder_sock.send_to(&reply_send, from).unwrap();
+        });
+
+        let got = client.send_and_await(&req, responder_addr, false, cky_i, Some(cky_r), exchange::MAIN).unwrap();
+        assert_eq!(got, reply);
+        responder.join().unwrap();
+    }
+
+    /// With no reply at all, `send_and_await` must give up after
+    /// `MAX_RETRANSMITS` resends (exactly `MAX_RETRANSMITS + 1` total sends)
+    /// rather than retry forever, surfacing the same read-timeout error
+    /// `recv_matching` alone would have.
+    #[test]
+    fn send_and_await_gives_up_after_max_retransmits() {
+        let client = Client { transport: UdpTransport::bind("127.0.0.1:0").unwrap(), natt_transport: None, entropy: SeedEntropy::new(1) };
+        client.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let sends_seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let sends_seen2 = sends_seen.clone();
+        let counter = std::thread::spawn(move || {
+            let mut buf = [0u8; 128];
+            listener.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+            while listener.recv_from(&mut buf).is_ok() {
+                sends_seen2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        let cky_i = [0xAA; 8];
+        let req = blank_header(exchange::MAIN);
+        let err = client.send_and_await(&req, listener_addr, false, cky_i, None, exchange::MAIN).unwrap_err();
+        assert!(matches!(err, DriverError::Io(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)));
+
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(sends_seen.load(std::sync::atomic::Ordering::SeqCst), Client::<SeedEntropy>::MAX_RETRANSMITS + 1);
+        counter.join().unwrap();
     }
 }

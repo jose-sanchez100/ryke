@@ -63,19 +63,41 @@ impl IsakmpHeader {
     pub const LEN: usize = 28;
     pub const VERSION_1_0: u8 = 0x10;
 
+    /// Parse the 28-byte header, validating the two fields the caller can't
+    /// sanity-check itself: the major version (RFC 2408 §3.1 -- a responder
+    /// receiving a message with a major version it doesn't speak must reject
+    /// it, exactly like [`crate::ikev2::message::IkeHeader::parse`] already
+    /// does for IKEv2's own major version) and the declared total-message
+    /// `length` against the number of bytes actually received (UDP already
+    /// gives each call one whole datagram -- see [`crate::transport::UdpTransport::recv_from`] --
+    /// so a `length` that disagrees with it is either a mis-framed message or
+    /// a lying peer, either way not safe to hand to a payload-chain parser
+    /// that trusts per-payload lengths but never re-checks the header's own
+    /// claim). Every consumer in this crate calls this before touching
+    /// anything else in the buffer, so validating both here (rather than
+    /// separately in each of them, as before) is what actually makes it
+    /// uniform.
     pub fn parse(bytes: &[u8]) -> Result<IsakmpHeader, IkeError> {
         if bytes.len() < Self::LEN {
             return Err(IkeError::Truncated { need: Self::LEN, have: bytes.len() });
+        }
+        let version = bytes[17];
+        if version >> 4 != Self::VERSION_1_0 >> 4 {
+            return Err(IkeError::UnsupportedVersion(version >> 4));
+        }
+        let length = u32::from_be_bytes(bytes[24..28].try_into().unwrap());
+        if length as usize != bytes.len() {
+            return Err(IkeError::BadLength { declared: length as usize, available: bytes.len() });
         }
         Ok(IsakmpHeader {
             init_cookie: bytes[0..8].try_into().unwrap(),
             resp_cookie: bytes[8..16].try_into().unwrap(),
             next_payload: bytes[16],
-            version: bytes[17],
+            version,
             exchange_type: bytes[18],
             flags: bytes[19],
             message_id: u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
-            length: u32::from_be_bytes(bytes[24..28].try_into().unwrap()),
+            length,
         })
     }
 
@@ -191,6 +213,49 @@ mod tests {
         assert_eq!(IsakmpHeader::parse(&h.to_bytes()).unwrap(), h);
         assert_eq!(h.to_bytes().len(), IsakmpHeader::LEN);
         assert!(IsakmpHeader::parse(&[0u8; 10]).is_err());
+    }
+
+    /// RFC 2408 §3.1: a major version this crate doesn't speak must be
+    /// rejected, mirroring what `ikev2::message::IkeHeader::parse` already
+    /// does for its own major version -- an IKEv2 message (major version 2)
+    /// misrouted to this parser is exactly the case that must not silently
+    /// half-parse.
+    #[test]
+    fn parse_rejects_a_non_ikev1_major_version() {
+        let h = IsakmpHeader {
+            init_cookie: [1; 8],
+            resp_cookie: [2; 8],
+            next_payload: payload::NONE,
+            version: 0x20, // major version 2, minor 0 -- an IKEv2 header
+            exchange_type: exchange::MAIN,
+            flags: 0,
+            message_id: 0,
+            length: IsakmpHeader::LEN as u32,
+        };
+        let err = IsakmpHeader::parse(&h.to_bytes()).unwrap_err();
+        assert_eq!(err, IkeError::UnsupportedVersion(2));
+    }
+
+    /// The header's own `length` field must agree with what was actually
+    /// received -- `IsakmpHeader::parse` is always handed one whole UDP
+    /// datagram (see `crate::transport::UdpTransport::recv_from`), so a
+    /// `length` that disagrees with it is a lying or malformed peer, not
+    /// something a payload-chain parser that trusts per-payload lengths
+    /// should be handed.
+    #[test]
+    fn parse_rejects_a_length_that_disagrees_with_the_buffer() {
+        let h = IsakmpHeader {
+            init_cookie: [1; 8],
+            resp_cookie: [2; 8],
+            next_payload: payload::NONE,
+            version: IsakmpHeader::VERSION_1_0,
+            exchange_type: exchange::MAIN,
+            flags: 0,
+            message_id: 0,
+            length: 9999, // doesn't match the 28-byte buffer below
+        };
+        let err = IsakmpHeader::parse(&h.to_bytes()).unwrap_err();
+        assert_eq!(err, IkeError::BadLength { declared: 9999, available: IsakmpHeader::LEN });
     }
 
     #[test]

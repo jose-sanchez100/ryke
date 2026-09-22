@@ -1,8 +1,9 @@
 //! A blocking IKEv1 **responder** (server) over UDP: Aggressive Mode or Main
-//! Mode (Phase 1) + Quick Mode (Phase 2), PSK authentication. Per-client
-//! handshake state is keyed by the cookie pair so the multi-message
-//! exchanges correlate. On completion the established ESP CHILD SA is
-//! available via [`Server::take_child`].
+//! Mode (Phase 1) + Quick Mode (Phase 2), authenticated by a PSK or, in Main
+//! Mode, an RSA signature (see [`Phase1Config`]). Per-client handshake state
+//! is keyed by the cookie pair so the multi-message exchanges correlate. On
+//! completion the established ESP CHILD SA is available via
+//! [`Server::take_child`].
 //!
 //! This is a test double for [`super::Client`], not a gateway, and what holds
 //! for it says nothing about the client or the library's other building
@@ -107,7 +108,7 @@ struct Session {
 }
 
 /// A UDP IKEv1 responder driven by an [`Entropy`] source, authenticating peers
-/// with a pre-shared key.
+/// as its [`Phase1Config`] says.
 pub struct Server<E> {
     transport: UdpTransport,
     entropy: E,

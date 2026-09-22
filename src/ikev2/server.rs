@@ -2,15 +2,16 @@
 //!
 //! Handles the two-message handshake — `IKE_SA_INIT` then `IKE_AUTH` — keeping
 //! per-SA state keyed by the SPI pair so the second message can be correlated
-//! with the first. Uses pre-shared-key authentication.
+//! with the first. Authenticates as its [`AuthConfig`] says: a pre-shared key,
+//! or certificates (RFC 7427 signatures).
 //!
 //! This is a *minimal* responder in the sense of RFC 7296 Appendix A, not a
 //! gateway, and what holds for it says nothing about [`crate::Ikev2Session`]
 //! (the client) or the library's other building blocks. What it does:
 //!
-//! - one IKE SA and one ESP CHILD SA per `IKE_SA_INIT` + `IKE_AUTH`, PSK
-//!   authentication only: no EAP, no certificates, no NAT traversal, no
-//!   configuration payload, no cookies;
+//! - one IKE SA and one ESP CHILD SA per `IKE_SA_INIT` + `IKE_AUTH`, and
+//!   nothing else: no EAP, no NAT traversal, no configuration payload, no
+//!   cookies;
 //! - window size 1 (§2.3): a request is taken only with the next Message ID
 //!   (§2.2); a retransmission of the last one gets the response already sent,
 //!   unchanged, never a new one (§2.1); any other request is dropped
@@ -89,7 +90,7 @@ struct IkeSa {
 }
 
 /// A UDP IKEv2 responder driven by an [`Entropy`] source, authenticating peers
-/// with a pre-shared key.
+/// as its [`AuthConfig`] says.
 pub struct Server<E> {
     transport: UdpTransport,
     entropy: E,

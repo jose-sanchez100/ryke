@@ -2,31 +2,101 @@
 //!
 //! A **clean-room** IKEv2 / IKE implementation in Rust — `ryke` = **R**ust + **IKE**.
 //!
-//! It implements **both sides independently**: a client ([`Role::Initiator`])
-//! that starts exchanges and a server ([`Role::Responder`]) that answers them.
-//! The protocol is built from the RFCs; it does not wrap OpenSSL or any existing
-//! IKE/IPsec daemon, and copies no third-party code.
+//! It covers IKEv2 (RFC 7296) and IKEv1 (RFC 2409), with code for both sides
+//! of the exchanges: [`Role::Initiator`] starts them, [`Role::Responder`]
+//! answers them. The protocol is built from the RFCs; it does not wrap
+//! OpenSSL or any existing IKE/IPsec daemon, and copies no third-party code.
 //!
-//! ## Scope & architecture
+//! ## What each part guarantees
 //!
-//! - **Control plane (this crate):** UDP 500/4500, message framing, exchange
-//!   state machines, crypto + key schedule, and authentication (certificate and
-//!   EAP-MSCHAPv2 for native iOS/Android clients on the server side).
-//! - **Data plane:** a **userspace ESP** implementation in Rust (AES-GCM).
-//!   `ryke` encrypts/decrypts the tunneled packets itself — it does not use the
-//!   OS kernel's IPsec stack, and no external software is involved. The library
-//!   moves packets you hand it (via [`Tunnel`], or the lower-level [`EspSa`] /
-//!   [`ChildSa`]); capturing a machine's real traffic (e.g. a TUN device) is the
-//!   consumer's job, deliberately out of scope.
+//! ryke comes in layers, and what holds for one says nothing about another:
+//! an RFC requirement a building block meets is met by a session only where
+//! the session puts it to use, and neither says anything about the bundled
+//! servers.
 //!
-//! ## What works today
+//! ### Building blocks
 //!
-//! - Message framing: header + generic payload chain (RFC 7296 §3.1–3.2).
-//! - Payloads: Security Association (proposals/transforms), Key Exchange, Nonce.
-//! - Crypto core for `IKE_SA_INIT`: X25519 (RFC 7748), HMAC-SHA256 PRF
-//!   (RFC 4231), `prf+`, and the SKEYSEED / SK_* key schedule (§2.13–2.14).
+//! The per-exchange modules -- [`ikev2::exchange`], [`ikev2::ike_auth`],
+//! [`ikev2::eap_auth`], [`ikev2::rekey`], [`ikev2::ike_rekey`],
+//! [`ikev2::informational`], [`ikev2::mobike`], [`ikev2::fragment`],
+//! [`ikev1::phase1`], [`ikev1::xauth`], [`ikev1::cfg`], [`ikev1::quick`] and
+//! [`ikev1::informational`] -- parse, check and build the messages of one
+//! exchange. What they know of it is what the caller hands back in: the SA's
+//! keys, or a value that carries one exchange from step to step (a Main-Mode
+//! responder state, an [`EapResponder`]). Message IDs and the request
+//! window, answering a retransmitted request with the same response,
+//! retransmitting one's own requests, timers and lifetimes, simultaneous
+//! exchanges, and which exchange may come when are up to whoever puts them
+//! together.
 //!
-//! See `docs/implementation-plan.md` for the milestone roadmap.
+//! ### Initiator sessions
+//!
+//! The client side, as a VPN client uses it:
+//!
+//! - IKEv2: [`Ikev2Session`] connects (IKE_SA_INIT with NAT-T, IKE_AUTH with a
+//!   PSK, a certificate or EAP-MSCHAPv2, the first CHILD SA) and yields a
+//!   [`LivenessSession`], which runs the IKE SA from then on: Message IDs,
+//!   liveness checks, rekeys of the IKE SA and of the CHILD SAs (IPv4 and a
+//!   separate IPv6 one), Deletes, and simultaneous rekeys (RFC 7296 §2.8.1,
+//!   §2.8.2). It answers the peer's requests too -- liveness checks, Deletes
+//!   and rekeys -- repeats its answer to a retransmitted INFORMATIONAL or
+//!   CHILD SA rekey request, and refuses a new CHILD SA with
+//!   `NO_ADDITIONAL_SAS`.
+//! - IKEv1: [`ikev1::Client`] connects (Main Mode with a PSK or an RSA
+//!   signature, or Aggressive Mode with a PSK; XAUTH and Mode-Config when
+//!   asked for; Quick Mode) and yields an [`ikev1::Established`]. No session
+//!   object follows: the caller keeps the Phase-1 state and calls
+//!   [`ikev1::informational::peek`] and [`ikev1::informational::probe`]
+//!   (which answer the peer's R-U-THERE and report its Deletes),
+//!   [`ikev1::quick::rekey_child`] and its IPv6 counterparts, and
+//!   [`ikev1::Established::close_message`].
+//!
+//! Both retransmit their handshake requests, and the IKEv2 session its
+//! INFORMATIONAL and IKE SA rekey requests too. Neither runs in the
+//! background: the peer's requests are answered only while the caller is
+//! inside one of these calls. Not done:
+//!
+//! - IKEv2: a `CREATE_CHILD_SA` request of the session's own is sent once,
+//!   never retransmitted.
+//! - IKEv1: a Quick Mode or a Phase 1 the gateway starts goes unanswered,
+//!   and the ISAKMP SA is never rekeyed; once its lifetime is up, a new
+//!   `connect` is the way on.
+//!
+//! ### Bundled servers
+//!
+//! [`ikev2::server::Server`] and [`ikev1::server::Server`] are minimal
+//! responders for tests and examples, not gateways: a PSK or certificates
+//! (in IKEv1, Main Mode only), one CHILD SA at a time, no EAP or XAUTH, no
+//! NAT-T, and never an exchange of their own. Their module docs list what
+//! they do.
+//!
+//! [`ikev2::client::Client`] is the matching minimal IKEv2 initiator: the
+//! handshake, nothing after it.
+//!
+//! ### What the consumer supplies
+//!
+//! - **The data plane.** The sessions hand out each CHILD SA's SPIs and keys
+//!   ([`ConnectedTunnel`], [`RekeyedChild`], [`ChildSa`]). Installing them
+//!   (in the kernel's XFRM, or in ryke's userspace ESP: [`Tunnel`],
+//!   [`EspSa`]), swapping them at every rekey, and capturing the traffic to
+//!   carry (a TUN device or anything else) are the consumer's.
+//! - **The host's configuration.** The addresses, DNS servers and split
+//!   routes the gateway assigns come back as data; applying them is the
+//!   consumer's.
+//! - **The schedule.** When to check liveness, when to rekey (from the
+//!   negotiated lifetimes and [`LivenessSession::ike_sa_age`]), how many
+//!   missed checks mean the peer is gone, when to reconnect, and whether to
+//!   bring back a CHILD SA the peer deleted
+//!   ([`LivenessSession::take_peer_deleted_children`]).
+//! - **Credentials and trust.** Pre-shared keys, certificates and private
+//!   keys, EAP credentials, the trusted CAs, the name the gateway's
+//!   certificate must carry, and the time its validity is checked against.
+//! - **Sockets and randomness.** The UDP sockets, if the caller binds them
+//!   itself (both 500 and 4500 for NAT-T), and an [`Entropy`] source where
+//!   one is asked for ([`OsEntropy`] outside tests).
+//!
+//! `docs/implementation-plan.md` is the original roadmap, older than most of
+//! the above.
 
 // Shared crypto core (used by both IKEv1 and IKEv2).
 pub mod crypto;

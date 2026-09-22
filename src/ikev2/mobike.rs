@@ -8,6 +8,14 @@
 //! - When a peer's address changes it sends an INFORMATIONAL request with
 //!   `UPDATE_SA_ADDRESSES` (RFC 4555 §3.5); the receiver updates the SA's peer
 //!   address to that packet's *observed* source and answers.
+//!
+//! Since the second half is the consumer's, ryke's responders never advertise
+//! MOBIKE on their own: a consumer that implements it opts in through
+//! [`crate::ikev2::ike_auth::responder_process_auth_with_mobike`] or
+//! [`crate::ikev2::eap_auth::EapResponder::set_mobike`], and even then the
+//! notify is echoed only to an initiator that sent it (RFC 4555 §3.1).
+//! [`crate::ikev2::server::Server`] handles no INFORMATIONAL exchange, so it
+//! does not opt in.
 
 use crate::error::IkeError;
 use crate::ikev2::exchange::CompletedSaInit;

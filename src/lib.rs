@@ -80,7 +80,8 @@ pub use ikev2::ike_rekey::{is_ike_sa_rekey, responder_process_ike_rekey};
 pub use ikev2::ike_auth::{
     client_sent_certreq, esp_offer, initiator_auth_request, initiator_eap_request,
     initiator_verify_auth, is_eap_request, peer_id_from_auth, peer_id_from_request,
-    responder_process_auth, AssignedConfig, AuthConfig, ChildTsOffer, LocalAuth, PeerAuth,
+    responder_process_auth, responder_process_auth_with_mobike, AssignedConfig, AuthConfig,
+    ChildTsOffer, LocalAuth, PeerAuth,
 };
 pub use ikev2::message::{
     payloads, ExchangeType, Flags, IkeHeader, MessageBuilder, PayloadIter, PayloadType, RawPayload,

@@ -227,6 +227,9 @@ struct AuthPayloads {
     /// still established when the CHILD SA of `IKE_AUTH` fails, so the response
     /// then carries a valid ID/AUTH and this notify but no SA/TS payloads.
     child_error: Option<u16>,
+    /// Whether the peer sent `N(MOBIKE_SUPPORTED)` (RFC 4555 §3.1) -- a
+    /// responder may echo it, enabling MOBIKE, only when this is set.
+    mobike_supported: bool,
 }
 
 /// The type of `body` (a Notify payload body) if it is a CHILD-SA error
@@ -257,6 +260,7 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
     let mut tsr = None;
     let mut initial_contact = false;
     let mut child_error = None;
+    let mut mobike_supported = false;
     for payload in payloads(first, inner) {
         let payload = payload?;
         match payload.payload_type {
@@ -285,6 +289,8 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
                 if let Ok(n) = Notify::parse(payload.data) {
                     if n.notify_type == notify_type::INITIAL_CONTACT {
                         initial_contact = true;
+                    } else if n.notify_type == notify_type::MOBIKE_SUPPORTED {
+                        mobike_supported = true;
                     } else if child_error.is_none() && notify_type::is_child_sa_error(n.notify_type) {
                         child_error = Some(n.notify_type);
                     }
@@ -303,6 +309,7 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
         tsr,
         initial_contact,
         child_error,
+        mobike_supported,
     })
 }
 
@@ -589,6 +596,8 @@ pub fn initiator_eap_request_with_certs(
 /// whether it sent `N(INITIAL_CONTACT)` (RFC 7296 §2.4) -- the caller should
 /// tear down any prior IKE/CHILD SA it holds for the same peer identity when
 /// this is set, since it only has meaning once AUTH has verified.
+///
+/// Does not enable MOBIKE: see [`responder_process_auth_with_mobike`].
 pub fn responder_process_auth(
     sa: &CompletedSaInit,
     request: &[u8],
@@ -597,6 +606,29 @@ pub fn responder_process_auth(
     iv: &[u8; 8],
     assigned: Option<&AssignedConfig>,
 ) -> Result<(Vec<u8>, Identification, u32, bool), IkeError> {
+    let (response, peer_id, peer_child_spi, initial_contact, _mobike) =
+        responder_process_auth_with_mobike(sa, request, cfg, child_spi, iv, assigned, false)?;
+    Ok((response, peer_id, peer_child_spi, initial_contact))
+}
+
+/// Like [`responder_process_auth`], but `mobike` states whether the caller
+/// implements MOBIKE (RFC 4555): it answers an INFORMATIONAL carrying
+/// `N(UPDATE_SA_ADDRESSES)` (see [`crate::ikev2::mobike`]) by moving the IKE SA
+/// and its CHILD SAs to that request's observed source address. Only then, and
+/// only if the initiator offered it (§3.1), does the response carry
+/// `N(MOBIKE_SUPPORTED)` -- advertising it without that handling would have a
+/// MOBIKE client migrate onto a path we never follow. The extra returned flag
+/// is whether MOBIKE is in force for this IKE SA, i.e. whether the caller must
+/// honor `UPDATE_SA_ADDRESSES` from this peer.
+pub fn responder_process_auth_with_mobike(
+    sa: &CompletedSaInit,
+    request: &[u8],
+    cfg: &AuthConfig,
+    child_spi: u32,
+    iv: &[u8; 8],
+    assigned: Option<&AssignedConfig>,
+    mobike: bool,
+) -> Result<(Vec<u8>, Identification, u32, bool, bool), IkeError> {
     // The initiator encrypts with SK_ei.
     let (first, inner) = open_encrypted(sa.suite.sk_cipher(), request, &sa.keys.sk_ei, &sa.keys.sk_ai)?;
     let got = parse_auth_inner(first, &inner)?;
@@ -630,13 +662,17 @@ pub fn responder_process_auth(
     inner_out.push((PayloadType::SecurityAssociation, esp_offer(child_spi).to_bytes()));
     inner_out.push((PayloadType::TrafficSelectorInitiator, tsi));
     inner_out.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
-    // Advertise MOBIKE so the client migrates the SA across network changes instead
-    // of reconnecting (RFC 4555).
-    inner_out.push((PayloadType::Notify, crate::ikev2::mobike::mobike_supported().to_bytes()));
+    // RFC 4555 §3.1: the responder includes MOBIKE_SUPPORTED only if the
+    // initiator did, and we only when the caller actually follows the client
+    // across address changes -- then it migrates instead of reconnecting.
+    let mobike = mobike && got.mobike_supported;
+    if mobike {
+        inner_out.push((PayloadType::Notify, crate::ikev2::mobike::mobike_supported().to_bytes()));
+    }
     let first_out = first_payload_type(&inner_out);
     let inner_bytes = encode_payload_chain(&inner_out);
     let response = build_encrypted(sa.suite.sk_cipher(), ike_auth_header(sa, true), first_out, &inner_bytes, &sa.keys.sk_er, &sa.keys.sk_ar, iv)?;
-    Ok((response, peer_id, peer_child_spi, got.initial_contact))
+    Ok((response, peer_id, peer_child_spi, got.initial_contact, mobike))
 }
 
 /// Decrypt an `IKE_AUTH` request and return the peer's claimed identity (`IDi`)
@@ -849,6 +885,56 @@ mod tests {
         let (resp, _, _, _ic) = responder_process_auth(&resp_sa, &req, &rcfg, 2, &[2u8; 8], None).unwrap();
         let (_, _, _esp_suite, got_ip, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0)).unwrap();
         assert_eq!(got_ip, None);
+    }
+
+    /// The decrypted payload chain of an `IKE_AUTH` message.
+    fn sk_chain(cipher: SkCipher, msg: &[u8], sk_e: &[u8], sk_a: &[u8]) -> Vec<(PayloadType, Vec<u8>)> {
+        let (first, inner) = open_encrypted(cipher, msg, sk_e, sk_a).unwrap();
+        payloads(first, &inner).map(|p| p.map(|p| (p.payload_type, p.data.to_vec()))).collect::<Result<_, _>>().unwrap()
+    }
+
+    /// `req` with `N(MOBIKE_SUPPORTED)` appended to its `SK{}`, as a MOBIKE
+    /// client sends it (RFC 4555 §3.1). The initiator's AUTH does not cover
+    /// Notify payloads, so the request still verifies.
+    fn offering_mobike(init_sa: &CompletedSaInit, req: &[u8]) -> Vec<u8> {
+        let mut chain = sk_chain(init_sa.suite.sk_cipher(), req, &init_sa.keys.sk_ei, &init_sa.keys.sk_ai);
+        chain.push((PayloadType::Notify, crate::ikev2::mobike::mobike_supported().to_bytes()));
+        let bytes = encode_payload_chain(&chain);
+        build_encrypted(init_sa.suite.sk_cipher(), ike_auth_header(init_sa, false), first_payload_type(&chain), &bytes, &init_sa.keys.sk_ei, &init_sa.keys.sk_ai, &[1u8; 8]).unwrap()
+    }
+
+    fn response_advertises_mobike(init_sa: &CompletedSaInit, resp: &[u8]) -> bool {
+        crate::ikev2::mobike::peer_supports_mobike(&sk_chain(init_sa.suite.sk_cipher(), resp, &init_sa.keys.sk_er, &init_sa.keys.sk_ar))
+    }
+
+    #[test]
+    fn mobike_is_advertised_only_when_the_caller_opts_in_and_the_initiator_offered_it() {
+        let (init_sa, resp_sa) = run_sa_init();
+        let psk = b"pw".to_vec();
+        let icfg = AuthConfig::psk(Identification::fqdn("c"), psk.clone());
+        let rcfg = AuthConfig::psk(Identification::fqdn("s"), psk);
+        let plain = initiator_auth_request(&init_sa, &icfg, 1, &esp_offer(0), &[1u8; 8]).unwrap();
+        let offered = offering_mobike(&init_sa, &plain);
+        let with_mobike = |req: &[u8], mobike: bool| {
+            let (resp, peer, _spi, _ic, in_force) =
+                responder_process_auth_with_mobike(&resp_sa, req, &rcfg, 2, &[2u8; 8], None, mobike).unwrap();
+            assert_eq!(peer, Identification::fqdn("c"));
+            // Whatever it says about MOBIKE, the response is a valid one.
+            initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0)).unwrap();
+            (response_advertises_mobike(&init_sa, &resp), in_force)
+        };
+
+        // The default entry point never advertises MOBIKE, not even to a client
+        // offering it: nothing behind it (e.g. `Server`) follows that client to
+        // a new address, so it would migrate onto a path we drop.
+        let (resp, ..) = responder_process_auth(&resp_sa, &offered, &rcfg, 2, &[2u8; 8], None).unwrap();
+        assert!(!response_advertises_mobike(&init_sa, &resp));
+        assert_eq!(with_mobike(&offered, false), (false, false));
+        // Opted in, but the initiator did not offer it: RFC 4555 §3.1 has the
+        // responder include MOBIKE_SUPPORTED only in reply to the initiator's.
+        assert_eq!(with_mobike(&plain, true), (false, false));
+        // Opted in and offered: advertised, and reported as in force.
+        assert_eq!(with_mobike(&offered, true), (true, true));
     }
 
     /// An `IKE_AUTH` response the way a responder sends it when only the CHILD

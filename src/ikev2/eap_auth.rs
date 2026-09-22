@@ -624,6 +624,10 @@ pub struct EapResponder {
     /// in the final message — so the cascade's per-client inner IP is handed out
     /// over EAP just like the PSK path.
     assigned: Option<AssignedConfig>,
+    /// Whether the consumer implements MOBIKE -- see [`set_mobike`](Self::set_mobike).
+    mobike: bool,
+    /// Whether the initiator sent `N(MOBIKE_SUPPORTED)` in any `IKE_AUTH` request.
+    peer_mobike: bool,
 }
 
 impl EapResponder {
@@ -662,6 +666,8 @@ impl EapResponder {
             peer_idi: Vec::new(),
             peer_child_spi: None,
             assigned: None,
+            mobike: false,
+            peer_mobike: false,
         }
     }
 
@@ -669,6 +675,24 @@ impl EapResponder {
     /// Payload (a native client needs it to configure its tunnel interface).
     pub fn set_assigned(&mut self, assigned: Option<AssignedConfig>) {
         self.assigned = assigned;
+    }
+
+    /// Declare that the consumer implements MOBIKE (RFC 4555): it answers an
+    /// INFORMATIONAL carrying `N(UPDATE_SA_ADDRESSES)` (see
+    /// [`crate::ikev2::mobike`]) by moving the IKE SA and its CHILD SAs to that
+    /// request's observed source address. Off by default: only then, and only if
+    /// the initiator offered it (§3.1), does the final message carry
+    /// `N(MOBIKE_SUPPORTED)` -- see [`mobike_enabled`](Self::mobike_enabled).
+    pub fn set_mobike(&mut self, enabled: bool) {
+        self.mobike = enabled;
+    }
+
+    /// Whether MOBIKE is in force for this IKE SA -- we opted in and the
+    /// initiator offered it -- i.e. whether the consumer must honor
+    /// `UPDATE_SA_ADDRESSES` from this peer. Meaningful once
+    /// [`EapEvent::Established`] has been returned.
+    pub fn mobike_enabled(&self) -> bool {
+        self.mobike && self.peer_mobike
     }
 
     /// The initiator's ESP SPI (captured from SAi2), for deriving the CHILD SA
@@ -685,6 +709,7 @@ impl EapResponder {
 
     pub fn handle(&mut self, message: &[u8], entropy: &mut impl Entropy) -> Result<EapEvent, IkeError> {
         let (msg_id, ps) = decrypt(&self.sa, message)?;
+        self.peer_mobike |= crate::ikev2::mobike::peer_supports_mobike(&ps);
 
         // msg-1: IDi + SA + TS, no AUTH, no EAP → authenticate ourselves and
         // start EAP with an Identity request: SK{ IDr, [CERT,] AUTH, EAP }.
@@ -768,13 +793,16 @@ impl EapResponder {
                 inner.push((PayloadType::SecurityAssociation, esp_offer(self.child_spi).to_bytes()));
                 inner.push((PayloadType::TrafficSelectorInitiator, tsi));
                 inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
-                // Advertise MOBIKE so the client migrates the SA across network
+                // Advertise MOBIKE -- so the client migrates the SA across network
                 // changes (Wi-Fi↔cellular / NAT rebind) via UPDATE_SA_ADDRESSES
-                // instead of tearing the tunnel down and reconnecting.
-                inner.push((
-                    PayloadType::Notify,
-                    crate::ikev2::mobike::mobike_supported().to_bytes(),
-                ));
+                // instead of reconnecting -- only when the consumer follows it
+                // there and the client offered it (RFC 4555 §3.1).
+                if self.mobike_enabled() {
+                    inner.push((
+                        PayloadType::Notify,
+                        crate::ikev2::mobike::mobike_supported().to_bytes(),
+                    ));
+                }
                 let msg = build_sk(&self.sa, msg_id, true, &inner, &iv(entropy))?;
                 return Ok(EapEvent::Established(Some(msg)));
             }
@@ -927,12 +955,24 @@ mod tests {
     /// Run the EAP exchange up to the responder's final message (the one with
     /// its MSK-keyed AUTH + SA/TS), and return it with both endpoints.
     fn run_to_final_message() -> (EapInitiator, EapResponder, Vec<u8>) {
+        run_to_final_message_with_mobike(false, false)
+    }
+
+    /// [`run_to_final_message`] with the responder's [`EapResponder::set_mobike`]
+    /// set to `opt_in`, and `N(MOBIKE_SUPPORTED)` added to msg-1 when `offer`.
+    fn run_to_final_message_with_mobike(offer: bool, opt_in: bool) -> (EapInitiator, EapResponder, Vec<u8>) {
         let (init_sa, resp_sa) = sa_pair();
         let mut initiator = EapInitiator::new(init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111, ServerVerify::Insecure);
         let mut responder = EapResponder::new(resp_sa, Identification::fqdn("gw"), ServerAuth::Psk(b"psk".to_vec()), b"alice".to_vec(), "s3cret".into(), 0x2222);
+        responder.set_mobike(opt_in);
         let mut ie = SeedEntropy::new(1);
         let mut re = SeedEntropy::new(2);
         let mut in_flight = initiator.start(&mut ie).unwrap();
+        if offer {
+            let (msg_id, mut ps) = decrypt(&responder.sa, &in_flight).unwrap();
+            ps.push((PayloadType::Notify, crate::ikev2::mobike::mobike_supported().to_bytes()));
+            in_flight = build_sk(&initiator.sa, msg_id, false, &ps, &[4u8; 8]).unwrap();
+        }
         let final_msg = loop {
             match responder.handle(&in_flight, &mut re).unwrap() {
                 EapEvent::Reply(m) => match initiator.handle(&m, &mut ie).unwrap() {
@@ -965,6 +1005,21 @@ mod tests {
         }
         inner.push((PayloadType::Notify, Notify::status(error, Vec::new()).to_bytes()));
         build_sk(&responder.sa, msg_id, true, &inner, &[3u8; 8]).unwrap()
+    }
+
+    #[test]
+    fn eap_responder_advertises_mobike_only_when_opted_in_and_offered() {
+        // (initiator offered, responder opted in) -> MOBIKE advertised + in force.
+        for (offer, opt_in, expect) in [(false, false, false), (true, false, false), (false, true, false), (true, true, true)] {
+            let (mut initiator, responder, final_msg) = run_to_final_message_with_mobike(offer, opt_in);
+            let (_msg_id, ps) = decrypt(&initiator.sa, &final_msg).unwrap();
+            // By default nothing behind the responder follows a client to a new
+            // address, so it must not invite one to move (RFC 4555); opted in,
+            // it still answers only an initiator that offered MOBIKE (§3.1).
+            assert_eq!(crate::ikev2::mobike::peer_supports_mobike(&ps), expect, "offer={offer} opt_in={opt_in}");
+            assert_eq!(responder.mobike_enabled(), expect, "offer={offer} opt_in={opt_in}");
+            assert!(matches!(initiator.handle(&final_msg, &mut SeedEntropy::new(1)), Ok(EapEvent::Established(None))));
+        }
     }
 
     #[test]

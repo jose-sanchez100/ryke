@@ -51,16 +51,14 @@
 //!   [`ikev1::quick::rekey_child`] and its IPv6 counterparts, and
 //!   [`ikev1::Established::close_message`].
 //!
-//! Both retransmit their handshake requests, and the IKEv2 session its
-//! INFORMATIONAL and IKE SA rekey requests too. Neither runs in the
-//! background: the peer's requests are answered only while the caller is
-//! inside one of these calls. Not done:
-//!
-//! - IKEv2: a `CREATE_CHILD_SA` request of the session's own is sent once,
-//!   never retransmitted.
-//! - IKEv1: a Quick Mode or a Phase 1 the gateway starts goes unanswered,
-//!   and the ISAKMP SA is never rekeyed; once its lifetime is up, a new
-//!   `connect` is the way on.
+//! Both retransmit their handshake requests, and the IKEv2 session every
+//! request of its own after that too. Neither runs in the background: the
+//! peer's requests are answered only while the caller is inside one of
+//! these calls. Not done in IKEv1: a Quick Mode of its own after `connect`
+//! (a rekey, the IPv6 CHILD SA) is sent once, never retransmitted; a Quick
+//! Mode or a Phase 1 the gateway starts goes unanswered; and the ISAKMP SA
+//! is never rekeyed -- once its lifetime is up, a new `connect` is the way
+//! on.
 //!
 //! ### Bundled servers
 //!

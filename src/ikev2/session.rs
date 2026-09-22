@@ -599,6 +599,11 @@ impl LivenessSession {
     /// whichever of the two new ones survives (RFC 7296 §2.8.1) -- possibly
     /// the peer's -- and is what the caller installs; see
     /// [`Self::settle_rekey`].
+    ///
+    /// `timeout` is per attempt, here and in every other `CREATE_CHILD_SA`
+    /// this session starts: a request left unanswered that long is sent again
+    /// (RFC 7296 §2.1), three attempts in all, before the exchange fails with
+    /// [`io::ErrorKind::TimedOut`] and leaves the CHILD SA as it was.
     pub fn rekey_child(&mut self, timeout: Duration) -> Result<RekeyedChild, DriverError> {
         let old = ChildSpis { local: self.child_local_spi, peer: self.child_peer_spi };
         // A unified SA keeps being proposed as one: rekeying it IPv4-only would
@@ -733,9 +738,10 @@ impl LivenessSession {
     /// and is deleted by whoever created it, and whoever created the survivor
     /// deletes `old`. If ours is the redundant one the peer's is returned
     /// instead; if theirs is, the peer deletes it, and that Delete is
-    /// answered with ours. If our exchange failed instead -- our request was
-    /// lost, or the peer answered `CHILD_SA_NOT_FOUND` because its own rekey
-    /// had already replaced `old` -- the peer's SA stands and the error means
+    /// answered with ours. If our exchange failed instead -- our request went
+    /// unanswered, retransmissions included, or the peer answered
+    /// `CHILD_SA_NOT_FOUND` because its own rekey had already replaced `old`
+    /// -- the peer's SA stands and the error means
     /// nothing. Only the survivor is ever handed to the caller, which holds
     /// one CHILD SA per family: the redundant SA's inbound traffic is not
     /// accepted in the moment before its Delete, although RFC 7296 §2.8.1
@@ -874,8 +880,7 @@ impl LivenessSession {
         let pfs: Option<PfsKeyExchange> =
             self.pfs_group.zip(dh_private.as_ref()).map(|(group, private)| (group, private.as_slice()));
 
-        let mid = self.next_message_id;
-        self.next_message_id += 1;
+        let mid = self.alloc_message_id();
         let mut iv = [0u8; 8];
         entropy.fill(&mut iv);
         ike_debug!(
@@ -895,47 +900,23 @@ impl LivenessSession {
             ts,
             &iv,
         )?;
-        let wire = wrap(&req, self.float);
-        crate::debug::dump(">>>", self.dest, &wire);
-        self.sock.send_to(&wire, self.dest)?;
-
-        // A plain single read here used to assume whatever came back next
-        // had to be the CREATE_CHILD_SA response -- but the peer tearing
-        // down the whole tunnel sends the CHILD SA's own Delete first (which
-        // is what starts a from-scratch recreate through this very function,
-        // see `create_child_primary`/`create_child_ipv6`) and the IKE SA's
-        // Delete a moment later, which can arrive while this exchange is
-        // still waiting. That Delete would fail to parse as a CREATE_CHILD_SA
-        // response and this call would just error out, leaving the caller to
-        // retry the recreate forever against a peer with no IKE SA left to
-        // answer under -- confirmed live against a real FortiGate (see
-        // `IkeError::PeerTornDown`'s doc). So, same shape as
-        // `recv_and_classify`: loop until the real response (matching this
-        // exchange's message id) arrives, answering (and checking for a
-        // teardown in) anything else the peer sends meanwhile.
-        let deadline = Instant::now() + timeout;
-        let response = loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+        // Whatever the peer sends while this waits is answered, and a Delete of
+        // the whole IKE SA ends the wait: the peer tearing the tunnel down
+        // deletes the CHILD SA first (which is what starts a from-scratch
+        // recreate through here, see `create_child_primary`/`create_child_ipv6`)
+        // and the IKE SA a moment later -- confirmed live against a real
+        // FortiGate (see `IkeError::PeerTornDown`'s doc). A peer-started IKE SA
+        // rekey colliding with this exchange is refused with TEMPORARY_FAILURE
+        // (RFC 7296 §2.25.1), for the peer to retry once this is over. A lost
+        // request or response is retransmitted, the same bytes every time
+        // (§2.1): the peer answers a retransmission with the answer it already
+        // gave, so no second SA is made.
+        let response = match self.request_response(&wrap(&req, self.float), mid, timeout)? {
+            Reply::Response(response) => response,
+            Reply::PeerTornDown => return Err(IkeError::PeerTornDown.into()),
+            Reply::Unanswered => {
+                ike_debug!("CREATE_CHILD_SA ({what}): no answer to message id {mid}, retransmissions included");
                 return Err(io::Error::from(io::ErrorKind::TimedOut).into());
-            }
-            self.sock.set_read_timeout(Some(remaining))?;
-            let mut buf = [0u8; 4096];
-            let n = self.recv_datagram(&mut buf, remaining)?;
-            crate::debug::dump("<<<", self.dest, &buf[..n]);
-            let msg = unwrap(&buf[..n], self.float)?;
-            let header = IkeHeader::parse(&msg)?;
-            if header.flags.response {
-                if header.message_id == mid {
-                    break msg;
-                }
-                continue; // a stale/unrelated response -- keep waiting
-            }
-            // A peer-started IKE SA rekey colliding with this exchange is
-            // refused with TEMPORARY_FAILURE (RFC 7296 §2.25.1), for the peer
-            // to retry once this is over.
-            if self.answer_peer_request(&header, &msg)? {
-                return Err(IkeError::PeerTornDown.into());
             }
         };
         let (child, tsr) = rekey::initiator_complete_child(
@@ -4946,6 +4927,66 @@ mod tests {
         assert_eq!(while_rekeying, Some(notify_type::TEMPORARY_FAILURE));
         assert_eq!(while_deleting, Some(notify_type::TEMPORARY_FAILURE));
         assert!(probe_ok, "the refused IKE SA rekey left the IKE SA as it was");
+    }
+
+    /// RFC 7296 §2.1: a CHILD SA rekey whose request is lost, and then whose
+    /// response is, is sent again, the same bytes each time. The gateway
+    /// answers the retransmission with the answer it already gave, and that
+    /// completes the rekey: one new SA, the one the gateway made.
+    #[test]
+    fn a_child_sa_rekey_whose_request_then_response_is_lost_is_retransmitted_until_answered() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let lost = recv_from_client(&sock); // never reaches the gateway
+                let answered = recv_from_client(&sock);
+                let (response, child) = gateway_answers_rekey(&sa, &answered, &[0x80u8; 32]); // never reaches the client
+                let again = recv_from_client(&sock);
+                sock.send_to(&response, from).unwrap(); // the same answer, resent
+                let client_delete = recv_from_client(&sock);
+                sock.send_to(&informational_answer(&sa, &client_delete, &[RESPONDER_CHILD_SPI]), from).unwrap();
+                (lost, answered, again, client_spi, delete_in(&sa, &client_delete), child.outbound.spi())
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let rekeyed = tunnel.liveness.rekey_child(Duration::from_millis(300)).expect("answered at the third attempt");
+        let (lost, answered, again, old_local_spi, client_deleted, gateway_made) = gateway.join().unwrap();
+        assert_eq!(lost, answered, "a retransmission is the same bytes");
+        assert_eq!(answered, again, "a retransmission is the same bytes");
+        assert_eq!((rekeyed.local_spi, rekeyed.peer_spi), (gateway_made, PEER_L_SPI), "the SA the gateway made");
+        assert_eq!(client_deleted, Some(Delete::esp(vec![old_local_spi])), "the rekey is done as usual");
+        assert_eq!(tunnel.liveness.child_peer_spi, PEER_L_SPI);
+    }
+
+    /// ...and one never answered fails after three attempts, all the same
+    /// bytes, with a timeout: the CHILD SA stays the one it was, and nothing
+    /// is sent to delete it.
+    #[test]
+    fn a_child_sa_rekey_never_answered_fails_after_three_attempts_and_keeps_the_child_sa() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, _sa, _from, client_spi) = responder_through_auth_spis(bind, psk);
+                let sent: Vec<Vec<u8>> = (0..3).map(|_| recv_from_client(&sock)).collect();
+                (sent, client_spi, client_stays_quiet(&sock))
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let err = tunnel.liveness.rekey_child(Duration::from_millis(300)).map(|_| ()).expect_err("never answered");
+        let (sent, old_local_spi, quiet) = gateway.join().unwrap();
+        assert!(matches!(&err, DriverError::Io(e) if e.kind() == io::ErrorKind::TimedOut), "{err}");
+        assert!(sent.iter().all(|m| *m == sent[0]), "a retransmission is the same bytes");
+        assert!(quiet, "three attempts, and no Delete");
+        assert_eq!((tunnel.liveness.child_local_spi, tunnel.liveness.child_peer_spi), (old_local_spi, RESPONDER_CHILD_SPI));
     }
 
     /// The IKE SPI and DH secret of the scripted gateway's own IKE SA rekeys.

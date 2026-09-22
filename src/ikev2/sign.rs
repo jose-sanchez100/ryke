@@ -318,16 +318,15 @@ pub fn verify_cert_signed_by(leaf_der: &[u8], issuer_der: &[u8]) -> Result<(), I
     }
 }
 
-/// Whether the certificate's `SubjectAltName` contains `name` as a dNSName
-/// (exact, ASCII-case-insensitive; wildcards are not expanded). Modern
-/// iOS/Android bind the server identity this way — a valid cert for one host
-/// must not authenticate another, so callers doing cert auth must check this.
-pub fn cert_has_dns_name(cert_der: &[u8], name: &str) -> Result<bool, IkeError> {
+/// A certificate's `SubjectAltName` dNSName entries, verbatim (no case
+/// normalization). Shared by [`cert_has_dns_name`] and `validate_chain`'s
+/// name-constraint enforcement.
+fn cert_dns_names(cert_der: &[u8]) -> Result<Vec<String>, IkeError> {
     use der::Decode;
     use x509_cert::ext::pkix::{name::GeneralName, SubjectAltName};
     let cert = x509_cert::Certificate::from_der(cert_der)
         .map_err(|_| IkeError::Crypto("malformed certificate DER"))?;
-    let Some(exts) = &cert.tbs_certificate.extensions else { return Ok(false) };
+    let Some(exts) = &cert.tbs_certificate.extensions else { return Ok(Vec::new()) };
     for ext in exts.iter() {
         // id-ce-subjectAltName (2.5.29.17).
         if ext.extn_id.to_string() != "2.5.29.17" {
@@ -335,15 +334,24 @@ pub fn cert_has_dns_name(cert_der: &[u8], name: &str) -> Result<bool, IkeError> 
         }
         let san = SubjectAltName::from_der(ext.extn_value.as_bytes())
             .map_err(|_| IkeError::Crypto("malformed SubjectAltName"))?;
-        for gn in san.0.iter() {
-            if let GeneralName::DnsName(dns) = gn {
-                if dns.as_str().eq_ignore_ascii_case(name) {
-                    return Ok(true);
-                }
-            }
-        }
+        return Ok(san
+            .0
+            .iter()
+            .filter_map(|gn| match gn {
+                GeneralName::DnsName(dns) => Some(dns.as_str().to_string()),
+                _ => None,
+            })
+            .collect());
     }
-    Ok(false)
+    Ok(Vec::new())
+}
+
+/// Whether the certificate's `SubjectAltName` contains `name` as a dNSName
+/// (exact, ASCII-case-insensitive; wildcards are not expanded). Modern
+/// iOS/Android bind the server identity this way — a valid cert for one host
+/// must not authenticate another, so callers doing cert auth must check this.
+pub fn cert_has_dns_name(cert_der: &[u8], name: &str) -> Result<bool, IkeError> {
+    Ok(cert_dns_names(cert_der)?.iter().any(|dns| dns.eq_ignore_ascii_case(name)))
 }
 
 /// A certificate's `(notBefore, notAfter)` as Unix seconds.
@@ -355,21 +363,147 @@ pub fn cert_validity(cert_der: &[u8]) -> Result<(u64, u64), IkeError> {
     Ok((v.not_before.to_unix_duration().as_secs(), v.not_after.to_unix_duration().as_secs()))
 }
 
-/// Whether a certificate asserts `BasicConstraints` with `CA:TRUE`.
-pub fn cert_is_ca(cert_der: &[u8]) -> Result<bool, IkeError> {
+/// A certificate's `BasicConstraints`, if present.
+fn basic_constraints(cert_der: &[u8]) -> Result<Option<x509_cert::ext::pkix::BasicConstraints>, IkeError> {
     use der::Decode;
     use x509_cert::ext::pkix::BasicConstraints;
     let cert = x509_cert::Certificate::from_der(cert_der)
         .map_err(|_| IkeError::Crypto("malformed certificate DER"))?;
-    let Some(exts) = &cert.tbs_certificate.extensions else { return Ok(false) };
+    let Some(exts) = &cert.tbs_certificate.extensions else { return Ok(None) };
     for ext in exts.iter() {
         if ext.extn_id.to_string() == "2.5.29.19" {
             let bc = BasicConstraints::from_der(ext.extn_value.as_bytes())
                 .map_err(|_| IkeError::Crypto("malformed BasicConstraints"))?;
-            return Ok(bc.ca);
+            return Ok(Some(bc));
         }
     }
-    Ok(false)
+    Ok(None)
+}
+
+/// Whether a certificate asserts `BasicConstraints` with `CA:TRUE`.
+pub fn cert_is_ca(cert_der: &[u8]) -> Result<bool, IkeError> {
+    Ok(basic_constraints(cert_der)?.is_some_and(|bc| bc.ca))
+}
+
+/// A certificate's `KeyUsage`, if present.
+fn key_usage(cert_der: &[u8]) -> Result<Option<x509_cert::ext::pkix::KeyUsage>, IkeError> {
+    use der::Decode;
+    use x509_cert::ext::pkix::KeyUsage;
+    let cert = x509_cert::Certificate::from_der(cert_der)
+        .map_err(|_| IkeError::Crypto("malformed certificate DER"))?;
+    let Some(exts) = &cert.tbs_certificate.extensions else { return Ok(None) };
+    for ext in exts.iter() {
+        if ext.extn_id.to_string() == "2.5.29.15" {
+            let ku = KeyUsage::from_der(ext.extn_value.as_bytes())
+                .map_err(|_| IkeError::Crypto("malformed KeyUsage"))?;
+            return Ok(Some(ku));
+        }
+    }
+    Ok(None)
+}
+
+/// A certificate's `NameConstraints`, if present.
+fn name_constraints(cert_der: &[u8]) -> Result<Option<x509_cert::ext::pkix::NameConstraints>, IkeError> {
+    use der::Decode;
+    use x509_cert::ext::pkix::NameConstraints;
+    let cert = x509_cert::Certificate::from_der(cert_der)
+        .map_err(|_| IkeError::Crypto("malformed certificate DER"))?;
+    let Some(exts) = &cert.tbs_certificate.extensions else { return Ok(None) };
+    for ext in exts.iter() {
+        if ext.extn_id.to_string() == "2.5.29.30" {
+            let nc = NameConstraints::from_der(ext.extn_value.as_bytes())
+                .map_err(|_| IkeError::Crypto("malformed NameConstraints"))?;
+            return Ok(Some(nc));
+        }
+    }
+    Ok(None)
+}
+
+/// RFC 5280 §4.2.1.9: whether a CA whose `BasicConstraints.pathLenConstraint`
+/// is `path_len` may still have `cas_below` non-self-issued intermediate CA
+/// certificates follow it before the end-entity certificate. `None` (the
+/// extension omitted the field, meaning "unconstrained") always allows.
+fn path_len_ok(path_len: Option<u8>, cas_below: u8) -> bool {
+    match path_len {
+        Some(max) => cas_below <= max,
+        None => true,
+    }
+}
+
+/// RFC 5280 §4.2.1.3: whether a `KeyUsage` (if present) authorizes its
+/// holder to sign other certificates. A cert asserting `CA:TRUE` but whose
+/// KeyUsage explicitly omits `keyCertSign` is not a valid issuer despite the
+/// BasicConstraints flag -- the case the audit's "KeyUsage, especially la
+/// autorización de una CA para firmar certificados" specifically calls out.
+/// A missing KeyUsage extension is permissive (many real-world CAs omit it).
+fn key_cert_sign_ok(ku: Option<&x509_cert::ext::pkix::KeyUsage>) -> bool {
+    ku.is_none_or(|ku| ku.key_cert_sign())
+}
+
+/// RFC 5280 §4.2.1.10 dNSName matching: `name` is within the domain `base`
+/// expresses (exact match, or a subdomain of it), ASCII-case-insensitive.
+fn dns_name_within_base(name: &str, base: &str) -> bool {
+    if name.eq_ignore_ascii_case(base) {
+        return true;
+    }
+    match name.len().checked_sub(base.len()) {
+        Some(prefix_len) if prefix_len > 0 => {
+            name[prefix_len - 1..prefix_len] == *"."
+                && name[prefix_len..].eq_ignore_ascii_case(base)
+        }
+        _ => false,
+    }
+}
+
+/// RFC 5280 §4.2.1.10: whether `nc` permits every name in `leaf_dns`. Only
+/// dNSName-typed subtrees are enforced -- a constraint list containing only
+/// other name forms (rfc822Name, directoryName, ...) doesn't restrict
+/// dNSName and is treated as no restriction, matching the RFC's per-name-type
+/// scoping. This only checks the leaf's own SAN dNSNames, not intermediate
+/// certificates' names -- the leaf's dNSName is the only identity this
+/// crate's callers ever bind to (see `expected_dns` in `verify_cert_auth`).
+fn name_constraints_allow(nc: &x509_cert::ext::pkix::NameConstraints, leaf_dns: &[String]) -> bool {
+    use x509_cert::ext::pkix::{constraints::name::GeneralSubtree, name::GeneralName};
+    fn dns_bases(subtrees: &Option<Vec<GeneralSubtree>>) -> Vec<&str> {
+        subtrees
+            .iter()
+            .flatten()
+            .filter_map(|st| match &st.base {
+                GeneralName::DnsName(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+    let excluded = dns_bases(&nc.excluded_subtrees);
+    if leaf_dns.iter().any(|n| excluded.iter().any(|b| dns_name_within_base(n, b))) {
+        return false;
+    }
+    let permitted = dns_bases(&nc.permitted_subtrees);
+    if !permitted.is_empty() && !leaf_dns.iter().all(|n| permitted.iter().any(|b| dns_name_within_base(n, b))) {
+        return false;
+    }
+    true
+}
+
+/// Whether `cert_der` is authorized to have issued whatever comes below it
+/// in the path: its `pathLenConstraint` (if any) isn't exceeded, its
+/// `KeyUsage` (if any) permits signing certificates, and its
+/// `NameConstraints` (if any) don't exclude / fail to permit the leaf's own
+/// SAN dNSNames. Applied uniformly to accepted intermediates and to the
+/// trust anchor that terminates the path.
+fn issuer_is_authorized(cert_der: &[u8], cas_below: u8, leaf_dns: &[String]) -> Result<bool, IkeError> {
+    if !path_len_ok(basic_constraints(cert_der)?.and_then(|bc| bc.path_len_constraint), cas_below) {
+        return Ok(false);
+    }
+    if !key_cert_sign_ok(key_usage(cert_der)?.as_ref()) {
+        return Ok(false);
+    }
+    if let Some(nc) = name_constraints(cert_der)? {
+        if !name_constraints_allow(&nc, leaf_dns) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// DER of a certificate's subject distinguished name — RFC 7296's
@@ -417,19 +551,25 @@ fn within_validity(cert_der: &[u8], now_unix: u64) -> Result<(), IkeError> {
 
 /// Build and validate an X.509 path from `leaf_der` up to one of `anchors`,
 /// using `intermediates` (leaf and each intermediate must be within their
-/// validity window at `now_unix`; each non-anchor issuer must be a CA). This is
-/// signature + validity + BasicConstraints(CA) validation. It does **not** check
-/// `pathLenConstraint`, name constraints, key usage / EKU, or revocation
-/// (CRL/OCSP) — the last needs network access a library cannot assume. (Every
-/// cert on the path is still a real CA whose signature chains to the anchor, so
-/// an unenforced path length introduces no untrusted key.)
+/// validity window at `now_unix`; each non-anchor issuer must be a CA). This
+/// is signature + validity + BasicConstraints(CA) + `pathLenConstraint` +
+/// KeyUsage(keyCertSign) validation, plus NameConstraints enforcement scoped
+/// to the leaf's own SAN dNSNames (see `name_constraints_allow`'s doc). It
+/// does **not** check EKU, critical-extension recognition, certificate
+/// policy processing, or revocation (CRL/OCSP) — the last needs network
+/// access a library cannot assume.
 pub fn validate_chain(
     leaf_der: &[u8],
     intermediates: &[Vec<u8>],
     anchors: &[Vec<u8>],
     now_unix: u64,
 ) -> Result<(), IkeError> {
+    let leaf_dns = cert_dns_names(leaf_der)?;
     let mut current = leaf_der.to_vec();
+    // Number of non-self-issued intermediate CA certs already accepted
+    // between the issuer now being considered and the leaf (RFC 5280
+    // §4.2.1.9's pathLenConstraint counts exactly this).
+    let mut cas_below: u8 = 0;
     // At most one hop per intermediate, plus the final hop to an anchor.
     for _ in 0..=intermediates.len() {
         within_validity(&current, now_unix)?;
@@ -437,7 +577,10 @@ pub fn validate_chain(
 
         // Reaching a trust anchor that issued `current` terminates the path.
         for anchor in anchors {
-            if subject_dn(anchor)? == want_issuer && verify_cert_signed_by(&current, anchor).is_ok() {
+            if subject_dn(anchor)? == want_issuer
+                && verify_cert_signed_by(&current, anchor).is_ok()
+                && matches!(issuer_is_authorized(anchor, cas_below, &leaf_dns), Ok(true))
+            {
                 return Ok(());
             }
         }
@@ -445,10 +588,14 @@ pub fn validate_chain(
         let next = intermediates.iter().find(|inter| {
             subject_dn(inter).ok().as_deref() == Some(&want_issuer)
                 && matches!(cert_is_ca(inter), Ok(true))
+                && matches!(issuer_is_authorized(inter, cas_below, &leaf_dns), Ok(true))
                 && verify_cert_signed_by(&current, inter).is_ok()
         });
         match next {
-            Some(inter) => current = inter.clone(),
+            Some(inter) => {
+                current = inter.clone();
+                cas_below += 1;
+            }
             None => return Err(IkeError::AuthFailed),
         }
     }
@@ -719,6 +866,130 @@ mod tests {
         // The simple two-cert fixtures: leaf issued straight off the CA anchor.
         let (nb, _na) = cert_validity(LEAF_CERT_DER).unwrap();
         validate_chain(LEAF_CERT_DER, &[], &[CA_CERT_DER.to_vec()], nb + 1).unwrap();
+    }
+
+    #[test]
+    fn path_len_ok_enforces_the_pathlenconstraint_boundary() {
+        assert!(path_len_ok(None, 0));
+        assert!(path_len_ok(None, 200)); // unconstrained allows any depth
+        assert!(path_len_ok(Some(0), 0));
+        assert!(!path_len_ok(Some(0), 1));
+        assert!(path_len_ok(Some(2), 2));
+        assert!(!path_len_ok(Some(1), 2));
+    }
+
+    #[test]
+    fn key_cert_sign_ok_requires_the_bit_only_when_keyusage_is_present() {
+        use x509_cert::ext::pkix::{KeyUsage, KeyUsages};
+        assert!(key_cert_sign_ok(None)); // omitted extension is permissive
+        let with_bit = KeyUsage(KeyUsages::KeyCertSign.into());
+        assert!(key_cert_sign_ok(Some(&with_bit)));
+        let without_bit = KeyUsage(KeyUsages::DigitalSignature.into());
+        assert!(!key_cert_sign_ok(Some(&without_bit)));
+    }
+
+    #[test]
+    fn dns_name_within_base_matches_exact_and_subdomains_but_not_bare_substrings() {
+        assert!(dns_name_within_base("example.com", "example.com"));
+        assert!(dns_name_within_base("host.example.com", "example.com"));
+        assert!(dns_name_within_base("a.b.example.com", "example.com"));
+        assert!(dns_name_within_base("EXAMPLE.com", "example.COM")); // case-insensitive
+        // A bare substring match (no dot boundary) must not count as a subdomain.
+        assert!(!dns_name_within_base("evilexample.com", "example.com"));
+        assert!(!dns_name_within_base("example.com.evil.net", "example.com"));
+        assert!(!dns_name_within_base("other.com", "example.com"));
+        assert!(!dns_name_within_base("com", "example.com")); // shorter than base
+    }
+
+    #[test]
+    fn name_constraints_allow_enforces_excluded_and_permitted_dns_subtrees() {
+        use x509_cert::ext::pkix::constraints::name::GeneralSubtree;
+        use x509_cert::ext::pkix::name::GeneralName;
+        use x509_cert::ext::pkix::NameConstraints;
+
+        fn dns_subtree(name: &str) -> GeneralSubtree {
+            GeneralSubtree {
+                base: GeneralName::DnsName(der::asn1::Ia5String::new(name).unwrap()),
+                minimum: 0,
+                maximum: None,
+            }
+        }
+
+        // Excluded subtree rejects a matching leaf name.
+        let excluded = NameConstraints {
+            permitted_subtrees: None,
+            excluded_subtrees: Some(vec![dns_subtree("example.com")]),
+        };
+        assert!(!name_constraints_allow(&excluded, &["vpn.example.com".to_string()]));
+        assert!(name_constraints_allow(&excluded, &["vpn.other.com".to_string()]));
+
+        // Permitted subtree allows only in-domain names.
+        let permitted = NameConstraints {
+            permitted_subtrees: Some(vec![dns_subtree("example.com")]),
+            excluded_subtrees: None,
+        };
+        assert!(name_constraints_allow(&permitted, &["vpn.example.com".to_string()]));
+        assert!(!name_constraints_allow(&permitted, &["vpn.other.com".to_string()]));
+
+        // A non-dNSName-typed subtree doesn't restrict dNSName matching.
+        let other_type = NameConstraints {
+            permitted_subtrees: Some(vec![GeneralSubtree {
+                base: GeneralName::Rfc822Name(der::asn1::Ia5String::new("user@example.com").unwrap()),
+                minimum: 0,
+                maximum: None,
+            }]),
+            excluded_subtrees: None,
+        };
+        assert!(name_constraints_allow(&other_type, &["vpn.other.com".to_string()]));
+
+        // No leaf dNSNames at all is vacuously permitted.
+        assert!(name_constraints_allow(&permitted, &[]));
+    }
+
+    #[test]
+    fn chain_rejects_a_path_deeper_than_the_roots_pathlenconstraint() {
+        use crate::test_certs::{PATHLEN_INT_DER, PATHLEN_LEAF_DER, PATHLEN_ROOT_DER};
+        let (nb, _na) = cert_validity(PATHLEN_LEAF_DER).unwrap();
+        let now = nb + 1;
+        // PATHLEN_ROOT asserts pathlen:0, but there's one intermediate below it.
+        assert!(validate_chain(
+            PATHLEN_LEAF_DER,
+            &[PATHLEN_INT_DER.to_vec()],
+            &[PATHLEN_ROOT_DER.to_vec()],
+            now
+        )
+        .is_err());
+        // Trusting the intermediate directly still validates -- the check is
+        // scoped to pathLenConstraint, not a blanket rejection of the chain.
+        validate_chain(PATHLEN_LEAF_DER, &[], &[PATHLEN_INT_DER.to_vec()], now).unwrap();
+    }
+
+    #[test]
+    fn chain_rejects_an_issuer_whose_keyusage_omits_keycertsign() {
+        use crate::test_certs::{CONSTRAINT_ROOT_DER, NOKCS_INT_DER, NOKCS_LEAF_DER};
+        let (nb, _na) = cert_validity(NOKCS_LEAF_DER).unwrap();
+        let now = nb + 1;
+        assert!(validate_chain(
+            NOKCS_LEAF_DER,
+            &[NOKCS_INT_DER.to_vec()],
+            &[CONSTRAINT_ROOT_DER.to_vec()],
+            now
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn chain_rejects_a_leaf_name_the_issuer_name_constraints_exclude() {
+        use crate::test_certs::{CONSTRAINT_ROOT_DER, EXCLUDED_INT_DER, EXCLUDED_LEAF_DER};
+        let (nb, _na) = cert_validity(EXCLUDED_LEAF_DER).unwrap();
+        let now = nb + 1;
+        assert!(validate_chain(
+            EXCLUDED_LEAF_DER,
+            &[EXCLUDED_INT_DER.to_vec()],
+            &[CONSTRAINT_ROOT_DER.to_vec()],
+            now
+        )
+        .is_err());
     }
 
     #[test]

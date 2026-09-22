@@ -18,7 +18,7 @@
 //! requires this round rejects the following Quick Mode proposal outright
 //! ("peer has not completed Configuration Method") if it's skipped.
 
-use super::crypto1::{self, AES_BLOCK};
+use super::crypto1;
 use super::isakmp::{exchange, payload, IsakmpHeader, Payload};
 use super::modecfg::{cfg, ConfigPayload};
 use super::phase1::Phase1State;
@@ -56,9 +56,9 @@ pub fn build_cfg_request(st: &Phase1State, msgid: u32) -> Result<(Vec<u8>, Vec<u
 /// same round. `ipv6: false` is byte-for-byte the IPv4-only request.
 pub fn build_cfg_request_with(st: &Phase1State, msgid: u32, ipv6: bool) -> Result<(Vec<u8>, Vec<u8>), IkeError> {
     let req = if ipv6 { ConfigPayload::request_dual_stack(msgid as u16) } else { ConfigPayload::request_ipv4(msgid as u16) };
-    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
+    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
     let hdr = cfg_header(st.cky_i, st.cky_r, msgid);
-    let (msg, next_iv) = phase2::build_encrypted(hdr, st.prf, &st.skeyid_a, &st.enc_key, &iv0, &[(payload::ATTRIBUTE, req.to_bytes())])?;
+    let (msg, next_iv) = phase2::build_encrypted(hdr, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0, &[(payload::ATTRIBUTE, req.to_bytes())])?;
     Ok((msg, next_iv))
 }
 
@@ -69,7 +69,7 @@ pub fn parse_cfg_reply(st: &Phase1State, reply: &[u8], req_next_iv: &[u8]) -> Re
     if hdr.exchange_type != exchange::TRANSACTION {
         return Err(IkeError::Crypto("expected a Transaction (Mode-Config) message"));
     }
-    let (_h, ps, _next) = phase2::parse_encrypted(reply, st.prf, &st.skeyid_a, &st.enc_key, req_next_iv)?;
+    let (_h, ps, _next) = phase2::parse_encrypted(reply, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, req_next_iv)?;
     let got = ConfigPayload::parse(&attribute_payload(&ps)?.data)?;
     if got.cfg_type != cfg::REPLY {
         return Err(IkeError::Crypto("expected a Mode-Config REPLY"));
@@ -92,8 +92,8 @@ pub(crate) mod test_gateway {
     /// subnet -- what a gateway with IPv6 configured answers a
     /// [`build_cfg_request_with`]`(.., true)` with.
     pub fn handle_request_dual_stack(st: &Phase1State, request: &[u8], msgid: u32, addr: Ipv4Addr, addr6: (Ipv6Addr, u8)) -> Vec<u8> {
-        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
-        let (_h, ps, iv1) = phase2::parse_encrypted(request, st.prf, &st.skeyid_a, &st.enc_key, &iv0).unwrap();
+        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
+        let (_h, ps, iv1) = phase2::parse_encrypted(request, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0).unwrap();
         let got = ConfigPayload::parse(&attribute_payload(&ps).unwrap().data).unwrap();
         assert_eq!(got.cfg_type, cfg::REQUEST);
 
@@ -113,7 +113,7 @@ pub(crate) mod test_gateway {
             ],
         );
         let hdr = cfg_header(st.cky_i, st.cky_r, msgid);
-        let (msg, _next) = phase2::build_encrypted(hdr, st.prf, &st.skeyid_a, &st.enc_key, &iv1, &[(payload::ATTRIBUTE, reply.to_bytes())]).unwrap();
+        let (msg, _next) = phase2::build_encrypted(hdr, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv1, &[(payload::ATTRIBUTE, reply.to_bytes())]).unwrap();
         msg
     }
 
@@ -121,8 +121,8 @@ pub(crate) mod test_gateway {
     /// [`build_cfg_request`] did) and build a REPLY granting `addr` (plus a
     /// fixed /24 netmask and one DNS server) on the same message-id.
     pub fn handle_request(st: &Phase1State, request: &[u8], msgid: u32, addr: Ipv4Addr) -> Vec<u8> {
-        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
-        let (_h, ps, iv1) = phase2::parse_encrypted(request, st.prf, &st.skeyid_a, &st.enc_key, &iv0).unwrap();
+        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
+        let (_h, ps, iv1) = phase2::parse_encrypted(request, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0).unwrap();
         let got = ConfigPayload::parse(&attribute_payload(&ps).unwrap().data).unwrap();
         assert_eq!(got.cfg_type, cfg::REQUEST);
 
@@ -136,7 +136,7 @@ pub(crate) mod test_gateway {
             ],
         );
         let hdr = cfg_header(st.cky_i, st.cky_r, msgid);
-        let (msg, _next) = phase2::build_encrypted(hdr, st.prf, &st.skeyid_a, &st.enc_key, &iv1, &[(payload::ATTRIBUTE, reply.to_bytes())]).unwrap();
+        let (msg, _next) = phase2::build_encrypted(hdr, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv1, &[(payload::ATTRIBUTE, reply.to_bytes())]).unwrap();
         msg
     }
 }

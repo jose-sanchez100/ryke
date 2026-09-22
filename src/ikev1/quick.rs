@@ -29,7 +29,7 @@
 use std::net::{Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use super::crypto1::{self, Prf, AES_BLOCK};
+use super::crypto1::{self, Prf};
 use super::informational;
 use super::isakmp::{self, exchange, payload, IsakmpHeader, Payload};
 use super::payloads::{
@@ -352,6 +352,7 @@ pub struct QuickInitiator {
     skeyid_a: Vec<u8>,
     skeyid_d: Vec<u8>,
     enc_key: Vec<u8>,
+    enc_block: usize,
     cky_i: [u8; 8],
     cky_r: [u8; 8],
     msgid: u32,
@@ -470,7 +471,7 @@ fn initiate_quick_with_ids(
 
     let pfs = pfs_group.map(|group| (group, entropy.next_array32()));
 
-    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
+    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
     let mut after = vec![
         (payload::SA, esp_sa(local_spi, cipher, pfs_group, st.floated, life_duration).to_bytes()),
         (payload::NONCE, ni.clone()),
@@ -480,12 +481,13 @@ fn initiate_quick_with_ids(
     }
     after.push((payload::ID, id_local.clone()));
     after.push((payload::ID, id_remote.clone()));
-    let (msg1, iv1) = phase2::build_encrypted(qm_header(st.cky_i, st.cky_r, msgid), st.prf, &st.skeyid_a, &st.enc_key, &iv0, &after)?;
+    let (msg1, iv1) = phase2::build_encrypted(qm_header(st.cky_i, st.cky_r, msgid), st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0, &after)?;
     Ok((msg1, QuickInitiator {
         prf: st.prf,
         skeyid_a: st.skeyid_a.clone(),
         skeyid_d: st.skeyid_d.clone(),
         enc_key: st.enc_key.clone(),
+        enc_block: st.enc_block,
         cky_i: st.cky_i,
         cky_r: st.cky_r,
         msgid,
@@ -506,7 +508,7 @@ impl QuickInitiator {
     /// actually-negotiated lifetime (RFC 2407 §4.5 -- see
     /// `negotiated_p2_lifetime`'s doc).
     pub fn complete(self, msg2: &[u8]) -> Result<(Vec<u8>, ChildSa, u32), IkeError> {
-        let (_hdr, ps, iv2) = phase2::decrypt_payloads(msg2, &self.enc_key, &self.iv1)?;
+        let (_hdr, ps, iv2) = phase2::decrypt_payloads(msg2, &self.enc_key, self.enc_block, &self.iv1)?;
         let nr = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
         isakmp::check_nonce_len(&nr)?;
         let peer_spi = peer_esp_spi(&ps)?;
@@ -546,7 +548,7 @@ impl QuickInitiator {
         }
 
         let h3 = hash3(self.prf, &self.skeyid_a, self.msgid, &self.ni, &nr);
-        let (msg3, _) = phase2::encrypt_payloads(qm_header(self.cky_i, self.cky_r, self.msgid), &self.enc_key, &iv2, &[(payload::HASH, h3)])?;
+        let (msg3, _) = phase2::encrypt_payloads(qm_header(self.cky_i, self.cky_r, self.msgid), &self.enc_key, self.enc_block, &iv2, &[(payload::HASH, h3)])?;
         let child = match &self.pfs {
             Some((group, dh_private)) => {
                 let gxr = find(&ps, payload::KE).ok_or(IkeError::MissingPayload("KE"))?.data.clone();
@@ -568,6 +570,7 @@ pub struct QuickResponder {
     skeyid_a: Vec<u8>,
     skeyid_d: Vec<u8>,
     enc_key: Vec<u8>,
+    enc_block: usize,
     msgid: u32,
     local_spi: u32,
     peer_spi: u32,
@@ -602,8 +605,8 @@ pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) 
     if msgid == 0 {
         return Err(IkeError::Crypto("quick mode message_id must not be zero"));
     }
-    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
-    let (_h, ps, iv1) = phase2::parse_encrypted(msg1, st.prf, &st.skeyid_a, &st.enc_key, &iv0)?; // verifies HASH(1)
+    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
+    let (_h, ps, iv1) = phase2::parse_encrypted(msg1, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0)?; // verifies HASH(1)
     let ni = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
     isakmp::check_nonce_len(&ni)?;
     let peer_spi = peer_esp_spi(&ps)?;
@@ -634,12 +637,13 @@ pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) 
     for p in ps.iter().filter(|p| p.payload_type == payload::ID) {
         after.push((payload::ID, p.data.clone()));
     }
-    let (msg2, iv2) = phase2::build_encrypted_prefixed(qm_header(st.cky_i, st.cky_r, msgid), st.prf, &st.skeyid_a, &st.enc_key, &iv1, &ni, &after)?;
+    let (msg2, iv2) = phase2::build_encrypted_prefixed(qm_header(st.cky_i, st.cky_r, msgid), st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv1, &ni, &after)?;
     Ok((msg2, QuickResponder {
         prf: st.prf,
         skeyid_a: st.skeyid_a.clone(),
         skeyid_d: st.skeyid_d.clone(),
         enc_key: st.enc_key.clone(),
+        enc_block: st.enc_block,
         msgid,
         local_spi,
         peer_spi,
@@ -655,7 +659,7 @@ impl QuickResponder {
     /// Process message 3 (`HASH(3)`), verify it, and return the established ESP
     /// CHILD SA.
     pub fn complete(self, msg3: &[u8]) -> Result<ChildSa, IkeError> {
-        let (_hdr, ps, _iv) = phase2::decrypt_payloads(msg3, &self.enc_key, &self.iv2)?;
+        let (_hdr, ps, _iv) = phase2::decrypt_payloads(msg3, &self.enc_key, self.enc_block, &self.iv2)?;
         let got = find(&ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
         if got != hash3(self.prf, &self.skeyid_a, self.msgid, &self.ni, &self.nr) {
             return Err(IkeError::AuthFailed);
@@ -1024,8 +1028,8 @@ mod tests {
     fn respond_quick_forging_answer(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy, sa: &SaPayload, id_payloads: &[Vec<u8>]) -> Vec<u8> {
         let hdr = IsakmpHeader::parse(msg1).unwrap();
         let msgid = hdr.message_id;
-        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
-        let (_h, ps, iv1) = phase2::parse_encrypted(msg1, st.prf, &st.skeyid_a, &st.enc_key, &iv0).unwrap();
+        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
+        let (_h, ps, iv1) = phase2::parse_encrypted(msg1, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0).unwrap();
         let ni = find(&ps, payload::NONCE).unwrap().data.clone();
         let mut nr = vec![0u8; 16];
         entropy.fill(&mut nr);
@@ -1033,7 +1037,7 @@ mod tests {
         for id in id_payloads {
             after.push((payload::ID, id.clone()));
         }
-        let (msg2, _iv2) = phase2::build_encrypted_prefixed(qm_header(st.cky_i, st.cky_r, msgid), st.prf, &st.skeyid_a, &st.enc_key, &iv1, &ni, &after).unwrap();
+        let (msg2, _iv2) = phase2::build_encrypted_prefixed(qm_header(st.cky_i, st.cky_r, msgid), st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv1, &ni, &after).unwrap();
         msg2
     }
 
@@ -1435,8 +1439,8 @@ mod tests {
 
         // The trailing Delete must name the just-superseded local SPI.
         let hdr = IsakmpHeader::parse(&delete_bytes).unwrap();
-        let iv0 = crypto1::phase2_iv(rstate2.prf, &rstate2.phase1_iv, hdr.message_id, AES_BLOCK);
-        let (_h, ps, _iv) = phase2::parse_encrypted(&delete_bytes, rstate2.prf, &rstate2.skeyid_a, &rstate2.enc_key, &iv0).unwrap();
+        let iv0 = crypto1::phase2_iv(rstate2.prf, &rstate2.phase1_iv, hdr.message_id, rstate2.enc_block);
+        let (_h, ps, _iv) = phase2::parse_encrypted(&delete_bytes, rstate2.prf, &rstate2.skeyid_a, &rstate2.enc_key, rstate2.enc_block, &iv0).unwrap();
         let del = ps.iter().find(|p| p.payload_type == payload::DELETE).unwrap();
         let (proto, spi) = informational::parse_delete(&del.data).unwrap();
         assert_eq!(proto, protocol::ESP);
@@ -1515,8 +1519,8 @@ mod tests {
 
         // What the responder sees: IDci = our VIP/128, IDcr = ::/0, both IPv6 subnets.
         let msgid = IsakmpHeader::parse(&qm1).unwrap().message_id;
-        let iv0 = crypto1::phase2_iv(rstate.prf, &rstate.phase1_iv, msgid, AES_BLOCK);
-        let (_h, ps, _iv) = phase2::parse_encrypted(&qm1, rstate.prf, &rstate.skeyid_a, &rstate.enc_key, &iv0).unwrap();
+        let iv0 = crypto1::phase2_iv(rstate.prf, &rstate.phase1_iv, msgid, rstate.enc_block);
+        let (_h, ps, _iv) = phase2::parse_encrypted(&qm1, rstate.prf, &rstate.skeyid_a, &rstate.enc_key, rstate.enc_block, &iv0).unwrap();
         let ids: Vec<Id> = ps.iter().filter(|p| p.payload_type == payload::ID).map(|p| Id::parse(&p.data).unwrap()).collect();
         assert_eq!(ids.len(), 2);
         assert!(ids.iter().all(|i| i.id_type == id_type::IPV6_ADDR_SUBNET && i.data.len() == 32));
@@ -1628,8 +1632,8 @@ mod tests {
 
         let delete = delete.unwrap();
         let hdr = IsakmpHeader::parse(&delete).unwrap();
-        let iv0 = crypto1::phase2_iv(rstate.prf, &rstate.phase1_iv, hdr.message_id, AES_BLOCK);
-        let (_h, ps, _iv) = phase2::parse_encrypted(&delete, rstate.prf, &rstate.skeyid_a, &rstate.enc_key, &iv0).unwrap();
+        let iv0 = crypto1::phase2_iv(rstate.prf, &rstate.phase1_iv, hdr.message_id, rstate.enc_block);
+        let (_h, ps, _iv) = phase2::parse_encrypted(&delete, rstate.prf, &rstate.skeyid_a, &rstate.enc_key, rstate.enc_block, &iv0).unwrap();
         let del = ps.iter().find(|p| p.payload_type == payload::DELETE).unwrap();
         let (proto, spi) = informational::parse_delete(&del.data).unwrap();
         assert_eq!((proto, spi), (protocol::ESP, &old_local_spi.to_be_bytes()[..]));

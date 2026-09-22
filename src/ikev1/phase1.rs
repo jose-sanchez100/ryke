@@ -234,8 +234,19 @@ pub struct Phase1State {
     pub skeyid_d: Vec<u8>,
     pub skeyid_a: Vec<u8>,
     pub skeyid_e: Vec<u8>,
-    /// Derived AES-256 key.
+    /// Derived Phase-1 cipher key -- AES-CBC (128/192/256-bit) or, only when
+    /// negotiated against a peer whose offer didn't include AES at all, the
+    /// historical TripleDES-CBC (see [`enc_block`](Self::enc_block)).
     pub enc_key: Vec<u8>,
+    /// The CBC block length `enc_key` was derived for: [`crypto1::AES_BLOCK`]
+    /// (16) or [`crypto1::DES3_BLOCK`] (8) -- the two ciphers can't be told
+    /// apart from `enc_key`'s length alone (AES-192 and TripleDES-EDE3 both
+    /// use a 24-byte key), so every later exchange that encrypts or decrypts
+    /// under this Phase 1 (Quick Mode, XAUTH, Mode-Config, Informational)
+    /// needs this alongside `enc_key` to pick the right primitive and IV
+    /// width.
+    #[zeroize(skip)]
+    pub enc_block: usize,
     /// `HASH(g^xi | g^xr)` — the seed for every post-Phase-1 message IV.
     #[zeroize(skip)]
     pub phase1_iv: Vec<u8>,
@@ -279,46 +290,56 @@ pub struct Phase1State {
 }
 
 /// Pick the first offered transform we support: AES-CBC (128/192/256-bit,
-/// per the offered `KEY_LENGTH` attribute), HASH SHA-256 (or SHA-1), DH
-/// group 2 (or 14), and -- matching our own configured `local_auth` --
-/// either PSK/XAUTH-PSK auth (`want_sig: false`) or RSA-SIG/XAUTH-RSA auth
+/// per the offered `KEY_LENGTH` attribute) or the historical TripleDES-CBC
+/// (RFC 4109 §3's mandatory legacy algorithm -- a fixed 24-byte EDE3 key,
+/// never a `KEY_LENGTH` attribute), HASH SHA-256 (or SHA-1), DH group 2 (or
+/// 14), and -- matching our own configured `local_auth` -- either
+/// PSK/XAUTH-PSK auth (`want_sig: false`) or RSA-SIG/XAUTH-RSA auth
 /// (`want_sig: true`); a real gateway policy only ever offers/accepts the
 /// one method it's configured for. Returns the transform to echo plus the
-/// mapped primitives (the `usize` is the AES key length in bytes).
-fn select_transform(sa: &SaPayload, want_sig: bool) -> Option<(Transform, Prf, DhGroup, usize)> {
-    for prop in &sa.proposals {
-        for t in &prop.transforms {
-            if t.attr(attr::ENCRYPTION) != Some(enc::AES_CBC) {
-                continue;
-            }
-            let key_len = match t.attr(attr::KEY_LENGTH) {
-                Some(128) => 16,
-                Some(192) => 24,
-                Some(256) => 32,
-                _ => continue,
-            };
-            let prf = match t.attr(attr::HASH) {
-                Some(hash::SHA2_256) => Prf::Sha256,
-                Some(hash::SHA1) => Prf::Sha1,
-                _ => continue,
-            };
-            let group = match t.attr(attr::GROUP_DESC) {
-                Some(2) => DhGroup::Modp1024,
-                Some(14) => DhGroup::Modp2048,
-                _ => continue,
-            };
-            let auth_ok = if want_sig {
-                matches!(t.attr(attr::AUTH_METHOD), Some(auth::RSA_SIG) | Some(auth::XAUTH_INIT_RSA))
-            } else {
-                matches!(t.attr(attr::AUTH_METHOD), Some(auth::PSK) | Some(auth::XAUTH_INIT_PSK))
-            };
-            if !auth_ok {
-                continue;
-            }
-            return Some((t.clone(), prf, group, key_len));
-        }
-    }
-    None
+/// mapped primitives (`usize, usize` = cipher key length, CBC block length
+/// in bytes -- see [`Phase1State::enc_block`] for why both travel together).
+///
+/// TripleDES is a last resort, not just another option: any acceptable AES
+/// transform anywhere in the offer wins over it, whatever the peer's own
+/// preference order -- so a peer offering both never gets downgraded to the
+/// 64-bit-block cipher, and only a peer offering nothing stronger does.
+fn select_transform(sa: &SaPayload, want_sig: bool) -> Option<(Transform, Prf, DhGroup, usize, usize)> {
+    let offered = || sa.proposals.iter().flat_map(|prop| &prop.transforms);
+    offered()
+        .find_map(|t| accept_transform(t, want_sig, false))
+        .or_else(|| offered().find_map(|t| accept_transform(t, want_sig, true)))
+}
+
+/// One transform's worth of [`select_transform`]: `Some` with the mapped
+/// primitives if we support it, TripleDES-CBC only when `allow_3des`.
+fn accept_transform(t: &Transform, want_sig: bool, allow_3des: bool) -> Option<(Transform, Prf, DhGroup, usize, usize)> {
+    let (key_len, block) = match t.attr(attr::ENCRYPTION)? {
+        enc::AES_CBC => match t.attr(attr::KEY_LENGTH)? {
+            128 => (16, crypto1::AES_BLOCK),
+            192 => (24, crypto1::AES_BLOCK),
+            256 => (32, crypto1::AES_BLOCK),
+            _ => return None,
+        },
+        enc::TRIPLE_DES_CBC if allow_3des => (24, crypto1::DES3_BLOCK),
+        _ => return None,
+    };
+    let prf = match t.attr(attr::HASH)? {
+        hash::SHA2_256 => Prf::Sha256,
+        hash::SHA1 => Prf::Sha1,
+        _ => return None,
+    };
+    let group = match t.attr(attr::GROUP_DESC)? {
+        2 => DhGroup::Modp1024,
+        14 => DhGroup::Modp2048,
+        _ => return None,
+    };
+    let auth_ok = if want_sig {
+        matches!(t.attr(attr::AUTH_METHOD), Some(auth::RSA_SIG) | Some(auth::XAUTH_INIT_RSA))
+    } else {
+        matches!(t.attr(attr::AUTH_METHOD), Some(auth::PSK) | Some(auth::XAUTH_INIT_PSK))
+    };
+    auth_ok.then(|| (t.clone(), prf, group, key_len, block))
 }
 
 fn find(payloads: &[isakmp::Payload], t: u8) -> Option<&isakmp::Payload> {
@@ -391,7 +412,7 @@ pub fn respond_aggressive(
     let peer_supports_dpd = ps.iter().any(|p| p.payload_type == payload::VENDOR_ID && p.data == DPD_VENDOR_ID);
 
     let sa = SaPayload::parse(&sa_p.data)?;
-    let (chosen, prf, group, key_len) =
+    let (chosen, prf, group, key_len, block) =
         select_transform(&sa, false).ok_or(IkeError::NoProposalChosen)?;
     if gxi.len() != group.public_len() {
         return Err(IkeError::BadKeyExchange { group: group.transform_id(), len: gxi.len() });
@@ -413,7 +434,7 @@ pub fn respond_aggressive(
     let skeyid_a = crypto1::skeyid_a(prf, &skeyid, &skeyid_d, &gxy, &cky_i, &cky_r);
     let skeyid_e = crypto1::skeyid_e(prf, &skeyid, &skeyid_a, &gxy, &cky_i, &cky_r);
     let enc_key = crypto1::derive_cipher_key(prf, &skeyid_e, key_len);
-    let phase1_iv = crypto1::phase1_iv(prf, &gxi, &gxr, AES_BLOCK);
+    let phase1_iv = crypto1::phase1_iv(prf, &gxi, &gxr, block);
 
     // HASH_R = prf(SKEYID, g^xr | g^xi | CKY-R | CKY-I | SAi_b | IDir_b).
     let idir_b = cfg.our_id.to_bytes();
@@ -484,6 +505,7 @@ pub fn respond_aggressive(
         skeyid_a,
         skeyid_e,
         enc_key,
+        enc_block: block,
         phase1_iv,
         gxi,
         gxr,
@@ -514,6 +536,7 @@ impl Phase1State {
         skeyid_d: Vec<u8>,
         skeyid_e: Vec<u8>,
         enc_key: Vec<u8>,
+        enc_block: usize,
         phase1_iv: Vec<u8>,
     ) -> Self {
         Phase1State {
@@ -526,6 +549,7 @@ impl Phase1State {
             skeyid_a,
             skeyid_e,
             enc_key,
+            enc_block,
             phase1_iv,
             gxi: Vec::new(),
             gxr: Vec::new(),
@@ -547,7 +571,7 @@ impl Phase1State {
         let body = &msg3[IsakmpHeader::LEN..];
         let decrypted;
         let (first, payload_bytes) = if hdr.encrypted() {
-            decrypted = crypto1::aes_cbc_decrypt(&self.enc_key, &self.phase1_iv, body)?;
+            decrypted = crypto1::cbc_decrypt(self.enc_block, &self.enc_key, &self.phase1_iv, body)?;
             (hdr.next_payload, decrypted.as_slice())
         } else {
             (hdr.next_payload, body)
@@ -672,7 +696,9 @@ pub enum Ikev1ExchangeMode {
 
 /// The initiator's SA offer: AES-CBC (`key_len` bytes) / SHA-256 / `group` /
 /// one of PSK, XAUTH-PSK, RSA-SIG, XAUTH-RSA (`want_sig` selects the RSA-SIG
-/// pair).
+/// pair). Never TripleDES-CBC: our responder accepts it from a legacy peer
+/// (see [`select_transform`]), but as initiator there's no reason to ever
+/// propose the weaker cipher ourselves.
 fn initiator_sa(group: DhGroup, xauth: bool, want_sig: bool, key_len: usize, life_duration: u32) -> SaPayload {
     let auth_method = match (want_sig, xauth) {
         (false, false) => auth::PSK,
@@ -871,6 +897,7 @@ impl AggressiveInitiator {
             skeyid_a,
             skeyid_e,
             enc_key,
+            enc_block: AES_BLOCK,
             phase1_iv,
             gxi: self.gxi,
             gxr,
@@ -1163,7 +1190,7 @@ impl MainKeSent {
                 out
             }
         };
-        let (msg5, iv_after_msg5) = phase2::encrypt_payloads(hdr5, &enc_key, &phase1_iv, &out_payloads)?;
+        let (msg5, iv_after_msg5) = phase2::encrypt_payloads(hdr5, &enc_key, AES_BLOCK, &phase1_iv, &out_payloads)?;
 
         let state = MainIdSent {
             prf,
@@ -1264,7 +1291,7 @@ impl MainIdSent {
     /// (as opposed to a malformed message), see [`AuthFailure`]'s doc for why the
     /// error carries a teardown Delete the caller should send.
     pub fn complete_id(self, msg6: &[u8], entropy: &mut impl Entropy) -> Result<Phase1State, AuthFailure> {
-        let (_hdr, ps, iv_after_msg6) = phase2::decrypt_payloads(msg6, &self.enc_key, &self.iv_after_msg5)?;
+        let (_hdr, ps, iv_after_msg6) = phase2::decrypt_payloads(msg6, &self.enc_key, AES_BLOCK, &self.iv_after_msg5)?;
         let idr_b = find(&ps, payload::ID).ok_or(IkeError::MissingPayload("ID"))?.data.clone();
         let expect_hr = crypto1::hash_r(self.prf, &self.skeyid, &self.gxr, &self.gxi, &self.cky_r, &self.cky_i, &self.sai_b, &idr_b);
         let verify: Result<(), IkeError> = (|| {
@@ -1307,6 +1334,7 @@ impl MainIdSent {
             skeyid_a: self.skeyid_a,
             skeyid_e: self.skeyid_e,
             enc_key: self.enc_key,
+            enc_block: AES_BLOCK,
             // NOT `self.phase1_iv` (the raw `HASH(g^xi|g^xr)` seed used only
             // to encrypt message 5) -- RFC 2409 App. B seeds the first
             // post-Phase-1 message's IV from the IV *after the last
@@ -1363,7 +1391,7 @@ pub fn respond_main(cfg: &Phase1Config, msg1: &[u8], entropy: &mut impl Entropy,
     let sai_b = sa_p.data.clone();
     let sa = SaPayload::parse(&sai_b)?;
     let want_sig = matches!(cfg.local_auth, Ikev1LocalAuth::Sig { .. });
-    let (chosen, prf, group, key_len) = select_transform(&sa, want_sig).ok_or(IkeError::NoProposalChosen)?;
+    let (chosen, prf, group, key_len, block) = select_transform(&sa, want_sig).ok_or(IkeError::NoProposalChosen)?;
     let initiator_offered_lifetime = chosen.attr_u32(attr::LIFE_DURATION).unwrap_or(0);
     let peer_supports_natt = peer_offers_natt(&ps);
 
@@ -1394,6 +1422,7 @@ pub fn respond_main(cfg: &Phase1Config, msg1: &[u8], entropy: &mut impl Entropy,
         prf,
         group,
         key_len,
+        block,
         cky_i,
         cky_r,
         local_auth: cfg.local_auth.clone(),
@@ -1414,6 +1443,7 @@ pub struct MainRespSaSent {
     prf: Prf,
     group: DhGroup,
     key_len: usize,
+    block: usize,
     cky_i: [u8; 8],
     cky_r: [u8; 8],
     local_auth: Ikev1LocalAuth,
@@ -1474,6 +1504,7 @@ impl MainRespSaSent {
             prf: self.prf,
             group: self.group,
             key_len: self.key_len,
+            block: self.block,
             cky_i: self.cky_i,
             cky_r: self.cky_r,
             local_auth: self.local_auth,
@@ -1499,6 +1530,7 @@ pub struct MainRespKeSent {
     prf: Prf,
     group: DhGroup,
     key_len: usize,
+    block: usize,
     cky_i: [u8; 8],
     cky_r: [u8; 8],
     local_auth: Ikev1LocalAuth,
@@ -1531,9 +1563,9 @@ impl MainRespKeSent {
         let skeyid_a = crypto1::skeyid_a(self.prf, &skeyid, &skeyid_d, &gxy, &self.cky_i, &self.cky_r);
         let skeyid_e = crypto1::skeyid_e(self.prf, &skeyid, &skeyid_a, &gxy, &self.cky_i, &self.cky_r);
         let enc_key = crypto1::derive_cipher_key(self.prf, &skeyid_e, self.key_len);
-        let phase1_iv = crypto1::phase1_iv(self.prf, &self.gxi, &self.gxr, AES_BLOCK);
+        let phase1_iv = crypto1::phase1_iv(self.prf, &self.gxi, &self.gxr, self.block);
 
-        let (_hdr, ps, iv_after_msg5) = phase2::decrypt_payloads(msg5, &enc_key, &phase1_iv)?;
+        let (_hdr, ps, iv_after_msg5) = phase2::decrypt_payloads(msg5, &enc_key, self.block, &phase1_iv)?;
         let idii_b = find(&ps, payload::ID).ok_or(IkeError::MissingPayload("ID"))?.data.clone();
         let expect_hi = crypto1::hash_i(self.prf, &skeyid, &self.gxi, &self.gxr, &self.cky_i, &self.cky_r, &self.sai_b, &idii_b);
         if matches!(self.local_auth, Ikev1LocalAuth::Sig { .. }) {
@@ -1581,7 +1613,7 @@ impl MainRespKeSent {
                 out
             }
         };
-        let (msg6, iv_after_msg6) = phase2::encrypt_payloads(hdr6, &enc_key, &iv_after_msg5, &out_payloads)?;
+        let (msg6, iv_after_msg6) = phase2::encrypt_payloads(hdr6, &enc_key, self.block, &iv_after_msg5, &out_payloads)?;
 
         let state = Phase1State {
             prf: self.prf,
@@ -1593,6 +1625,7 @@ impl MainRespKeSent {
             skeyid_a,
             skeyid_e,
             enc_key,
+            enc_block: self.block,
             // Not the local `phase1_iv` (the raw seed, only needed to
             // decrypt message 5 above) -- see the matching comment in
             // `MainIdSent::complete_id`: post-Phase-1 exchanges must seed
@@ -1631,6 +1664,7 @@ mod tests {
             skeyid_a: vec![0xAAu8; 32],
             skeyid_e: vec![0xAAu8; 32],
             enc_key: vec![0xAAu8; 32],
+            enc_block: AES_BLOCK,
             phase1_iv: vec![3u8; 16],
             gxi: vec![4u8; 16],
             gxr: vec![5u8; 16],
@@ -1771,6 +1805,232 @@ mod tests {
             &[(payload::HASH, hash_i)],
         );
         st.verify_hash_i(&msg3).expect("HASH_I must verify → Phase 1 complete");
+    }
+
+    /// One Phase-1 transform the way a legacy peer offers it: `cipher` (with a
+    /// `KEY_LENGTH` only for AES -- TripleDES never carries one), SHA-256,
+    /// MODP-1024, PSK.
+    fn p1_transform(num: u8, cipher: u16) -> Transform {
+        let mut attributes = vec![Attribute::short(attr::ENCRYPTION, cipher)];
+        if cipher == enc::AES_CBC {
+            attributes.push(Attribute::short(attr::KEY_LENGTH, 256));
+        }
+        attributes.extend([
+            Attribute::short(attr::HASH, hash::SHA2_256),
+            Attribute::short(attr::GROUP_DESC, 2),
+            Attribute::short(attr::AUTH_METHOD, auth::PSK),
+            Attribute::short(attr::LIFE_TYPE, life::SECONDS),
+            Attribute::long_u32(attr::LIFE_DURATION, 28800),
+        ]);
+        Transform { num, transform_id: 1, attributes }
+    }
+
+    fn p1_offer(transforms: Vec<Transform>) -> SaPayload {
+        SaPayload {
+            doi: IPSEC_DOI,
+            situation: SIT_IDENTITY_ONLY,
+            proposals: vec![Proposal { num: 1, protocol_id: protocol::ISAKMP, spi: Vec::new(), transforms }],
+        }
+    }
+
+    #[test]
+    fn select_transform_accepts_triple_des_but_only_as_a_last_resort() {
+        // RFC 4109 §3: TripleDES-CBC is IKEv1's historical mandatory Phase-1
+        // cipher, so a peer offering nothing else must still get an answer...
+        let only_3des = p1_offer(vec![p1_transform(1, enc::TRIPLE_DES_CBC)]);
+        let (t, prf, group, key_len, block) = select_transform(&only_3des, false).expect("a TripleDES-only offer must be accepted");
+        assert_eq!(t.attr(attr::ENCRYPTION), Some(enc::TRIPLE_DES_CBC));
+        assert_eq!((prf, group, key_len, block), (Prf::Sha256, DhGroup::Modp1024, 24, crypto1::DES3_BLOCK));
+
+        // ...but never at AES's expense: even listed first (the peer's own
+        // preference), TripleDES loses to any acceptable AES transform.
+        let both = p1_offer(vec![p1_transform(1, enc::TRIPLE_DES_CBC), p1_transform(2, enc::AES_CBC)]);
+        let (t, _, _, key_len, block) = select_transform(&both, false).unwrap();
+        assert_eq!((t.num, t.attr(attr::ENCRYPTION)), (2, Some(enc::AES_CBC)));
+        assert_eq!((key_len, block), (32, crypto1::AES_BLOCK));
+
+        // And still subject to every other check (a PSK offer vs a Sig config).
+        assert!(select_transform(&only_3des, true).is_none());
+    }
+
+    #[test]
+    fn aggressive_responder_accepts_a_triple_des_only_offer_and_decrypts_its_message_3() {
+        let cfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(b"testpsk".to_vec()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 3, 204]),
+        };
+        let aggr_hdr = |cky_i, cky_r, flags| IsakmpHeader {
+            init_cookie: cky_i,
+            resp_cookie: cky_r,
+            next_payload: payload::NONE,
+            version: IsakmpHeader::VERSION_1_0,
+            exchange_type: exchange::AGGRESSIVE,
+            flags,
+            message_id: 0,
+            length: 0,
+        };
+        let cky_i = [0xAB; 8];
+        let mut ie = SeedEntropy::new(7);
+        let i_priv = ie.next_array32();
+        let gxi = DhGroup::Modp1024.public(&i_priv);
+        let ni = vec![0x11; 16];
+        let idi_b = Id { id_type: id_type::KEY_ID, protocol: 0, port: 0, data: b"grp".to_vec() }.to_bytes();
+        let sai_b = p1_offer(vec![p1_transform(1, enc::TRIPLE_DES_CBC)]).to_bytes();
+        let msg1 = isakmp::build_message(aggr_hdr(cky_i, [0; 8], 0), &[
+            (payload::SA, sai_b.clone()),
+            (payload::KE, gxi.clone()),
+            (payload::NONCE, ni.clone()),
+            (payload::ID, idi_b.clone()),
+        ]);
+        let (msg2, st) = respond_aggressive(&cfg, &msg1, &mut SeedEntropy::new(9), "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap())
+            .expect("the responder must accept a TripleDES-only offer");
+
+        // The initiator's own key schedule: a 24-byte EDE3 key, 8-byte IV.
+        let h2 = IsakmpHeader::parse(&msg2).unwrap();
+        let cky_r = h2.resp_cookie;
+        let p2 = isakmp::parse_payloads(h2.next_payload, &msg2[IsakmpHeader::LEN..]).unwrap();
+        let gxr = find(&p2, payload::KE).unwrap().data.clone();
+        let nr = find(&p2, payload::NONCE).unwrap().data.clone();
+        let prf = Prf::Sha256;
+        let gxy = DhGroup::Modp1024.shared(&i_priv, &gxr).unwrap();
+        let skeyid = crypto1::skeyid_psk(prf, b"testpsk", &ni, &nr);
+        let skeyid_d = crypto1::skeyid_d(prf, &skeyid, &gxy, &cky_i, &cky_r);
+        let skeyid_a = crypto1::skeyid_a(prf, &skeyid, &skeyid_d, &gxy, &cky_i, &cky_r);
+        let skeyid_e = crypto1::skeyid_e(prf, &skeyid, &skeyid_a, &gxy, &cky_i, &cky_r);
+        let enc_key = crypto1::derive_cipher_key(prf, &skeyid_e, 24);
+        assert_eq!(st.enc_key, enc_key);
+        assert_eq!(st.enc_block, crypto1::DES3_BLOCK);
+
+        // Message 3 arriving encrypted (the NAT-T-floated case `verify_hash_i`
+        // decrypts), sealed straight through `des3_cbc_encrypt`: the 36-byte
+        // HASH payload pads to 40 bytes -- whole 8-byte blocks, but not whole
+        // AES blocks, so only a TripleDES decrypt can even parse it.
+        let hash_i = crypto1::hash_i(prf, &skeyid, &gxi, &gxr, &cky_i, &cky_r, &sai_b, &idi_b);
+        let (first, plain3) = isakmp::encode_payloads(&[(payload::HASH, hash_i)]);
+        let iv = crypto1::phase1_iv(prf, &gxi, &gxr, crypto1::DES3_BLOCK);
+        let ct3 = crypto1::des3_cbc_encrypt(&enc_key, &iv, &crypto1::pad_to_block(&plain3, crypto1::DES3_BLOCK)).unwrap();
+        assert_ne!(ct3.len() % crypto1::AES_BLOCK, 0);
+        let mut hdr3 = aggr_hdr(cky_i, cky_r, isakmp::flags::ENCRYPTION);
+        hdr3.next_payload = first;
+        hdr3.length = (IsakmpHeader::LEN + ct3.len()) as u32;
+        let mut msg3 = hdr3.to_bytes();
+        msg3.extend_from_slice(&ct3);
+        st.verify_hash_i(&msg3).expect("an encrypted HASH_I must verify under the negotiated TripleDES key");
+    }
+
+    /// A full Main Mode where our *responder* faces a legacy initiator that
+    /// only offers TripleDES-CBC -- played by hand, since our own initiator
+    /// never offers it (see `initiator_sa`). The initiator side seals message
+    /// 5 and opens message 6 straight through `des3_cbc_*` (pinned to an
+    /// OpenSSL known answer in crypto1's tests), not through `phase2`'s
+    /// dispatch, so a responder that negotiated TripleDES but still ran AES
+    /// underneath, or derived the wrong key/IV width, can't agree with it.
+    /// Then a Quick Mode runs over the resulting ISAKMP SA, both directions.
+    #[test]
+    fn main_mode_responder_completes_with_a_triple_des_only_initiator_and_quick_mode_runs_over_it() {
+        let psk = b"correct horse battery staple".to_vec();
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
+        let gateway: SocketAddr = "192.168.0.1:500".parse().unwrap();
+        let initiator: SocketAddr = "10.1.1.1:500".parse().unwrap();
+        let main_hdr = |cky_i, cky_r, flags| IsakmpHeader {
+            init_cookie: cky_i,
+            resp_cookie: cky_r,
+            next_payload: payload::NONE,
+            version: IsakmpHeader::VERSION_1_0,
+            exchange_type: exchange::MAIN,
+            flags,
+            message_id: 0,
+            length: 0,
+        };
+        let mut ie = SeedEntropy::new(0x3DE5);
+        let mut re = SeedEntropy::new(0x4444);
+
+        // Messages 1/2: a TripleDES-only offer, which the responder must
+        // accept and echo.
+        let cky_i = [0x3D; 8];
+        let sai_b = p1_offer(vec![p1_transform(1, enc::TRIPLE_DES_CBC)]).to_bytes();
+        let msg1 = isakmp::build_message(main_hdr(cky_i, [0; 8], 0), &[(payload::SA, sai_b.clone())]);
+        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re, gateway, initiator).expect("the responder must accept a TripleDES-only offer");
+        let h2 = IsakmpHeader::parse(&msg2).unwrap();
+        let cky_r = h2.resp_cookie;
+        let p2 = isakmp::parse_payloads(h2.next_payload, &msg2[IsakmpHeader::LEN..]).unwrap();
+        let sar = SaPayload::parse(&find(&p2, payload::SA).unwrap().data).unwrap();
+        assert_eq!(sar.proposals[0].transforms[0].attr(attr::ENCRYPTION), Some(enc::TRIPLE_DES_CBC));
+
+        // Messages 3/4: KE + nonces, in the clear.
+        let i_priv = ie.next_array32();
+        let gxi = DhGroup::Modp1024.public(&i_priv);
+        let ni = vec![0x11; 16];
+        let msg3 = isakmp::build_message(main_hdr(cky_i, cky_r, 0), &[(payload::KE, gxi.clone()), (payload::NONCE, ni.clone())]);
+        let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
+        let h4 = IsakmpHeader::parse(&msg4).unwrap();
+        let p4 = isakmp::parse_payloads(h4.next_payload, &msg4[IsakmpHeader::LEN..]).unwrap();
+        let gxr = find(&p4, payload::KE).unwrap().data.clone();
+        let nr = find(&p4, payload::NONCE).unwrap().data.clone();
+
+        // The initiator's own key schedule: a 24-byte EDE3 key, 8-byte IV.
+        let prf = Prf::Sha256;
+        let gxy = DhGroup::Modp1024.shared(&i_priv, &gxr).unwrap();
+        let skeyid = crypto1::skeyid_psk(prf, &psk, &ni, &nr);
+        let skeyid_d = crypto1::skeyid_d(prf, &skeyid, &gxy, &cky_i, &cky_r);
+        let skeyid_a = crypto1::skeyid_a(prf, &skeyid, &skeyid_d, &gxy, &cky_i, &cky_r);
+        let skeyid_e = crypto1::skeyid_e(prf, &skeyid, &skeyid_a, &gxy, &cky_i, &cky_r);
+        let enc_key = crypto1::derive_cipher_key(prf, &skeyid_e, 24);
+        let iv5 = crypto1::phase1_iv(prf, &gxi, &gxr, crypto1::DES3_BLOCK);
+
+        // Message 5: IDii + HASH_I, TripleDES-encrypted.
+        let idii_b = Id::ipv4([10, 1, 1, 1]).to_bytes();
+        let hash_i = crypto1::hash_i(prf, &skeyid, &gxi, &gxr, &cky_i, &cky_r, &sai_b, &idii_b);
+        let (first, plain5) = isakmp::encode_payloads(&[(payload::ID, idii_b), (payload::HASH, hash_i)]);
+        let ct5 = crypto1::des3_cbc_encrypt(&enc_key, &iv5, &crypto1::pad_to_block(&plain5, crypto1::DES3_BLOCK)).unwrap();
+        let mut hdr5 = main_hdr(cky_i, cky_r, isakmp::flags::ENCRYPTION);
+        hdr5.next_payload = first;
+        hdr5.length = (IsakmpHeader::LEN + ct5.len()) as u32;
+        let mut msg5 = hdr5.to_bytes();
+        msg5.extend_from_slice(&ct5);
+
+        // Message 6: the responder's IDir + HASH_R, which the initiator
+        // opens the same way, chaining the IV from message 5.
+        let (msg6, rstate) = r2.complete_id(&msg5).expect("HASH_I must verify under the TripleDES key");
+        let h6 = IsakmpHeader::parse(&msg6).unwrap();
+        let ct6 = &msg6[IsakmpHeader::LEN..];
+        let plain6 = crypto1::des3_cbc_decrypt(&enc_key, &crypto1::next_iv(&ct5, crypto1::DES3_BLOCK), ct6).unwrap();
+        let p6 = isakmp::parse_payloads(h6.next_payload, &plain6).unwrap();
+        let idir_b = find(&p6, payload::ID).unwrap().data.clone();
+        let expect_hr = crypto1::hash_r(prf, &skeyid, &gxr, &gxi, &cky_r, &cky_i, &sai_b, &idir_b);
+        assert_eq!(find(&p6, payload::HASH).unwrap().data, expect_hr, "HASH_R must verify under the TripleDES key");
+
+        assert_eq!(rstate.enc_key, enc_key);
+        assert_eq!(rstate.enc_block, crypto1::DES3_BLOCK);
+        // RFC 2409 App. B: post-Phase-1 IVs seed from message 6's last
+        // (8-byte) ciphertext block.
+        let phase1_iv = crypto1::next_iv(ct6, crypto1::DES3_BLOCK);
+        assert_eq!(rstate.phase1_iv, phase1_iv);
+
+        // Phase 2 over the TripleDES ISAKMP SA, the initiator resuming from
+        // the key material it derived on its own above.
+        let istate = Phase1State::resume(prf, DhGroup::Modp1024, cky_i, cky_r, skeyid_a, skeyid_d, skeyid_e, enc_key.clone(), crypto1::DES3_BLOCK, phase1_iv);
+        let ts = ([10, 0, 99, 0], [255, 255, 255, 0]);
+        let (qm1, qi) = crate::ikev1::quick::initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, ts, ts, 3600).unwrap();
+        let hq1 = IsakmpHeader::parse(&qm1).unwrap();
+        let qm1_iv = crypto1::phase2_iv(prf, &istate.phase1_iv, hq1.message_id, crypto1::DES3_BLOCK);
+        let plain_qm1 = crypto1::des3_cbc_decrypt(&enc_key, &qm1_iv, &qm1[IsakmpHeader::LEN..]).unwrap();
+        let pq1 = isakmp::parse_payloads(hq1.next_payload, &plain_qm1).expect("Quick Mode message 1 must be TripleDES-encrypted");
+        assert_eq!(pq1[0].payload_type, payload::HASH);
+        assert!(find(&pq1, payload::SA).is_some());
+        let (qm2, qr) = crate::ikev1::quick::respond_quick(&rstate, &qm1, &mut re).unwrap();
+        let (qm3, mut ichild, _lifetime) = qi.complete(&qm2).unwrap();
+        let mut rchild = qr.complete(&qm3).unwrap();
+        let pkt: Vec<u8> = (0..40u8).collect();
+        assert_eq!(rchild.inbound.open(&ichild.outbound.seal(&pkt, 4).unwrap()).unwrap().0, pkt);
+        assert_eq!(ichild.inbound.open(&rchild.outbound.seal(&pkt, 4).unwrap()).unwrap().0, pkt);
     }
 
     #[test]
@@ -2128,8 +2388,8 @@ mod tests {
         let iv0 = crypto1::phase2_iv(istate.prf, &istate.phase1_iv, {
             let hdr = IsakmpHeader::parse(&qm1).unwrap();
             hdr.message_id
-        }, AES_BLOCK);
-        let (_h, ps, _next) = phase2::parse_encrypted(&qm1, istate.prf, &istate.skeyid_a, &istate.enc_key, &iv0).unwrap();
+        }, istate.enc_block);
+        let (_h, ps, _next) = phase2::parse_encrypted(&qm1, istate.prf, &istate.skeyid_a, &istate.enc_key, istate.enc_block, &iv0).unwrap();
         let sa = SaPayload::parse(&find(&ps, payload::SA).unwrap().data).unwrap();
         let encap_mode = sa.proposals[0].transforms[0].attr(4 /* esp_attr::ENCAP_MODE */).unwrap();
         assert_eq!(encap_mode, 3, "floated Quick Mode must declare UDP_ENCAP_TUNNEL (3), not plain tunnel mode (1)");

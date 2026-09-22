@@ -22,9 +22,19 @@ type Aes192CbcEnc = cbc::Encryptor<aes::Aes192>;
 type Aes192CbcDec = cbc::Decryptor<aes::Aes192>;
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+type Des3CbcEnc = cbc::Encryptor<des::TdesEde3>;
+type Des3CbcDec = cbc::Decryptor<des::TdesEde3>;
 
 /// AES block size — the CBC IV and padding granularity.
 pub const AES_BLOCK: usize = 16;
+
+/// TripleDES-CBC block size (RFC 2451's 64-bit DES block, unlike AES's
+/// 128-bit one) -- RFC 4109 §3's historical mandatory-to-implement IKEv1
+/// Phase-1 cipher. This crate's own initiator never offers it (see
+/// `phase1::initiator_sa`'s doc); it's only ever negotiated when acting as a
+/// responder against a peer whose offer carries no acceptable AES-CBC
+/// transform at all (see `phase1::select_transform`).
+pub const DES3_BLOCK: usize = 8;
 
 /// The negotiated Phase-1 PRF / hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,6 +251,57 @@ pub fn next_iv(ciphertext: &[u8], block: usize) -> Vec<u8> {
     ciphertext[ciphertext.len().saturating_sub(block)..].to_vec()
 }
 
+/// TripleDES-CBC encrypt (raw, no padding). `plaintext` must be block-aligned.
+/// `key` must be exactly 24 bytes (EDE3 / "keying option 1", RFC 2451 §3,
+/// three independent DES keys) -- unlike AES-CBC, IKEv1 doesn't negotiate a
+/// variable width for this transform (no `KEY_LENGTH` attribute is sent).
+pub fn des3_cbc_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, IkeError> {
+    if plaintext.len() % DES3_BLOCK != 0 {
+        return Err(IkeError::Crypto("CBC plaintext not block-aligned"));
+    }
+    if key.len() != 24 {
+        return Err(IkeError::Crypto("unsupported TripleDES-CBC key length (need 24 bytes)"));
+    }
+    let bad_key = || IkeError::Crypto("bad TripleDES-CBC key/iv");
+    Ok(Des3CbcEnc::new_from_slices(key, iv).map_err(|_| bad_key())?.encrypt_padded_vec_mut::<NoPadding>(plaintext))
+}
+
+/// TripleDES-CBC decrypt (raw, no padding). See [`des3_cbc_encrypt`] for the
+/// key-length requirement.
+pub fn des3_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, IkeError> {
+    if ciphertext.is_empty() || ciphertext.len() % DES3_BLOCK != 0 {
+        return Err(IkeError::Crypto("CBC ciphertext not block-aligned"));
+    }
+    if key.len() != 24 {
+        return Err(IkeError::Crypto("unsupported TripleDES-CBC key length (need 24 bytes)"));
+    }
+    let bad_key = || IkeError::Crypto("bad TripleDES-CBC key/iv");
+    let bad_ct = || IkeError::Crypto("TripleDES-CBC decrypt failed");
+    Des3CbcDec::new_from_slices(key, iv).map_err(|_| bad_key())?.decrypt_padded_vec_mut::<NoPadding>(ciphertext).map_err(|_| bad_ct())
+}
+
+/// Dispatch to the AES-CBC or TripleDES-CBC primitive by block length -- the
+/// two can't be told apart from the key alone (AES-192 and TripleDES-EDE3
+/// both take a 24-byte key), so every caller past Phase 1 carries the
+/// negotiated block length (see `Phase1State::enc_block`) alongside the key
+/// rather than re-deriving the algorithm from it.
+pub fn cbc_encrypt(block: usize, key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, IkeError> {
+    match block {
+        AES_BLOCK => aes_cbc_encrypt(key, iv, plaintext),
+        DES3_BLOCK => des3_cbc_encrypt(key, iv, plaintext),
+        _ => Err(IkeError::Crypto("unsupported CBC block size")),
+    }
+}
+
+/// See [`cbc_encrypt`].
+pub fn cbc_decrypt(block: usize, key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, IkeError> {
+    match block {
+        AES_BLOCK => aes_cbc_decrypt(key, iv, ciphertext),
+        DES3_BLOCK => des3_cbc_decrypt(key, iv, ciphertext),
+        _ => Err(IkeError::Crypto("unsupported CBC block size")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +376,39 @@ mod tests {
         assert_eq!(pt, plain);
         // The next-message IV is the last ciphertext block.
         assert_eq!(next_iv(&ct, AES_BLOCK), ct[ct.len() - AES_BLOCK..]);
+    }
+
+    #[test]
+    fn des3_cbc_matches_an_openssl_known_answer_and_dispatches_by_block() {
+        // `printf 'The quick brown fox jump' | openssl enc -des-ede3-cbc -nopad
+        //   -K 0123456789abcdef23456789abcdef01456789abcdef0123 -iv f69f2445df4f9b17`
+        // -- an independent implementation, pinning the EDE3 key order and
+        // the CBC chaining, not just an encrypt/decrypt roundtrip.
+        let key = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x45, 0x67,
+            0x89, 0xab, 0xcd, 0xef, 0x01, 0x23,
+        ];
+        let iv = [0xf6, 0x9f, 0x24, 0x45, 0xdf, 0x4f, 0x9b, 0x17];
+        let plain = b"The quick brown fox jump";
+        let expected = [
+            0x63, 0x69, 0x3c, 0x3d, 0x37, 0x8a, 0x86, 0x2f, 0x80, 0x51, 0xae, 0x7c, 0x29, 0x34, 0xa2, 0x96, 0xaa, 0x6c,
+            0x31, 0x02, 0xb6, 0xe5, 0xb7, 0x9e,
+        ];
+        let ct = des3_cbc_encrypt(&key, &iv, plain).unwrap();
+        assert_eq!(ct, expected);
+        assert_eq!(des3_cbc_decrypt(&key, &iv, &ct).unwrap(), plain);
+        assert_eq!(next_iv(&ct, DES3_BLOCK), ct[ct.len() - DES3_BLOCK..]);
+
+        // The dispatch selects TripleDES by block length -- a 24-byte key
+        // alone would equally fit AES-192.
+        assert_eq!(cbc_encrypt(DES3_BLOCK, &key, &iv, plain).unwrap(), expected);
+        assert_eq!(cbc_decrypt(DES3_BLOCK, &key, &iv, &ct).unwrap(), plain);
+        assert!(cbc_encrypt(12, &key, &iv, plain).is_err());
+
+        // EDE3 only: no 16-byte two-key variant, no unaligned input.
+        assert!(des3_cbc_encrypt(&key[..16], &iv, plain).is_err());
+        assert!(des3_cbc_encrypt(&key, &iv, &plain[..20]).is_err());
+        assert!(des3_cbc_decrypt(&key, &iv, &ct[..20]).is_err());
     }
 
     /// AES-128 and AES-192 must round-trip too (RFC 2409's `KEY_LENGTH`

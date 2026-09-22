@@ -1,12 +1,14 @@
 //! Encrypted phase-2 ISAKMP messages — Transaction/XAUTH, Mode-Config, Quick
 //! Mode, and encrypted Informational. Each carries a leading HASH payload
-//! (`HASH = prf(SKEYID_a, M-ID | <payloads after HASH>)`) and is AES-CBC
-//! encrypted under SKEYID_e with per-message-id IV chaining (RFC 2409 App. B):
+//! (`HASH = prf(SKEYID_a, M-ID | <payloads after HASH>)`) and is CBC-encrypted
+//! under SKEYID_e -- AES, or TripleDES when a peer negotiated it with our
+//! responder (see `block` below and [`crypto1::cbc_encrypt`]) -- with
+//! per-message-id IV chaining (RFC 2409 App. B):
 //! the first message of a message-id seeds its IV from `HASH(phase1_iv | M-ID)`,
 //! and each subsequent message in that conversation chains from the previous
 //! message's last ciphertext block.
 
-use super::crypto1::{self, Prf, AES_BLOCK};
+use super::crypto1::{self, Prf};
 use super::isakmp::{self, flags, payload, IsakmpHeader, Payload};
 use crate::error::IkeError;
 
@@ -18,20 +20,23 @@ pub fn build_encrypted(
     prf: Prf,
     skeyid_a: &[u8],
     enc_key: &[u8],
+    block: usize,
     iv: &[u8],
     payloads_after_hash: &[(u8, Vec<u8>)],
 ) -> Result<(Vec<u8>, Vec<u8>), IkeError> {
-    build_encrypted_prefixed(header, prf, skeyid_a, enc_key, iv, &[], payloads_after_hash)
+    build_encrypted_prefixed(header, prf, skeyid_a, enc_key, block, iv, &[], payloads_after_hash)
 }
 
 /// Like [`build_encrypted`] but the HASH also covers `hash_prefix` immediately
 /// after the message-id — Quick Mode HASH(2) prefixes the initiator nonce Ni_b:
 /// `HASH(2) = prf(SKEYID_a, M-ID | Ni_b | SA | Nr | …)`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_encrypted_prefixed(
     mut header: IsakmpHeader,
     prf: Prf,
     skeyid_a: &[u8],
     enc_key: &[u8],
+    block: usize,
     iv: &[u8],
     hash_prefix: &[u8],
     payloads_after_hash: &[(u8, Vec<u8>)],
@@ -48,9 +53,9 @@ pub fn build_encrypted_prefixed(
     all.extend_from_slice(payloads_after_hash);
     let (first, plaintext) = isakmp::encode_payloads(&all);
 
-    let padded = crypto1::pad_to_block(&plaintext, AES_BLOCK);
-    let ct = crypto1::aes_cbc_encrypt(enc_key, iv, &padded)?;
-    let next = crypto1::next_iv(&ct, AES_BLOCK);
+    let padded = crypto1::pad_to_block(&plaintext, block);
+    let ct = crypto1::cbc_encrypt(block, enc_key, iv, &padded)?;
+    let next = crypto1::next_iv(&ct, block);
 
     header.next_payload = first;
     header.flags |= flags::ENCRYPTION;
@@ -66,13 +71,14 @@ pub fn build_encrypted_prefixed(
 pub fn encrypt_payloads(
     mut header: IsakmpHeader,
     enc_key: &[u8],
+    block: usize,
     iv: &[u8],
     payloads: &[(u8, Vec<u8>)],
 ) -> Result<(Vec<u8>, Vec<u8>), IkeError> {
     let (first, plaintext) = isakmp::encode_payloads(payloads);
-    let padded = crypto1::pad_to_block(&plaintext, AES_BLOCK);
-    let ct = crypto1::aes_cbc_encrypt(enc_key, iv, &padded)?;
-    let next = crypto1::next_iv(&ct, AES_BLOCK);
+    let padded = crypto1::pad_to_block(&plaintext, block);
+    let ct = crypto1::cbc_encrypt(block, enc_key, iv, &padded)?;
+    let next = crypto1::next_iv(&ct, block);
     header.next_payload = first;
     header.flags |= flags::ENCRYPTION;
     header.length = (IsakmpHeader::LEN + ct.len()) as u32;
@@ -88,12 +94,13 @@ pub fn encrypt_payloads(
 pub fn decrypt_payloads(
     data: &[u8],
     enc_key: &[u8],
+    block: usize,
     iv: &[u8],
 ) -> Result<(IsakmpHeader, Vec<Payload>, Vec<u8>), IkeError> {
     let header = IsakmpHeader::parse(data)?;
     let ct = &data[IsakmpHeader::LEN..];
-    let plaintext = crypto1::aes_cbc_decrypt(enc_key, iv, ct)?;
-    let next = crypto1::next_iv(ct, AES_BLOCK);
+    let plaintext = crypto1::cbc_decrypt(block, enc_key, iv, ct)?;
+    let next = crypto1::next_iv(ct, block);
     let payloads = isakmp::parse_payloads(header.next_payload, &plaintext)?;
     Ok((header, payloads, next))
 }
@@ -105,12 +112,13 @@ pub fn parse_encrypted(
     prf: Prf,
     skeyid_a: &[u8],
     enc_key: &[u8],
+    block: usize,
     iv: &[u8],
 ) -> Result<(IsakmpHeader, Vec<Payload>, Vec<u8>), IkeError> {
     let header = IsakmpHeader::parse(data)?;
     let ct = &data[IsakmpHeader::LEN..];
-    let plaintext = crypto1::aes_cbc_decrypt(enc_key, iv, ct)?;
-    let next = crypto1::next_iv(ct, AES_BLOCK);
+    let plaintext = crypto1::cbc_decrypt(block, enc_key, iv, ct)?;
+    let next = crypto1::next_iv(ct, block);
     let payloads = isakmp::parse_payloads(header.next_payload, &plaintext)?;
 
     let hash_p = payloads
@@ -134,6 +142,7 @@ pub fn parse_encrypted(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::crypto1::AES_BLOCK;
     use super::super::isakmp::exchange;
 
     #[test]
@@ -153,9 +162,9 @@ mod tests {
             length: 0,
         };
         let attr = vec![(payload::ATTRIBUTE, vec![1u8, 0, 0, 0, 0x80, 0x11, 0, 1])];
-        let (msg, _next) = build_encrypted(hdr, prf, &skeyid_a, &enc_key, &iv, &attr).unwrap();
+        let (msg, _next) = build_encrypted(hdr, prf, &skeyid_a, &enc_key, AES_BLOCK, &iv, &attr).unwrap();
 
-        let (h2, payloads, _n2) = parse_encrypted(&msg, prf, &skeyid_a, &enc_key, &iv).unwrap();
+        let (h2, payloads, _n2) = parse_encrypted(&msg, prf, &skeyid_a, &enc_key, AES_BLOCK, &iv).unwrap();
         assert_eq!(h2.message_id, 0xDEADBEEF);
         assert!(h2.flags & flags::ENCRYPTION != 0);
         assert_eq!(payloads[0].payload_type, payload::HASH);
@@ -164,6 +173,6 @@ mod tests {
 
         // A wrong key must fail the HASH check.
         let bad = [0x99u8; 32];
-        assert!(parse_encrypted(&msg, prf, &bad, &enc_key, &iv).is_err());
+        assert!(parse_encrypted(&msg, prf, &bad, &enc_key, AES_BLOCK, &iv).is_err());
     }
 }

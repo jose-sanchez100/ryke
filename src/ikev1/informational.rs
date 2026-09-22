@@ -59,7 +59,7 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use super::crypto1::{self, AES_BLOCK};
+use super::crypto1;
 use super::isakmp::{exchange, payload, IsakmpHeader};
 use super::payloads::{protocol, IPSEC_DOI};
 use super::phase1::Phase1State;
@@ -148,9 +148,9 @@ fn build_single_informational(st: &Phase1State, entropy: &mut impl Entropy, payl
     entropy.fill(&mut mid_b);
     let msgid = u32::from_be_bytes(mid_b) | 1; // non-zero
 
-    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
+    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
     let hdr = info_header(st.cky_i, st.cky_r, msgid);
-    let (msg, _next) = phase2::build_encrypted(hdr, st.prf, &st.skeyid_a, &st.enc_key, &iv0, &[(payload_type, body)])?;
+    let (msg, _next) = phase2::build_encrypted(hdr, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0, &[(payload_type, body)])?;
     Ok(msg)
 }
 
@@ -369,8 +369,8 @@ fn watch(
         if header.exchange_type != exchange::INFORMATIONAL || header.init_cookie != st.cky_i || header.resp_cookie != st.cky_r {
             continue; // not an Informational for this ISAKMP SA -- ignore, keep waiting out the timeout
         }
-        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, header.message_id, AES_BLOCK);
-        let Ok((_h, payloads, _next)) = phase2::parse_encrypted(datagram, st.prf, &st.skeyid_a, &st.enc_key, &iv0) else {
+        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, header.message_id, st.enc_block);
+        let Ok((_h, payloads, _next)) = phase2::parse_encrypted(datagram, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0) else {
             continue;
         };
         if let Some(del) = payloads.iter().find(|p| p.payload_type == payload::DELETE) {
@@ -460,8 +460,8 @@ pub(crate) fn is_isakmp_sa_delete(st: &Phase1State, datagram: &[u8]) -> bool {
     if header.exchange_type != exchange::INFORMATIONAL || header.init_cookie != st.cky_i || header.resp_cookie != st.cky_r {
         return false;
     }
-    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, header.message_id, AES_BLOCK);
-    let Ok((_h, payloads, _next)) = phase2::parse_encrypted(datagram, st.prf, &st.skeyid_a, &st.enc_key, &iv0) else {
+    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, header.message_id, st.enc_block);
+    let Ok((_h, payloads, _next)) = phase2::parse_encrypted(datagram, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0) else {
         return false;
     };
     let Some(del) = payloads.iter().find(|p| p.payload_type == payload::DELETE) else { return false };
@@ -481,8 +481,8 @@ pub(crate) fn peer_error_notify(st: &Phase1State, msg: &[u8]) -> Option<(u16, &'
     if header.exchange_type != exchange::INFORMATIONAL || header.init_cookie != st.cky_i || header.resp_cookie != st.cky_r {
         return None;
     }
-    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, header.message_id, AES_BLOCK);
-    let (_h, payloads, _next) = phase2::parse_encrypted(msg, st.prf, &st.skeyid_a, &st.enc_key, &iv0).ok()?;
+    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, header.message_id, st.enc_block);
+    let (_h, payloads, _next) = phase2::parse_encrypted(msg, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0).ok()?;
     let notify = payloads.iter().find(|p| p.payload_type == payload::NOTIFY)?;
     let (msg_type, _data) = parse_notify(&notify.data)?;
     (1..16384).contains(&msg_type).then(|| (msg_type, error_notify_name(msg_type)))
@@ -625,8 +625,8 @@ mod tests {
         let hdr = IsakmpHeader::parse(msg).unwrap();
         assert_eq!(hdr.exchange_type, exchange::INFORMATIONAL);
         assert!(hdr.flags & flags::ENCRYPTION != 0);
-        let iv0 = crypto1::phase2_iv(gw_st.prf, &gw_st.phase1_iv, hdr.message_id, AES_BLOCK);
-        let (_h, payloads, _next) = phase2::parse_encrypted(msg, gw_st.prf, &gw_st.skeyid_a, &gw_st.enc_key, &iv0).unwrap();
+        let iv0 = crypto1::phase2_iv(gw_st.prf, &gw_st.phase1_iv, hdr.message_id, gw_st.enc_block);
+        let (_h, payloads, _next) = phase2::parse_encrypted(msg, gw_st.prf, &gw_st.skeyid_a, &gw_st.enc_key, gw_st.enc_block, &iv0).unwrap();
         let deletes: Vec<_> = payloads.into_iter().filter(|p| p.payload_type == payload::DELETE).collect();
         assert_eq!(deletes.len(), 1);
         deletes.into_iter().next().unwrap()
@@ -661,9 +661,9 @@ mod tests {
         let mut e = SeedEntropy::new(0xC0FFEE);
         let (esp_msg, _isakmp_msg) = build_delete(&client_st, &mut e, 0x1234_5678).unwrap();
         let hdr = IsakmpHeader::parse(&esp_msg).unwrap();
-        let iv0 = crypto1::phase2_iv(gw_st.prf, &gw_st.phase1_iv, hdr.message_id, AES_BLOCK);
+        let iv0 = crypto1::phase2_iv(gw_st.prf, &gw_st.phase1_iv, hdr.message_id, gw_st.enc_block);
         let bad_key = vec![0x99u8; gw_st.skeyid_a.len()];
-        assert!(phase2::parse_encrypted(&esp_msg, gw_st.prf, &bad_key, &gw_st.enc_key, &iv0).is_err());
+        assert!(phase2::parse_encrypted(&esp_msg, gw_st.prf, &bad_key, &gw_st.enc_key, gw_st.enc_block, &iv0).is_err());
     }
 
     #[test]
@@ -743,8 +743,8 @@ mod tests {
         let mut buf = [0u8; 8192];
         let n = gw_sock.recv(&mut buf).unwrap();
         let hdr = IsakmpHeader::parse(&buf[..n]).unwrap();
-        let iv0 = crypto1::phase2_iv(gw_st.prf, &gw_st.phase1_iv, hdr.message_id, AES_BLOCK);
-        let (_h, payloads, _next) = phase2::parse_encrypted(&buf[..n], gw_st.prf, &gw_st.skeyid_a, &gw_st.enc_key, &iv0).unwrap();
+        let iv0 = crypto1::phase2_iv(gw_st.prf, &gw_st.phase1_iv, hdr.message_id, gw_st.enc_block);
+        let (_h, payloads, _next) = phase2::parse_encrypted(&buf[..n], gw_st.prf, &gw_st.skeyid_a, &gw_st.enc_key, gw_st.enc_block, &iv0).unwrap();
         let notify = payloads.into_iter().find(|p| p.payload_type == payload::NOTIFY).unwrap();
         let (msg_type, data) = parse_notify(&notify.data).unwrap();
         assert_eq!(msg_type, notify_type::R_U_THERE_ACK);
@@ -767,8 +767,8 @@ mod tests {
             let mut buf = [0u8; 8192];
             let n = gw_sock.recv(&mut buf).unwrap();
             let hdr = IsakmpHeader::parse(&buf[..n]).unwrap();
-            let iv0 = crypto1::phase2_iv(gw_st.prf, &gw_st.phase1_iv, hdr.message_id, AES_BLOCK);
-            let (_h, payloads, _next) = phase2::parse_encrypted(&buf[..n], gw_st.prf, &gw_st.skeyid_a, &gw_st.enc_key, &iv0).unwrap();
+            let iv0 = crypto1::phase2_iv(gw_st.prf, &gw_st.phase1_iv, hdr.message_id, gw_st.enc_block);
+            let (_h, payloads, _next) = phase2::parse_encrypted(&buf[..n], gw_st.prf, &gw_st.skeyid_a, &gw_st.enc_key, gw_st.enc_block, &iv0).unwrap();
             let notify = payloads.into_iter().find(|p| p.payload_type == payload::NOTIFY).unwrap();
             let (msg_type, data) = parse_notify(&notify.data).unwrap();
             assert_eq!(msg_type, notify_type::R_U_THERE);
@@ -958,8 +958,8 @@ mod tests {
     fn gateway_reads_notify(gw_st: &Phase1State, datagram: &[u8]) -> (u16, Vec<u8>) {
         let ike = crate::ikev2::natt::unwrap_ike_4500(datagram).expect("the client must send IKE on 4500 with the non-ESP marker");
         let hdr = IsakmpHeader::parse(ike).unwrap();
-        let iv0 = crypto1::phase2_iv(gw_st.prf, &gw_st.phase1_iv, hdr.message_id, AES_BLOCK);
-        let (_h, payloads, _next) = phase2::parse_encrypted(ike, gw_st.prf, &gw_st.skeyid_a, &gw_st.enc_key, &iv0).unwrap();
+        let iv0 = crypto1::phase2_iv(gw_st.prf, &gw_st.phase1_iv, hdr.message_id, gw_st.enc_block);
+        let (_h, payloads, _next) = phase2::parse_encrypted(ike, gw_st.prf, &gw_st.skeyid_a, &gw_st.enc_key, gw_st.enc_block, &iv0).unwrap();
         let notify = payloads.into_iter().find(|p| p.payload_type == payload::NOTIFY).unwrap();
         let (t, d) = parse_notify(&notify.data).unwrap();
         (t, d.to_vec())

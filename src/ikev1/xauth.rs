@@ -18,7 +18,7 @@
 //! exactly what [`super::phase2::parse_encrypted`]/`build_encrypted` already
 //! implement, so this module only supplies the XAUTH-specific payload content.
 
-use super::crypto1::{self, AES_BLOCK};
+use super::crypto1;
 use super::isakmp::{exchange, payload, IsakmpHeader};
 use super::modecfg::{cfg, cfg_attr, xauth_status, xauth_type, ConfigPayload};
 use super::payloads::Attribute;
@@ -59,7 +59,7 @@ pub fn build_xauth_reply(st: &Phase1State, request: &[u8], user: &[u8], password
     if hdr.exchange_type != exchange::TRANSACTION {
         return Err(IkeError::Crypto("expected a Transaction (XAUTH) message"));
     }
-    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, hdr.message_id, AES_BLOCK);
+    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, hdr.message_id, st.enc_block);
     ike_debug!(
         "XAUTH: request msg-id={:08x}, phase1_iv={}, computed iv0={}, ciphertext_len={}",
         hdr.message_id,
@@ -67,7 +67,7 @@ pub fn build_xauth_reply(st: &Phase1State, request: &[u8], user: &[u8], password
         hexfmt(&iv0),
         request.len().saturating_sub(IsakmpHeader::LEN)
     );
-    let (_h, ps, iv1) = phase2::parse_encrypted(request, st.prf, &st.skeyid_a, &st.enc_key, &iv0)?;
+    let (_h, ps, iv1) = phase2::parse_encrypted(request, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0)?;
     let got = ConfigPayload::parse(&attribute_payload(&ps)?.data)?;
     if got.cfg_type != cfg::REQUEST {
         return Err(IkeError::Crypto("expected an XAUTH REQUEST"));
@@ -83,7 +83,7 @@ pub fn build_xauth_reply(st: &Phase1State, request: &[u8], user: &[u8], password
         ],
     );
     let out_hdr = xauth_header(st.cky_i, st.cky_r, hdr.message_id);
-    let (msg, _next) = phase2::build_encrypted(out_hdr, st.prf, &st.skeyid_a, &st.enc_key, &iv1, &[(payload::ATTRIBUTE, reply.to_bytes())])?;
+    let (msg, _next) = phase2::build_encrypted(out_hdr, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv1, &[(payload::ATTRIBUTE, reply.to_bytes())])?;
     Ok(msg)
 }
 
@@ -97,7 +97,7 @@ pub fn build_xauth_ack(st: &Phase1State, set_message: &[u8]) -> Result<(Vec<u8>,
     if hdr.exchange_type != exchange::TRANSACTION {
         return Err(IkeError::Crypto("expected a Transaction (XAUTH) message"));
     }
-    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, hdr.message_id, AES_BLOCK);
+    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, hdr.message_id, st.enc_block);
     ike_debug!(
         "XAUTH: set msg-id={:08x}, phase1_iv={}, computed iv0={}, ciphertext_len={}",
         hdr.message_id,
@@ -105,7 +105,7 @@ pub fn build_xauth_ack(st: &Phase1State, set_message: &[u8]) -> Result<(Vec<u8>,
         hexfmt(&iv0),
         set_message.len().saturating_sub(IsakmpHeader::LEN)
     );
-    let (_h, ps, iv1) = phase2::parse_encrypted(set_message, st.prf, &st.skeyid_a, &st.enc_key, &iv0)?;
+    let (_h, ps, iv1) = phase2::parse_encrypted(set_message, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0)?;
     let got = ConfigPayload::parse(&attribute_payload(&ps)?.data)?;
     if got.cfg_type != cfg::SET {
         return Err(IkeError::Crypto("expected an XAUTH SET"));
@@ -114,7 +114,7 @@ pub fn build_xauth_ack(st: &Phase1State, set_message: &[u8]) -> Result<(Vec<u8>,
 
     let ack = ConfigPayload::new(cfg::ACK, got.identifier, Vec::new());
     let out_hdr = xauth_header(st.cky_i, st.cky_r, hdr.message_id);
-    let (msg, _next) = phase2::build_encrypted(out_hdr, st.prf, &st.skeyid_a, &st.enc_key, &iv1, &[(payload::ATTRIBUTE, ack.to_bytes())])?;
+    let (msg, _next) = phase2::build_encrypted(out_hdr, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv1, &[(payload::ATTRIBUTE, ack.to_bytes())])?;
     Ok((msg, ok))
 }
 
@@ -139,9 +139,9 @@ pub(crate) mod test_gateway {
                 Attribute::long_bytes(cfg_attr::XAUTH_USER_PASSWORD, Vec::new()),
             ],
         );
-        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, AES_BLOCK);
+        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
         let hdr = xauth_header(st.cky_i, st.cky_r, msgid);
-        let (msg, next) = phase2::build_encrypted(hdr, st.prf, &st.skeyid_a, &st.enc_key, &iv0, &[(payload::ATTRIBUTE, req.to_bytes())]).unwrap();
+        let (msg, next) = phase2::build_encrypted(hdr, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0, &[(payload::ATTRIBUTE, req.to_bytes())]).unwrap();
         (msg, next)
     }
 
@@ -150,7 +150,7 @@ pub(crate) mod test_gateway {
     /// message-id), returning the extracted (user, password) and the SET
     /// message granting/denying `accept`.
     pub fn handle_reply(st: &Phase1State, reply: &[u8], req_next_iv: &[u8], msgid: u32, accept: bool) -> ((Vec<u8>, Vec<u8>), Vec<u8>) {
-        let (_h, ps, _iv1) = phase2::parse_encrypted(reply, st.prf, &st.skeyid_a, &st.enc_key, req_next_iv).unwrap();
+        let (_h, ps, _iv1) = phase2::parse_encrypted(reply, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, req_next_iv).unwrap();
         let got = ConfigPayload::parse(&attribute_payload(&ps).unwrap().data).unwrap();
         assert_eq!(got.cfg_type, cfg::REPLY);
         let user = got.attr(cfg_attr::XAUTH_USER_NAME).unwrap().bytes();
@@ -162,9 +162,9 @@ pub(crate) mod test_gateway {
         let set_msgid = msgid.wrapping_add(1);
         let status = if accept { xauth_status::OK } else { xauth_status::FAIL };
         let set = ConfigPayload::new(cfg::SET, 0x3333, vec![Attribute::short(cfg_attr::XAUTH_STATUS, status)]);
-        let iv0_set = crypto1::phase2_iv(st.prf, &st.phase1_iv, set_msgid, AES_BLOCK);
+        let iv0_set = crypto1::phase2_iv(st.prf, &st.phase1_iv, set_msgid, st.enc_block);
         let set_hdr = xauth_header(st.cky_i, st.cky_r, set_msgid);
-        let (set_msg, _next) = phase2::build_encrypted(set_hdr, st.prf, &st.skeyid_a, &st.enc_key, &iv0_set, &[(payload::ATTRIBUTE, set.to_bytes())]).unwrap();
+        let (set_msg, _next) = phase2::build_encrypted(set_hdr, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0_set, &[(payload::ATTRIBUTE, set.to_bytes())]).unwrap();
         ((user, password), set_msg)
     }
 }

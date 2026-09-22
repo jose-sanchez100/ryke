@@ -686,6 +686,10 @@ impl QuickResponder {
 /// send (or to get any reply to) that closing Delete never fails the rekey
 /// itself: the new CHILD SA is already live by that point, and the old one
 /// will eventually be reaped by its own lifetime expiry either way.
+///
+/// `timeout` is per attempt: message 1 goes out up to three times, the same
+/// bytes each time, before the rekey fails as timed out -- with the old
+/// CHILD SA left alone, no Delete sent.
 #[allow(clippy::too_many_arguments)]
 pub fn rekey_child(
     sock: &dyn IkeSocket,
@@ -711,11 +715,12 @@ pub fn rekey_child(
 /// (`ts_local`/`ts_remote` as `(network, prefix length)`, see
 /// [`initiate_quick_ipv6`]). Same transport handling as [`rekey_child`]
 /// (`sock` must be the socket the peer is reachable on, NAT-T floated per
-/// `st.floated`), minus the trailing Delete: nothing is being replaced. An
-/// error Notify from the peer (typically NO-PROPOSAL-CHOSEN /
+/// `st.floated`, `timeout` per attempt), minus the trailing Delete: nothing is
+/// being replaced. An error Notify from the peer (typically NO-PROPOSAL-CHOSEN /
 /// INVALID-ID-INFORMATION when its Phase 2 has no IPv6 selector) comes back as
-/// [`IkeError::PeerRejected`] straight away rather than after `timeout`; the
-/// IPv4 CHILD SA and the Phase-1 SA are unaffected either way.
+/// [`IkeError::PeerRejected`] straight away rather than after the
+/// retransmissions; the IPv4 CHILD SA and the Phase-1 SA are unaffected
+/// either way.
 #[allow(clippy::too_many_arguments)]
 pub fn create_child_ipv6(
     sock: &dyn IkeSocket,
@@ -804,12 +809,24 @@ fn delete_superseded(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl 
     }
 }
 
+/// How many times [`quick_exchange`] sends message 1: once, then again, the
+/// identical bytes, each time `timeout` passes without message 2 (RFC 2408
+/// §5.1) -- the same count `LivenessSession` uses for its IKEv2 requests.
+const QUICK_MODE_ATTEMPTS: u32 = 3;
+
 /// Drive one initiator Quick Mode exchange to completion over `sock`: send
-/// `msg1`, wait (up to `timeout`) for the matching message 2, answer with
-/// message 3, and hand back the derived CHILD SA's SPIs/keys plus the
-/// negotiated lifetime. Datagrams that aren't this exchange's message 2 are
-/// skipped -- except an error Notify from the peer for this ISAKMP SA, which
-/// ends the wait at once as [`IkeError::PeerRejected`].
+/// `msg1`, wait up to `timeout` for the matching message 2 -- resending
+/// `msg1` unchanged when none comes, up to [`QUICK_MODE_ATTEMPTS`] sends in
+/// all -- answer with message 3, and hand back the derived CHILD SA's
+/// SPIs/keys plus the negotiated lifetime. Datagrams that aren't this
+/// exchange's message 2 are skipped -- except an error Notify from the peer
+/// for this ISAKMP SA, which ends the wait at once as
+/// [`IkeError::PeerRejected`], and a Delete of the ISAKMP SA
+/// ([`IkeError::PeerTornDown`]).
+///
+/// Message 3 is sent once: nothing answers it. If it is lost, the gateway's
+/// retransmitted message 2 arrives after this has returned, and goes
+/// unanswered.
 fn quick_exchange(
     sock: &dyn IkeSocket,
     st: &Phase1State,
@@ -820,24 +837,65 @@ fn quick_exchange(
     what: &str,
 ) -> Result<(RekeyedChild, u32), DriverError> {
     let msgid = IsakmpHeader::parse(&msg1)?.message_id;
-    ike_debug!("Quick Mode ({what}): sending msg1 to {peer} (msgid={msgid:08x})");
-    send_ike(sock, st, peer, &msg1)?;
+    let mut msg2 = None;
+    for attempt in 1..=QUICK_MODE_ATTEMPTS {
+        if attempt == 1 {
+            ike_debug!("Quick Mode ({what}): sending msg1 to {peer} (msgid={msgid:08x})");
+        } else {
+            ike_debug!("Quick Mode ({what}): no reply within {timeout:?}, retransmitting msg1 (attempt {attempt}/{QUICK_MODE_ATTEMPTS})");
+        }
+        send_ike(sock, st, peer, &msg1)?;
+        msg2 = await_quick_reply(sock, st, msgid, timeout, what)?;
+        if msg2.is_some() {
+            break;
+        }
+    }
+    let Some(msg2) = msg2 else {
+        ike_debug!("Quick Mode ({what}): no reply to msgid={msgid:08x}, retransmissions included");
+        return Err(IkeError::Crypto("Quick Mode: timed out waiting for the Quick Mode reply").into());
+    };
 
+    let (msg3, child, negotiated_lifetime) = qi.complete(&msg2)?;
+    send_ike(sock, st, peer, &msg3)?;
+
+    let key_out = ChildKeyMaterial {
+        cipher: child.outbound.cipher(),
+        enc: child.outbound.enc_material(),
+        integ: child.outbound.integ_key().to_vec(),
+    };
+    let key_in = ChildKeyMaterial {
+        cipher: child.inbound.cipher(),
+        enc: child.inbound.enc_material(),
+        integ: child.inbound.integ_key().to_vec(),
+    };
+    let rekeyed = RekeyedChild { local_spi: child.inbound.spi(), peer_spi: child.outbound.spi(), key_out, key_in };
+    ike_debug!(
+        "Quick Mode ({what}): complete -- spi_in={:08x} spi_out={:08x}, lifetime {negotiated_lifetime}s",
+        rekeyed.local_spi, rekeyed.peer_spi
+    );
+    Ok((rekeyed, negotiated_lifetime))
+}
+
+/// Wait up to `timeout` for message 2 of the Quick Mode `msgid`, for
+/// [`quick_exchange`]: `None` when none came in time.
+fn await_quick_reply(
+    sock: &dyn IkeSocket,
+    st: &Phase1State,
+    msgid: u32,
+    timeout: Duration,
+    what: &str,
+) -> Result<Option<Vec<u8>>, DriverError> {
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 8192];
-    let msg2 = loop {
+    loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            ike_debug!("Quick Mode ({what}): timed out after {timeout:?} waiting for the gateway's reply");
-            return Err(IkeError::Crypto("Quick Mode: timed out waiting for the Quick Mode reply").into());
+            return Ok(None);
         }
         sock.set_read_timeout(Some(remaining))?;
         let (n, from) = match sock.recv_from(&mut buf) {
             Ok(r) => r,
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                ike_debug!("Quick Mode ({what}): timed out after {timeout:?} waiting for the gateway's reply");
-                return Err(IkeError::Crypto("Quick Mode: timed out waiting for the Quick Mode reply").into());
-            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         crate::debug::dump("<<<", from, &buf[..n]);
@@ -872,28 +930,8 @@ fn quick_exchange(
         if hdr.init_cookie != st.cky_i || hdr.resp_cookie != st.cky_r || hdr.exchange_type != exchange::QUICK || hdr.message_id != msgid {
             continue;
         }
-        break msg;
-    };
-
-    let (msg3, child, negotiated_lifetime) = qi.complete(&msg2)?;
-    send_ike(sock, st, peer, &msg3)?;
-
-    let key_out = ChildKeyMaterial {
-        cipher: child.outbound.cipher(),
-        enc: child.outbound.enc_material(),
-        integ: child.outbound.integ_key().to_vec(),
-    };
-    let key_in = ChildKeyMaterial {
-        cipher: child.inbound.cipher(),
-        enc: child.inbound.enc_material(),
-        integ: child.inbound.integ_key().to_vec(),
-    };
-    let rekeyed = RekeyedChild { local_spi: child.inbound.spi(), peer_spi: child.outbound.spi(), key_out, key_in };
-    ike_debug!(
-        "Quick Mode ({what}): complete -- spi_in={:08x} spi_out={:08x}, lifetime {negotiated_lifetime}s",
-        rekeyed.local_spi, rekeyed.peer_spi
-    );
-    Ok((rekeyed, negotiated_lifetime))
+        return Ok(Some(msg));
+    }
 }
 
 #[cfg(test)]
@@ -1702,6 +1740,79 @@ mod tests {
         );
         assert!(matches!(err, Err(DriverError::Ike(IkeError::Crypto(m))) if m.contains("timed out")), "got {:?}", err.map(|_| ()));
     }
+
+    /// RFC 2408 §5.1: an unanswered message 1 is sent again, byte for byte.
+    /// Here the gateway never gets the first one, and its answer to the second
+    /// is lost; the third gets that same answer again -- what a responder does
+    /// with a request it has already answered -- and the rekey completes as
+    /// usual, trailing Delete included.
+    #[test]
+    fn a_quick_mode_rekey_whose_request_then_reply_is_lost_is_retransmitted_until_answered() {
+        let (isock, rsock, iaddr, raddr) = loopback_pair();
+        let (istate, rstate, mut ie, mut re) = phase1_pair(0x9a01, 0x9a02, iaddr, raddr);
+        let old_local_spi = 0x0bad_beef;
+        let responder = std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            let mut recv = || {
+                let n = rsock.recv(&mut buf).unwrap();
+                buf[..n].to_vec()
+            };
+            let first = recv(); // lost on its way
+            let second = recv();
+            let (msg2, qr) = respond_quick(&rstate, &second, &mut re).unwrap(); // lost on its way back
+            let third = recv();
+            rsock.send_to(&msg2, iaddr).unwrap();
+            let child = qr.complete(&recv()).unwrap();
+            let delete = recv();
+            ([first, second, third], child, delete, rstate)
+        });
+
+        let ts = ([10, 212, 134, 202], [255, 255, 255, 255]);
+        let (rekeyed, lifetime) =
+            rekey_child(&isock, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, ts, ([0; 4], [0; 4]), 1800, Duration::from_millis(300), old_local_spi)
+                .unwrap();
+        assert_eq!(lifetime, 1800);
+        let (requests, mut rchild, delete, rstate) = responder.join().unwrap();
+        assert!(requests.iter().all(|r| *r == requests[0]), "a retransmission must be the same bytes");
+
+        let mut ours = EspSa::new_with_cipher(rekeyed.local_spi, rekeyed.key_in.cipher, &rekeyed.key_in.enc, &rekeyed.key_in.integ).unwrap();
+        let pkt: Vec<u8> = (0..40u8).collect();
+        let sealed = rchild.outbound.seal(&pkt, 4).unwrap();
+        assert_eq!(ours.open(&sealed).unwrap(), (pkt, 4));
+
+        let hdr = IsakmpHeader::parse(&delete).unwrap();
+        let iv0 = crypto1::phase2_iv(rstate.prf, &rstate.phase1_iv, hdr.message_id, rstate.enc_block);
+        let (_h, ps, _iv) = phase2::parse_encrypted(&delete, rstate.prf, &rstate.skeyid_a, &rstate.enc_key, rstate.enc_block, &iv0).unwrap();
+        let del = ps.iter().find(|p| p.payload_type == payload::DELETE).unwrap();
+        assert_eq!(informational::parse_delete(&del.data).unwrap(), (protocol::ESP, &old_local_spi.to_be_bytes()[..]));
+    }
+
+    /// A gateway that never answers gets message 1 three times, the same bytes
+    /// each time, and then the rekey fails as timed out -- with no Delete for
+    /// the old CHILD SA, which is still the one in use.
+    #[test]
+    fn a_quick_mode_rekey_never_answered_fails_after_three_attempts_and_deletes_nothing() {
+        let (isock, rsock, iaddr, raddr) = loopback_pair();
+        let (istate, _rstate, mut ie, _re) = phase1_pair(0x9b01, 0x9b02, iaddr, raddr);
+        let ts = ([10, 212, 134, 202], [255, 255, 255, 255]);
+        let timeout = Duration::from_millis(200);
+        let started = Instant::now();
+        let err = rekey_child(&isock, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, ts, ([0; 4], [0; 4]), 3600, timeout, 0x0bad_beef);
+        let elapsed = started.elapsed();
+        assert!(matches!(err, Err(DriverError::Ike(IkeError::Crypto(m))) if m.contains("timed out")), "got {:?}", err.map(|_| ()));
+        assert!(elapsed >= timeout * 3, "each attempt gets the whole timeout, took {elapsed:?}");
+
+        rsock.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let mut buf = [0u8; 8192];
+        let mut sent = Vec::new();
+        while let Ok(n) = rsock.recv(&mut buf) {
+            sent.push(buf[..n].to_vec());
+        }
+        assert_eq!(sent.len(), 3, "message 1 and two retransmissions, and no Delete");
+        assert!(sent.iter().all(|m| *m == sent[0]), "a retransmission must be the same bytes");
+        assert_eq!(IsakmpHeader::parse(&sent[0]).unwrap().exchange_type, exchange::QUICK);
+    }
+
     /// The reason `IkeSocket` exists: a host whose ESP pump is the only reader
     /// of the IKE socket hands the exchange its IKE datagrams through a
     /// [`ChannelIo`]. A Quick Mode rekey then completes -- reply read from the

@@ -51,14 +51,17 @@
 //!   [`ikev1::quick::rekey_child`] and its IPv6 counterparts, and
 //!   [`ikev1::Established::close_message`].
 //!
-//! Both retransmit their handshake requests, and the IKEv2 session every
-//! request of its own after that too. Neither runs in the background: the
-//! peer's requests are answered only while the caller is inside one of
-//! these calls. Not done in IKEv1: a Quick Mode of its own after `connect`
-//! (a rekey, the IPv6 CHILD SA) is sent once, never retransmitted; a Quick
-//! Mode or a Phase 1 the gateway starts goes unanswered; and the ISAKMP SA
-//! is never rekeyed -- once its lifetime is up, a new `connect` is the way
-//! on.
+//! Both retransmit their requests: the handshake's, and after it every
+//! request of the IKEv2 session's own and each IKEv1 Quick Mode. IKEv1's
+//! liveness check, [`ikev1::informational::probe`], sends one R-U-THERE per
+//! call: repeating it, with a new sequence number (RFC 3706), is the
+//! caller's. Neither runs in the background: the peer's requests are
+//! answered only while the caller is inside one of these calls. Not done in
+//! IKEv1: the last message of an exchange (Aggressive Mode's third, Quick
+//! Mode's third) is sent once, so if it is lost the gateway's retransmission
+//! of the message before it goes unanswered; a Quick Mode or a Phase 1 the
+//! gateway starts goes unanswered; and the ISAKMP SA is never rekeyed --
+//! once its lifetime is up, a new `connect` is the way on.
 //!
 //! ### Bundled servers
 //!

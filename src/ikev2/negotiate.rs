@@ -9,8 +9,15 @@
 //!
 //! ENCR candidates, strongest-first: ChaCha20-Poly1305, AES-GCM-16 (256/192/
 //! 128), AES-CBC (256/192/128), 3DES. PRF/INTEG candidates, strongest-first:
-//! SHA2-512, SHA2-384, SHA2-256, SHA-1, MD5. DH candidates, strongest-first:
-//! X25519, ECP-521/384/256, MODP-8192 down to MODP-768.
+//! SHA2-512, SHA2-384, SHA2-256, SHA-1. DH candidates, strongest-first:
+//! X25519, ECP-521/384/256, MODP-8192 down to MODP-1024.
+//!
+//! PRF_HMAC_MD5, AUTH_HMAC_MD5_96 and MODP-768 (group 1) are deliberately
+//! absent from these tables: RFC 8247 marks all three MUST NOT for IKEv2, so
+//! this crate must neither offer them as an initiator nor accept a peer's
+//! echo of them, even though the wire format and `crypto`/`payload` modules
+//! can still represent them (IKEv1, governed by different RFCs, still uses
+//! them via its own, separate negotiation path).
 //!
 //! Note: an **IKE** proposal carries ENCR, PRF, (INTEG for non-AEAD), and D-H —
 //! but *not* ESN. ESN is only valid for ESP/AH (CHILD SA) proposals
@@ -163,7 +170,6 @@ const PRF_CANDIDATES: &[u16] = &[
     transform_id::PRF_HMAC_SHA2_384,
     transform_id::PRF_HMAC_SHA2_256,
     transform_id::PRF_HMAC_SHA1,
-    transform_id::PRF_HMAC_MD5,
 ];
 
 const INTEG_CANDIDATES: &[u16] = &[
@@ -171,7 +177,6 @@ const INTEG_CANDIDATES: &[u16] = &[
     transform_id::AUTH_HMAC_SHA2_384_192,
     transform_id::AUTH_HMAC_SHA2_256_128,
     transform_id::AUTH_HMAC_SHA1_96,
-    transform_id::AUTH_HMAC_MD5_96,
 ];
 
 const DH_CANDIDATES: &[u16] = &[
@@ -186,7 +191,6 @@ const DH_CANDIDATES: &[u16] = &[
     transform_id::MODP_2048,
     transform_id::MODP_1536,
     transform_id::MODP_1024,
-    transform_id::MODP_768,
 ];
 
 fn select_from_proposal(proposal: &Proposal) -> Option<ChosenSuite> {
@@ -402,21 +406,41 @@ mod tests {
         assert_eq!(chosen.key_lengths().prf, 64);
         assert_eq!(chosen.key_lengths().encr, 36); // 32-byte key + 4-byte salt
 
-        // Legacy classic combo: 3DES + HMAC-MD5-96 + PRF-MD5 + MODP-768.
+        // Legacy classic combo, still supported: 3DES + HMAC-SHA1-96 + PRF-SHA1 + MODP-1024.
         let sa2 = proposal(1, vec![
             tf(transform_type::ENCR, transform_id::TRIPLE_DES, None),
-            tf(transform_type::INTEG, transform_id::AUTH_HMAC_MD5_96, None),
-            tf(transform_type::PRF, transform_id::PRF_HMAC_MD5, None),
-            tf(transform_type::DH, transform_id::MODP_768, None),
+            tf(transform_type::INTEG, transform_id::AUTH_HMAC_SHA1_96, None),
+            tf(transform_type::PRF, transform_id::PRF_HMAC_SHA1, None),
+            tf(transform_type::DH, transform_id::MODP_1024, None),
         ]);
         let chosen2 = select(&sa2).unwrap();
         assert_eq!(chosen2.encr_id, transform_id::TRIPLE_DES);
         assert_eq!(chosen2.encr_key_bits, 192);
-        assert_eq!(chosen2.integ_id, Some(transform_id::AUTH_HMAC_MD5_96));
-        assert_eq!(chosen2.dh_id, transform_id::MODP_768);
+        assert_eq!(chosen2.integ_id, Some(transform_id::AUTH_HMAC_SHA1_96));
+        assert_eq!(chosen2.dh_id, transform_id::MODP_1024);
         assert_eq!(chosen2.key_lengths().encr, 24); // 3DES key, no salt
-        assert_eq!(chosen2.key_lengths().integ, 16); // HMAC-MD5 key length
-        assert_eq!(chosen2.key_lengths().prf, 16);
+    }
+
+    #[test]
+    fn rejects_the_rfc8247_must_not_algorithms() {
+        // PRF_HMAC_MD5 and AUTH_HMAC_MD5_96 (RFC 8247 §2.3/§2.4) and
+        // MODP-768/group 1 (RFC 8247 §2.5) must never be selectable for
+        // IKEv2, even though `ikev2::payload`/`crypto` can still represent
+        // them (IKEv1 still uses them via its own negotiation path).
+        let md5 = proposal(1, vec![
+            tf(transform_type::ENCR, transform_id::TRIPLE_DES, None),
+            tf(transform_type::INTEG, transform_id::AUTH_HMAC_MD5_96, None),
+            tf(transform_type::PRF, transform_id::PRF_HMAC_MD5, None),
+            tf(transform_type::DH, transform_id::MODP_2048, None),
+        ]);
+        assert!(select(&md5).is_none());
+
+        let modp768 = proposal(1, vec![
+            tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)),
+            tf(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, None),
+            tf(transform_type::DH, transform_id::MODP_768, None),
+        ]);
+        assert!(select(&modp768).is_none());
     }
 
     #[test]

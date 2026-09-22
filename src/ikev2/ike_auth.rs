@@ -677,12 +677,18 @@ pub fn client_sent_certreq(sa: &CompletedSaInit, request: &[u8]) -> bool {
 /// the tunnel. Returned by [`initiator_verify_auth`].
 pub type VerifiedAuth = (Identification, u32, Option<ChosenEspSuite>, Option<Ipv4Addr>, Option<TrafficSelectors>);
 
-/// Initiator: decrypt + verify the responder's `IKE_AUTH` response. See
+/// Initiator: decrypt + verify the responder's `IKE_AUTH` response. `esp_offer`
+/// must be the same CHILD SA proposal template this side actually sent (see
+/// [`initiator_auth_request_with_cfg`]'s doc) -- the responder's SAr2 is
+/// checked against it (RFC 7296 §2.7) so a peer can't answer with an
+/// ENCR/INTEG/ESN combination it never actually saw offered (see
+/// [`ChosenEspSuite::matches_offer`]'s doc for why that matters). See
 /// [`VerifiedAuth`] for the returned fields.
 pub fn initiator_verify_auth(
     sa: &CompletedSaInit,
     response: &[u8],
     cfg: &AuthConfig,
+    esp_offer: &SecurityAssociation,
 ) -> Result<VerifiedAuth, IkeError> {
     // The responder encrypts with SK_er.
     let (first, inner) = open_encrypted(sa.suite.sk_cipher(), response, &sa.keys.sk_er, &sa.keys.sk_ar)?;
@@ -697,6 +703,11 @@ pub fn initiator_verify_auth(
         return Err(IkeError::PeerRejected { notify_type: t, name: notify_type_name(t) });
     }
     let peer_child_spi = got.child_spi.ok_or(IkeError::MissingPayload("SA"))?;
+    if let Some(suite) = &got.esp_suite {
+        if !suite.matches_offer(esp_offer) {
+            return Err(IkeError::NoProposalChosen);
+        }
+    }
     Ok((Identification::parse(&got.id_body)?, peer_child_spi, got.esp_suite, got.assigned_ip4, got.tsr))
 }
 
@@ -750,7 +761,7 @@ mod tests {
         assert_eq!(learned_initiator, Identification::fqdn("client.example"));
         assert_eq!(init_spi, 0xDEADBEEF); // and learned its CHILD SA SPI
 
-        let (learned_responder, resp_spi, _esp_suite, _assigned, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg).unwrap();
+        let (learned_responder, resp_spi, _esp_suite, _assigned, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0)).unwrap();
         assert_eq!(learned_responder, Identification::fqdn("gw.example"));
         assert_eq!(resp_spi, 0xCAFEBABE); // initiator learned the responder's CHILD SA SPI
     }
@@ -805,7 +816,7 @@ mod tests {
         let (resp, learned_i, _spi, _ic) =
             responder_process_auth(&resp_sa, &req, &rcfg, 0xCAFEBABE, &[2u8; 8], Some(&assigned)).unwrap();
         assert_eq!(learned_i, Identification::fqdn("client.example"));
-        let (_learned_r, _rspi, _esp_suite, got_ip, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg).unwrap();
+        let (_learned_r, _rspi, _esp_suite, got_ip, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0)).unwrap();
         assert_eq!(got_ip, Some(Ipv4Addr::new(10, 8, 0, 4)));
     }
 
@@ -817,7 +828,7 @@ mod tests {
         let rcfg = AuthConfig::psk(Identification::fqdn("s"), psk);
         let req = initiator_auth_request(&init_sa, &icfg, 1, &esp_offer(0), &[1u8; 8]).unwrap();
         let (resp, _, _, _ic) = responder_process_auth(&resp_sa, &req, &rcfg, 2, &[2u8; 8], None).unwrap();
-        let (_, _, _esp_suite, got_ip, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg).unwrap();
+        let (_, _, _esp_suite, got_ip, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0)).unwrap();
         assert_eq!(got_ip, None);
     }
 
@@ -857,7 +868,7 @@ mod tests {
             let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), psk);
             let resp = child_rejected_response(&resp_sa, &rcfg, error);
             assert_eq!(
-                initiator_verify_auth(&init_sa, &resp, &icfg).unwrap_err(),
+                initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0)).unwrap_err(),
                 IkeError::PeerRejected { notify_type: error, name: notify_type_name(error) },
             );
         }
@@ -871,7 +882,7 @@ mod tests {
         let icfg = AuthConfig::psk(Identification::fqdn("client.example"), b"right".to_vec());
         let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), b"wrong".to_vec());
         let resp = child_rejected_response(&resp_sa, &rcfg, notify_type::TS_UNACCEPTABLE);
-        assert_eq!(initiator_verify_auth(&init_sa, &resp, &icfg).unwrap_err(), IkeError::AuthFailed);
+        assert_eq!(initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0)).unwrap_err(), IkeError::AuthFailed);
     }
 
     #[test]
@@ -883,7 +894,47 @@ mod tests {
         let icfg = AuthConfig::psk(Identification::fqdn("client.example"), psk.clone());
         let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), psk);
         let resp = child_rejected_response(&resp_sa, &rcfg, notify_type::AUTHENTICATION_FAILED);
-        assert_eq!(initiator_verify_auth(&init_sa, &resp, &icfg).unwrap_err(), IkeError::MissingPayload("SA"));
+        assert_eq!(initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0)).unwrap_err(), IkeError::MissingPayload("SA"));
+    }
+
+    #[test]
+    fn initiator_rejects_an_esp_suite_the_responder_never_actually_offered() {
+        // We offer AES-GCM-256 (`esp_offer`'s default). A responder answering
+        // with AES-CBC-128/HMAC-SHA1-96 -- a combination `select_esp`/
+        // `sk::SkCipher` can decode just fine -- must be rejected rather than
+        // silently accepted as if we had proposed it (RFC 7296 §2.7).
+        let (init_sa, resp_sa) = run_sa_init();
+        let psk = b"pw".to_vec();
+        let icfg = AuthConfig::psk(Identification::fqdn("client.example"), psk.clone());
+        let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), psk);
+
+        let idr_body = rcfg.id.to_bytes();
+        let octets = responder_signed_octets(resp_sa.suite.prf_algorithm(), &resp_sa.resp_message, &resp_sa.ni, &resp_sa.keys.sk_pr, &idr_body);
+        let (auth, certs) = build_local_auth(&rcfg, &resp_sa, &octets).unwrap();
+        let downgrade = SecurityAssociation {
+            proposals: vec![Proposal {
+                num: 1,
+                protocol_id: protocol_id::ESP,
+                spi: 0xCAFEBABEu32.to_be_bytes().to_vec(),
+                transforms: vec![
+                    Transform { transform_type: transform_type::ENCR, transform_id: transform_id::AES_CBC, key_length: Some(128) },
+                    Transform { transform_type: transform_type::INTEG, transform_id: transform_id::AUTH_HMAC_SHA1_96, key_length: None },
+                    Transform { transform_type: transform_type::ESN, transform_id: transform_id::ESN_NONE, key_length: None },
+                ],
+            }],
+        };
+        let mut inner = vec![(PayloadType::IdResponder, idr_body)];
+        inner.extend(certs);
+        inner.push((PayloadType::Authentication, auth.to_bytes()));
+        inner.push((PayloadType::SecurityAssociation, downgrade.to_bytes()));
+        inner.push((PayloadType::TrafficSelectorInitiator, full_tunnel_ts()));
+        inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+        let first = first_payload_type(&inner);
+        let bytes = encode_payload_chain(&inner);
+        let response = build_encrypted(resp_sa.suite.sk_cipher(), ike_auth_header(&resp_sa, true), first, &bytes, &resp_sa.keys.sk_er, &resp_sa.keys.sk_ar, &[2u8; 8]).unwrap();
+
+        let err = initiator_verify_auth(&init_sa, &response, &icfg, &esp_offer(0)).unwrap_err();
+        assert_eq!(err, IkeError::NoProposalChosen);
     }
 
     #[test]
@@ -937,7 +988,7 @@ mod tests {
         let req = initiator_auth_request(&init_sa, &cert_config(), 0xDEADBEEF, &esp_offer(0), &[1u8; 8]).unwrap();
         let (resp, learned_i, _init_spi, _ic) = responder_process_auth(&resp_sa, &req, &cert_config(), 0xCAFEBABE, &[2u8; 8], None).unwrap();
         assert_eq!(learned_i, Identification::fqdn("vpn.example.com"));
-        let (learned_r, _resp_spi, _esp_suite, _assigned, _tsr) = initiator_verify_auth(&init_sa, &resp, &cert_config()).unwrap();
+        let (learned_r, _resp_spi, _esp_suite, _assigned, _tsr) = initiator_verify_auth(&init_sa, &resp, &cert_config(), &esp_offer(0)).unwrap();
         assert_eq!(learned_r, Identification::fqdn("vpn.example.com"));
     }
 

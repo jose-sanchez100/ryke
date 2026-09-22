@@ -174,10 +174,11 @@ impl<E: Entropy> Client<E> {
         self.enable_natt_encap(floated)?;
         let mut iv = [0u8; 8];
         self.entropy.fill(&mut iv);
-        let request = ike_auth::initiator_auth_request(sa, cfg, child_spi, &ike_auth::esp_offer(0), &iv)?;
+        let esp_offer = ike_auth::esp_offer(0);
+        let request = ike_auth::initiator_auth_request(sa, cfg, child_spi, &esp_offer, &iv)?;
         self.send_step(&request, server, floated)?;
         let response = self.recv_step(floated)?;
-        let (id, spi, _esp_suite, ip4, _tsr) = ike_auth::initiator_verify_auth(sa, &response, cfg)?;
+        let (id, spi, _esp_suite, ip4, _tsr) = ike_auth::initiator_verify_auth(sa, &response, cfg, &esp_offer)?;
         Ok((id, spi, ip4))
     }
 

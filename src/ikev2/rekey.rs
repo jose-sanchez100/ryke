@@ -28,6 +28,7 @@ use crate::error::IkeError;
 use crate::esp::ChildSa;
 use crate::ikev2::exchange::CompletedSaInit;
 use crate::ikev2::ike_auth::esp_offer_for_cipher;
+use crate::ikev2::negotiate;
 use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
 };
@@ -552,6 +553,18 @@ pub fn initiator_complete_child(
     let peer_sa = SecurityAssociation::parse(&sa_bytes)?;
     let pfs_group = dh_transform_id(&peer_sa).and_then(DhGroup::from_transform_id);
 
+    // RFC 7296 §2.7: the response's ESP proposal must be built from the offer
+    // we actually sent (`esp_offer_for_cipher(_, cipher)` -- `build_child_request`/
+    // `build_rekey_request_with_pfs` never send anything else), not merely a
+    // combination `select_esp` can decode. Without this, a peer could answer
+    // a rekey/new-CHILD-SA request with a different cipher (or turn ESN on)
+    // and we'd derive keys for `cipher` while the peer runs something else,
+    // or silently disagree about the sequence-number space.
+    let peer_esp_suite = negotiate::select_esp(&peer_sa).ok_or(IkeError::NoProposalChosen)?;
+    if !peer_esp_suite.matches_offer(&esp_offer_for_cipher(0, cipher)) {
+        return Err(IkeError::NoProposalChosen);
+    }
+
     let peer_ke = find_ke(first, &inner)?;
     let pfs_secret = match (pfs_group, peer_ke, dh_private) {
         (Some(group), Some(ke), Some(our_priv)) => {
@@ -969,6 +982,38 @@ mod tests {
             matches!(err, IkeError::PeerRejected { notify_type: notify_type::TS_UNACCEPTABLE, .. }),
             "expected PeerRejected(TS_UNACCEPTABLE), got {err:?}"
         );
+    }
+
+    /// We ask `initiator_complete_child` to complete a rekey running
+    /// AES-256-GCM. A response whose SA proposal actually names
+    /// AES-CBC-128/HMAC-SHA1-96 -- a combination `select_esp`/`sk::SkCipher`
+    /// can decode fine -- must be rejected (RFC 7296 §2.7), not accepted
+    /// while we go on deriving keys for the cipher we expected.
+    #[test]
+    fn initiator_rejects_a_create_child_sa_response_with_an_unoffered_cipher() {
+        let (init_sa, resp_sa) = sa_pair();
+        let downgrade = esp_offer_for_cipher(0x2222_2222, SkCipher::Aes128Cbc(IntegAlgorithm::HmacSha1_96));
+        let ts = TrafficSelectors::ipv4_full_tunnel();
+        let inner = vec![
+            (PayloadType::SecurityAssociation, downgrade.to_bytes()),
+            (PayloadType::Nonce, vec![0x44; 32]),
+            (PayloadType::TrafficSelectorInitiator, ts.to_bytes()),
+            (PayloadType::TrafficSelectorResponder, ts.to_bytes()),
+        ];
+        let first = first_payload_type(&inner);
+        let resp = build_encrypted(
+            resp_sa.suite.sk_cipher(),
+            create_child_header(&resp_sa, 2, true),
+            first,
+            &encode_payload_chain(&inner),
+            our_sk_e(&resp_sa),
+            our_sk_a(&resp_sa),
+            &[2u8; 8],
+        )
+        .unwrap();
+
+        let err = initiator_complete_child(&init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, None, &resp).err().unwrap();
+        assert_eq!(err, IkeError::NoProposalChosen);
     }
 
     fn extract_tsi(resp: &[u8], init_sa: &CompletedSaInit) -> Vec<u8> {

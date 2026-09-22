@@ -248,6 +248,12 @@ pub struct ChosenEspSuite {
     pub encr_id: u16,
     pub encr_key_bits: u16,
     pub integ_id: Option<u16>,
+    /// Whether the proposal named `ESN_ENABLED` -- an absent ESN transform
+    /// (some peers omit it) is taken as `false`, same convention as
+    /// [`crate::ikev2::rekey`]'s `choose_child_proposal`. This crate's data
+    /// plane ([`crate::esp`]) only implements plain 32-bit sequence numbers,
+    /// so `matches_offer` rejects a peer that turns ESN on.
+    pub esn: bool,
 }
 
 impl ChosenEspSuite {
@@ -256,6 +262,51 @@ impl ChosenEspSuite {
     /// doesn't implement.
     pub fn sk_cipher(&self) -> Option<crate::ikev2::sk::SkCipher> {
         crate::ikev2::sk::SkCipher::from_encr_integ(self.encr_id, self.encr_key_bits, self.integ_id)
+    }
+
+    /// Whether every transform this suite names was actually present in
+    /// `offer`'s ESP/AH proposal. Mirrors [`ChosenSuite::matches_offer`] for
+    /// the CHILD SA: RFC 7296 §2.7 requires the peer's SAr2/SAi2 answer to be
+    /// built from the ESP proposal *we* sent, not merely a combination
+    /// `select_esp`/`sk::SkCipher` knows how to decode. Without this check, a
+    /// misbehaving or on-path peer could answer e.g. AES-CBC-128/HMAC-SHA1 to
+    /// an AES-GCM-256-only ESP offer (silently downgrading the data-plane
+    /// cipher we derive and run), or turn ESN on when we only offered
+    /// `ESN_NONE` (this crate's 32-bit ESP sequence counters would then
+    /// disagree with what the peer believes it negotiated).
+    pub fn matches_offer(&self, offer: &SecurityAssociation) -> bool {
+        let Some(proposal) = offer.proposals.iter().find(|p| p.protocol_id == protocol_id::ESP) else {
+            return false;
+        };
+        let encr_key_bits = if fixed_key_bits(self.encr_id).is_some() { None } else { Some(self.encr_key_bits) };
+        if !has(proposal, transform_type::ENCR, self.encr_id, encr_key_bits) {
+            return false;
+        }
+        match self.integ_id {
+            Some(integ) => {
+                if !has(proposal, transform_type::INTEG, integ, None) {
+                    return false;
+                }
+            }
+            None => {
+                if proposal.transforms.iter().any(|t| t.transform_type == transform_type::INTEG) {
+                    return false;
+                }
+            }
+        }
+        let wanted_esn = if self.esn { transform_id::ESN_ENABLED } else { transform_id::ESN_NONE };
+        esn_matches(proposal, wanted_esn)
+    }
+}
+
+/// Whether `proposal`'s ESN transform (if any) is `esn_id` -- an altogether
+/// absent ESN transform is taken as `ESN_NONE`, same convention
+/// [`crate::ikev2::rekey`]'s `choose_child_proposal` already uses.
+fn esn_matches(proposal: &Proposal, esn_id: u16) -> bool {
+    let mut named = proposal.transforms.iter().filter(|t| t.transform_type == transform_type::ESN).map(|t| t.transform_id);
+    match named.next() {
+        Some(_) => proposal.transforms.iter().any(|t| t.transform_type == transform_type::ESN && t.transform_id == esn_id),
+        None => esn_id == transform_id::ESN_NONE,
     }
 }
 
@@ -271,7 +322,11 @@ pub fn select_esp(sa: &SecurityAssociation) -> Option<ChosenEspSuite> {
         .iter()
         .find(|t| t.transform_type == transform_type::INTEG)
         .map(|t| t.transform_id);
-    Some(ChosenEspSuite { encr_id: encr.transform_id, encr_key_bits, integ_id })
+    let esn = proposal
+        .transforms
+        .iter()
+        .any(|t| t.transform_type == transform_type::ESN && t.transform_id == transform_id::ESN_ENABLED);
+    Some(ChosenEspSuite { encr_id: encr.transform_id, encr_key_bits, integ_id, esn })
 }
 
 #[cfg(test)]
@@ -447,5 +502,87 @@ mod tests {
     fn select_esp_ignores_a_non_esp_proposal() {
         let sa = proposal(1, vec![tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256))]);
         assert_eq!(select_esp(&sa), None);
+    }
+
+    #[test]
+    fn select_esp_reads_esn_enabled() {
+        let sa = esp_proposal(vec![
+            tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)),
+            tf(transform_type::ESN, transform_id::ESN_ENABLED, None),
+        ]);
+        assert!(select_esp(&sa).unwrap().esn);
+    }
+
+    #[test]
+    fn select_esp_treats_a_missing_esn_transform_as_none() {
+        let sa = esp_proposal(vec![tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256))]);
+        assert!(!select_esp(&sa).unwrap().esn);
+    }
+
+    #[test]
+    fn esp_suite_matches_offer_accepts_exactly_what_was_offered() {
+        let offer = esp_proposal(vec![
+            tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)),
+            tf(transform_type::ESN, transform_id::ESN_NONE, None),
+        ]);
+        let chosen = select_esp(&offer).unwrap();
+        assert!(chosen.matches_offer(&offer));
+    }
+
+    #[test]
+    fn esp_suite_matches_offer_rejects_a_downgraded_cipher() {
+        // We offered AES-GCM-256 only; a peer answering AES-CBC-128/HMAC-SHA1
+        // (a combination `sk::SkCipher` can decode fine) must not pass as if
+        // we had proposed it.
+        let offer = esp_proposal(vec![
+            tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)),
+            tf(transform_type::ESN, transform_id::ESN_NONE, None),
+        ]);
+        let answer = esp_proposal(vec![
+            tf(transform_type::ENCR, transform_id::AES_CBC, Some(128)),
+            tf(transform_type::INTEG, transform_id::AUTH_HMAC_SHA1_96, None),
+            tf(transform_type::ESN, transform_id::ESN_NONE, None),
+        ]);
+        let chosen = select_esp(&answer).unwrap();
+        assert!(!chosen.matches_offer(&offer));
+    }
+
+    #[test]
+    fn esp_suite_matches_offer_rejects_esn_turned_on() {
+        // We only ever offer ESN_NONE (no ESN implementation in the data
+        // plane); a peer flipping it to ESN_ENABLED must be rejected even
+        // though the ENCR/INTEG match exactly.
+        let offer = esp_proposal(vec![
+            tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)),
+            tf(transform_type::ESN, transform_id::ESN_NONE, None),
+        ]);
+        let answer = esp_proposal(vec![
+            tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)),
+            tf(transform_type::ESN, transform_id::ESN_ENABLED, None),
+        ]);
+        let chosen = select_esp(&answer).unwrap();
+        assert!(!chosen.matches_offer(&offer));
+    }
+
+    #[test]
+    fn esp_suite_matches_offer_rejects_integ_forced_onto_an_aead_offer() {
+        let offer = esp_proposal(vec![
+            tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)),
+            tf(transform_type::ESN, transform_id::ESN_NONE, None),
+        ]);
+        let answer = esp_proposal(vec![
+            tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)),
+            tf(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, None),
+            tf(transform_type::ESN, transform_id::ESN_NONE, None),
+        ]);
+        let chosen = select_esp(&answer).unwrap();
+        assert!(!chosen.matches_offer(&offer));
+    }
+
+    #[test]
+    fn esp_suite_matches_offer_rejects_a_non_esp_offer() {
+        let chosen = ChosenEspSuite { encr_id: transform_id::AES_GCM_16, encr_key_bits: 256, integ_id: None, esn: false };
+        let offer = proposal(1, vec![tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256))]);
+        assert!(!chosen.matches_offer(&offer));
     }
 }

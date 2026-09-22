@@ -1878,7 +1878,7 @@ impl<E: Entropy> Ikev2Session<E> {
         let response =
             send_and_retry_reassembling(&sock, dest, &wire, float, sa.suite.sk_cipher(), &sa.keys.sk_er, &sa.keys.sk_ar)?;
 
-        let (_peer_id, peer_spi, esp_suite, assigned_ip4, tsr) = match ike_auth::initiator_verify_auth(&sa, &response, cfg) {
+        let (_peer_id, peer_spi, esp_suite, assigned_ip4, tsr) = match ike_auth::initiator_verify_auth(&sa, &response, cfg, esp_offer) {
             Ok(v) => v,
             Err(e) => {
                 // RFC 7296 §1.2: an authenticated peer that refused only the

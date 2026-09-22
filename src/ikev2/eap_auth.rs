@@ -523,8 +523,20 @@ impl EapInitiator {
                 return Ok(EapEvent::Failed(None));
             };
             if got.method == auth_method::SHARED_KEY && got.data == expect {
+                let esp_suite = SecurityAssociation::parse(sar2).ok().and_then(|sa| negotiate::select_esp(&sa));
+                // RFC 7296 §2.7: the responder's SAr2 must be built from the
+                // ESP proposal we actually offered, not merely one
+                // `select_esp` knows how to decode -- see
+                // ChosenEspSuite::matches_offer's doc. Once the MSK-keyed
+                // AUTH above has verified, a mismatch here is a downgrade
+                // attempt, not a malformed message.
+                if let Some(suite) = &esp_suite {
+                    if !suite.matches_offer(&self.esp_offer) {
+                        return Err(IkeError::NoProposalChosen);
+                    }
+                }
                 self.peer_child_spi = esp_spi_from_sa(sar2);
-                self.peer_esp_suite = SecurityAssociation::parse(sar2).ok().and_then(|sa| negotiate::select_esp(&sa));
+                self.peer_esp_suite = esp_suite;
                 if let Some(cp) = find(&ps, PayloadType::Configuration).and_then(|d| Configuration::parse(d).ok()) {
                     self.assigned_ip4 = cp.assigned_ipv4();
                     self.configuration = Some(cp);
@@ -817,7 +829,7 @@ mod tests {
     use super::*;
     use crate::entropy::SeedEntropy;
     use crate::ikev2::exchange::{default_offer, initiator_complete, initiator_request, responder_respond, LocalSecret};
-    use crate::ikev2::payload::{notify_type, Notify};
+    use crate::ikev2::payload::{notify_type, protocol_id, transform_id, transform_type, Notify, Proposal, Transform};
     use crate::test_certs::{CA_CERT_DER, LEAF_CERT_DER, LEAF_SCALAR, RSA_KEY_PK8};
 
     #[derive(PartialEq, Eq, Debug)]
@@ -986,6 +998,41 @@ mod tests {
         let (mut initiator, responder, final_msg) = run_to_final_message();
         let rejected = child_rejected_final(&initiator, &responder, &final_msg, notify_type::TS_UNACCEPTABLE, true);
         assert!(matches!(initiator.handle(&rejected, &mut SeedEntropy::new(1)), Ok(EapEvent::Failed(None))));
+    }
+
+    #[test]
+    fn eap_final_message_with_an_unoffered_esp_suite_is_rejected() {
+        // `EapInitiator` offers AES-GCM-256 by default. A responder whose
+        // final message's SAr2 names AES-CBC-128/HMAC-SHA1-96 instead -- a
+        // combination `select_esp`/`sk::SkCipher` can decode fine -- must be
+        // rejected, not silently accepted as the negotiated cipher (RFC 7296
+        // §2.7): the AUTH doesn't cover SA/TS, so a compromised or on-path
+        // responder that already knows how to pass EAP could otherwise
+        // downgrade the data-plane cipher undetected.
+        let (mut initiator, responder, final_msg) = run_to_final_message();
+        let (msg_id, ps) = decrypt(&initiator.sa, &final_msg).unwrap();
+        let mut inner: Payloads = ps
+            .into_iter()
+            .filter(|(t, _)| matches!(t, PayloadType::IdResponder | PayloadType::Authentication))
+            .collect();
+        let downgrade = SecurityAssociation {
+            proposals: vec![Proposal {
+                num: 1,
+                protocol_id: protocol_id::ESP,
+                spi: 0x2222u32.to_be_bytes().to_vec(),
+                transforms: vec![
+                    Transform { transform_type: transform_type::ENCR, transform_id: transform_id::AES_CBC, key_length: Some(128) },
+                    Transform { transform_type: transform_type::INTEG, transform_id: transform_id::AUTH_HMAC_SHA1_96, key_length: None },
+                    Transform { transform_type: transform_type::ESN, transform_id: transform_id::ESN_NONE, key_length: None },
+                ],
+            }],
+        };
+        inner.push((PayloadType::SecurityAssociation, downgrade.to_bytes()));
+        inner.push((PayloadType::TrafficSelectorInitiator, full_tunnel_ts()));
+        inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+        let tampered = build_sk(&responder.sa, msg_id, true, &inner, &[3u8; 8]).unwrap();
+        let err = initiator.handle(&tampered, &mut SeedEntropy::new(1)).unwrap_err();
+        assert_eq!(err, IkeError::NoProposalChosen);
     }
 
     #[test]

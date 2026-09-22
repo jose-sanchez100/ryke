@@ -38,7 +38,7 @@ use crate::ikev2::exchange::{
 use crate::ikev2::fragment;
 use crate::ikev2::ike_auth::{self, AuthConfig, ChildTsOffer};
 use crate::ikev2::ike_rekey;
-use crate::ikev2::informational::{build_informational, dpd_request, open_informational};
+use crate::ikev2::informational::{build_informational, dpd_request, open_from_peer, payload_list};
 use crate::ikev2::message::{payloads, ExchangeType, IkeHeader, PayloadType};
 use crate::ikev1::quick::{ChildKeyMaterial, RekeyedChild};
 use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
@@ -183,7 +183,55 @@ const MESSAGE_IDS_KEPT_FOR_ENDING: u32 = 64;
 /// routine cleanup and not the tunnel going down.
 struct RetiredIkeSa {
     sa: CompletedSaInit,
+    /// Its receive window, which goes on as it was (RFC 7296 §2.2).
+    requests: PeerRequests,
+    /// The peer deleted it: nothing but a retransmission of that Delete is
+    /// answered on it any more.
+    deleted: bool,
     since: Instant,
+}
+
+impl RetiredIkeSa {
+    fn new(sa: CompletedSaInit, requests: PeerRequests) -> Self {
+        RetiredIkeSa { sa, requests, deleted: false, since: Instant::now() }
+    }
+}
+
+/// Which of this session's IKE SAs a message from the peer is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnIkeSa {
+    Current,
+    Retired,
+}
+
+/// A request from the peer this session answered, and the answer as sent.
+struct AnsweredRequest {
+    message_id: u32,
+    request: Vec<u8>,
+    response: Vec<u8>,
+    /// Whether it ended the tunnel.
+    tears_down: bool,
+}
+
+/// The receiving side of an IKE SA's Message IDs (RFC 7296 §2.1-§2.3): the
+/// ID the peer's next request carries, and the answer to its last one. The
+/// window is one request wide -- this side never sends `SET_WINDOW_SIZE` --
+/// so the only request answered is the next one; the last one, sent again
+/// byte for byte, is a retransmission and gets the same answer without being
+/// acted on again (§2.1), and anything else is dropped unanswered: an older
+/// request is a replay, a later one is outside the window, and a different
+/// request under the last one's ID is neither (INVALID_MESSAGE_ID, which may
+/// be sent, is not, §2.3). Kept apart from the IDs of our own requests
+/// (`LivenessSession::next_message_id`): the two ends number their requests
+/// independently (§2.2).
+#[derive(Default)]
+struct PeerRequests {
+    /// `None` until the first request is answered. RFC 7296 §2.2 has the
+    /// peer's first request carry 0; whichever authentic one comes first is
+    /// taken instead, since nothing on this IKE SA was answered before it
+    /// that it could be a replay of.
+    next: Option<u64>,
+    last: Option<AnsweredRequest>,
 }
 
 /// Where this session's IKE SA is in its life -- see [`LivenessSession::rekey_ike`].
@@ -262,10 +310,6 @@ struct PeerChildState {
     /// Rekeys answered but not yet collected ([`LivenessSession::take_peer_rekeys`]).
     pending: Vec<PeerRekeyedChild>,
     superseded: Vec<SupersededChild>,
-    /// The last rekey request answered and the answer sent, to repeat if the
-    /// peer retransmits the request because that answer was lost -- the
-    /// request itself no longer names an SA this side knows.
-    last: Option<(Vec<u8>, Vec<u8>)>,
     /// A CHILD SA the peer deleted outright (not superseding it with a rekey)
     /// while the other family was still up -- not yet collected
     /// ([`LivenessSession::take_peer_deleted_children`]). The caller
@@ -408,18 +452,13 @@ pub struct LivenessSession {
     /// [`Self::answer_peer_request`] tears the whole tunnel down instead of
     /// clearing this.
     primary_child_alive: bool,
-    /// The last INFORMATIONAL request from the peer this session answered
-    /// (its raw bytes, the response wire bytes, and whether that response
-    /// tore the tunnel down), to resend verbatim if the peer retransmits it
-    /// because our answer was lost -- RFC 7296 §2.1 requires a retransmitted
-    /// request to get the identical response. Without this, re-processing a
-    /// retransmitted Delete could answer differently the second time (e.g.
-    /// state already updated by the first pass, like `peer_child.superseded`
-    /// having the matching entry removed) even though it's the same request,
-    /// leaving the peer without confirmation of the SPI it's still waiting
-    /// to hear deleted. Mirrors [`PeerChildState::last`]'s same trick for
-    /// `CREATE_CHILD_SA`.
-    last_informational_ack: Option<(Vec<u8>, Vec<u8>, bool)>,
+    /// The current IKE SA's receive window: which request of the peer's is
+    /// answered next, and the answer to resend verbatim when the peer
+    /// retransmits the last one because our answer was lost (RFC 7296 §2.1)
+    /// -- acting on it again could answer differently, state having moved on
+    /// (a `peer_child.superseded` entry gone, say), and leave the peer
+    /// without the Delete it waits for.
+    peer_requests: PeerRequests,
 }
 
 /// Result of one [`LivenessSession::probe`] call.
@@ -428,13 +467,13 @@ pub enum Liveness {
     /// The peer answered our DPD probe -- still up.
     Alive,
     /// An unsolicited INFORMATIONAL carrying a Delete payload for the whole
-    /// IKE SA -- or for the CHILD SA this session currently relies on --
+    /// IKE SA -- or for the CHILD SAs this session currently relies on --
     /// arrived from the peer: it tore the tunnel down on its own initiative
     /// (e.g. an admin disconnected it on the gateway). Already ack'd on the
     /// peer's behalf before returning. A CHILD SA Delete naming some *other*
-    /// SPI is not this -- see [`LivenessSession::recv_and_classify`]'s doc:
-    /// that's routine post-rekey cleanup of the SA [`LivenessSession::rekey_child`]
-    /// just superseded, and does not end the tunnel.
+    /// SPI is not this -- see [`LivenessSession::answer_peer_informational`]'s
+    /// doc: that's routine post-rekey cleanup of the SA a rekey just
+    /// superseded, and does not end the tunnel.
     PeerTornDown,
     /// No reply within the timeout. Could be transient packet loss rather
     /// than a dead peer -- callers should require a few consecutive misses
@@ -526,34 +565,6 @@ impl LivenessSession {
         self.recv_and_classify(timeout, None)
     }
 
-    /// Shared receive loop for `probe`/`peek`: reads until `timeout`
-    /// elapses, classifying whatever arrives. A request arriving from the
-    /// peer instead of our own ack (typically carrying a Delete payload,
-    /// since a peer tearing the SA down sends one unprompted) is itself
-    /// ack'd -- a reply is owed per RFC 7296 regardless of what it turns out
-    /// to mean; a benign unsolicited message (e.g. the peer running its own
-    /// DPD probe against us) is otherwise ignored, continuing to wait out
-    /// the remaining timeout. `expected_mid`, when set (from `probe`), is
-    /// the request id whose response counts as our own [`Liveness::Alive`]
-    /// confirmation -- a response with any other id is a stale/unrelated ack
-    /// and is ignored; `peek` passes `None` since it never sent anything, so
-    /// any response it happens to see is necessarily stale.
-    ///
-    /// A Delete payload is only [`Liveness::PeerTornDown`] when it actually
-    /// ends this tunnel: `protocol_id::IKE` (the whole IKE SA, and thereby
-    /// every CHILD SA under it, RFC 7296 §1.4.1) always qualifies; a
-    /// `protocol_id::ESP` Delete only qualifies when it names `child_peer_spi`
-    /// -- the CHILD SA this session is currently relying on. Confirmed live
-    /// against a real FortiGate: after [`Self::rekey_child`] installs a fresh
-    /// CHILD SA, the gateway deletes the *old*, now-superseded one and
-    /// notifies this side of it via exactly this kind of unsolicited Delete
-    /// -- treating every Delete as a teardown (the previous behavior) tore
-    /// this whole tunnel down on its own successful rekey, leaving the new
-    /// CHILD SA the gateway had just finished installing orphaned. A Delete
-    /// naming any other SPI (or an unparseable one) is likewise not a
-    /// teardown -- same reasoning, just for whichever earlier generation it
-    /// happens to reference -- and is silently ignored, continuing to wait
-    /// out the timeout, same as any other benign unsolicited message.
     /// Gracefully tear down the IKE SA before dropping the socket: sends a
     /// Delete payload for the whole IKE SA (RFC 7296 §1.4.1 — this implicitly
     /// deletes every CHILD SA under it too, no separate ESP Delete needed).
@@ -1002,242 +1013,331 @@ impl LivenessSession {
         Ok(())
     }
 
+    /// Shared receive loop for `probe`/`peek`: reads until `timeout`
+    /// elapses, classifying whatever arrives. `expected_mid`, when set (from
+    /// `probe`), is the Message ID of our INFORMATIONAL request whose answer
+    /// is [`Liveness::Alive`] -- only the genuine answer counts (see
+    /// [`Self::is_answer`]), and any other response is stale or forged and
+    /// passed over; `peek` passes `None` since it never sent anything. A
+    /// request from the peer is answered, or not, by
+    /// [`Self::answer_peer_request`], and the wait goes on unless it ended
+    /// the tunnel ([`Liveness::PeerTornDown`]). A datagram that isn't an
+    /// IKEv2 message at all is dropped: anyone can send one.
     fn recv_and_classify(&mut self, timeout: Duration, expected_mid: Option<u32>) -> Result<Liveness, DriverError> {
-        self.sock.set_read_timeout(Some(timeout))?;
+        let quiet = if expected_mid.is_some() { Liveness::NoReply } else { Liveness::Alive };
+        let deadline = Instant::now() + timeout;
         let mut buf = [0u8; 8192];
         loop {
-            // See `external_rx`'s own doc: on Windows a background thread is
-            // this socket's sole reader and forwards already-demuxed IKE
-            // datagrams here instead.
-            let raw: &[u8] = if let Some(rx) = &self.external_rx {
-                match rx.recv_timeout(timeout) {
-                    Ok(datagram) => {
-                        buf[..datagram.len()].copy_from_slice(&datagram);
-                        &buf[..datagram.len()]
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        return Ok(if expected_mid.is_some() { Liveness::NoReply } else { Liveness::Alive });
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Ok(if expected_mid.is_some() { Liveness::NoReply } else { Liveness::Alive });
-                    }
-                }
-            } else {
-                match self.sock.recv(&mut buf) {
-                    Ok(n) => &buf[..n],
-                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                        return Ok(if expected_mid.is_some() { Liveness::NoReply } else { Liveness::Alive });
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(quiet);
+            }
+            self.sock.set_read_timeout(Some(remaining))?;
+            let n = match self.recv_datagram(&mut buf, remaining) {
+                Ok(n) => n,
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => return Ok(quiet),
+                // The Windows receive thread is gone: nothing more comes this way.
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe && self.external_rx.is_some() => return Ok(quiet),
+                Err(e) => return Err(e.into()),
             };
-            let n = raw.len();
             crate::debug::dump("<<<", self.dest, &buf[..n]);
-            let msg = unwrap(&buf[..n], self.float)?;
-            let header = IkeHeader::parse(&msg)?;
-
+            let Ok(msg) = unwrap(&buf[..n], self.float) else { continue };
+            let Ok(header) = IkeHeader::parse(&msg) else { continue };
             if header.flags.response {
-                // A matching Message ID alone isn't proof the peer answered --
-                // it's an unauthenticated header field an off-path attacker who
-                // knows/observes the (sequential, not secret) next id can spoof
-                // in an empty or garbage UDP datagram, faking liveness for a
-                // dead or MITM'd peer and defeating DPD's whole purpose. Require
-                // the response to actually decrypt and authenticate under this
-                // IKE SA's keys (the header itself is covered by the AEAD/HMAC,
-                // so a forged Message ID also fails here) before trusting it.
-                if expected_mid == Some(header.message_id) && open_informational(&self.sa, &msg).is_ok() {
+                if expected_mid.is_some_and(|mid| self.is_answer(&header, &msg, mid, ExchangeType::Informational)) {
                     return Ok(Liveness::Alive);
                 }
-                continue; // stale/unrelated, or an unauthenticated response -- keep waiting
+                continue;
             }
-
             if self.answer_peer_request(&header, &msg)? {
                 return Ok(Liveness::PeerTornDown);
             }
         }
     }
 
-    /// Answer one request the peer sent on its own initiative. `true` when
-    /// it ended the tunnel (see [`Self::recv_and_classify`]'s doc for which
-    /// Deletes do).
+    /// Whether `msg` is the peer's answer to our request `mid` of `exchange`
+    /// on the current IKE SA (RFC 7296 §2.2, §3.1): a response with that
+    /// Message ID and exchange type, on this IKE SA's SPIs, from the peer's
+    /// side of it -- and authentic. The integrity check covers the header,
+    /// but the keys don't depend on it, so it doesn't make the rest of these
+    /// checks redundant. A Message ID alone proves nothing: it is sequential,
+    /// and a forged datagram carrying it would otherwise fake liveness for a
+    /// dead peer.
+    fn is_answer(&self, header: &IkeHeader, msg: &[u8], mid: u32, exchange: ExchangeType) -> bool {
+        header.flags.response
+            && header.message_id == mid
+            && header.exchange_type == exchange
+            && from_peer_on(&self.sa, header)
+            && open_from_peer(&self.sa, msg).is_ok()
+    }
+
+    /// The IKE SA a message from the peer is on, by its header: the current
+    /// one, or the one retired after a rekey, if either.
+    fn ike_sa_of(&self, header: &IkeHeader) -> Option<OnIkeSa> {
+        if from_peer_on(&self.sa, header) {
+            Some(OnIkeSa::Current)
+        } else if self.ike.retired.as_ref().is_some_and(|r| from_peer_on(&r.sa, header)) {
+            Some(OnIkeSa::Retired)
+        } else {
+            None
+        }
+    }
+
+    fn ike_sa(&self, on: OnIkeSa) -> &CompletedSaInit {
+        match (on, &self.ike.retired) {
+            (OnIkeSa::Retired, Some(retired)) => &retired.sa,
+            _ => &self.sa,
+        }
+    }
+
+    fn peer_requests(&self, on: OnIkeSa) -> &PeerRequests {
+        match (on, &self.ike.retired) {
+            (OnIkeSa::Retired, Some(retired)) => &retired.requests,
+            _ => &self.peer_requests,
+        }
+    }
+
+    fn peer_requests_on(&mut self, on: OnIkeSa) -> &mut PeerRequests {
+        match (on, &mut self.ike.retired) {
+            (OnIkeSa::Retired, Some(retired)) => &mut retired.requests,
+            _ => &mut self.peer_requests,
+        }
+    }
+
+    /// Send `wire`, our answer to the peer's request `request` (with
+    /// `header`) on the IKE SA `on`, and keep it as that IKE SA's answer to
+    /// resend should the peer retransmit the request (RFC 7296 §2.1). The
+    /// peer's next request is then the one after it. `tears_down` is whether
+    /// the request ended the tunnel, for the retransmission to say so again.
+    fn respond(&mut self, on: OnIkeSa, header: &IkeHeader, request: &[u8], wire: Vec<u8>, tears_down: bool) {
+        crate::debug::dump(">>>", self.dest, &wire);
+        let _ = self.sock.send_to(&wire, self.dest);
+        let requests = self.peer_requests_on(on);
+        requests.next = Some(u64::from(header.message_id) + 1);
+        requests.last = Some(AnsweredRequest { message_id: header.message_id, request: request.to_vec(), response: wire, tears_down });
+    }
+
+    /// Answer one request the peer sent on its own initiative -- `true` when
+    /// it ended the tunnel. What is not a request this session should answer
+    /// is dropped without an answer or any change of state, in this order:
+    /// one on neither of this session's IKE SAs (by the SPIs and the
+    /// Initiator flag of the header, RFC 7296 §3.1), one outside that IKE
+    /// SA's receive window ([`PeerRequests`]: a retransmission of the last
+    /// one answered gets its answer again instead), and one that does not
+    /// authenticate (§2.21.3: nothing is acted on before that). Only then is
+    /// the request acted on: an INFORMATIONAL by
+    /// [`Self::answer_peer_informational`], a `CREATE_CHILD_SA` by
+    /// [`Self::answer_peer_create_child_sa`] -- on the retired IKE SA it is
+    /// refused with `NO_ADDITIONAL_SAS`, the CHILD SAs having moved to the
+    /// new one -- and nothing else.
     fn answer_peer_request(&mut self, header: &IkeHeader, msg: &[u8]) -> Result<bool, DriverError> {
         if self.ike.retired.as_ref().is_some_and(|r| r.since.elapsed() > RETIRED_IKE_SA_TTL) {
             self.ike.retired = None;
         }
         self.peer_child.superseded.retain(|s| s.since.elapsed() <= SUPERSEDED_CHILD_TTL);
-        // A CREATE_CHILD_SA is the peer rekeying on its own timer (RFC 7296
-        // §1.3). Nothing else is a meaningful request on an established IKE SA.
-        match header.exchange_type {
-            ExchangeType::Informational => {}
-            ExchangeType::CreateChildSa => {
-                self.answer_peer_create_child_sa(header, msg)?;
-                return Ok(false);
-            }
-            _ => return Ok(false),
-        }
-        if let Some((_, response, tears_down)) = self.last_informational_ack.as_ref().filter(|(request, _, _)| request == msg) {
-            ike_debug!("INFORMATIONAL: peer retransmitted its request -- resending our answer");
-            let _ = self.sock.send_to(response, self.dest);
-            return Ok(*tears_down);
-        }
-        // An INFORMATIONAL request -- ack it regardless of content, then
-        // decide what it means. After a peer-started IKE SA rekey the peer
-        // deletes the SA it replaced under *that* SA's keys, so those are
-        // tried too when the current ones can't open the message.
-        let (opened, on_retired) = match open_informational(&self.sa, msg) {
-            Ok(ps) => (Some(ps), false),
-            Err(_) => match self.ike.retired.as_ref().map(|r| open_informational(&r.sa, msg)) {
-                Some(Ok(ps)) => (Some(ps), true),
-                _ => (None, false),
-            },
-        };
-        let delete = opened
-            .and_then(|ps| ps.into_iter().find(|(t, _)| *t == PayloadType::Delete))
-            .and_then(|(_, body)| Delete::parse(&body).ok());
-        let mut ack_iv = [0u8; 8];
-        OsEntropy::new()?.fill(&mut ack_iv);
-        let ack_sa = match &self.ike.retired {
-            Some(r) if on_retired => &r.sa,
-            _ => &self.sa,
-        };
-        // The peer deleting a CHILD SA its own rekey replaced: the answer to a
-        // Delete carries the Delete for the other direction (RFC 7296 §1.4.1),
-        // i.e. our inbound SPI of the pair. Anything else is acked empty.
-        let mut ack_payloads = Vec::new();
-        // The peer's SPI of a CHILD SA this Delete names that an exchange of
-        // our own in flight is about: that exchange settles what it means.
-        let mut collided = None;
-        if let (false, Some(Delete { protocol_id: p, spis })) = (on_retired, &delete) {
-            if *p == protocol_id::ESP {
-                let mut ours: Vec<u32> =
-                    self.peer_child.superseded.iter().filter(|c| spis.contains(&c.peer_spi)).map(|c| c.local_spi).collect();
-                if !ours.is_empty() {
-                    ike_debug!("INFORMATIONAL: peer deleted the CHILD SA its rekey replaced (spi_in={ours:08x?})");
-                    self.peer_child.superseded.retain(|c| !spis.contains(&c.peer_spi));
-                }
-                // RFC 7296 §2.25.1: a CHILD SA we are rekeying is answered as
-                // usual, with our Delete for it. (One both sides are deleting
-                // is answered without it, ours being on its way: no SA we
-                // delete is ever left in `superseded`, and nothing else adds
-                // a Delete payload.)
-                if let Some(own) = self.peer_child.in_flight.as_mut() {
-                    if let ChildOp::Rekey(old) = own.op {
-                        if spis.contains(&old.peer) {
-                            ike_debug!("INFORMATIONAL: peer deleted the CHILD SA we are rekeying (spi_in={:08x})", old.local);
-                            if !ours.contains(&old.local) {
-                                ours.push(old.local);
-                            }
-                            own.old_deleted = true;
-                            collided = Some(old.peer);
-                        }
-                    }
-                }
-                if !ours.is_empty() {
-                    ack_payloads.push((PayloadType::Delete, Delete::esp(ours).to_bytes()));
-                }
-            }
-        }
-        if let Ok(ack) = build_informational(ack_sa, header.message_id, true, &ack_payloads, &ack_iv) {
-            let wire = wrap(&ack, self.float);
-            let _ = self.sock.send_to(&wire, self.dest);
-            // `tears_down` isn't known yet (computed below, only reachable
-            // when `!on_retired`) -- placeholder `false` until then.
-            self.last_informational_ack = Some((msg.to_vec(), wire, false));
-        }
-        if on_retired {
-            // The peer deleting an IKE SA we moved on from: routine.
-            if matches!(delete, Some(Delete { protocol_id: p, .. }) if p == protocol_id::IKE) {
-                ike_debug!("INFORMATIONAL: peer deleted the IKE SA we moved on from");
-                self.ike.retired = None;
-            }
-            return Ok(false);
-        }
-        // See `recv_and_classify`'s own doc for why only an IKE SA Delete
-        // (or a primary CHILD SA Delete with no other family left standing)
-        // ends the tunnel -- an ESP Delete for any other SPI is either
-        // routine post-rekey cleanup of a superseded CHILD SA (handled
-        // above), or one family's CHILD SA going away on its own while the
-        // IKE SA and the other family are still perfectly good: RFC 7296
-        // §1.4.1 only makes deleting the IKE SA imply deleting every CHILD SA
-        // under it, never the other way around, so there is an IKE SA worth
-        // keeping alive. That case is queued in `peer_child.deleted` for the
-        // caller to collect and renegotiate a replacement for (see
-        // [`Self::take_peer_deleted_children`]) -- not a teardown. Nor is the
-        // SA an exchange of our own is about (`collided`): that exchange
-        // settles it -- see [`Self::settle_rekey`]. Nor, likewise, is the
-        // IKE SA a rekey of ours is about, once the peer rekeyed it too.
-        let tears_down = match delete {
-            Some(Delete { protocol_id: p, .. }) if p == protocol_id::IKE => match self.ike.rekeying.as_mut() {
-                // RFC 7296 §2.8.2: the peer's own rekey, which we answered, is
-                // done and it deletes the IKE SA that rekey replaced, never
-                // having seen ours -- see [`Self::rekey_ike`].
-                Some(own) if own.crossed.is_some() => {
-                    ike_debug!("INFORMATIONAL: peer deleted the IKE SA we are rekeying, having rekeyed it itself -- dropping our rekey");
-                    own.old_deleted = true;
-                    false
-                }
-                _ => true,
-            },
-            Some(Delete { protocol_id: p, mut spis }) if p == protocol_id::ESP => {
-                spis.retain(|s| Some(*s) != collided);
-                if spis.contains(&self.child_peer_spi) && self.primary_child_alive {
-                    if self.child6.is_some() {
-                        ike_debug!(
-                            "INFORMATIONAL: peer deleted the primary CHILD SA (spi_out={:08x}) -- IPv6 CHILD SA and IKE SA are still up, renegotiating it",
-                            self.child_peer_spi
-                        );
-                        self.primary_child_alive = false;
-                        self.peer_child.deleted.push(ChildKind::Primary);
-                        false
-                    } else {
-                        true
-                    }
-                } else if let Some(c6) = self.child6.filter(|c| spis.contains(&c.peer)) {
-                    ike_debug!(
-                        "INFORMATIONAL: peer deleted the IPv6 CHILD SA (spi_out={:08x}) -- primary CHILD SA and IKE SA are still up, renegotiating it",
-                        c6.peer
-                    );
-                    self.child6 = None;
-                    self.peer_child.deleted.push(ChildKind::Ipv6);
-                    false
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        };
-        if let Some(cached) = self.last_informational_ack.as_mut().filter(|(request, _, _)| request == msg) {
-            cached.2 = tears_down;
-        }
-        if tears_down {
-            ike_debug!("INFORMATIONAL: peer sent Delete -- tunnel torn down by the gateway");
-        }
-        Ok(tears_down)
-    }
-
-    /// Answer a `CREATE_CHILD_SA` the peer started: an IKE SA rekey -- see
-    /// [`Self::answer_peer_ike_rekey`] -- otherwise one of a CHILD SA -- see
-    /// [`Self::answer_peer_child_request`]. What can't be taken on is refused,
-    /// still as a `CREATE_CHILD_SA` response.
-    fn answer_peer_create_child_sa(&mut self, header: &IkeHeader, msg: &[u8]) -> Result<(), DriverError> {
+        let mid = header.message_id;
         // A retransmission of the IKE rekey we already took on means our
         // answer was lost: send it again. The IKE SA it came on may be gone.
         if let Some((_, response)) = self.ike.answered_rekey.as_ref().filter(|(request, _)| request == msg) {
             ike_debug!("CREATE_CHILD_SA: the peer retransmitted its IKE SA rekey -- resending our answer");
             let _ = self.sock.send_to(response, self.dest);
-            return Ok(());
+            return Ok(false);
         }
+        let Some(on) = self.ike_sa_of(header) else {
+            ike_debug!("request {mid} from the peer: not on this session's IKE SA -- dropped");
+            return Ok(false);
+        };
+        let requests = self.peer_requests(on);
+        if let Some(last) = requests.last.as_ref().filter(|last| last.message_id == mid) {
+            if last.request != msg {
+                ike_debug!("request {mid} from the peer: not the request answered under that message id -- dropped");
+                return Ok(false);
+            }
+            ike_debug!("request {mid} from the peer: retransmitted -- resending our answer");
+            let _ = self.sock.send_to(&last.response, self.dest);
+            return Ok(last.tears_down);
+        }
+        if let Some(next) = requests.next.filter(|next| *next != u64::from(mid)) {
+            ike_debug!("request {mid} from the peer: outside the receive window (expecting {next}) -- dropped");
+            return Ok(false);
+        }
+        if on == OnIkeSa::Retired && self.ike.retired.as_ref().is_some_and(|r| r.deleted) {
+            ike_debug!("request {mid} from the peer: on the IKE SA it deleted -- dropped");
+            return Ok(false);
+        }
+        let Ok((first, body)) = open_from_peer(self.ike_sa(on), msg) else {
+            ike_debug!("request {mid} from the peer: does not authenticate -- dropped");
+            return Ok(false);
+        };
+        let inner = payload_list(first, &body);
         let mut iv = [0u8; 8];
         OsEntropy::new()?.fill(&mut iv);
-        // Only answer what authenticates (`open_informational` is just the SK
-        // decrypt+verify, whatever the exchange).
-        let Ok(inner) = open_informational(&self.sa, msg) else {
-            return Ok(());
-        };
-        if ike_rekey::is_ike_sa_rekey(&inner) {
-            return self.answer_peer_ike_rekey(header, msg, &iv);
+        match (header.exchange_type, on, inner) {
+            (ExchangeType::Informational, _, inner) => self.answer_peer_informational(on, header, msg, inner.unwrap_or_default(), &iv),
+            (ExchangeType::CreateChildSa, OnIkeSa::Current, Ok(inner)) => {
+                self.answer_peer_create_child_sa(header, msg, &inner, &iv)?;
+                Ok(false)
+            }
+            (ExchangeType::CreateChildSa, OnIkeSa::Retired, _) => {
+                self.refuse_peer_child_request(on, header, msg, &iv, notify_type::NO_ADDITIONAL_SAS, "on the IKE SA a rekey replaced")?;
+                Ok(false)
+            }
+            _ => Ok(false),
         }
-        self.answer_peer_child_request(header, msg, &iv)
+    }
+
+    /// Answer an INFORMATIONAL request from the peer on the IKE SA `on`,
+    /// carrying the payloads `inner` (none when they can't be parsed, which
+    /// still gets an empty answer), and act on its Delete payloads -- every
+    /// one of them, and every SPI each names (RFC 7296 §3.11). `true` when
+    /// that ended the tunnel.
+    ///
+    /// A Delete of the IKE SA (§1.4.1) takes every CHILD SA under it with it
+    /// and is answered empty; it ends the tunnel, except while a rekey of ours
+    /// of that IKE SA crossed the peer's own, which the Delete completes
+    /// (§2.8.2, see [`Self::rekey_ike`]). On the IKE SA retired after a
+    /// rekey, a Delete is routine: the CHILD SAs moved on.
+    ///
+    /// A Delete of CHILD SAs is answered with our Delete for each pair
+    /// (§1.4.1), naming our inbound SPI of it, but for one we are deleting
+    /// ourselves, whose Delete is on its way (§2.25.1). It ends the tunnel
+    /// only when it leaves it no CHILD SA: the primary with no IPv6 one, or
+    /// both. One family's CHILD SA going on its own, the other still up, is
+    /// queued in `peer_child.deleted` for the caller to renegotiate (see
+    /// [`Self::take_peer_deleted_children`]); nothing in §1.4.1 makes
+    /// deleting a CHILD SA delete the IKE SA or any other. The CHILD SA a
+    /// rekey of the peer's replaced is the peer's routine cleanup -- confirmed
+    /// live against a FortiGate, which deletes the old SA right after every
+    /// rekey -- and one a CHILD SA exchange of ours is about is settled by
+    /// that exchange ([`Self::settle_rekey`]). SPIs this side doesn't know
+    /// are passed over.
+    fn answer_peer_informational(
+        &mut self,
+        on: OnIkeSa,
+        header: &IkeHeader,
+        msg: &[u8],
+        inner: Vec<(PayloadType, Vec<u8>)>,
+        iv: &[u8; 8],
+    ) -> Result<bool, DriverError> {
+        let deletes: Vec<Delete> =
+            inner.into_iter().filter(|(t, _)| *t == PayloadType::Delete).filter_map(|(_, body)| Delete::parse(&body).ok()).collect();
+        let ike_deleted = deletes.iter().any(|d| d.protocol_id == protocol_id::IKE);
+        let named: Vec<u32> = deletes.iter().filter(|d| d.protocol_id == protocol_id::ESP).flat_map(|d| d.spis.iter().copied()).collect();
+
+        if on == OnIkeSa::Retired || ike_deleted {
+            let ack = build_informational(self.ike_sa(on), header.message_id, true, &[], iv)?;
+            let tears_down = on == OnIkeSa::Current && self.peer_deleted_ike_sa();
+            if let (OnIkeSa::Retired, true, Some(retired)) = (on, ike_deleted, self.ike.retired.as_mut()) {
+                ike_debug!("INFORMATIONAL: peer deleted the IKE SA we moved on from");
+                retired.deleted = true;
+            }
+            self.respond(on, header, msg, wrap(&ack, self.float), tears_down);
+            if tears_down {
+                ike_debug!("INFORMATIONAL: peer deleted the IKE SA -- tunnel torn down by the gateway");
+            }
+            return Ok(tears_down);
+        }
+
+        // What the Delete payloads name, before anything changes: the answer
+        // is built first, so that failing to leaves everything as it was.
+        let superseded: Vec<u32> = self.peer_child.superseded.iter().filter(|c| named.contains(&c.peer_spi)).map(|c| c.local_spi).collect();
+        // The CHILD SA a CHILD SA exchange of our own is about, if named.
+        let collided = self.peer_child.in_flight.as_ref().and_then(|own| match own.op {
+            ChildOp::Rekey(old) | ChildOp::Close(old) if named.contains(&old.peer) => Some(own.op),
+            _ => None,
+        });
+        let (collided_peer, rekeying) = match collided {
+            Some(ChildOp::Rekey(old)) => (Some(old.peer), Some(old.local)),
+            Some(ChildOp::Close(closing)) => (Some(closing.peer), None),
+            _ => (None, None),
+        };
+        let names = |spi: u32| named.contains(&spi) && Some(spi) != collided_peer;
+        let primary = self.primary_child_alive && names(self.child_peer_spi);
+        let child6 = self.child6.filter(|c| names(c.peer));
+        // Ours for each pair, but for an SA we are deleting (RFC 7296 §2.25.1).
+        let mut ours = superseded.clone();
+        for spi in rekeying.into_iter().chain(primary.then_some(self.child_local_spi)).chain(child6.map(|c| c.local)) {
+            if !ours.contains(&spi) {
+                ours.push(spi);
+            }
+        }
+        let payloads: Vec<_> = if ours.is_empty() { Vec::new() } else { vec![(PayloadType::Delete, Delete::esp(ours).to_bytes())] };
+        let ack = build_informational(&self.sa, header.message_id, true, &payloads, iv)?;
+
+        if !superseded.is_empty() {
+            ike_debug!("INFORMATIONAL: peer deleted the CHILD SA its rekey replaced (spi_in={superseded:08x?})");
+            self.peer_child.superseded.retain(|c| !named.contains(&c.peer_spi));
+        }
+        match collided {
+            Some(ChildOp::Rekey(old)) => {
+                ike_debug!("INFORMATIONAL: peer deleted the CHILD SA we are rekeying (spi_in={:08x})", old.local);
+                if let Some(own) = self.peer_child.in_flight.as_mut() {
+                    own.old_deleted = true;
+                }
+            }
+            Some(ChildOp::Close(closing)) => {
+                ike_debug!("INFORMATIONAL: peer deleted the CHILD SA we are deleting (spi_in={:08x}) -- ours is on its way", closing.local);
+            }
+            _ => {}
+        }
+        let tears_down = primary && (self.child6.is_none() || child6.is_some());
+        if !tears_down {
+            if primary {
+                ike_debug!(
+                    "INFORMATIONAL: peer deleted the primary CHILD SA (spi_out={:08x}) -- IPv6 CHILD SA and IKE SA are still up, renegotiating it",
+                    self.child_peer_spi
+                );
+                self.primary_child_alive = false;
+                self.peer_child.deleted.push(ChildKind::Primary);
+            }
+            if let Some(c6) = child6 {
+                ike_debug!(
+                    "INFORMATIONAL: peer deleted the IPv6 CHILD SA (spi_out={:08x}) -- primary CHILD SA and IKE SA are still up, renegotiating it",
+                    c6.peer
+                );
+                self.child6 = None;
+                self.peer_child.deleted.push(ChildKind::Ipv6);
+            }
+        }
+        self.respond(on, header, msg, wrap(&ack, self.float), tears_down);
+        if tears_down {
+            ike_debug!("INFORMATIONAL: peer deleted the tunnel's CHILD SAs -- tunnel torn down by the gateway");
+        }
+        Ok(tears_down)
+    }
+
+    /// The peer deleted the current IKE SA: whether that ends the tunnel. It
+    /// doesn't while a rekey of ours crossed the peer's own (RFC 7296
+    /// §2.8.2): the peer's rekey, which we answered, is done, and it deletes
+    /// the IKE SA that rekey replaced, never having seen ours -- which is
+    /// dropped (see [`Self::rekey_ike`]).
+    fn peer_deleted_ike_sa(&mut self) -> bool {
+        match self.ike.rekeying.as_mut() {
+            Some(own) if own.crossed.is_some() => {
+                ike_debug!("INFORMATIONAL: peer deleted the IKE SA we are rekeying, having rekeyed it itself -- dropping our rekey");
+                own.old_deleted = true;
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// Answer a `CREATE_CHILD_SA` the peer started on the current IKE SA,
+    /// carrying the payloads `inner`: an IKE SA rekey -- see
+    /// [`Self::answer_peer_ike_rekey`] -- otherwise one of a CHILD SA -- see
+    /// [`Self::answer_peer_child_request`]. What can't be taken on is refused,
+    /// still as a `CREATE_CHILD_SA` response.
+    fn answer_peer_create_child_sa(
+        &mut self,
+        header: &IkeHeader,
+        msg: &[u8],
+        inner: &[(PayloadType, Vec<u8>)],
+        iv: &[u8; 8],
+    ) -> Result<(), DriverError> {
+        if ike_rekey::is_ike_sa_rekey(inner) {
+            return self.answer_peer_ike_rekey(header, msg, iv);
+        }
+        self.answer_peer_child_request(header, msg, iv)
     }
 
     /// The peer rekeying the IKE SA (RFC 7296 §2.18): taken on, and the session
@@ -1259,7 +1359,7 @@ impl LivenessSession {
             None
         };
         if let Some(why) = collision {
-            return self.refuse_peer_child_request(header, iv, notify_type::TEMPORARY_FAILURE, why);
+            return self.refuse_peer_child_request(OnIkeSa::Current, header, msg, iv, notify_type::TEMPORARY_FAILURE, why);
         }
         let mut entropy = OsEntropy::new()?;
         let mut dh_private = [0u8; 32];
@@ -1275,11 +1375,14 @@ impl LivenessSession {
         let (response, new_sa) = match ike_rekey::responder_process_ike_rekey(&self.sa, msg, new_spi_r, &dh_private, &nr, iv) {
             Ok(answered) => answered,
             Err(e) => {
-                return self.refuse_peer_child_request(header, iv, notify_type::NO_ADDITIONAL_SAS, &format!("the IKE SA rekey cannot be taken on: {e}"));
+                let why = format!("the IKE SA rekey cannot be taken on: {e}");
+                return self.refuse_peer_child_request(OnIkeSa::Current, header, msg, iv, notify_type::NO_ADDITIONAL_SAS, &why);
             }
         };
+        // Recorded in the window of the IKE SA it came on before this session
+        // leaves that IKE SA.
         let wire = wrap(&response, self.float);
-        let _ = self.sock.send_to(&wire, self.dest);
+        self.respond(OnIkeSa::Current, header, msg, wire.clone(), false);
         self.ike.answered_rekey = Some((msg.to_vec(), wire));
         match self.ike.rekeying.as_mut() {
             Some(own) => {
@@ -1304,8 +1407,7 @@ impl LivenessSession {
     /// Move to `new_sa`, an IKE SA the peer's rekey made: the one it replaced
     /// is the peer's to delete, and that Delete is routine ([`RetiredIkeSa`]).
     fn move_to_peers_ike_sa(&mut self, new_sa: CompletedSaInit) {
-        let old = self.switch_ike_sa(new_sa);
-        self.ike.retired = Some(RetiredIkeSa { sa: old, since: Instant::now() });
+        self.ike.retired = Some(self.switch_ike_sa(new_sa));
     }
 
     /// The `CREATE_CHILD_SA` requests that aren't an IKE SA rekey: the peer
@@ -1325,21 +1427,20 @@ impl LivenessSession {
     /// weigh against ours, not handed to the caller. While we rekey or delete
     /// the IKE SA, any of these is refused with `TEMPORARY_FAILURE` (§2.25.2).
     fn answer_peer_child_request(&mut self, header: &IkeHeader, msg: &[u8], iv: &[u8; 8]) -> Result<(), DriverError> {
-        if let Some((_, response)) = self.peer_child.last.as_ref().filter(|(request, _)| request == msg) {
-            ike_debug!("CREATE_CHILD_SA: the peer retransmitted its CHILD SA rekey -- resending our answer");
-            let _ = self.sock.send_to(response, self.dest);
-            return Ok(());
-        }
+        let current = OnIkeSa::Current;
         if self.ike.rekeying.is_some() || self.ike.closing {
-            return self.refuse_peer_child_request(header, iv, notify_type::TEMPORARY_FAILURE, "we are rekeying or deleting the IKE SA");
+            let why = "we are rekeying or deleting the IKE SA";
+            return self.refuse_peer_child_request(current, header, msg, iv, notify_type::TEMPORARY_FAILURE, why);
         }
         let Some(rekeyed_spi) = rekey::rekey_sa_spi(&self.sa, msg) else {
-            return self.refuse_peer_child_request(header, iv, notify_type::NO_ADDITIONAL_SAS, "a new CHILD SA is not taken on");
+            return self.refuse_peer_child_request(current, header, msg, iv, notify_type::NO_ADDITIONAL_SAS, "a new CHILD SA is not taken on");
         };
         let crossed = match self.peer_child.in_flight.as_ref() {
             Some(OwnChildOp { op: ChildOp::Close(c), .. }) if c.peer == rekeyed_spi => {
                 return self.refuse_peer_child_request(
+                    current,
                     header,
+                    msg,
                     iv,
                     notify_type::TEMPORARY_FAILURE,
                     &format!("we are deleting the CHILD SA with spi {rekeyed_spi:08x}"),
@@ -1354,7 +1455,9 @@ impl LivenessSession {
             (ChildKind::Ipv6, child6)
         } else {
             return self.refuse_peer_child_request(
+                current,
                 header,
+                msg,
                 iv,
                 notify_type::CHILD_SA_NOT_FOUND,
                 &format!("no CHILD SA with spi {rekeyed_spi:08x}"),
@@ -1373,8 +1476,7 @@ impl LivenessSession {
         };
         match rekey::responder_answer_child_rekey(&self.sa, msg, new_spi, &nr, self.cipher, &self.pfs, &dh_private, iv) {
             Ok((response, child)) => {
-                let wire = wrap(&response, self.float);
-                let _ = self.sock.send_to(&wire, self.dest);
+                self.respond(current, header, msg, wrap(&response, self.float), false);
                 let rekeyed = rekeyed_child(&child);
                 ike_debug!(
                     "CREATE_CHILD_SA: the peer rekeyed the {kind:?} CHILD SA (message id {}) -- new spi_in={:08x} spi_out={:08x}",
@@ -1390,7 +1492,6 @@ impl LivenessSession {
                     }
                     None => self.peer_child.pending.push(PeerRekeyedChild { kind, child: rekeyed }),
                 }
-                self.peer_child.last = Some((msg.to_vec(), wire));
                 Ok(())
             }
             Err(e) => {
@@ -1401,23 +1502,40 @@ impl LivenessSession {
                     IkeError::InvalidKeGroup(group) => (notify_type::INVALID_KE_PAYLOAD, group.to_be_bytes().to_vec()),
                     _ => (notify_type::INVALID_SYNTAX, Vec::new()),
                 };
-                self.refuse_peer_child_request_with(header, iv, reason, data, &format!("cannot take it on: {e}"))
+                self.refuse_peer_child_request_with(current, header, msg, iv, reason, data, &format!("cannot take it on: {e}"))
             }
         }
     }
 
-    fn refuse_peer_child_request(&self, header: &IkeHeader, iv: &[u8; 8], reason: u16, why: &str) -> Result<(), DriverError> {
-        self.refuse_peer_child_request_with(header, iv, reason, Vec::new(), why)
+    fn refuse_peer_child_request(
+        &mut self,
+        on: OnIkeSa,
+        header: &IkeHeader,
+        msg: &[u8],
+        iv: &[u8; 8],
+        reason: u16,
+        why: &str,
+    ) -> Result<(), DriverError> {
+        self.refuse_peer_child_request_with(on, header, msg, iv, reason, Vec::new(), why)
     }
 
-    fn refuse_peer_child_request_with(&self, header: &IkeHeader, iv: &[u8; 8], reason: u16, data: Vec<u8>, why: &str) -> Result<(), DriverError> {
-        if let Ok(refusal) = rekey::build_child_error_with_data(&self.sa, header.message_id, reason, data, iv) {
-            ike_debug!(
-                "CREATE_CHILD_SA request from the peer (message id {}) -- refusing with {}: {why}",
-                header.message_id, notify_type_name(reason)
-            );
-            let _ = self.sock.send_to(&wrap(&refusal, self.float), self.dest);
-        }
+    /// Refuse the peer's `CREATE_CHILD_SA` request `msg` on the IKE SA `on`
+    /// with the error notify `reason` carrying `data` -- an answer like any
+    /// other, resent as it is if the request is retransmitted (RFC 7296 §2.1).
+    #[allow(clippy::too_many_arguments)]
+    fn refuse_peer_child_request_with(
+        &mut self,
+        on: OnIkeSa,
+        header: &IkeHeader,
+        msg: &[u8],
+        iv: &[u8; 8],
+        reason: u16,
+        data: Vec<u8>,
+        why: &str,
+    ) -> Result<(), DriverError> {
+        let refusal = rekey::build_child_error_with_data(self.ike_sa(on), header.message_id, reason, data, iv)?;
+        ike_debug!("CREATE_CHILD_SA request from the peer (message id {}) -- refusing with {}: {why}", header.message_id, notify_type_name(reason));
+        self.respond(on, header, msg, wrap(&refusal, self.float), false);
         Ok(())
     }
 
@@ -1445,16 +1563,15 @@ impl LivenessSession {
         std::mem::take(&mut self.peer_child.deleted)
     }
 
-    /// Move to `new_sa` as the IKE SA (Message IDs start again at 0, RFC 7296
-    /// §2.18), returning the one it replaced. The CHILD SAs come along
-    /// untouched: only their parent changed.
-    fn switch_ike_sa(&mut self, new_sa: CompletedSaInit) -> CompletedSaInit {
+    /// Move to `new_sa` as the IKE SA (Message IDs start again at 0 both ways,
+    /// RFC 7296 §2.18), returning the one it replaced with its receive
+    /// window, which goes on as it was. The CHILD SAs come along untouched:
+    /// only their parent changed.
+    fn switch_ike_sa(&mut self, new_sa: CompletedSaInit) -> RetiredIkeSa {
         self.next_message_id = 0;
         self.ike.since = Instant::now();
-        // Message IDs start over, so an old request's bytes can't be told apart from a new one's by ID.
-        self.peer_child.last = None;
-        self.last_informational_ack = None;
-        std::mem::replace(&mut self.sa, new_sa)
+        let old = std::mem::replace(&mut self.sa, new_sa);
+        RetiredIkeSa::new(old, std::mem::take(&mut self.peer_requests))
     }
 
     /// How long the current IKE SA has been up -- since the handshake, or since
@@ -1539,8 +1656,7 @@ impl LivenessSession {
                 ike_debug!("CREATE_CHILD_SA (IKE SA rekey): the peer rekeyed the IKE SA too -- ours holds the lowest nonce, deleting it and keeping the peer's");
                 // Ours is deleted like any IKE SA, on it (RFC 7296 §1.4.1),
                 // and meanwhile the peer deletes the old one, which is routine.
-                let old = self.switch_ike_sa(new_sa);
-                self.ike.retired = Some(RetiredIkeSa { sa: old, since: Instant::now() });
+                self.ike.retired = Some(self.switch_ike_sa(new_sa));
                 if let Err(e) = self.delete_ike_sa("the redundant IKE SA of a simultaneous rekey") {
                     ike_debug!("CREATE_CHILD_SA (IKE SA rekey): failed to delete the redundant IKE SA: {e}");
                 }
@@ -1549,7 +1665,7 @@ impl LivenessSession {
             Some(Ok((new_sa, _))) => {
                 ike_debug!("CREATE_CHILD_SA (IKE SA rekey): the peer rekeyed the IKE SA too -- its new SA holds the lowest nonce, the peer deletes it; keeping ours");
                 // Its Delete comes on it, and is routine.
-                self.ike.retired = Some(RetiredIkeSa { sa: crossed.sa, since: Instant::now() });
+                self.ike.retired = Some(RetiredIkeSa::new(crossed.sa, PeerRequests::default()));
                 self.finish_ike_rekey(new_sa);
             }
             ours => {
@@ -1580,12 +1696,15 @@ impl LivenessSession {
 
     /// Send `wire`, a request already built for Message ID `mid`, and wait for
     /// its response, retransmitting the identical bytes (RFC 7296 §2.1) a few
-    /// times when `timeout` passes without one. Requests the peer sends
-    /// meanwhile are answered as usual. [`Reply::Unanswered`] too when the
-    /// peer deleted the IKE SA after rekeying it itself (see
-    /// [`OwnIkeRekey::old_deleted`]): no answer is coming.
+    /// times when `timeout` passes without one. Only the genuine answer counts
+    /// (see [`Self::is_answer`]); anything else with its Message ID is passed
+    /// over. Requests the peer sends meanwhile are answered as usual.
+    /// [`Reply::Unanswered`] too when the peer deleted the IKE SA after
+    /// rekeying it itself (see [`OwnIkeRekey::old_deleted`]): no answer is
+    /// coming.
     fn request_response(&mut self, wire: &[u8], mid: u32, timeout: Duration) -> Result<Reply, DriverError> {
         const ATTEMPTS: u32 = 3;
+        let exchange = IkeHeader::parse(&unwrap(wire, self.float)?)?.exchange_type;
         for attempt in 0..ATTEMPTS {
             if attempt > 0 {
                 ike_debug!("request {mid}: retransmitting to {} (attempt {}/{ATTEMPTS})", self.dest, attempt + 1);
@@ -1609,10 +1728,10 @@ impl LivenessSession {
                 let Ok(msg) = unwrap(&buf[..n], self.float) else { continue };
                 let Ok(header) = IkeHeader::parse(&msg) else { continue };
                 if header.flags.response {
-                    if header.message_id == mid {
+                    if self.is_answer(&header, &msg, mid, exchange) {
                         return Ok(Reply::Response(msg));
                     }
-                    continue; // a stale/unrelated response -- keep waiting
+                    continue; // stale, unrelated or forged -- keep waiting
                 }
                 if self.answer_peer_request(&header, &msg)? {
                     return Ok(Reply::PeerTornDown);
@@ -1827,6 +1946,14 @@ fn send_and_retry_reassembling(
         // Anything else (a stray retransmit of an earlier message, ...) is
         // just ignored -- keep waiting for the rest of this message.
     }
+}
+
+/// Whether `header` is that of a message from the peer on the IKE SA `sa`
+/// (RFC 7296 §3.1): its SPIs, and the Initiator flag of the peer's role in it
+/// -- set when the peer is the IKE SA's original initiator, which after a
+/// rekey is whoever started the rekey (§2.18).
+fn from_peer_on(sa: &CompletedSaInit, header: &IkeHeader) -> bool {
+    header.initiator_spi == sa.spi_i && header.responder_spi == sa.spi_r && header.flags.initiator == (sa.role == Role::Responder)
 }
 
 fn wrap(msg: &[u8], float: bool) -> Vec<u8> {
@@ -2256,7 +2383,7 @@ impl<E: Entropy> Ikev2Session<E> {
             cfg_subnets6: info.subnets6.clone(),
             child_carries_ipv6: false,
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None,
+            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
         };
         if want_cfg && assigned_ip4.is_none() {
             ike_debug!("IKE_AUTH: CHILD SA refused ({rejection}) and no CFG_REPLY came with it -- no inner address to build on, closing");
@@ -2462,7 +2589,7 @@ impl<E: Entropy> Ikev2Session<E> {
             cfg_subnets6: info.subnets6.clone(),
             child_carries_ipv6: !child_subnets6.is_empty(),
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None,
+            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
         };
         Ok(ConnectedTunnel {
             local_spi,
@@ -2758,7 +2885,7 @@ impl<E: Entropy> Ikev2Session<E> {
             cfg_subnets6: info.subnets6.clone(),
             child_carries_ipv6: !child_subnets6.is_empty(),
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None,
+            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
         };
 
         Ok(ConnectedTunnel {
@@ -2813,6 +2940,7 @@ mod tests {
         initiator_complete, initiator_request, responder_respond, responder_respond_natt, SaInitResult,
     };
     use crate::ikev2::ike_auth::{responder_process_auth, AssignedConfig};
+    use crate::ikev2::informational::open_informational;
     use crate::ikev2::message::Flags;
     use crate::ikev2::payload::Delete;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -2872,7 +3000,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
@@ -2906,7 +3034,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         // Must NOT report Alive on the forged datagram -- with no genuine
         // reply arriving, the probe times out instead.
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::NoReply);
@@ -2937,7 +3065,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
@@ -2967,7 +3095,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -2994,7 +3122,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         liveness.close().unwrap();
         responder.join().unwrap();
     }
@@ -3008,7 +3136,7 @@ mod tests {
         let (init_sa, _resp_sa) = liveness_sa_pair();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         liveness.close().unwrap();
     }
 
@@ -3023,7 +3151,7 @@ mod tests {
         let unreachable: SocketAddr = silent_peer.local_addr().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::NoReply);
     }
 
@@ -3033,7 +3161,7 @@ mod tests {
         let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         // Unlike probe(), silence on a peek is Alive (nothing new to
         // report), not NoReply -- peek never asked anything.
         assert_eq!(liveness.peek(Duration::from_millis(50)).unwrap(), Liveness::Alive);
@@ -3067,7 +3195,7 @@ mod tests {
         probe_sock.send_to(b"hello", bind).unwrap();
 
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -3133,7 +3261,7 @@ mod tests {
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None,
+            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
         };
         // Whatever the answer, the request is not a teardown: the IKE SA stands.
         assert_eq!(liveness.peek(Duration::from_millis(1500)).unwrap(), Liveness::Alive);
@@ -3325,7 +3453,7 @@ mod tests {
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(),
             primary_child_alive: true,
-            last_informational_ack: None,
+            peer_requests: PeerRequests::default(),
         };
         let err = liveness.rekey_child(Duration::from_secs(2)).err().expect("the answer without PFS is refused");
         assert!(matches!(err, DriverError::Ike(IkeError::NoProposalChosen)), "got {err:?}");
@@ -3466,7 +3594,7 @@ mod tests {
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None,
+            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
         };
         // The stale Delete is ignored and the wait times out -- silence
         // (nothing new to report) is Alive, exactly as if nothing had
@@ -3510,7 +3638,7 @@ mod tests {
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None,
+            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
         };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
@@ -3560,7 +3688,7 @@ mod tests {
             child_carries_ipv6: false,
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(),
-            primary_child_alive: true, last_informational_ack: None,
+            primary_child_alive: true, peer_requests: PeerRequests::default(),
         };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::Alive, "the IKE SA and the IPv6 CHILD SA are still good");
         assert_eq!(liveness.take_peer_deleted_children(), vec![ChildKind::Primary]);
@@ -3610,7 +3738,7 @@ mod tests {
             child_carries_ipv6: false,
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(),
-            primary_child_alive: true, last_informational_ack: None,
+            primary_child_alive: true, peer_requests: PeerRequests::default(),
         };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::Alive, "the IKE SA and the primary CHILD SA are still good");
         assert_eq!(liveness.take_peer_deleted_children(), vec![ChildKind::Ipv6]);
@@ -3680,11 +3808,437 @@ mod tests {
                 ..Default::default()
             },
             primary_child_alive: true,
-            last_informational_ack: None,
+            peer_requests: PeerRequests::default(),
         };
         assert_eq!(liveness.peek(Duration::from_millis(600)).unwrap(), Liveness::Alive);
         assert!(liveness.peer_child.superseded.is_empty(), "drained exactly once, not once per retransmission");
         responder.join().unwrap();
+    }
+
+    /// A session on the IKE SA `sa` whose gateway is `gateway`, a plain socket
+    /// the test drives by hand: primary CHILD SA `0xBBBB` inbound / `0xAAAA`
+    /// outbound, and `child6` as the IPv6 one.
+    fn session_facing(gateway: &UdpSocket, sa: CompletedSaInit, child6: Option<ChildSpis>) -> LivenessSession {
+        gateway.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        LivenessSession {
+            sock: UdpSocket::bind("127.0.0.1:0").unwrap(),
+            sa,
+            dest: gateway.local_addr().unwrap(),
+            float: false,
+            next_message_id: 2,
+            cipher: SkCipher::Aes256Gcm,
+            pfs: PfsPolicy::none(),
+            child_local_spi: 0xBBBB,
+            child_peer_spi: 0xAAAA,
+            external_rx: None,
+            child6,
+            cfg_subnets6: Vec::new(),
+            child_carries_ipv6: false,
+            ike: IkeSaState::new(),
+            peer_child: PeerChildState::default(),
+            primary_child_alive: true,
+            peer_requests: PeerRequests::default(),
+        }
+    }
+
+    /// The gateway sends `msg`, and the session takes in what is waiting.
+    fn deliver(liveness: &mut LivenessSession, gateway: &UdpSocket, msg: &[u8]) -> Liveness {
+        gateway.send_to(msg, liveness.sock.local_addr().unwrap()).unwrap();
+        liveness.peek(Duration::from_millis(100)).expect("nothing the gateway's end sends makes peek fail")
+    }
+
+    /// What the session sent the gateway next, if anything.
+    fn sent_to(gateway: &UdpSocket) -> Option<Vec<u8>> {
+        let mut buf = [0u8; 4096];
+        gateway.recv_from(&mut buf).ok().map(|(n, _)| buf[..n].to_vec())
+    }
+
+    fn delete_payload(delete: Delete) -> (PayloadType, Vec<u8>) {
+        (PayloadType::Delete, delete.to_bytes())
+    }
+
+    /// The header of a message from the gateway on `sa` (its end of an IKE SA
+    /// [`liveness_sa_pair`] made), as RFC 7296 §3.1 has it: the gateway is
+    /// the original responder, so its Initiator flag is clear.
+    fn gateway_header(sa: &CompletedSaInit, mid: u32, exchange_type: ExchangeType, response: bool) -> IkeHeader {
+        IkeHeader {
+            initiator_spi: sa.spi_i,
+            responder_spi: sa.spi_r,
+            next_payload: PayloadType::NoNext,
+            major_version: 2,
+            minor_version: 0,
+            exchange_type,
+            flags: Flags { initiator: false, version: false, response },
+            message_id: mid,
+            length: 0,
+        }
+    }
+
+    /// A message under `header` as it stands, carrying `payloads` in its SK
+    /// payload under the gateway's keys of `sa` -- authentic whatever the
+    /// header says, since the keys don't depend on it.
+    fn from_gateway(sa: &CompletedSaInit, header: IkeHeader, payloads: &[(PayloadType, Vec<u8>)]) -> Vec<u8> {
+        use crate::ikev2::message::{encode_payload_chain, first_payload_type};
+
+        let inner = encode_payload_chain(payloads);
+        sk::build_encrypted(sa.suite.sk_cipher(), header, first_payload_type(payloads), &inner, &sa.keys.sk_er, &sa.keys.sk_ar, &[6u8; 8]).unwrap()
+    }
+
+    /// The payloads of `msg`, a message the gateway built on `sa` -- the
+    /// inverse of [`from_gateway`].
+    fn gateway_payloads(sa: &CompletedSaInit, msg: &[u8]) -> Vec<(PayloadType, Vec<u8>)> {
+        let (first, inner) = open_encrypted(sa.suite.sk_cipher(), msg, &sa.keys.sk_er, &sa.keys.sk_ar).unwrap();
+        payloads(first, &inner).map(|p| p.map(|p| (p.payload_type, p.data.to_vec()))).collect::<Result<_, _>>().unwrap()
+    }
+
+    /// `msg` with its integrity check value broken.
+    fn tampered(mut msg: Vec<u8>) -> Vec<u8> {
+        let last = msg.len() - 1;
+        msg[last] ^= 1;
+        msg
+    }
+
+    /// Every ESP SPI the Delete payloads of the session's answer `msg` name, sorted.
+    fn esp_spis_deleted(sa: &CompletedSaInit, msg: &[u8]) -> Vec<u32> {
+        let mut spis: Vec<u32> = open_informational(sa, msg)
+            .unwrap()
+            .into_iter()
+            .filter(|(t, _)| *t == PayloadType::Delete)
+            .map(|(_, body)| Delete::parse(&body).unwrap())
+            .filter(|d| d.protocol_id == protocol_id::ESP)
+            .flat_map(|d| d.spis)
+            .collect();
+        spis.sort_unstable();
+        spis
+    }
+
+    /// RFC 7296 §2.21.3, §2.2: a request is answered, and acted on, only once
+    /// it authenticates. A Delete of the IKE SA whose integrity check fails,
+    /// or one under our own direction's keys (a reflection of our traffic),
+    /// gets no answer and changes nothing -- and does not use up the Message
+    /// ID the gateway's next genuine request carries.
+    #[test]
+    fn a_request_that_does_not_authenticate_is_neither_answered_nor_acted_on() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+
+        let forged = tampered(build_informational(&resp_sa, 0, false, &[delete_payload(Delete::ike_sa())], &[7u8; 8]).unwrap());
+        assert_eq!(deliver(&mut liveness, &gateway, &forged), Liveness::Alive, "an unauthenticated Delete ends nothing");
+        assert_eq!(sent_to(&gateway), None, "nor is it answered");
+        let reflected = build_informational(&liveness.sa, 0, false, &[delete_payload(Delete::esp(vec![0xAAAA]))], &[7u8; 8]).unwrap();
+        assert_eq!(deliver(&mut liveness, &gateway, &reflected), Liveness::Alive);
+        assert_eq!(sent_to(&gateway), None);
+        assert!(liveness.primary_child_alive);
+
+        let genuine = build_informational(&resp_sa, 0, false, &[], &[8u8; 8]).unwrap();
+        assert_eq!(deliver(&mut liveness, &gateway, &genuine), Liveness::Alive);
+        let answer = sent_to(&gateway).expect("the genuine request with that Message ID is answered");
+        assert_eq!(IkeHeader::parse(&answer).unwrap().message_id, 0);
+        assert!(open_informational(&resp_sa, &answer).unwrap().is_empty());
+    }
+
+    /// RFC 7296 §2.1-§2.3: each IKE SA keeps a receive window of one request.
+    /// The last request answered, sent again byte for byte, is a
+    /// retransmission and gets the very same answer. An older one -- 100 once
+    /// 101 is answered -- is a replay, one past the next expected ID is
+    /// outside the window, and a different request under an ID already
+    /// answered is neither: none is answered, and the next expected ID still is.
+    #[test]
+    fn the_receive_window_resends_the_last_answer_and_drops_everything_else_but_the_next_request() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        let request = |mid: u32, iv: u8| build_informational(&resp_sa, mid, false, &[], &[iv; 8]).unwrap();
+
+        let (r100, r101) = (request(100, 1), request(101, 2));
+        deliver(&mut liveness, &gateway, &r100);
+        assert!(sent_to(&gateway).is_some(), "100 is answered");
+        deliver(&mut liveness, &gateway, &r101);
+        let a101 = sent_to(&gateway).expect("101 is answered");
+
+        deliver(&mut liveness, &gateway, &r101);
+        assert_eq!(sent_to(&gateway), Some(a101), "a retransmission gets the identical answer");
+        deliver(&mut liveness, &gateway, &r100);
+        assert_eq!(sent_to(&gateway), None, "an older request is a replay: not answered again");
+        deliver(&mut liveness, &gateway, &request(103, 3));
+        assert_eq!(sent_to(&gateway), None, "past the window");
+        deliver(&mut liveness, &gateway, &request(101, 4));
+        assert_eq!(sent_to(&gateway), None, "another request under an ID already answered");
+        deliver(&mut liveness, &gateway, &request(102, 5));
+        let a102 = sent_to(&gateway).expect("the next expected request is answered");
+        assert_eq!(IkeHeader::parse(&a102).unwrap().message_id, 102);
+    }
+
+    /// RFC 7296 §3.1, §2.2: a request is one on this IKE SA only when its
+    /// header says so -- the IKE SA's SPIs, and the Initiator flag of the
+    /// gateway's role in it. The integrity check covers the header, but the
+    /// keys don't depend on it, so a body authentic under a header naming
+    /// other SPIs, or claiming the other role, must be dropped unanswered.
+    #[test]
+    fn a_request_whose_header_is_not_this_ike_sas_is_dropped() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        let delete = [delete_payload(Delete::ike_sa())];
+
+        let mut other_spis = gateway_header(&resp_sa, 0, ExchangeType::Informational, false);
+        other_spis.responder_spi ^= 1;
+        let mut other_role = gateway_header(&resp_sa, 0, ExchangeType::Informational, false);
+        other_role.flags.initiator = true;
+        for header in [other_spis, other_role] {
+            assert_eq!(deliver(&mut liveness, &gateway, &from_gateway(&resp_sa, header, &delete)), Liveness::Alive);
+            assert_eq!(sent_to(&gateway), None);
+        }
+        // Control: under this IKE SA's own header, the same Delete ends the tunnel.
+        let genuine = from_gateway(&resp_sa, gateway_header(&resp_sa, 0, ExchangeType::Informational, false), &delete);
+        assert_eq!(deliver(&mut liveness, &gateway, &genuine), Liveness::PeerTornDown);
+        assert!(sent_to(&gateway).is_some());
+    }
+
+    /// Anyone can send the IKE socket a datagram that is no IKEv2 message --
+    /// too short to be one, or of another major version. It is dropped, and
+    /// `peek` and `probe` carry on as if it had never come rather than fail.
+    #[test]
+    fn a_datagram_that_is_no_ikev2_message_is_dropped_without_failing_the_session() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        let mut version_1 = build_informational(&resp_sa, 0, false, &[], &[1u8; 8]).unwrap();
+        version_1[17] = 0x10;
+        for junk in [b"garbage".to_vec(), version_1] {
+            assert_eq!(deliver(&mut liveness, &gateway, &junk), Liveness::Alive);
+            assert_eq!(sent_to(&gateway), None);
+        }
+
+        // Nor does junk ahead of a probe's answer (Message ID 2) hide it.
+        let to = liveness.sock.local_addr().unwrap();
+        gateway.send_to(b"garbage", to).unwrap();
+        gateway.send_to(&build_informational(&resp_sa, 2, true, &[], &[2u8; 8]).unwrap(), to).unwrap();
+        assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::Alive);
+    }
+
+    /// Nor does a stream of datagrams keep `peek` waiting past its timeout:
+    /// each one read doesn't start the wait over.
+    #[test]
+    fn peek_keeps_to_its_timeout_while_datagrams_keep_coming() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        let to = liveness.sock.local_addr().unwrap();
+        let foreign = build_informational(&resp_sa, 7, true, &[], &[1u8; 8]).unwrap(); // an answer to nothing
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sender = thread::spawn({
+            let stop = stop.clone();
+            move || {
+                let until = Instant::now() + Duration::from_secs(3);
+                while !stop.load(Ordering::Relaxed) && Instant::now() < until {
+                    let _ = gateway.send_to(&foreign, to);
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        });
+        let started = Instant::now();
+        let live = liveness.peek(Duration::from_millis(200));
+        let took = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        sender.join().unwrap();
+        assert_eq!(live.unwrap(), Liveness::Alive);
+        assert!(took < Duration::from_millis(1000), "peek(200ms) took {took:?}");
+    }
+
+    /// RFC 7296 §2.2, §3.1: the answer to our request is the response with its
+    /// Message ID on this IKE SA, of the request's exchange, from the peer's
+    /// role, and authentic. A response short of any of that is not it: a
+    /// probe answered only with such decoys got no answer.
+    #[test]
+    fn only_the_genuine_answer_to_a_probe_counts() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        let to = liveness.sock.local_addr().unwrap();
+        let answer = |mid: u32, change: &dyn Fn(&mut IkeHeader)| {
+            let mut header = gateway_header(&resp_sa, mid, ExchangeType::Informational, true);
+            change(&mut header);
+            from_gateway(&resp_sa, header, &[])
+        };
+
+        let decoys = [
+            answer(2, &|h| h.exchange_type = ExchangeType::CreateChildSa),
+            answer(2, &|h| h.initiator_spi ^= 1),
+            answer(2, &|h| h.flags.initiator = true),
+            tampered(answer(2, &|_| ())),
+        ];
+        for decoy in &decoys {
+            gateway.send_to(decoy, to).unwrap();
+        }
+        assert_eq!(liveness.probe(Duration::from_millis(200)).unwrap(), Liveness::NoReply);
+
+        // Control: the genuine answer to the next probe (Message ID 3).
+        gateway.send_to(&answer(3, &|_| ()), to).unwrap();
+        assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::Alive);
+    }
+
+    /// The same for our CREATE_CHILD_SA: responses with the rekey's Message ID
+    /// that are not the gateway's answer -- one that does not authenticate,
+    /// one on other SPIs, one claiming the other role, one of another
+    /// exchange -- arriving ahead of the real answer are passed over, and the
+    /// rekey completes on the real one.
+    #[test]
+    fn a_rekey_takes_the_genuine_answer_past_decoys_with_its_message_id() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        gateway.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let from = liveness.sock.local_addr().unwrap();
+        let peer = thread::spawn(move || {
+            let request = recv_from_client(&gateway);
+            let mid = IkeHeader::parse(&request).unwrap().message_id;
+            let (answer, child) = gateway_answers_rekey(&resp_sa, &request, &[0x80u8; 32]);
+            let inner = gateway_payloads(&resp_sa, &answer);
+            let decoy = |change: &dyn Fn(&mut IkeHeader)| {
+                let mut header = gateway_header(&resp_sa, mid, ExchangeType::CreateChildSa, true);
+                change(&mut header);
+                from_gateway(&resp_sa, header, &inner)
+            };
+            let decoys = [
+                tampered(answer.clone()),
+                decoy(&|h| h.responder_spi ^= 1),
+                decoy(&|h| h.flags.initiator = true),
+                build_informational(&resp_sa, mid, true, &[], &[3u8; 8]).unwrap(),
+            ];
+            for decoy in decoys.iter().chain([&answer]) {
+                gateway.send_to(decoy, from).unwrap();
+            }
+            let delete = recv_from_client(&gateway);
+            gateway.send_to(&informational_answer(&resp_sa, &delete, &[0xAAAA]), from).unwrap();
+            (child.outbound.spi(), delete_in(&resp_sa, &delete))
+        });
+
+        let rekeyed = liveness.rekey_child(Duration::from_secs(2)).expect("the rekey completes on the gateway's real answer");
+        let (gateway_made, deleted) = peer.join().unwrap();
+        assert_eq!((rekeyed.local_spi, rekeyed.peer_spi), (gateway_made, PEER_L_SPI));
+        assert_eq!(deleted, Some(Delete::esp(vec![0xBBBB])), "and the SA it replaced is deleted as usual");
+    }
+
+    /// RFC 7296 §3.11, §1.4.1: an INFORMATIONAL may carry several Delete
+    /// payloads, and each counts. A Delete of the IKE SA after one naming an
+    /// SA this side doesn't know still ends the tunnel, and is answered with
+    /// an empty INFORMATIONAL, as a Delete of the IKE SA is.
+    #[test]
+    fn every_delete_payload_of_a_request_counts() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        let payloads = [delete_payload(Delete::esp(vec![0x1234])), delete_payload(Delete::ike_sa())];
+        let request = build_informational(&resp_sa, 0, false, &payloads, &[7u8; 8]).unwrap();
+        assert_eq!(deliver(&mut liveness, &gateway, &request), Liveness::PeerTornDown);
+        let answer = sent_to(&gateway).expect("answered");
+        assert!(open_informational(&resp_sa, &answer).unwrap().is_empty(), "the answer to a Delete of the IKE SA is empty");
+    }
+
+    /// ...and so does every SPI they name: a Delete of both CHILD SAs, in one
+    /// payload or two, leaves the tunnel with none, which ends it as the
+    /// primary's alone does when there is no IPv6 one. The answer carries our
+    /// Delete for each pair (RFC 7296 §1.4.1).
+    #[test]
+    fn a_delete_naming_both_child_sas_takes_both() {
+        for deletes in [vec![Delete::esp(vec![0x7777, 0xAAAA])], vec![Delete::esp(vec![0x7777]), Delete::esp(vec![0xAAAA])]] {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut liveness = session_facing(&gateway, init_sa, Some(ChildSpis { local: 0x6666, peer: 0x7777 }));
+            let payloads: Vec<_> = deletes.into_iter().map(delete_payload).collect();
+            let request = build_informational(&resp_sa, 0, false, &payloads, &[7u8; 8]).unwrap();
+            assert_eq!(deliver(&mut liveness, &gateway, &request), Liveness::PeerTornDown, "{} payload(s)", payloads.len());
+            assert_eq!(esp_spis_deleted(&resp_sa, &sent_to(&gateway).expect("answered")), vec![0x6666, 0xBBBB]);
+        }
+    }
+
+    /// RFC 7296 §1.4.1: "the response in the INFORMATIONAL exchange will
+    /// contain Delete payloads for the paired SAs going in the other
+    /// direction" -- the gateway deleting one of the tunnel's CHILD SAs gets
+    /// ours for it back, naming our inbound SPI of the pair.
+    #[test]
+    fn a_child_sa_delete_is_answered_with_ours_for_the_pair() {
+        for (named, ours, left) in [(0xAAAA, 0xBBBB, ChildKind::Primary), (0x7777, 0x6666, ChildKind::Ipv6)] {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut liveness = session_facing(&gateway, init_sa, Some(ChildSpis { local: 0x6666, peer: 0x7777 }));
+            let request = build_informational(&resp_sa, 0, false, &[delete_payload(Delete::esp(vec![named]))], &[7u8; 8]).unwrap();
+            assert_eq!(deliver(&mut liveness, &gateway, &request), Liveness::Alive);
+            assert_eq!(esp_spis_deleted(&resp_sa, &sent_to(&gateway).expect("answered")), vec![ours]);
+            assert_eq!(liveness.take_peer_deleted_children(), vec![left]);
+        }
+    }
+
+    /// RFC 7296 §2.2, §2.18: the window belongs to the IKE SA. After the
+    /// gateway rekeyed it, the old IKE SA keeps its own until it is gone:
+    /// another request under the ID its rekey took (0) is not answered, its
+    /// Delete (1) is answered on it and a retransmission of that Delete gets
+    /// the same answer, but nothing after it is (§1.4.1: the IKE SA is gone),
+    /// while the new IKE SA starts over at 0.
+    #[test]
+    fn a_retired_ike_sa_keeps_its_own_receive_window() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        let ni = [0x55u8; 32];
+        assert_eq!(deliver(&mut liveness, &gateway, &gateway_ike_rekey(&resp_sa, 0, &ni)), Liveness::Alive);
+        let new_sa = gateway_ike_rekey_done(&resp_sa, &ni, &sent_to(&gateway).expect("the IKE SA rekey is answered"));
+
+        let reusing_0 = build_informational(&resp_sa, 0, false, &[], &[2u8; 8]).unwrap();
+        assert_eq!(deliver(&mut liveness, &gateway, &reusing_0), Liveness::Alive);
+        assert_eq!(sent_to(&gateway), None, "Message ID 0 of the old IKE SA was its rekey's");
+
+        let delete = ike_delete_request(&resp_sa, 1);
+        assert_eq!(deliver(&mut liveness, &gateway, &delete), Liveness::Alive, "the old IKE SA's Delete is routine");
+        let answer = sent_to(&gateway).expect("answered on the old IKE SA");
+        assert!(open_informational(&resp_sa, &answer).unwrap().is_empty());
+        assert_eq!(deliver(&mut liveness, &gateway, &delete), Liveness::Alive);
+        assert_eq!(sent_to(&gateway), Some(answer), "a retransmitted Delete gets the same answer");
+        assert_eq!(deliver(&mut liveness, &gateway, &build_informational(&resp_sa, 2, false, &[], &[3u8; 8]).unwrap()), Liveness::Alive);
+        assert_eq!(sent_to(&gateway), None, "the deleted IKE SA answers nothing new");
+
+        assert_eq!(deliver(&mut liveness, &gateway, &build_informational(&new_sa, 0, false, &[], &[4u8; 8]).unwrap()), Liveness::Alive);
+        assert!(open_informational(&new_sa, &sent_to(&gateway).expect("the new IKE SA's 0 is answered")).is_ok());
+    }
+
+    /// RFC 7296 §2.1: a refusal is an answer like any other. The gateway
+    /// retransmitting a CREATE_CHILD_SA this side refused gets the same bytes
+    /// back, not a refusal built anew.
+    #[test]
+    fn a_refused_create_child_sa_retransmitted_gets_the_same_refusal() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        let ts = TrafficSelectors::ipv4_full_tunnel();
+        let request = rekey::build_child_request(&resp_sa, 100, None, PEER_NEW_SPI, &PEER_NI, SkCipher::Aes256Gcm, None, &ts, &[7u8; 8]).unwrap();
+        deliver(&mut liveness, &gateway, &request);
+        let refusal = sent_to(&gateway).expect("refused");
+        assert_eq!(refusal_reason(&resp_sa, &refusal), notify_type::NO_ADDITIONAL_SAS);
+        deliver(&mut liveness, &gateway, &request);
+        assert_eq!(sent_to(&gateway), Some(refusal), "the same refusal, byte for byte");
+    }
+
+    /// RFC 7296 §2.2: two counters, one for our requests and one for the
+    /// gateway's. Ours going up (probes 2 and 3) leaves the ID the gateway's
+    /// next request carries alone (0, then 1), and the other way round.
+    #[test]
+    fn our_message_ids_and_the_gateways_are_counted_apart() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        let to = liveness.sock.local_addr().unwrap();
+        for mid in [2, 3] {
+            gateway.send_to(&build_informational(&resp_sa, mid, true, &[], &[1u8; 8]).unwrap(), to).unwrap();
+            assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::Alive);
+        }
+        while sent_to(&gateway).is_some() {} // the probes themselves
+        for mid in [0, 1] {
+            deliver(&mut liveness, &gateway, &build_informational(&resp_sa, mid, false, &[], &[2u8; 8]).unwrap());
+            assert_eq!(IkeHeader::parse(&sent_to(&gateway).expect("answered")).unwrap().message_id, mid);
+        }
+        assert_eq!(liveness.next_message_id, 4, "answering the gateway uses none of ours");
     }
 
     // A free-ish loopback port per test, avoiding cross-test collisions
@@ -5700,7 +6254,7 @@ mod tests {
         let (init_sa, _resp_sa) = liveness_sa_pair();
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let dest = sock.local_addr().unwrap();
-        LivenessSession { sock, sa: init_sa, dest, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None }
+        LivenessSession { sock, sa: init_sa, dest, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() }
     }
 
     #[test]

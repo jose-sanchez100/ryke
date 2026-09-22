@@ -79,9 +79,24 @@ pub fn dpd_request(sa: &CompletedSaInit, message_id: u32, iv: &[u8; 8]) -> Resul
 /// Decrypt an INFORMATIONAL from the peer, returning its inner payloads as
 /// `(type, body)` pairs. An empty result is a DPD liveness probe/ack.
 pub fn open_informational(sa: &CompletedSaInit, message: &[u8]) -> Result<Vec<(PayloadType, Vec<u8>)>, IkeError> {
-    let (first, inner) = open_encrypted(sa.suite.sk_cipher(), message, peer_sk_e(sa), peer_sk_a(sa))?;
+    let (first, inner) = open_from_peer(sa, message)?;
+    payload_list(first, &inner)
+}
+
+/// Decrypt and authenticate `message`, one the peer sent on `sa` in any
+/// exchange, returning the first inner payload's type and the SK payload's
+/// plaintext. This is the integrity check alone (RFC 7296 §3.14): whether the
+/// header's SPIs, flags, exchange type and Message ID are what such a message
+/// should carry is the caller's to check -- the keys don't depend on them.
+pub fn open_from_peer(sa: &CompletedSaInit, message: &[u8]) -> Result<(PayloadType, Vec<u8>), IkeError> {
+    open_encrypted(sa.suite.sk_cipher(), message, peer_sk_e(sa), peer_sk_a(sa))
+}
+
+/// The payload chain starting with a `first` payload in `body`, as
+/// `(type, body)` pairs.
+pub fn payload_list(first: PayloadType, body: &[u8]) -> Result<Vec<(PayloadType, Vec<u8>)>, IkeError> {
     let mut out = Vec::new();
-    for payload in payloads(first, &inner) {
+    for payload in payloads(first, body) {
         let payload = payload?;
         out.push((payload.payload_type, payload.data.to_vec()));
     }

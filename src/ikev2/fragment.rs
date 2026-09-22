@@ -297,6 +297,29 @@ fn open_fragment_cbc(cipher: SkCipher, message: &[u8], sk_e: &[u8], sk_a: &[u8])
     })
 }
 
+/// Read a fragment's Fragment Number / Total Fragments straight off the
+/// wire, without verifying its AEAD tag / CBC ICV. Both fields sit in the
+/// SKF generic header, which is authenticated but not encrypted under either
+/// framing (see the module docs), so this is cheap enough for a caller to
+/// use as a queueing/deduplication key *before* paying for a full decrypt on
+/// every arrival. Never trust the returned numbers for anything beyond that
+/// bookkeeping -- [`reassemble`] still independently authenticates every
+/// fragment's content once a full set is in hand.
+pub fn peek_fragment_header(message: &[u8]) -> Result<(u16, u16), IkeError> {
+    let header = IkeHeader::parse(message)?;
+    if header.next_payload != PayloadType::EncryptedFragment {
+        return Err(IkeError::MissingPayload("SKF"));
+    }
+    let body = &message[IkeHeader::LEN..];
+    let min_body = 4 + SKF_EXTRA;
+    if body.len() < min_body {
+        return Err(IkeError::Truncated { need: min_body, have: body.len() });
+    }
+    let frag_num = u16::from_be_bytes([body[4], body[5]]);
+    let total = u16::from_be_bytes([body[6], body[7]]);
+    Ok((frag_num, total))
+}
+
 /// Reassemble a set of SKF messages, sealed under `cipher`, into
 /// `(first_inner_type, inner_bytes)`. Fragments may arrive in any order; all
 /// of `1..=total` must be present exactly once, and every fragment's
@@ -447,6 +470,26 @@ mod tests {
         let last = frags[0].len() - 1;
         frags[0][last] ^= 1; // corrupt an ICV byte in the first fragment
         assert_eq!(reassemble(cipher, &frags, &sk_e, &sk_a).unwrap_err(), IkeError::BadIntegrity);
+    }
+
+    #[test]
+    fn peek_fragment_header_reads_number_and_total_without_the_keys() {
+        let sk_e = vec![1u8; 36];
+        let inner: Vec<u8> = (0..=200u8).collect();
+        let frags = build_fragments(SkCipher::Aes256Gcm, &header(), PayloadType::IdInitiator, &inner, &sk_e, &[], 1, 30).unwrap();
+        assert!(frags.len() > 1);
+        for (i, f) in frags.iter().enumerate() {
+            let (num, total) = peek_fragment_header(f).unwrap();
+            assert_eq!(num, (i + 1) as u16);
+            assert_eq!(total, frags.len() as u16);
+        }
+    }
+
+    #[test]
+    fn peek_fragment_header_rejects_a_non_skf_message() {
+        let mut hdr = header();
+        hdr.next_payload = PayloadType::Encrypted;
+        assert!(peek_fragment_header(&hdr.to_bytes()).is_err());
     }
 
     #[test]

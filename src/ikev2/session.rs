@@ -170,6 +170,12 @@ pub struct Ipv6Child {
 /// request if our answer never reached it.
 const RETIRED_IKE_SA_TTL: Duration = Duration::from_secs(60);
 
+/// How many of an IKE SA's last Message IDs only a rekey or Delete of the IKE
+/// SA may use, so that one can still be sent once the others have run out
+/// (RFC 7296 §2.2) -- enough for a rekey retried many times over, the Delete
+/// of the IKE SA it replaces, and a close.
+const MESSAGE_IDS_KEPT_FOR_ENDING: u32 = 64;
+
 /// An IKE SA this session has moved on from that the *peer* deletes: the one
 /// its rekey replaced (RFC 7296 §2.18), or the redundant one its rekey made
 /// when both ends rekeyed at once (§2.8.2). The peer still talks under its
@@ -438,15 +444,33 @@ pub enum Liveness {
 }
 
 impl LivenessSession {
-    /// Allocate the next request Message ID -- factored out of `probe` and
-    /// `delete_child_sa` (both used to inline `let mid = self.next_message_id;
-    /// self.next_message_id += 1;`) since [`Self::send_and_await`] now needs
-    /// the id fixed once, before entering its own retry loop, rather than
-    /// re-derived per attempt.
-    fn alloc_message_id(&mut self) -> u32 {
+    /// The Message ID for a request other than a rekey or Delete of the IKE
+    /// SA itself, fixed once before any retransmission. None is handed out
+    /// from the last [`MESSAGE_IDS_KEPT_FOR_ENDING`]: those are
+    /// [`Self::alloc_ending_message_id`]'s.
+    fn alloc_message_id(&mut self) -> Result<u32, IkeError> {
+        if self.message_ids_exhausted() {
+            return Err(IkeError::MessageIdsExhausted);
+        }
+        self.alloc_ending_message_id()
+    }
+
+    /// The Message ID for a request that rekeys or deletes the IKE SA: any
+    /// left. Message IDs never wrap (RFC 7296 §2.2), so the very last one,
+    /// `u32::MAX`, is never used -- it would leave nothing to go on to.
+    fn alloc_ending_message_id(&mut self) -> Result<u32, IkeError> {
         let mid = self.next_message_id;
-        self.next_message_id += 1;
-        mid
+        self.next_message_id = mid.checked_add(1).ok_or(IkeError::MessageIdsExhausted)?;
+        Ok(mid)
+    }
+
+    /// Whether this IKE SA has run through the Message IDs its requests may
+    /// use (RFC 7296 §2.2: they never wrap, and the IKE SA is then rekeyed or
+    /// closed). From here on, every request but [`Self::rekey_ike`] and
+    /// [`Self::close`] fails with [`IkeError::MessageIdsExhausted`] without
+    /// being sent; a rekey of the IKE SA, by either side, starts them over.
+    pub fn message_ids_exhausted(&self) -> bool {
+        self.next_message_id >= u32::MAX - MESSAGE_IDS_KEPT_FOR_ENDING
     }
 
     /// Send `wire` (already built for Message ID `expected_mid`) and wait up
@@ -478,7 +502,7 @@ impl LivenessSession {
     /// retransmitting a few times (see [`Self::send_and_await`]) before
     /// concluding [`Liveness::NoReply`].
     pub fn probe(&mut self, timeout: Duration) -> Result<Liveness, DriverError> {
-        let mid = self.alloc_message_id();
+        let mid = self.alloc_message_id()?;
 
         let mut iv = [0u8; 8];
         OsEntropy::new()?.fill(&mut iv);
@@ -539,6 +563,9 @@ impl LivenessSession {
     /// Best-effort: the local teardown that follows a call to this doesn't
     /// depend on the peer ever seeing this message, so a missing ack (or any
     /// I/O error past the initial send) is not surfaced as a hard failure.
+    /// It may use the Message IDs kept back for ending the IKE SA (see
+    /// [`Self::message_ids_exhausted`]); with none left at all it fails with
+    /// [`IkeError::MessageIdsExhausted`], having sent nothing.
     pub fn close(&mut self) -> Result<(), DriverError> {
         self.delete_ike_sa("graceful disconnect")
     }
@@ -546,7 +573,7 @@ impl LivenessSession {
     /// Send a Delete for the current IKE SA, on that SA, and best-effort wait
     /// for the ack. `why` only labels the debug output.
     fn delete_ike_sa(&mut self, why: &str) -> Result<(), DriverError> {
-        let mid = self.alloc_message_id();
+        let mid = self.alloc_ending_message_id()?;
         let mut iv = [0u8; 8];
         OsEntropy::new()?.fill(&mut iv);
         let del = Delete::ike_sa();
@@ -880,7 +907,7 @@ impl LivenessSession {
         let pfs: Option<PfsKeyExchange> =
             self.pfs_group.zip(dh_private.as_ref()).map(|(group, private)| (group, private.as_slice()));
 
-        let mid = self.alloc_message_id();
+        let mid = self.alloc_message_id()?;
         let mut iv = [0u8; 8];
         entropy.fill(&mut iv);
         ike_debug!(
@@ -965,7 +992,7 @@ impl LivenessSession {
     /// [`Self::settle_rekey`] to explicitly retire the CHILD SA a rekey just
     /// replaced -- see that call site's doc for why this exists.
     fn delete_child_sa(&mut self, child: ChildSpis) -> Result<(), DriverError> {
-        let mid = self.alloc_message_id();
+        let mid = self.alloc_message_id()?;
         let mut iv = [0u8; 8];
         OsEntropy::new()?.fill(&mut iv);
         let del = Delete::esp(vec![child.local]);
@@ -1451,6 +1478,12 @@ impl LivenessSession {
     /// the peer deleted the tunnel meanwhile. A refusal is an `Err`
     /// ([`IkeError::PeerRejected`]) and leaves the old IKE SA as it was.
     ///
+    /// This is how an IKE SA whose Message IDs have run out
+    /// ([`Self::message_ids_exhausted`]) goes on, and it may use the last few
+    /// kept for it. Once even those are gone it fails with
+    /// [`IkeError::MessageIdsExhausted`] without sending anything, and the
+    /// IKE SA can only be dropped.
+    ///
     /// The peer may rekey the IKE SA too while ours is in flight (RFC 7296
     /// §2.8.2). Its rekey is answered as usual, so three IKE SAs exist once
     /// ours is answered too: the new one made with the lowest of the four
@@ -1475,7 +1508,7 @@ impl LivenessSession {
         };
         let mut iv = [0u8; 8];
         entropy.fill(&mut iv);
-        let mid = self.alloc_message_id();
+        let mid = self.alloc_ending_message_id()?;
         ike_debug!("CREATE_CHILD_SA (IKE SA rekey): initiating -- new_spi_i={new_spi_i:016x}");
         let req = ike_rekey::build_ike_rekey_request(&self.sa, mid, new_spi_i, &ni, &dh_private, &iv)?;
         self.ike.rekeying = Some(OwnIkeRekey::default());
@@ -4987,6 +5020,75 @@ mod tests {
         assert!(sent.iter().all(|m| *m == sent[0]), "a retransmission is the same bytes");
         assert!(quiet, "three attempts, and no Delete");
         assert_eq!((tunnel.liveness.child_local_spi, tunnel.liveness.child_peer_spi), (old_local_spi, RESPONDER_CHILD_SPI));
+    }
+
+    /// RFC 7296 §2.2: Message IDs never wrap. Once an IKE SA's have run out, a
+    /// probe or a CHILD SA exchange fails without being sent, and the IDs
+    /// kept back carry the rekey of the IKE SA and the Delete of the one it
+    /// replaced. The new IKE SA starts again at 0.
+    #[test]
+    fn an_ike_sa_out_of_message_ids_sends_only_its_rekey_and_starts_over() {
+        let last = u32::MAX - MESSAGE_IDS_KEPT_FOR_ENDING - 1;
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from) = responder_through_auth(bind, psk);
+                let probe = recv_from_client(&sock);
+                sock.send_to(&informational_answer(&sa, &probe, &[]), from).unwrap();
+                let rekey = recv_from_client(&sock);
+                let (answer, new_sa) = gateway_answers_ike_rekey(&sa, &rekey, &[0x77u8; 32]);
+                sock.send_to(&answer, from).unwrap();
+                let delete = recv_from_client(&sock);
+                sock.send_to(&informational_answer(&sa, &delete, &[]), from).unwrap();
+                let probe_after = recv_from_client(&sock);
+                let on_new_sa = open_informational(&new_sa, &probe_after).is_ok();
+                sock.send_to(&informational_answer(&new_sa, &probe_after, &[]), from).unwrap();
+                let mids: Vec<u32> = [&probe, &rekey, &delete, &probe_after].iter().map(|m| IkeHeader::parse(m).unwrap().message_id).collect();
+                (mids, deletes_ike_sa(&sa, &delete), on_new_sa)
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        tunnel.liveness.next_message_id = last;
+        assert!(!tunnel.liveness.message_ids_exhausted());
+        assert_eq!(tunnel.liveness.probe(Duration::from_secs(2)).unwrap(), Liveness::Alive, "the last ordinary Message ID");
+        assert!(tunnel.liveness.message_ids_exhausted());
+        let exhausted = |r: Result<(), DriverError>| matches!(r, Err(DriverError::Ike(IkeError::MessageIdsExhausted)));
+        assert!(exhausted(tunnel.liveness.probe(Duration::from_secs(2)).map(|_| ())));
+        assert!(exhausted(tunnel.liveness.rekey_child(Duration::from_secs(2)).map(|_| ())));
+        assert!(exhausted(tunnel.liveness.create_child_ipv6(Duration::from_secs(2)).map(|_| ())));
+        assert_eq!(tunnel.liveness.rekey_ike(Duration::from_secs(2)).unwrap(), Liveness::Alive);
+        assert!(!tunnel.liveness.message_ids_exhausted());
+        assert_eq!(tunnel.liveness.probe(Duration::from_secs(2)).unwrap(), Liveness::Alive);
+        let (mids, deleted_old, on_new_sa) = gateway.join().unwrap();
+        assert_eq!(mids, vec![last, last + 1, last + 2, 0], "nothing sent while out of them; the rekey and the Delete on the ones kept back");
+        assert!(deleted_old, "the IKE SA the rekey replaced is deleted");
+        assert!(on_new_sa);
+    }
+
+    /// ...and with none left at all, even a close or rekey of the IKE SA fails
+    /// without sending anything: the counter never goes back to 0.
+    #[test]
+    fn message_ids_never_wrap() {
+        let mut session = recv_test_session(None);
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        session.dest = peer.local_addr().unwrap();
+        session.next_message_id = u32::MAX - 1;
+
+        session.close().unwrap(); // on the last one there is, unanswered
+        let mut buf = [0u8; 4096];
+        let (n, _) = peer.recv_from(&mut buf).unwrap();
+        assert_eq!(IkeHeader::parse(&buf[..n]).unwrap().message_id, u32::MAX - 1);
+        while peer.recv_from(&mut buf).is_ok() {} // its retransmissions
+
+        assert!(matches!(session.close(), Err(DriverError::Ike(IkeError::MessageIdsExhausted))));
+        assert!(matches!(session.rekey_ike(Duration::from_millis(100)), Err(DriverError::Ike(IkeError::MessageIdsExhausted))));
+        assert!(peer.recv_from(&mut buf).is_err(), "nothing sent");
+        assert_eq!(session.next_message_id, u32::MAX);
     }
 
     /// The IKE SPI and DH secret of the scripted gateway's own IKE SA rekeys.

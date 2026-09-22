@@ -108,4 +108,11 @@ pub enum IkeError {
     /// the tunnel dead immediately instead of scheduling a retry.
     #[error("the peer deleted the IKE SA while this exchange was in flight")]
     PeerTornDown,
+
+    /// The IKE SA has run through its Message IDs, which never wrap (RFC 7296
+    /// §2.2): it must be rekeyed, which starts them over, or closed. The last
+    /// few are kept for exactly that -- see
+    /// `crate::ikev2::session::LivenessSession::message_ids_exhausted`.
+    #[error("the IKE SA has used up its Message IDs; rekey it or close it")]
+    MessageIdsExhausted,
 }

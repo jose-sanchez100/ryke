@@ -82,7 +82,8 @@
 //!   routes the gateway assigns come back as data; applying them is the
 //!   consumer's.
 //! - **The schedule.** When to check liveness, when to rekey (from the
-//!   negotiated lifetimes and [`LivenessSession::ike_sa_age`]), how many
+//!   negotiated lifetimes and [`LivenessSession::ike_sa_age`], or at once
+//!   when [`LivenessSession::message_ids_exhausted`]), how many
 //!   missed checks mean the peer is gone, when to reconnect, and whether to
 //!   bring back a CHILD SA the peer deleted
 //!   ([`LivenessSession::take_peer_deleted_children`]).

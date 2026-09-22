@@ -113,7 +113,7 @@ fn main() {
     let (n, _) = sock.recv_from(&mut buf).expect("no IKE_AUTH response on :4500");
     let auth_resp = unwrap_ike_4500(&buf[..n]).expect("IKE_AUTH reply lacked non-ESP marker");
     let (got_server_id, peer_child_spi, _esp_suite, assigned, _tsr) =
-        initiator_verify_auth(&sa, auth_resp, &auth).expect("IKE_AUTH verify");
+        initiator_verify_auth(&sa, auth_resp, &auth, &esp_offer(0)).expect("IKE_AUTH verify");
     println!("✅ IKE_AUTH answered on :4500 (NAT-T float works) — server_id={got_server_id:?}");
     if got_server_id != Identification::fqdn(server_id) {
         eprintln!("⚠️  server identity mismatch (expected fqdn({server_id}))");

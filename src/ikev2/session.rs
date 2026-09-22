@@ -816,10 +816,18 @@ impl LivenessSession {
             let header = IkeHeader::parse(&msg)?;
 
             if header.flags.response {
-                if expected_mid == Some(header.message_id) {
+                // A matching Message ID alone isn't proof the peer answered --
+                // it's an unauthenticated header field an off-path attacker who
+                // knows/observes the (sequential, not secret) next id can spoof
+                // in an empty or garbage UDP datagram, faking liveness for a
+                // dead or MITM'd peer and defeating DPD's whole purpose. Require
+                // the response to actually decrypt and authenticate under this
+                // IKE SA's keys (the header itself is covered by the AEAD/HMAC,
+                // so a forged Message ID also fails here) before trusting it.
+                if expected_mid == Some(header.message_id) && open_informational(&self.sa, &msg).is_ok() {
                     return Ok(Liveness::Alive);
                 }
-                continue; // a stale/unrelated response -- keep waiting
+                continue; // stale/unrelated, or an unauthenticated response -- keep waiting
             }
 
             if self.answer_peer_request(&header, &msg, true)? {
@@ -2328,6 +2336,42 @@ mod tests {
         let mut liveness =
             LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::Alive);
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn liveness_probe_ignores_a_spoofed_response_with_the_right_message_id_but_no_real_key() {
+        // An off-path attacker who observes/guesses the (sequential, not
+        // secret) Message ID can trivially forge a response header with the
+        // right id and the Response flag set -- but can't produce a payload
+        // that decrypts under the real peer's keys. That must not count as
+        // proof of liveness (RFC 7296 §2.4): a real DPD probe demands the
+        // reply be crypto-authenticated, not just correlated by id.
+        let bind = next_addr();
+        let (init_sa, _resp_sa) = liveness_sa_pair();
+        // A second, unrelated SA pair stands in for "an attacker with no
+        // access to the real keys" -- its ciphertext is well-formed but
+        // fails to authenticate under `init_sa`'s peer keys.
+        let (_other_init, other_resp) = liveness_sa_pair();
+        let responder = thread::spawn(move || {
+            let sock = UdpSocket::bind(bind).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = [0u8; 2048];
+            let (n, from) = sock.recv_from(&mut buf).unwrap();
+            let req_id = IkeHeader::parse(&buf[..n]).unwrap().message_id;
+            // Forged ack: right Message ID and Response flag, wrong keys.
+            let forged = build_informational(&other_resp, req_id, true, &[], &[9u8; 8]).unwrap();
+            sock.send_to(&forged, from).unwrap();
+            // No genuine reply ever follows -- the peer is actually silent.
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness =
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true };
+        // Must NOT report Alive on the forged datagram -- with no genuine
+        // reply arriving, the probe times out instead.
+        assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::NoReply);
         responder.join().unwrap();
     }
 

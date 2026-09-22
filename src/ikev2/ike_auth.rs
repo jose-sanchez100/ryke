@@ -333,25 +333,38 @@ fn verify_psk(algo: crate::crypto::PrfAlgorithm, auth: &Authentication, psk: &[u
 }
 
 /// Build a server (responder) certificate AUTH, choosing the signature method by
-/// what the peer negotiated: RFC 7427 Digital Signature (method 14) when it
-/// advertised SHA-256 in `SIGNATURE_HASH_ALGORITHMS`, otherwise the classic
-/// ECDSA-P256-SHA256 (method 9, RFC 4754). A native EAP client (iOS) sends no
-/// `SIGNATURE_HASH_ALGORITHMS`, so it needs the classic method.
+/// what the peer negotiated and by our key type: RFC 7427 Digital Signature
+/// (method 14, works for either an RSA or an ECDSA key) when the peer
+/// advertised SHA-256 in `SIGNATURE_HASH_ALGORITHMS`, otherwise the matching
+/// classic method for our key -- ECDSA-P256-SHA256 (method 9, RFC 4754) for
+/// an EC key, or RSA Digital Signature (method 1, RFC 7296 §3.8) for an RSA
+/// key. A native EAP client (iOS) sends no `SIGNATURE_HASH_ALGORITHMS`, so it
+/// needs one of the classic methods. Picking by key type (rather than always
+/// trying method 9) matters because `sign_ecdsa_p256_raw` simply fails for an
+/// RSA key -- there is no such thing as "ECDSA-sign with an RSA key" to fall
+/// back to. Both classic methods this can emit are also accepted by our own
+/// [`verify_peer_auth`] (see [`crate::ikev2::sign::verify_cert_auth`]), so
+/// emission and verification stay symmetric.
 pub(crate) fn cert_auth_payload(
     key: &SigningKey,
     peer_signature_hashes: &[u16],
     octets: &[u8],
 ) -> Result<Authentication, IkeError> {
     if peer_signature_hashes.contains(&sighash::SHA2_256) {
-        Ok(Authentication {
+        return Ok(Authentication {
             method: auth_method::DIGITAL_SIGNATURE,
             data: key.sign_auth_data(octets)?,
-        })
-    } else {
-        Ok(Authentication {
+        });
+    }
+    match key {
+        SigningKey::EcdsaP256(_) => Ok(Authentication {
             method: auth_method::ECDSA_SHA256_P256,
             data: key.sign_ecdsa_p256_raw(octets)?,
-        })
+        }),
+        SigningKey::RsaSha256(_) => Ok(Authentication {
+            method: auth_method::RSA_SIG,
+            data: key.sign_classic_rsa_auth_data(octets)?,
+        }),
     }
 }
 
@@ -387,7 +400,13 @@ fn verify_peer_auth(
     match &cfg.peer {
         PeerAuth::Psk(psk) => verify_psk(algo, &got.auth, psk, expected_octets),
         PeerAuth::Cert { cas, expected_dns, now_unix } => {
-            if got.auth.method != auth_method::DIGITAL_SIGNATURE && got.auth.method != auth_method::RSA_SIG {
+            // Accept the same three methods `cert_auth_payload` can itself
+            // emit (14, 1, 9) -- a peer running the same fallback logic we
+            // do must not be rejected for it.
+            if !matches!(
+                got.auth.method,
+                auth_method::DIGITAL_SIGNATURE | auth_method::RSA_SIG | auth_method::ECDSA_SHA256_P256
+            ) {
                 return Err(IkeError::AuthFailed);
             }
             let leaf = got.certs.first().ok_or(IkeError::MissingPayload("CERT"))?;
@@ -990,6 +1009,47 @@ mod tests {
         assert_eq!(learned_i, Identification::fqdn("vpn.example.com"));
         let (learned_r, _resp_spi, _esp_suite, _assigned, _tsr) = initiator_verify_auth(&init_sa, &resp, &cert_config(), &esp_offer(0)).unwrap();
         assert_eq!(learned_r, Identification::fqdn("vpn.example.com"));
+    }
+
+    #[test]
+    fn ike_auth_cert_falls_back_to_the_classic_ecdsa_method_and_still_verifies() {
+        // When the peer hasn't negotiated RFC 7427 Digital Signature (empty
+        // SIGNATURE_HASH_ALGORITHMS -- e.g. a native EAP client, or another
+        // ryke instance that itself fell back), `cert_auth_payload` emits the
+        // classic method 9 (RFC 4754) for an EC key. Audit finding #8 flagged
+        // that `verify_peer_auth` rejected method 9 outright even though we
+        // produce that exact wire format ourselves, so this exact scenario
+        // used to fail IKE_AUTH outright.
+        let (mut init_sa, resp_sa) = run_sa_init();
+        init_sa.peer_signature_hashes.clear();
+        let req = initiator_auth_request(&init_sa, &cert_config(), 1, &esp_offer(0), &[1u8; 8]).unwrap();
+        let (_resp, learned_i, _init_spi, _ic) =
+            responder_process_auth(&resp_sa, &req, &cert_config(), 2, &[2u8; 8], None).unwrap();
+        assert_eq!(learned_i, Identification::fqdn("vpn.example.com"));
+    }
+
+    #[test]
+    fn cert_auth_payload_picks_the_fallback_by_key_type() {
+        // Before the fix, the "no negotiated Digital Signature" fallback
+        // always tried classic ECDSA (method 9) regardless of key type --
+        // which simply errors out for an RSA key instead of using the valid
+        // RSA alternative (audit finding #8, problem 2).
+        use crate::ikev2::sign::{SigningKey, VerifyingKey};
+        use crate::test_certs::{LEAF_SCALAR, RSA_KEY_PK8};
+        let octets = b"signed octets with no negotiated Digital Signature";
+
+        let ec_key = SigningKey::EcdsaP256(p256::ecdsa::SigningKey::from_slice(LEAF_SCALAR).unwrap());
+        let ec_auth = cert_auth_payload(&ec_key, &[], octets).unwrap();
+        assert_eq!(ec_auth.method, auth_method::ECDSA_SHA256_P256);
+
+        let rsa_key = SigningKey::rsa_from_pkcs8_der(RSA_KEY_PK8).unwrap();
+        let rsa_auth = cert_auth_payload(&rsa_key, &[], octets).unwrap();
+        assert_eq!(rsa_auth.method, auth_method::RSA_SIG);
+        // And it's a genuinely valid signature that our own verification
+        // path (not just this test) can check.
+        use rsa::pkcs8::DecodePrivateKey;
+        let pubk = VerifyingKey::Rsa(rsa::RsaPrivateKey::from_pkcs8_der(RSA_KEY_PK8).unwrap().to_public_key());
+        pubk.verify_classic_rsa_auth_data(&rsa_auth.data, octets).unwrap();
     }
 
     #[test]

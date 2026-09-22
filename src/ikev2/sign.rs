@@ -161,7 +161,11 @@ impl SigningKey {
     /// Sign as the classic IKEv2 method-9 AUTH (ECDSA-256, RFC 4754): the raw
     /// `r || s` (64 bytes for P-256) over `SHA-256(octets)`, with no RFC 7427
     /// algorithm wrapper. Used when the peer does not negotiate Digital
-    /// Signature (a native EAP client that sends no SIGNATURE_HASH_ALGORITHMS).
+    /// Signature (a native EAP client that sends no SIGNATURE_HASH_ALGORITHMS)
+    /// and our key is ECDSA. An RSA key in that same situation must use
+    /// [`Self::sign_classic_rsa_auth_data`] (method 1) instead -- see
+    /// `crate::ikev2::ike_auth::cert_auth_payload`, which picks between the two
+    /// by key type.
     pub fn sign_ecdsa_p256_raw(&self, signed_octets: &[u8]) -> Result<Vec<u8>, IkeError> {
         match self {
             SigningKey::EcdsaP256(key) => {
@@ -173,6 +177,28 @@ impl SigningKey {
                 Ok(sig.to_bytes().to_vec())
             }
             SigningKey::RsaSha256(_) => Err(IkeError::Crypto("method 9 needs an ECDSA P-256 key")),
+        }
+    }
+
+    /// Sign as the classic RFC 7296 §3.8 method-1 AUTH (RSA Digital
+    /// Signature): a plain PKCS#1 v1.5 signature, `DigestInfo`-prefixed, over
+    /// `SHA-256(signed_octets)` -- no RFC 7427 algorithm wrapper, unlike
+    /// method 14. This is the RSA counterpart to
+    /// [`Self::sign_ecdsa_p256_raw`]'s method 9: the fallback
+    /// `cert_auth_payload` picks when the peer hasn't negotiated Digital
+    /// Signature and our key is RSA rather than ECDSA. Not to be confused
+    /// with [`Self::sign_classic_rsa_raw`], the *unprefixed* IKEv1 SIG
+    /// payload convention.
+    pub fn sign_classic_rsa_auth_data(&self, signed_octets: &[u8]) -> Result<Vec<u8>, IkeError> {
+        match self {
+            SigningKey::RsaSha256(key) => {
+                let digest = Sha256::digest(signed_octets);
+                key.sign(rsa::Pkcs1v15Sign::new::<Sha256>(), &digest)
+                    .map_err(|_| IkeError::Crypto("RSA signing failed"))
+            }
+            SigningKey::EcdsaP256(_) => {
+                Err(IkeError::Crypto("method 1 (RSA Digital Signature) needs an RSA certificate key"))
+            }
         }
     }
 
@@ -264,6 +290,24 @@ impl VerifyingKey {
             return Ok(());
         }
         Err(IkeError::AuthFailed)
+    }
+
+    /// Verify a classic IKEv2 method-9 AUTH (ECDSA-256, RFC 4754): `sig` is
+    /// the raw `r || s` (64 bytes for P-256) over `SHA-256(signed_octets)`,
+    /// with no RFC 7427 algorithm wrapper -- the counterpart to
+    /// `SigningKey::sign_ecdsa_p256_raw`. Without this, a peer emitting
+    /// method 9 (e.g. because it didn't see our SIGNATURE_HASH_ALGORITHMS,
+    /// mirroring why we ourselves emit it in `cert_auth_payload`) could
+    /// never be verified, even though we produce that exact wire format
+    /// ourselves.
+    pub fn verify_ecdsa_p256_raw(&self, sig: &[u8], signed_octets: &[u8]) -> Result<(), IkeError> {
+        let VerifyingKey::EcdsaP256(vk) = self else {
+            return Err(IkeError::Crypto("method 9 (ECDSA Digital Signature) needs an EC certificate key"));
+        };
+        use p256::ecdsa::signature::hazmat::PrehashVerifier;
+        let sig = p256::ecdsa::Signature::from_slice(sig).map_err(|_| IkeError::AuthFailed)?;
+        let digest = Sha256::digest(signed_octets);
+        vk.verify_prehash(&digest, &sig).map_err(|_| IkeError::AuthFailed)
     }
 
     /// Verify method-14 AUTH Data against the §2.15 `signed_octets`.
@@ -607,10 +651,13 @@ pub fn validate_chain(
 /// anchors through `intermediates`), be within validity, vouch for
 /// `expected_dns` if given, and carry a signature over `signed_octets` that
 /// verifies under its key. `auth_method` selects the AUTH payload's wire
-/// format: RFC 7427 Digital Signature (14, self-describing algorithm) or the
+/// format: RFC 7427 Digital Signature (14, self-describing algorithm), the
 /// classic RFC 7296 §3.8 method 1 (RSA Digital Signature, a bare PKCS#1 v1.5
 /// signature) — a real FortiGate ("Certificates + EAP") sends method 1, not
-/// 14, live-confirmed.
+/// 14, live-confirmed — or the classic RFC 4754 method 9 (ECDSA Digital
+/// Signature, a bare raw-`r||s` signature), symmetric with what
+/// `crate::ikev2::ike_auth::cert_auth_payload` itself emits under the same
+/// circumstances (no negotiated Digital Signature).
 #[allow(clippy::too_many_arguments)]
 pub fn verify_cert_auth(
     leaf_der: &[u8],
@@ -639,6 +686,7 @@ pub fn verify_cert_auth(
     match auth_method {
         crate::ikev2::payload::auth_method::DIGITAL_SIGNATURE => vk.verify_auth_data(auth_data, signed_octets),
         crate::ikev2::payload::auth_method::RSA_SIG => vk.verify_classic_rsa_auth_data(auth_data, signed_octets),
+        crate::ikev2::payload::auth_method::ECDSA_SHA256_P256 => vk.verify_ecdsa_p256_raw(auth_data, signed_octets),
         _ => Err(IkeError::Crypto("unsupported AUTH method for certificate verification")),
     }
 }
@@ -762,6 +810,89 @@ mod tests {
         assert!(ec_signer.sign_classic_rsa_raw(hash_i).is_err());
         let ec_vk = VerifyingKey::from_cert_der(LEAF_CERT_DER).unwrap();
         assert!(ec_vk.verify_classic_rsa_raw(&sig, hash_i).is_err());
+    }
+
+    #[test]
+    fn ecdsa_method9_raw_sign_verify_roundtrips_and_rejects_tampering_and_wrong_key_type() {
+        // RFC 4754 classic method 9: no RFC 7427 wrapper, just raw r||s.
+        // `crate::ikev2::ike_auth::cert_auth_payload` emits exactly this wire
+        // format for an EC key with no negotiated Digital Signature; before
+        // this fix, nothing in this module could verify it (audit finding
+        // #8, problem 1).
+        let signer = ecdsa_leaf_signer();
+        let vk = VerifyingKey::from_cert_der(LEAF_CERT_DER).unwrap();
+        let octets = b"ResponderSignedOctets under classic method 9";
+        let sig = signer.sign_ecdsa_p256_raw(octets).unwrap();
+        vk.verify_ecdsa_p256_raw(&sig, octets).unwrap();
+
+        assert!(vk.verify_ecdsa_p256_raw(&sig, b"different octets").is_err());
+        let mut bad = sig.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        assert!(vk.verify_ecdsa_p256_raw(&bad, octets).is_err());
+
+        // A method-14-wrapped (DER SEQUENCE{r,s}, algorithm-prefixed) signature
+        // is not a bare r||s blob and must not verify as one.
+        let wrapped = signer.sign_auth_data(octets).unwrap();
+        assert!(vk.verify_ecdsa_p256_raw(&wrapped, octets).is_err());
+
+        // An RSA key can never verify an ECDSA signature.
+        let (_rsa_signer, rsa_vk) = rsa_signer();
+        assert!(rsa_vk.verify_ecdsa_p256_raw(&sig, octets).is_err());
+    }
+
+    #[test]
+    fn verify_cert_auth_accepts_method_9_symmetrically_with_cert_auth_payload() {
+        // Before this fix, `verify_cert_auth` had no branch for method 9 at
+        // all, so a peer emitting it -- including this code talking to
+        // itself -- could never be verified. Audit finding #8, problem 1.
+        let signer = ecdsa_leaf_signer();
+        let octets = b"ResponderSignedOctets: msgR | Ni | prf(SK_pr, IDr)";
+        let sig = signer.sign_ecdsa_p256_raw(octets).unwrap();
+        let now = cert_validity(LEAF_CERT_DER).unwrap().0 + 1;
+        verify_cert_auth(
+            LEAF_CERT_DER,
+            &[],
+            &[CA_CERT_DER.to_vec()],
+            None,
+            now,
+            crate::ikev2::payload::auth_method::ECDSA_SHA256_P256,
+            &sig,
+            octets,
+        )
+        .unwrap();
+
+        assert!(verify_cert_auth(
+            LEAF_CERT_DER,
+            &[],
+            &[CA_CERT_DER.to_vec()],
+            None,
+            now,
+            crate::ikev2::payload::auth_method::ECDSA_SHA256_P256,
+            &sig,
+            b"different octets",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn sign_classic_rsa_auth_data_produces_the_prefixed_method1_wire_format() {
+        // The RSA counterpart to `sign_ecdsa_p256_raw`'s method 9: what
+        // `cert_auth_payload` falls back to for an RSA key with no
+        // negotiated Digital Signature. Before this fix that fallback always
+        // tried an ECDSA-only operation and simply failed for an RSA key
+        // instead of using this valid alternative (audit finding #8, problem 2).
+        let (signer, verifier) = rsa_signer();
+        let octets = b"InitiatorSignedOctets under classic RSA method 1, via the new helper";
+        let sig = signer.sign_classic_rsa_auth_data(octets).unwrap();
+        verifier.verify_classic_rsa_auth_data(&sig, octets).unwrap();
+        assert!(verifier.verify_classic_rsa_auth_data(&sig, b"tampered").is_err());
+
+        // It's the prefixed method-1 form, not the unprefixed IKEv1 SIG payload.
+        assert!(verifier.verify_classic_rsa_raw(&sig, octets).is_err());
+
+        // An ECDSA key cannot produce a method-1 RSA signature.
+        let ec_signer = ecdsa_leaf_signer();
+        assert!(ec_signer.sign_classic_rsa_auth_data(octets).is_err());
     }
 
     #[test]

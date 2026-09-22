@@ -487,4 +487,99 @@ mod tests {
             Err(IkeError::NoProposalChosen)
         ));
     }
+
+    /// A `CREATE_CHILD_SA` message from `from` rekeying the IKE SA: the suite
+    /// `from` runs with its DH transforms replaced by `dh`, and `ke` as the KE.
+    fn ike_rekey_message(from: &CompletedSaInit, response: bool, dh: &[u16], ke: Option<KeyExchange>) -> Vec<u8> {
+        use crate::ikev2::payload::{transform_type, Transform};
+
+        let mut prop = from.suite.to_proposal();
+        prop.protocol_id = protocol_id::IKE;
+        prop.spi = 7u64.to_be_bytes().to_vec();
+        prop.transforms.retain(|t| t.transform_type != transform_type::DH);
+        prop.transforms.extend(dh.iter().map(|&id| Transform { transform_type: transform_type::DH, transform_id: id, key_length: None }));
+        let mut inner = vec![
+            (PayloadType::SecurityAssociation, SecurityAssociation { proposals: vec![prop] }.to_bytes()),
+            (PayloadType::Nonce, vec![0x66u8; 32]),
+        ];
+        inner.extend(ke.map(|ke| (PayloadType::KeyExchange, ke.to_bytes())));
+        let header = IkeHeader {
+            initiator_spi: from.spi_i,
+            responder_spi: from.spi_r,
+            next_payload: PayloadType::NoNext,
+            major_version: 2,
+            minor_version: 0,
+            exchange_type: ExchangeType::CreateChildSa,
+            flags: Flags { initiator: from.role == Role::Initiator, version: false, response },
+            message_id: 5,
+            length: 0,
+        };
+        let first = first_payload_type(&inner);
+        build_encrypted(from.suite.sk_cipher(), header, first, &encode_payload_chain(&inner), our_sk_e(from), our_sk_a(from), &[2u8; 8]).unwrap()
+    }
+
+    /// RFC 7296 §1.3.2, §2.18: the IKE SA rekey always runs a fresh DH -- its
+    /// KE is mandatory, not optional as a CHILD SA's PFS. So an answer that
+    /// drops the KE, the group, or names NONE, a group we don't know or
+    /// another one than the suite's, is refused by the initiator; the
+    /// untouched answer completes. (Checked apart from the CHILD SA rekey:
+    /// the audit's PFS removal doesn't reproduce here.)
+    #[test]
+    fn an_ike_rekey_answer_cannot_drop_or_swap_the_dh() {
+        let (init_sa, resp_sa) = sa_pair();
+        let (ni, dh, new_spi_i) = ([0x55u8; 32], [3u8; 32], 0xAABB_CCDD_1122_3344);
+        let group = DhGroup::from_transform_id(init_sa.suite.dh_id).unwrap();
+        let other = if group == DhGroup::Modp2048 { DhGroup::EcpP256 } else { DhGroup::Modp2048 };
+        let ke = |g: DhGroup| Some(KeyExchange { dh_group: g.transform_id(), data: g.public(&[9u8; 32]) });
+        let complete = |resp: &[u8]| initiator_complete_ike_rekey(&init_sa, &ni, new_spi_i, &dh, resp).map(|_| ());
+
+        let request = build_ike_rekey_request(&init_sa, 5, new_spi_i, &ni, &dh, &[1u8; 8]).unwrap();
+        let (response, _) = responder_process_ike_rekey(&resp_sa, &request, 7, &[9u8; 32], &[0x66u8; 32], &[2u8; 8]).unwrap();
+        assert_eq!(complete(&response), Ok(()), "control: the real answer");
+        assert_eq!(complete(&ike_rekey_message(&resp_sa, true, &[group.transform_id()], ke(group))), Ok(()), "control: hand-built");
+
+        let unknown = Some(KeyExchange { dh_group: 0x7777, data: vec![9; 256] });
+        let cases = [
+            ("no KE", ike_rekey_message(&resp_sa, true, &[group.transform_id()], None), IkeError::MissingPayload("KE")),
+            ("no DH transform", ike_rekey_message(&resp_sa, true, &[], ke(group)), IkeError::NoProposalChosen),
+            ("DH NONE", ike_rekey_message(&resp_sa, true, &[0], None), IkeError::MissingPayload("KE")),
+            ("an unknown group", ike_rekey_message(&resp_sa, true, &[0x7777], unknown), IkeError::NoProposalChosen),
+            ("another group", ike_rekey_message(&resp_sa, true, &[other.transform_id()], ke(other)), IkeError::NoProposalChosen),
+            (
+                "the suite's group, a KE of another",
+                ike_rekey_message(&resp_sa, true, &[group.transform_id()], ke(other)),
+                IkeError::DhGroupMismatch { expected: group.transform_id(), got: other.transform_id() },
+            ),
+        ];
+        for (what, answer, expected) in cases {
+            assert_eq!(complete(&answer), Err(expected), "{what}");
+        }
+    }
+
+    /// The responder side of the same: a peer's IKE SA rekey without a KE,
+    /// without a DH group, or on a group IKEv2 may not run (unknown, or
+    /// MODP-768, RFC 8247 §2.4) is refused, never answered without a fresh DH.
+    #[test]
+    fn an_ike_rekey_request_without_a_usable_dh_is_refused() {
+        let (init_sa, resp_sa) = sa_pair();
+        let group = DhGroup::from_transform_id(init_sa.suite.dh_id).unwrap();
+        let ke = |g: DhGroup| Some(KeyExchange { dh_group: g.transform_id(), data: g.public(&[3u8; 32]) });
+        let answer = |req: &[u8]| responder_process_ike_rekey(&resp_sa, req, 7, &[9u8; 32], &[0x66u8; 32], &[2u8; 8]).map(|_| ());
+
+        assert_eq!(answer(&ike_rekey_message(&init_sa, false, &[group.transform_id()], ke(group))), Ok(()), "control");
+        let cases = [
+            ("no KE", ike_rekey_message(&init_sa, false, &[group.transform_id()], None), IkeError::MissingPayload("KE")),
+            ("no DH transform", ike_rekey_message(&init_sa, false, &[], ke(group)), IkeError::NoProposalChosen),
+            ("DH NONE", ike_rekey_message(&init_sa, false, &[0], None), IkeError::MissingPayload("KE")),
+            (
+                "an unknown group",
+                ike_rekey_message(&init_sa, false, &[0x7777], Some(KeyExchange { dh_group: 0x7777, data: vec![9; 256] })),
+                IkeError::NoProposalChosen,
+            ),
+            ("MODP-768", ike_rekey_message(&init_sa, false, &[1], ke(DhGroup::Modp768)), IkeError::NoProposalChosen),
+        ];
+        for (what, request, expected) in cases {
+            assert_eq!(answer(&request), Err(expected), "{what}");
+        }
+    }
 }

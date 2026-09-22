@@ -46,7 +46,7 @@ use crate::ikev2::negotiate::{self, ChosenEspSuite};
 use crate::ikev2::payload::{
     notify_type, notify_type_name, protocol_id, Configuration, Delete, Identification, SecurityAssociation, TrafficSelectors,
 };
-use crate::ikev2::rekey::{self, dh_transform_id, PfsKeyExchange};
+use crate::ikev2::rekey::{self, PfsKeyExchange, PfsPolicy};
 use crate::ikev2::sk::{self, open_encrypted, SkCipher};
 use crate::role::Role;
 use crate::transport::{DriverError, MAX_DATAGRAM};
@@ -351,12 +351,12 @@ pub struct LivenessSession {
     /// must preserve it rather than silently falling back to a fixed
     /// default (see `ike_auth::esp_offer_for_cipher`'s own doc).
     cipher: SkCipher,
-    /// PFS DH group to use at CHILD SA rekey time, read off the DH transform
-    /// (if any) on the `esp_offer` this tunnel was connected with. `None`
-    /// when the profile configured no PFS group -- [`Self::rekey_child`]
-    /// then rekeys without PFS (still useful for key freshness, just not
-    /// this project's ask).
-    pfs_group: Option<DhGroup>,
+    /// The PFS policy of the `esp_offer` this tunnel was connected with
+    /// ([`PfsPolicy::from_offer`]): the group our `CREATE_CHILD_SA` requests
+    /// offer, if any -- none, and [`Self::rekey_child`] rekeys without PFS
+    /// (still useful for key freshness, just not this project's ask) -- and
+    /// what a rekey the peer starts has to keep.
+    pfs: PfsPolicy,
     /// The CHILD SA's current SPIs, updated after every successful rekey so
     /// the next one's `REKEY_SA` notify references the right value.
     child_local_spi: u32,
@@ -596,7 +596,7 @@ impl LivenessSession {
     /// achieves PFS (RFC 7296 §2.8: a rekey with no KE payload just refreshes
     /// keys from fresh nonces, no forward secrecy beyond `SK_d` itself).
     pub fn pfs_configured(&self) -> bool {
-        self.pfs_group.is_some()
+        self.pfs.proposed().is_some()
     }
 
     /// Windows only -- see [`Self`]'s `external_rx` doc. Redirects every
@@ -899,13 +899,13 @@ impl LivenessSession {
                 break s;
             }
         };
-        let dh_private = self.pfs_group.map(|_| {
+        let pfs_group = self.pfs.proposed();
+        let dh_private = pfs_group.map(|_| {
             let mut p = [0u8; 32];
             entropy.fill(&mut p);
             p
         });
-        let pfs: Option<PfsKeyExchange> =
-            self.pfs_group.zip(dh_private.as_ref()).map(|(group, private)| (group, private.as_slice()));
+        let pfs: Option<PfsKeyExchange> = pfs_group.zip(dh_private.as_ref()).map(|(group, private)| (group, private.as_slice()));
 
         let mid = self.alloc_message_id()?;
         let mut iv = [0u8; 8];
@@ -946,14 +946,7 @@ impl LivenessSession {
                 return Err(io::Error::from(io::ErrorKind::TimedOut).into());
             }
         };
-        let (child, tsr) = rekey::initiator_complete_child(
-            &self.sa,
-            &ni,
-            new_local_spi,
-            self.cipher,
-            dh_private.as_ref().map(|p| p.as_slice()),
-            &response,
-        )?;
+        let (child, tsr) = rekey::initiator_complete_child(&self.sa, &ni, new_local_spi, self.cipher, pfs, &response)?;
         ike_debug!(
             "CREATE_CHILD_SA ({what}): complete -- new spi_in={:08x} spi_out={:08x}",
             child.inbound.spi(), child.outbound.spi()
@@ -1378,7 +1371,7 @@ impl LivenessSession {
                 break spi;
             }
         };
-        match rekey::responder_answer_child_rekey(&self.sa, msg, new_spi, &nr, self.cipher, &dh_private, iv) {
+        match rekey::responder_answer_child_rekey(&self.sa, msg, new_spi, &nr, self.cipher, &self.pfs, &dh_private, iv) {
             Ok((response, child)) => {
                 let wire = wrap(&response, self.float);
                 let _ = self.sock.send_to(&wire, self.dest);
@@ -1401,17 +1394,24 @@ impl LivenessSession {
                 Ok(())
             }
             Err(e) => {
-                let reason = match e {
-                    IkeError::NoProposalChosen => notify_type::NO_PROPOSAL_CHOSEN,
-                    _ => notify_type::INVALID_SYNTAX,
+                // RFC 7296 §1.3: INVALID_KE_PAYLOAD names the group we'd take, for
+                // the peer to retry its rekey with a KE of it.
+                let (reason, data) = match e {
+                    IkeError::NoProposalChosen => (notify_type::NO_PROPOSAL_CHOSEN, Vec::new()),
+                    IkeError::InvalidKeGroup(group) => (notify_type::INVALID_KE_PAYLOAD, group.to_be_bytes().to_vec()),
+                    _ => (notify_type::INVALID_SYNTAX, Vec::new()),
                 };
-                self.refuse_peer_child_request(header, iv, reason, &format!("cannot take it on: {e}"))
+                self.refuse_peer_child_request_with(header, iv, reason, data, &format!("cannot take it on: {e}"))
             }
         }
     }
 
     fn refuse_peer_child_request(&self, header: &IkeHeader, iv: &[u8; 8], reason: u16, why: &str) -> Result<(), DriverError> {
-        if let Ok(refusal) = rekey::build_child_error(&self.sa, header.message_id, reason, iv) {
+        self.refuse_peer_child_request_with(header, iv, reason, Vec::new(), why)
+    }
+
+    fn refuse_peer_child_request_with(&self, header: &IkeHeader, iv: &[u8; 8], reason: u16, data: Vec<u8>, why: &str) -> Result<(), DriverError> {
+        if let Ok(refusal) = rekey::build_child_error_with_data(&self.sa, header.message_id, reason, data, iv) {
             ike_debug!(
                 "CREATE_CHILD_SA request from the peer (message id {}) -- refusing with {}: {why}",
                 header.message_id, notify_type_name(reason)
@@ -2248,7 +2248,7 @@ impl<E: Entropy> Ikev2Session<E> {
             float,
             next_message_id,
             cipher: cipher.unwrap_or(SkCipher::Aes256Gcm),
-            pfs_group: dh_transform_id(esp_offer).and_then(DhGroup::from_transform_id),
+            pfs: PfsPolicy::from_offer(esp_offer)?,
             child_local_spi: 0,
             child_peer_spi: 0,
             external_rx: None,
@@ -2345,6 +2345,9 @@ impl<E: Entropy> Ikev2Session<E> {
         esp_offer: &SecurityAssociation,
         local_port: u16,
     ) -> Result<ConnectedTunnel, DriverError> {
+        // A PFS group the ESP offer asks for and IKEv2 can't run fails here,
+        // before the gateway sees anything, not as a tunnel without PFS.
+        PfsPolicy::from_offer(esp_offer)?;
         let (sock, our_addr, sa, nat) = self.sa_init_on_port(peer, offer, local_port)?;
         self.connect_direct_after_sa_init(peer, cfg, want_cfg, esp_offer, sock, our_addr, sa, nat)
     }
@@ -2366,6 +2369,9 @@ impl<E: Entropy> Ikev2Session<E> {
         sock: UdpSocket,
         natt_sock: UdpSocket,
     ) -> Result<ConnectedTunnel, DriverError> {
+        // A PFS group the ESP offer asks for and IKEv2 can't run fails here,
+        // before the gateway sees anything, not as a tunnel without PFS.
+        PfsPolicy::from_offer(esp_offer)?;
         let (sock, our_addr, sa, nat) = self.sa_init_with_sockets(peer, offer, sock, natt_sock)?;
         self.connect_direct_after_sa_init(peer, cfg, want_cfg, esp_offer, sock, our_addr, sa, nat)
     }
@@ -2440,7 +2446,7 @@ impl<E: Entropy> Ikev2Session<E> {
 
         let cipher = resolve_esp_cipher(esp_suite)?;
         let (key_out, key_in) = Self::derive_keys(&sa, cipher);
-        let pfs_group = dh_transform_id(esp_offer).and_then(DhGroup::from_transform_id);
+        let pfs = PfsPolicy::from_offer(esp_offer)?;
         let liveness = LivenessSession {
             sock,
             sa,
@@ -2448,7 +2454,7 @@ impl<E: Entropy> Ikev2Session<E> {
             float,
             next_message_id: 2, // IKE_AUTH was message 1
             cipher,
-            pfs_group,
+            pfs,
             child_local_spi: local_spi,
             child_peer_spi: peer_spi,
             external_rx: None,
@@ -2539,6 +2545,9 @@ impl<E: Entropy> Ikev2Session<E> {
         sock: UdpSocket,
         natt_sock: UdpSocket,
     ) -> Result<ConnectedTunnel, DriverError> {
+        // A PFS group the ESP offer asks for and IKEv2 can't run fails here,
+        // before the gateway sees anything, not as a tunnel without PFS.
+        PfsPolicy::from_offer(esp_offer)?;
         let (sock, our_addr, sa, nat) = self.sa_init_with_sockets(peer, offer, sock, natt_sock)?;
         self.connect_eap_after_sa_init_ext(peer, local_id, creds, verify, client_certs, want_cfg, esp_offer, sock, our_addr, sa, nat)
     }
@@ -2559,6 +2568,9 @@ impl<E: Entropy> Ikev2Session<E> {
         esp_offer: &SecurityAssociation,
         local_port: u16,
     ) -> Result<ConnectedTunnel, DriverError> {
+        // A PFS group the ESP offer asks for and IKEv2 can't run fails here,
+        // before the gateway sees anything, not as a tunnel without PFS.
+        PfsPolicy::from_offer(esp_offer)?;
         let (sock, our_addr, sa, nat) = self.sa_init_on_port(peer, offer, local_port)?;
         self.connect_eap_after_sa_init(peer, local_id, creds, verify, want_cfg, esp_offer, sock, our_addr, sa, nat)
     }
@@ -2580,6 +2592,9 @@ impl<E: Entropy> Ikev2Session<E> {
         sock: UdpSocket,
         natt_sock: UdpSocket,
     ) -> Result<ConnectedTunnel, DriverError> {
+        // A PFS group the ESP offer asks for and IKEv2 can't run fails here,
+        // before the gateway sees anything, not as a tunnel without PFS.
+        PfsPolicy::from_offer(esp_offer)?;
         let (sock, our_addr, sa, nat) = self.sa_init_with_sockets(peer, offer, sock, natt_sock)?;
         self.connect_eap_after_sa_init(peer, local_id, creds, verify, want_cfg, esp_offer, sock, our_addr, sa, nat)
     }
@@ -2727,7 +2742,7 @@ impl<E: Entropy> Ikev2Session<E> {
         // the peer sent us (its own EAP-round message IDs) -- our own
         // requests and the peer's share one strictly-increasing sequence.
         let next_message_id = IkeHeader::parse(&last_message)?.message_id + 1;
-        let pfs_group = dh_transform_id(esp_offer).and_then(DhGroup::from_transform_id);
+        let pfs = PfsPolicy::from_offer(esp_offer)?;
         let liveness = LivenessSession {
             sock,
             sa: sa.clone(),
@@ -2735,7 +2750,7 @@ impl<E: Entropy> Ikev2Session<E> {
             float,
             next_message_id,
             cipher,
-            pfs_group,
+            pfs,
             child_local_spi: local_spi,
             child_peer_spi: peer_spi,
             external_rx: None,
@@ -2857,7 +2872,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
@@ -2891,7 +2906,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         // Must NOT report Alive on the forged datagram -- with no genuine
         // reply arriving, the probe times out instead.
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::NoReply);
@@ -2922,7 +2937,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
@@ -2952,7 +2967,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -2979,7 +2994,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         liveness.close().unwrap();
         responder.join().unwrap();
     }
@@ -2993,7 +3008,7 @@ mod tests {
         let (init_sa, _resp_sa) = liveness_sa_pair();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         liveness.close().unwrap();
     }
 
@@ -3008,7 +3023,7 @@ mod tests {
         let unreachable: SocketAddr = silent_peer.local_addr().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::NoReply);
     }
 
@@ -3018,7 +3033,7 @@ mod tests {
         let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         // Unlike probe(), silence on a peek is Alive (nothing new to
         // report), not NoReply -- peek never asked anything.
         assert_eq!(liveness.peek(Duration::from_millis(50)).unwrap(), Liveness::Alive);
@@ -3052,7 +3067,7 @@ mod tests {
         probe_sock.send_to(b"hello", bind).unwrap();
 
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -3063,15 +3078,9 @@ mod tests {
     /// Returns the answer as the peer receives it, the peer's IKE SA (to open
     /// it with) and the session afterwards.
     fn peer_child_request_answered(rekeyed: Option<u32>, child6: Option<ChildSpis>) -> (Vec<u8>, CompletedSaInit, LivenessSession) {
-        let (init_sa, resp_sa) = liveness_sa_pair();
-        let responder_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let bind = responder_sock.local_addr().unwrap();
-        let responder = thread::spawn(move || {
-            responder_sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let mut buf = [0u8; 2048];
-            let (_n, from) = responder_sock.recv_from(&mut buf).unwrap();
-            let request = rekey::build_child_request(
-                &resp_sa,
+        let request = move |resp_sa: &CompletedSaInit| {
+            rekey::build_child_request(
+                resp_sa,
                 100,
                 rekeyed,
                 PEER_NEW_SPI,
@@ -3081,7 +3090,27 @@ mod tests {
                 &TrafficSelectors::ipv4_full_tunnel(),
                 &[7u8; 8],
             )
-            .unwrap();
+            .unwrap()
+        };
+        peer_child_request_answered_with(PfsPolicy::none(), child6, request)
+    }
+
+    /// [`peer_child_request_answered`] for a session running the PFS policy
+    /// `pfs`, the peer sending the request `request` builds with its IKE SA
+    /// (message id 100).
+    fn peer_child_request_answered_with(
+        pfs: PfsPolicy,
+        child6: Option<ChildSpis>,
+        request: impl FnOnce(&CompletedSaInit) -> Vec<u8> + Send + 'static,
+    ) -> (Vec<u8>, CompletedSaInit, LivenessSession) {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let responder_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind = responder_sock.local_addr().unwrap();
+        let responder = thread::spawn(move || {
+            responder_sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = [0u8; 2048];
+            let (_n, from) = responder_sock.recv_from(&mut buf).unwrap();
+            let request = request(&resp_sa);
             responder_sock.send_to(&request, from).unwrap();
             let (n, _) = responder_sock.recv_from(&mut buf).unwrap();
             (buf[..n].to_vec(), resp_sa)
@@ -3096,7 +3125,7 @@ mod tests {
             float: false,
             next_message_id: 2,
             cipher: SkCipher::Aes256Gcm,
-            pfs_group: None,
+            pfs,
             child_local_spi: 0xBBBB,
             child_peer_spi: 0xAAAA,
             external_rx: None,
@@ -3118,6 +3147,11 @@ mod tests {
     /// The error a refusal carries, after checking it is a CREATE_CHILD_SA
     /// response echoing the request's message id.
     fn refusal_reason(resp_sa: &CompletedSaInit, response: &[u8]) -> u16 {
+        refusal_notify(resp_sa, response).0
+    }
+
+    /// [`refusal_reason`], with the notification's data.
+    fn refusal_notify(resp_sa: &CompletedSaInit, response: &[u8]) -> (u16, Vec<u8>) {
         let header = IkeHeader::parse(response).unwrap();
         assert_eq!(header.exchange_type, ExchangeType::CreateChildSa, "the answer must be a CREATE_CHILD_SA response");
         assert!(header.flags.response);
@@ -3126,8 +3160,211 @@ mod tests {
         inner
             .iter()
             .find(|(t, _)| *t == PayloadType::Notify)
-            .map(|(_, body)| crate::ikev2::payload::Notify::parse(body).unwrap().notify_type)
+            .map(|(_, body)| crate::ikev2::payload::Notify::parse(body).unwrap())
+            .map(|n| (n.notify_type, n.data.to_vec()))
             .expect("the refusal carries a Notify")
+    }
+
+    /// The peer's private DH key in these tests.
+    const PEER_DH: [u8; 32] = [5; 32];
+
+    /// A CREATE_CHILD_SA request from the peer (`sa`, message id 100)
+    /// rekeying its CHILD SA `0xAAAA`, built by hand: `proposals` offered,
+    /// and `ke` as the KE payload, if any.
+    fn hand_built_peer_rekey(
+        sa: &CompletedSaInit,
+        proposals: Vec<crate::ikev2::payload::Proposal>,
+        ke: Option<crate::ikev2::payload::KeyExchange>,
+    ) -> Vec<u8> {
+        use crate::ikev2::message::{encode_payload_chain, first_payload_type};
+        use crate::ikev2::payload::Notify;
+
+        let ts = TrafficSelectors::ipv4_full_tunnel();
+        let rekey_sa =
+            Notify { protocol_id: protocol_id::ESP, spi: 0xAAAAu32.to_be_bytes().to_vec(), notify_type: notify_type::REKEY_SA, data: Vec::new() };
+        let mut inner = vec![
+            (PayloadType::Notify, rekey_sa.to_bytes()),
+            (PayloadType::SecurityAssociation, SecurityAssociation { proposals }.to_bytes()),
+            (PayloadType::Nonce, PEER_NI.to_vec()),
+        ];
+        inner.extend(ke.map(|ke| (PayloadType::KeyExchange, ke.to_bytes())));
+        inner.push((PayloadType::TrafficSelectorInitiator, ts.to_bytes()));
+        inner.push((PayloadType::TrafficSelectorResponder, ts.to_bytes()));
+        let header = IkeHeader {
+            initiator_spi: sa.spi_i,
+            responder_spi: sa.spi_r,
+            next_payload: PayloadType::NoNext,
+            major_version: 2,
+            minor_version: 0,
+            exchange_type: ExchangeType::CreateChildSa,
+            flags: Flags { initiator: false, version: false, response: false },
+            message_id: 100,
+            length: 0,
+        };
+        let first = first_payload_type(&inner);
+        sk::build_encrypted(sa.suite.sk_cipher(), header, first, &encode_payload_chain(&inner), &sa.keys.sk_er, &sa.keys.sk_ar, &[7u8; 8]).unwrap()
+    }
+
+    /// An ESP offer running AES-GCM-256 with the DH transforms `dh`.
+    fn gcm_esp_offer_with_dh(spi: u32, dh: &[u16]) -> SecurityAssociation {
+        use crate::ikev2::payload::{transform_type, Transform};
+
+        let mut offer = ike_auth::esp_offer_for_cipher(spi, SkCipher::Aes256Gcm);
+        offer.proposals[0].transforms.extend(dh.iter().map(|&id| Transform {
+            transform_type: transform_type::DH,
+            transform_id: id,
+            key_length: None,
+        }));
+        offer
+    }
+
+    /// RFC 7296 §1.3, §3.3.6: with a PFS group configured, a gateway's rekey
+    /// that would drop PFS is refused NO_PROPOSAL_CHOSEN, and one on another
+    /// group while ours is offered too is refused INVALID_KE_PAYLOAD naming
+    /// ours -- both leave the CHILD SA as it was. The same rekey with PFS on
+    /// our group is answered and handed over.
+    #[test]
+    fn a_peer_rekey_must_keep_the_pfs_our_session_runs() {
+        use crate::ikev2::payload::transform_id::{ECP256, MODP_2048};
+
+        let required = || PfsPolicy::from_offer(&gcm_esp_offer_with_dh(0, &[MODP_2048])).unwrap();
+        let unchanged = |liveness: &mut LivenessSession| {
+            assert!(liveness.take_peer_rekeys().is_empty());
+            assert_eq!((liveness.child_local_spi, liveness.child_peer_spi), (0xBBBB, 0xAAAA), "nothing changed");
+        };
+
+        let no_pfs = |sa: &CompletedSaInit| hand_built_peer_rekey(sa, gcm_esp_offer_with_dh(PEER_NEW_SPI, &[]).proposals, None);
+        let (response, resp_sa, mut liveness) = peer_child_request_answered_with(required(), None, no_pfs);
+        assert_eq!(refusal_notify(&resp_sa, &response), (notify_type::NO_PROPOSAL_CHOSEN, Vec::new()));
+        unchanged(&mut liveness);
+
+        let other_group = |sa: &CompletedSaInit| {
+            let ke = crate::ikev2::payload::KeyExchange { dh_group: ECP256, data: DhGroup::EcpP256.public(&PEER_DH) };
+            hand_built_peer_rekey(sa, gcm_esp_offer_with_dh(PEER_NEW_SPI, &[ECP256, MODP_2048]).proposals, Some(ke))
+        };
+        let (response, resp_sa, mut liveness) = peer_child_request_answered_with(required(), None, other_group);
+        assert_eq!(refusal_notify(&resp_sa, &response), (notify_type::INVALID_KE_PAYLOAD, MODP_2048.to_be_bytes().to_vec()));
+        unchanged(&mut liveness);
+
+        // Control: PFS on our group.
+        let ours = |sa: &CompletedSaInit| {
+            let ke = crate::ikev2::payload::KeyExchange { dh_group: MODP_2048, data: DhGroup::Modp2048.public(&PEER_DH) };
+            hand_built_peer_rekey(sa, gcm_esp_offer_with_dh(PEER_NEW_SPI, &[MODP_2048]).proposals, Some(ke))
+        };
+        let (response, resp_sa, mut liveness) = peer_child_request_answered_with(required(), None, ours);
+        let (peer_child, _) =
+            rekey::initiator_complete_child(&resp_sa, &PEER_NI, PEER_NEW_SPI, SkCipher::Aes256Gcm, Some((DhGroup::Modp2048, &PEER_DH)), &response)
+                .expect("a PFS rekey answer, not a refusal");
+        let taken = liveness.take_peer_rekeys();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].child.key_in.enc, peer_child.outbound.enc_material(), "the PFS keys match");
+
+        // And a session whose offer leaves PFS optional ([MODP-2048, NONE]) takes the rekey without.
+        let optional = PfsPolicy::from_offer(&gcm_esp_offer_with_dh(0, &[MODP_2048, 0])).unwrap();
+        let (response, resp_sa, mut liveness) = peer_child_request_answered_with(optional, None, no_pfs);
+        rekey::initiator_complete_child(&resp_sa, &PEER_NI, PEER_NEW_SPI, SkCipher::Aes256Gcm, None, &response).expect("answered without PFS");
+        assert_eq!(liveness.take_peer_rekeys().len(), 1);
+    }
+
+    /// RFC 7296 §3.3.6: our CHILD SA rekey asked for PFS and the gateway's
+    /// answer leaves it out -- the right cipher, but no DH transform and no
+    /// KE. `rekey_child` refuses it rather than run the new SA without PFS,
+    /// and the session keeps the SA it had.
+    #[test]
+    fn rekey_child_refuses_an_answer_that_drops_our_pfs() {
+        use crate::ikev2::message::{encode_payload_chain, first_payload_type};
+        use crate::ikev2::payload::transform_id::MODP_2048;
+
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let responder_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind = responder_sock.local_addr().unwrap();
+        let responder = thread::spawn(move || {
+            responder_sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = [0u8; 4096];
+            let (n, from) = responder_sock.recv_from(&mut buf).unwrap();
+            let request = open_informational(&resp_sa, &buf[..n]).unwrap();
+            assert!(request.iter().any(|(t, _)| *t == PayloadType::KeyExchange), "the rekey asks for PFS");
+            let ts = TrafficSelectors::ipv4_full_tunnel();
+            let inner = vec![
+                (PayloadType::SecurityAssociation, gcm_esp_offer_with_dh(0xFEED_FACE, &[]).to_bytes()),
+                (PayloadType::Nonce, vec![0x77; 32]),
+                (PayloadType::TrafficSelectorInitiator, ts.to_bytes()),
+                (PayloadType::TrafficSelectorResponder, ts.to_bytes()),
+            ];
+            let mut header = IkeHeader::parse(&buf[..n]).unwrap();
+            header.flags = Flags { initiator: false, version: false, response: true };
+            header.next_payload = PayloadType::NoNext;
+            header.length = 0;
+            let answer = sk::build_encrypted(
+                resp_sa.suite.sk_cipher(),
+                header,
+                first_payload_type(&inner),
+                &encode_payload_chain(&inner),
+                &resp_sa.keys.sk_er,
+                &resp_sa.keys.sk_ar,
+                &[8u8; 8],
+            )
+            .unwrap();
+            responder_sock.send_to(&answer, from).unwrap();
+        });
+
+        let mut liveness = LivenessSession {
+            sock: UdpSocket::bind("127.0.0.1:0").unwrap(),
+            sa: init_sa,
+            dest: bind,
+            float: false,
+            next_message_id: 2,
+            cipher: SkCipher::Aes256Gcm,
+            pfs: PfsPolicy::from_offer(&gcm_esp_offer_with_dh(0, &[MODP_2048])).unwrap(),
+            child_local_spi: 0xBBBB,
+            child_peer_spi: 0xAAAA,
+            external_rx: None,
+            child6: None,
+            cfg_subnets6: Vec::new(),
+            child_carries_ipv6: false,
+            ike: IkeSaState::new(),
+            peer_child: PeerChildState::default(),
+            primary_child_alive: true,
+            last_informational_ack: None,
+        };
+        let err = liveness.rekey_child(Duration::from_secs(2)).err().expect("the answer without PFS is refused");
+        assert!(matches!(err, DriverError::Ike(IkeError::NoProposalChosen)), "got {err:?}");
+        assert_eq!((liveness.child_local_spi, liveness.child_peer_spi), (0xBBBB, 0xAAAA), "the SA in place is kept");
+        responder.join().unwrap();
+    }
+
+    /// An ESP offer whose PFS group IKEv2 can't run -- one this crate doesn't
+    /// know, or MODP-768 (RFC 8247 §2.4) -- fails every connect entry point
+    /// before anything reaches the gateway, rather than turning into a
+    /// tunnel without PFS.
+    #[test]
+    fn a_connect_with_a_pfs_group_ikev2_cannot_run_fails_before_sending_anything() {
+        use crate::ikev2::payload::transform_id::MODP_768;
+
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        gateway.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let peer = gateway.local_addr().unwrap();
+        for group in [0x7777, MODP_768] {
+            let esp_offer = gcm_esp_offer_with_dh(0, &[group]);
+            let cfg = AuthConfig::psk(Identification::fqdn("client.test"), b"shared-secret".to_vec());
+            let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+            let direct = session.connect_direct_on_port(peer, &default_ike_offer(), &cfg, false, &esp_offer, next_addr().port());
+            let creds = EapCreds { user: b"alice".to_vec(), password: "s3cret".to_string() };
+            let eap = session.connect_eap_on_port(
+                peer,
+                &default_ike_offer(),
+                Identification::fqdn("client.test"),
+                creds,
+                ServerVerify::Psk(b"group-psk".to_vec()),
+                false,
+                &esp_offer,
+                next_addr().port(),
+            );
+            for (path, result) in [("direct", direct.err()), ("EAP", eap.err())] {
+                assert!(matches!(result, Some(DriverError::Ike(IkeError::Crypto(_)))), "{path}, group {group}: {result:?}");
+            }
+            assert!(gateway.recv_from(&mut [0u8; 64]).is_err(), "group {group}: nothing reaches the gateway");
+        }
     }
 
     /// A gateway's own rekey timer fires: its CREATE_CHILD_SA request must be
@@ -3221,7 +3458,7 @@ mod tests {
             float: false,
             next_message_id: 2,
             cipher: SkCipher::Aes256Gcm,
-            pfs_group: None,
+            pfs: PfsPolicy::none(),
             child_local_spi: 0,
             child_peer_spi: 0xAAAA,
             external_rx: None,
@@ -3265,7 +3502,7 @@ mod tests {
             float: false,
             next_message_id: 2,
             cipher: SkCipher::Aes256Gcm,
-            pfs_group: None,
+            pfs: PfsPolicy::none(),
             child_local_spi: 0,
             child_peer_spi: 0xAAAA,
             external_rx: None,
@@ -3314,7 +3551,7 @@ mod tests {
             float: false,
             next_message_id: 2,
             cipher: SkCipher::Aes256Gcm,
-            pfs_group: None,
+            pfs: PfsPolicy::none(),
             child_local_spi: 0,
             child_peer_spi: 0xAAAA,
             external_rx: None,
@@ -3364,7 +3601,7 @@ mod tests {
             float: false,
             next_message_id: 2,
             cipher: SkCipher::Aes256Gcm,
-            pfs_group: None,
+            pfs: PfsPolicy::none(),
             child_local_spi: 0xBBBB,
             child_peer_spi: 0xAAAA,
             external_rx: None,
@@ -3430,7 +3667,7 @@ mod tests {
             float: false,
             next_message_id: 2,
             cipher: SkCipher::Aes256Gcm,
-            pfs_group: None,
+            pfs: PfsPolicy::none(),
             child_local_spi: 0,
             child_peer_spi: 0xAAAA,
             external_rx: None,
@@ -4568,7 +4805,8 @@ mod tests {
                 let (n, _) = sock.recv_from(&mut buf).unwrap();
                 let first_answer = buf[..n].to_vec();
                 let (new_child, _) =
-                    rekey::initiator_complete_child(&sa, &ni, new_spi, SkCipher::Aes256Gcm, Some(&dh), &first_answer).expect("a rekey answer");
+                    rekey::initiator_complete_child(&sa, &ni, new_spi, SkCipher::Aes256Gcm, Some((DhGroup::Modp2048, &dh)), &first_answer)
+                        .expect("a rekey answer");
 
                 // The same request again -- as if the answer had been lost.
                 sock.send_to(&request, from).unwrap();
@@ -5462,7 +5700,7 @@ mod tests {
         let (init_sa, _resp_sa) = liveness_sa_pair();
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let dest = sock.local_addr().unwrap();
-        LivenessSession { sock, sa: init_sa, dest, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs_group: None, child_local_spi: 0, child_peer_spi: 0, external_rx, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None }
+        LivenessSession { sock, sa: init_sa, dest, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, last_informational_ack: None }
     }
 
     #[test]

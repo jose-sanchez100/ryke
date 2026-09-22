@@ -125,10 +125,92 @@ pub fn dh_transform_id(sa: &SecurityAssociation) -> Option<u16> {
     sa.proposals.first()?.transforms.iter().find(|t| t.transform_type == transform_type::DH).map(|t| t.transform_id)
 }
 
+/// Every DH transform the first proposal of `sa` names, NONE (0) included.
+fn first_proposal_dh_ids(sa: &SecurityAssociation) -> Vec<u16> {
+    sa.proposals
+        .first()
+        .map(|p| p.transforms.iter().filter(|t| t.transform_type == transform_type::DH).map(|t| t.transform_id).collect())
+        .unwrap_or_default()
+}
+
+/// The PFS group a peer's rekey request settles on, for a responder whose
+/// policy is either PFS (`want_pfs`: it has a private key ready) or none.
+/// `offered` is the DH transforms of the request's proposal, `ke` its KE.
+///
+/// With PFS wanted, the KE's group has to be among `offered` and be one
+/// IKEv2 may run ([`negotiate::ikev2_dh_group`]): a group this crate doesn't
+/// know is refused, not taken as "no PFS". Without it, a proposal that lists
+/// no group, or NONE among its groups (RFC 7296 §3.3.6: PFS left optional),
+/// is answered without PFS; one that insists on a group is refused.
+fn requested_pfs(offered: &[u16], ke: Option<&KeyExchange>, want_pfs: bool) -> Result<Option<DhGroup>, IkeError> {
+    match (want_pfs, ke) {
+        (true, Some(ke)) if offered.contains(&ke.dh_group) => negotiate::ikev2_dh_group(ke.dh_group).map(Some).ok_or(IkeError::NoProposalChosen),
+        (true, Some(_)) => Err(IkeError::NoProposalChosen),
+        (true, None) if offered.iter().any(|&g| g != 0) => Err(IkeError::MissingPayload("KE")),
+        (true, None) => Err(IkeError::NoProposalChosen),
+        (false, _) if offered.is_empty() || offered.contains(&0) => Ok(None),
+        (false, _) => Err(IkeError::NoProposalChosen),
+    }
+}
+
 /// Our ephemeral share of a PFS exchange: the DH group both sides will use,
 /// plus our private key to derive the eventual shared secret from the peer's
 /// KE payload.
 pub type PfsKeyExchange<'a> = (DhGroup, &'a [u8]);
+
+/// Our side's PFS policy for the CHILD SAs a session creates and rekeys with
+/// `CREATE_CHILD_SA`. The DH transform is negotiated like any other (RFC 7296
+/// §1.3.1, §3.3.6), so which groups one may settle on -- and whether none at
+/// all -- is local policy, read off the local ESP offer
+/// ([`Self::from_offer`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PfsPolicy {
+    /// The groups a PFS exchange may use, ours to offer first. Empty when the
+    /// offer asked for no PFS, which then accepts any group a peer's own
+    /// rekey insists on (more than we asked for, never less).
+    groups: Vec<DhGroup>,
+    /// Whether an exchange without PFS is acceptable too.
+    optional: bool,
+}
+
+impl PfsPolicy {
+    /// No PFS configured: our own requests carry no KE, and a peer's rekey is
+    /// answered with or without PFS as it asks.
+    pub fn none() -> Self {
+        PfsPolicy { groups: Vec::new(), optional: true }
+    }
+
+    /// The policy an ESP offer states through the DH transforms of its first
+    /// proposal -- the one this crate's CHILD SAs are modelled on. None at
+    /// all, or just NONE (0), is [`Self::none`]. Groups make PFS required,
+    /// the first being the one our own requests offer, unless NONE is listed
+    /// next to them (RFC 7296 §3.3.6: PFS left optional). A group IKEv2 may
+    /// not run -- unknown to this crate, or MODP-768 (RFC 8247 §2.4) -- is an
+    /// error, not skipped: the offer asked for PFS, and dropping the group
+    /// would quietly run the tunnel without it.
+    pub fn from_offer(sa: &SecurityAssociation) -> Result<Self, IkeError> {
+        let ids = first_proposal_dh_ids(sa);
+        let mut groups = Vec::new();
+        for &id in ids.iter().filter(|&&id| id != 0) {
+            let group = negotiate::ikev2_dh_group(id).ok_or(IkeError::Crypto("the ESP offer names a PFS group IKEv2 cannot run"))?;
+            if !groups.contains(&group) {
+                groups.push(group);
+            }
+        }
+        let optional = groups.is_empty() || ids.contains(&0);
+        Ok(PfsPolicy { groups, optional })
+    }
+
+    /// The group our own `CREATE_CHILD_SA` requests offer PFS on, if any.
+    pub fn proposed(&self) -> Option<DhGroup> {
+        self.groups.first().copied()
+    }
+
+    /// Whether a peer's rekey may run PFS on the group `id`.
+    fn allows_group(&self, id: u16) -> bool {
+        self.groups.is_empty() || self.groups.iter().any(|g| g.transform_id() == id)
+    }
+}
 
 /// Initiator: build a CHILD-SA rekey request for the CHILD SA `rekeyed_spi`
 /// (the SPI we expect on inbound ESP for it, RFC 7296 §1.3.3),
@@ -231,7 +313,13 @@ pub fn build_child_refusal(sa: &CompletedSaInit, message_id: u32, iv: &[u8; 8]) 
 /// rekey this side *would* take on but can't (`NO_PROPOSAL_CHOSEN`,
 /// `CHILD_SA_NOT_FOUND`, ...), still answered as a `CREATE_CHILD_SA`.
 pub fn build_child_error(sa: &CompletedSaInit, message_id: u32, error: u16, iv: &[u8; 8]) -> Result<Vec<u8>, IkeError> {
-    let inner = vec![(PayloadType::Notify, Notify::status(error, Vec::new()).to_bytes())];
+    build_child_error_with_data(sa, message_id, error, Vec::new(), iv)
+}
+
+/// [`build_child_error`] with notification data: `INVALID_KE_PAYLOAD` carries
+/// the group the responder wants, two octets big-endian (RFC 7296 §1.3).
+pub fn build_child_error_with_data(sa: &CompletedSaInit, message_id: u32, error: u16, data: Vec<u8>, iv: &[u8; 8]) -> Result<Vec<u8>, IkeError> {
+    let inner = vec![(PayloadType::Notify, Notify::status(error, data).to_bytes())];
     let header = create_child_header(sa, message_id, true);
     let first = first_payload_type(&inner);
     let bytes = encode_payload_chain(&inner);
@@ -276,13 +364,16 @@ pub fn responder_process_rekey(
     responder_process_rekey_with_pfs(sa, request, new_spi, nr, SkCipher::Aes256Gcm, None, iv, assigned_ip)
 }
 
-/// Like [`responder_process_rekey`], but honors PFS when the request's ESP
-/// proposal carries a DH transform: `dh_private` is our ephemeral private key
-/// for that group, required in that case (a `MissingPayload("KE")` error if
-/// the peer signaled PFS but we weren't given one, or vice versa) -- the
-/// caller is expected to have generated one as soon as it saw the DH
-/// transform, mirroring [`crate::ikev2::ike_rekey::responder_process_ike_rekey`]'s
-/// `dh_private` parameter for the IKE-SA-rekey analog. `cipher` is the ESP
+/// Like [`responder_process_rekey`], with PFS: `dh_private` is both our
+/// ephemeral private key and our policy. `Some` requires PFS: the request's
+/// proposal must list a DH group IKEv2 may run and carry a KE of it, or the
+/// rekey is refused (`MissingPayload("KE")` without a KE,
+/// `NoProposalChosen` for a group not offered or not known). `None` runs
+/// without PFS: a proposal that lists no group, or NONE among its groups
+/// (PFS left optional), is answered without one; one that insists on a group
+/// is refused with `NoProposalChosen`. This mirrors
+/// [`crate::ikev2::ike_rekey::responder_process_ike_rekey`]'s `dh_private`
+/// parameter for the IKE-SA-rekey analog. `cipher` is the ESP
 /// cipher already running on the tunnel being rekeyed -- see
 /// [`esp_offer_for_cipher`]'s own doc for why the reply must preserve it.
 #[allow(clippy::too_many_arguments)]
@@ -301,7 +392,8 @@ pub fn responder_process_rekey_with_pfs(
     let (sa_bytes, ni) = find_sa_and_nonce(first, &inner)?;
     let peer_spi = esp_spi_from_sa(&sa_bytes)?;
     let peer_sa = SecurityAssociation::parse(&sa_bytes)?;
-    let pfs_group = dh_transform_id(&peer_sa).and_then(DhGroup::from_transform_id);
+    let peer_ke = find_ke(first, &inner)?;
+    let pfs_group = requested_pfs(&first_proposal_dh_ids(&peer_sa), peer_ke.as_ref(), dh_private.is_some())?;
 
     // Traffic selectors: mirror exactly what IKE_AUTH did for this client. At AUTH we
     // narrow TSi to the client's assigned /32 and set TSr = full-tunnel; iOS installs
@@ -330,16 +422,10 @@ pub fn responder_process_rekey_with_pfs(
         ),
     };
 
-    let peer_ke = find_ke(first, &inner)?;
-    let pfs_secret = match (pfs_group, peer_ke, dh_private) {
-        (Some(group), Some(ke), Some(our_priv)) => {
-            if ke.dh_group != group.transform_id() {
-                return Err(IkeError::DhGroupMismatch { expected: group.transform_id(), got: ke.dh_group });
-            }
-            Some(group.shared(our_priv, &ke.data)?)
-        }
-        (None, _, _) => None,
-        _ => return Err(IkeError::MissingPayload("KE")),
+    // `requested_pfs` only settles on a group from the KE, with our key in hand.
+    let pfs_secret = match (pfs_group, &peer_ke, dh_private) {
+        (Some(group), Some(ke), Some(our_priv)) => Some(group.shared(our_priv, &ke.data)?),
+        _ => None,
     };
 
     let child = match &pfs_secret {
@@ -377,7 +463,22 @@ pub fn responder_process_rekey_with_pfs(
 /// a rekey keeps the running `cipher` -- and, when the request carries a KE
 /// payload (`ke_group`), that KE's DH group among its alternatives, or no
 /// mandatory DH when it doesn't (a proposal with no DH transform at all takes
-/// either, and is then answered without PFS). Returns the proposal to send back (the
+/// either, and is then answered without PFS). A KE group IKEv2 may not run
+/// ([`negotiate::ikev2_dh_group`]) rules its proposals out rather than turning
+/// them into "no PFS".
+///
+/// `pfs` is our own policy on top of that: PFS only on a group it allows,
+/// and no PFS only when it makes PFS optional -- a rekey that would drop the
+/// PFS our side runs is refused, even when the peer offers that as an
+/// alternative.
+///
+/// Refused as `NoProposalChosen` when nothing fits -- except that a proposal
+/// we'd take on a group other than the KE's is `InvalidKeGroup` naming it
+/// (§1.3: the responder MUST reject with INVALID_KE_PAYLOAD and its preferred
+/// group, for the peer to retry with), and a KE of a group no proposal names
+/// is a malformed request (§3.4), `Crypto`.
+///
+/// Returns the proposal to send back (the
 /// chosen one's number, our `new_spi`, one transform per type), the peer's
 /// SPI from it, and the DH group PFS runs on, if any.
 fn choose_child_proposal(
@@ -385,8 +486,16 @@ fn choose_child_proposal(
     cipher: SkCipher,
     new_spi: u32,
     ke_group: Option<u16>,
+    pfs: &PfsPolicy,
 ) -> Result<(Proposal, u32, Option<DhGroup>), IkeError> {
+    let names_dh =
+        |g: u16| peer_sa.proposals.iter().any(|p| p.transforms.iter().any(|t| t.transform_type == transform_type::DH && t.transform_id == g));
+    if ke_group.is_some_and(|g| !names_dh(g)) {
+        return Err(IkeError::Crypto("CREATE_CHILD_SA: a KE payload of a DH group no proposal names"));
+    }
     let ours = esp_offer_for_cipher(new_spi, cipher).proposals.remove(0);
+    // The group of the first proposal we'd take, but not on the KE's group.
+    let mut wanted_group = None;
     for p in &peer_sa.proposals {
         if p.protocol_id != protocol_id::ESP || p.spi.len() != 4 {
             continue;
@@ -407,15 +516,19 @@ fn choose_child_proposal(
         }
         let dh_offered: Vec<u16> = of_type(transform_type::DH).map(|t| t.transform_id).collect();
         let group = match ke_group {
-            Some(g) if dh_offered.contains(&g) => match DhGroup::from_transform_id(g) {
+            Some(g) if dh_offered.contains(&g) && pfs.allows_group(g) => match negotiate::ikev2_dh_group(g) {
                 Some(group) => Some(group),
                 None => continue,
             },
             // A proposal with no DH of its own answers a rekey without PFS: the KE is
             // there for the proposals that do list its group (strongSwan sends
             // both kinds side by side, so a peer that can't do PFS still fits).
-            _ if dh_offered.is_empty() || dh_offered.contains(&0) => None,
-            _ => continue,
+            _ if pfs.optional && (dh_offered.is_empty() || dh_offered.contains(&0)) => None,
+            _ => {
+                wanted_group =
+                    wanted_group.or_else(|| dh_offered.iter().filter(|&&g| pfs.allows_group(g)).find_map(|&g| negotiate::ikev2_dh_group(g)));
+                continue;
+            }
         };
         let mut reply = ours.clone();
         reply.num = p.num;
@@ -426,10 +539,10 @@ fn choose_child_proposal(
         return Ok((reply, peer_spi, group));
     }
     ike_debug!(
-        "CREATE_CHILD_SA: none of the peer's ESP proposals fits the running cipher {cipher:?} (KE group {ke_group:?}); offered: {:?}",
+        "CREATE_CHILD_SA: none of the peer's ESP proposals fits the running cipher {cipher:?} (KE group {ke_group:?}, our PFS policy {pfs:?}, group we'd take {wanted_group:?}); offered: {:?}",
         peer_sa.proposals
     );
-    Err(IkeError::NoProposalChosen)
+    Err(wanted_group.map_or(IkeError::NoProposalChosen, |g| IkeError::InvalidKeGroup(g.transform_id())))
 }
 
 /// Responder side of a CHILD SA rekey the *peer* started (RFC 7296 §1.3.3): a
@@ -440,16 +553,20 @@ fn choose_child_proposal(
 /// used when the request carries a KE payload), and builds the response, which
 /// accepts the traffic selectors exactly as the peer proposed them: that is
 /// what its SA being replaced already carries. `new_spi` is the inbound SPI we
-/// choose for the new SA; `cipher` the one running on the SA being rekeyed.
+/// choose for the new SA; `cipher` the one running on the SA being rekeyed;
+/// `pfs` our side's PFS policy, which the rekey must keep (see
+/// [`choose_child_proposal`]).
 ///
 /// Which SA is being rekeyed is the caller's to check first ([`rekey_sa_spi`]):
 /// this only builds the new one. Returns `(response_bytes, ChildSa)`.
+#[allow(clippy::too_many_arguments)]
 pub fn responder_answer_child_rekey(
     sa: &CompletedSaInit,
     request: &[u8],
     new_spi: u32,
     nr: &[u8],
     cipher: SkCipher,
+    pfs: &PfsPolicy,
     dh_private: &[u8],
     iv: &[u8; 8],
 ) -> Result<(Vec<u8>, ChildSa), IkeError> {
@@ -470,7 +587,7 @@ pub fn responder_answer_child_rekey(
     let tsi = tsi.ok_or(IkeError::MissingPayload("TSi"))?;
     let tsr = tsr.ok_or(IkeError::MissingPayload("TSr"))?;
 
-    let (proposal, peer_spi, group) = choose_child_proposal(&peer_sa, cipher, new_spi, peer_ke.as_ref().map(|k| k.dh_group))?;
+    let (proposal, peer_spi, group) = choose_child_proposal(&peer_sa, cipher, new_spi, peer_ke.as_ref().map(|k| k.dh_group), pfs)?;
     let prf = sa.suite.prf_algorithm();
     let (child, ke_out) = match (group, &peer_ke) {
         (Some(group), Some(ke)) => {
@@ -509,19 +626,19 @@ pub fn initiator_complete_rekey(
 }
 
 /// Like [`initiator_complete_rekey`], but for a rekey started with
-/// [`build_rekey_request_with_pfs`]: `dh_private` must be the same ephemeral
-/// private key passed there whenever PFS was requested (`None` otherwise),
-/// and `cipher` the same cipher passed there too (preserving the tunnel's
+/// [`build_rekey_request_with_pfs`]: `pfs` must be the same group and
+/// ephemeral private key passed there (`None` if PFS wasn't requested), and
+/// `cipher` the same cipher passed there too (preserving the tunnel's
 /// already-negotiated algorithm -- see [`esp_offer_for_cipher`]'s own doc).
 pub fn initiator_complete_rekey_with_pfs(
     sa: &CompletedSaInit,
     ni: &[u8],
     new_spi: u32,
     cipher: SkCipher,
-    dh_private: Option<&[u8]>,
+    pfs: Option<PfsKeyExchange>,
     response: &[u8],
 ) -> Result<ChildSa, IkeError> {
-    initiator_complete_child(sa, ni, new_spi, cipher, dh_private, response).map(|(child, _tsr)| child)
+    initiator_complete_child(sa, ni, new_spi, cipher, pfs, response).map(|(child, _tsr)| child)
 }
 
 /// Like [`initiator_complete_rekey_with_pfs`], for either kind of
@@ -531,12 +648,19 @@ pub fn initiator_complete_rekey_with_pfs(
 /// response carrying an error Notify (`NO_PROPOSAL_CHOSEN`, `TS_UNACCEPTABLE`,
 /// ...) is [`IkeError::PeerRejected`] rather than a confusing missing-payload
 /// error.
+///
+/// `pfs` is the group and private key the request offered PFS with. The
+/// answer must keep it: name that group and carry a KE of it -- one that
+/// leaves them out, or names another group, is refused
+/// (`NoProposalChosen`, `MissingPayload("KE")`, `DhGroupMismatch`) rather
+/// than taken as a rekey without PFS. With `pfs` `None` the answer must not
+/// bring a group or a KE either.
 pub fn initiator_complete_child(
     sa: &CompletedSaInit,
     ni: &[u8],
     new_spi: u32,
     cipher: SkCipher,
-    dh_private: Option<&[u8]>,
+    pfs: Option<PfsKeyExchange>,
     response: &[u8],
 ) -> Result<(ChildSa, Option<TrafficSelectors>), IkeError> {
     let (first, inner) = open_encrypted(sa.suite.sk_cipher(), response, peer_sk_e(sa), peer_sk_a(sa))?;
@@ -561,7 +685,6 @@ pub fn initiator_complete_child(
     let (sa_bytes, nr) = find_sa_and_nonce(first, &inner)?;
     let peer_spi = esp_spi_from_sa(&sa_bytes)?;
     let peer_sa = SecurityAssociation::parse(&sa_bytes)?;
-    let pfs_group = dh_transform_id(&peer_sa).and_then(DhGroup::from_transform_id);
 
     // RFC 7296 §2.7: the response's ESP proposal must be built from the offer
     // we actually sent (`esp_offer_for_cipher(_, cipher)` -- `build_child_request`/
@@ -575,16 +698,35 @@ pub fn initiator_complete_child(
         return Err(IkeError::NoProposalChosen);
     }
 
+    // The same for PFS (§1.3.1, §3.3): the answer is one transform per type
+    // picked from our offer, so with PFS offered it names exactly our group
+    // and carries a KE of it. Reading the group off the answer instead would
+    // let it drop PFS, or swap in a group we never offered, just by leaving
+    // the transform out or naming another.
+    let answered_dh = first_proposal_dh_ids(&peer_sa);
     let peer_ke = find_ke(first, &inner)?;
-    let pfs_secret = match (pfs_group, peer_ke, dh_private) {
-        (Some(group), Some(ke), Some(our_priv)) => {
+    let pfs_secret = match pfs {
+        Some((group, our_priv)) => {
+            if answered_dh != [group.transform_id()] {
+                ike_debug!("CREATE_CHILD_SA: we offered PFS on DH group {} and the answer names {answered_dh:?}", group.transform_id());
+                return Err(IkeError::NoProposalChosen);
+            }
+            let ke = peer_ke.ok_or(IkeError::MissingPayload("KE"))?;
             if ke.dh_group != group.transform_id() {
                 return Err(IkeError::DhGroupMismatch { expected: group.transform_id(), got: ke.dh_group });
             }
             Some(group.shared(our_priv, &ke.data)?)
         }
-        (None, _, _) => None,
-        _ => return Err(IkeError::MissingPayload("KE")),
+        None => {
+            if !(answered_dh.is_empty() || answered_dh == [0]) {
+                ike_debug!("CREATE_CHILD_SA: we offered no PFS and the answer names DH {answered_dh:?}");
+                return Err(IkeError::NoProposalChosen);
+            }
+            if peer_ke.is_some() {
+                return Err(IkeError::Crypto("CREATE_CHILD_SA: a KE payload answering a request without PFS"));
+            }
+            None
+        }
     };
 
     let child = match &pfs_secret {
@@ -648,7 +790,8 @@ mod tests {
         let req = build_rekey_request_with_pfs(&init_sa, 2, old_child_spi, init_new_spi, &ni, SkCipher::Aes256Gcm, Some((group, &init_dh)), &[1u8; 8]).unwrap();
         let (resp, mut resp_child) =
             responder_process_rekey_with_pfs(&resp_sa, &req, resp_new_spi, &nr, SkCipher::Aes256Gcm, Some(&resp_dh), &[2u8; 8], None).unwrap();
-        let mut init_child = initiator_complete_rekey_with_pfs(&init_sa, &ni, init_new_spi, SkCipher::Aes256Gcm, Some(&init_dh), &resp).unwrap();
+        let mut init_child =
+            initiator_complete_rekey_with_pfs(&init_sa, &ni, init_new_spi, SkCipher::Aes256Gcm, Some((group, &init_dh)), &resp).unwrap();
 
         let pkt = init_child.outbound.seal(b"pfs A->B", next_header::IPV4).unwrap();
         assert_eq!(resp_child.inbound.open(&pkt).unwrap().0, b"pfs A->B");
@@ -672,11 +815,11 @@ mod tests {
 
         let req1 = build_rekey_request_with_pfs(&init_sa, 2, 0xDEAD_BEEF, 0x1111_1111, &ni, SkCipher::Aes256Gcm, Some((group, &[5u8; 32])), &[1u8; 8]).unwrap();
         let (resp1, _) = responder_process_rekey_with_pfs(&resp_sa, &req1, 0x2222_2222, &nr, SkCipher::Aes256Gcm, Some(&[6u8; 32]), &[2u8; 8], None).unwrap();
-        let child1 = initiator_complete_rekey_with_pfs(&init_sa, &ni, 0x1111_1111, SkCipher::Aes256Gcm, Some(&[5u8; 32]), &resp1).unwrap();
+        let child1 = initiator_complete_rekey_with_pfs(&init_sa, &ni, 0x1111_1111, SkCipher::Aes256Gcm, Some((group, &[5u8; 32])), &resp1).unwrap();
 
         let req2 = build_rekey_request_with_pfs(&init_sa, 4, 0x1111_1111, 0x3333_3333, &ni, SkCipher::Aes256Gcm, Some((group, &[7u8; 32])), &[3u8; 8]).unwrap();
         let (resp2, _) = responder_process_rekey_with_pfs(&resp_sa, &req2, 0x4444_4444, &nr, SkCipher::Aes256Gcm, Some(&[8u8; 32]), &[4u8; 8], None).unwrap();
-        let child2 = initiator_complete_rekey_with_pfs(&init_sa, &ni, 0x3333_3333, SkCipher::Aes256Gcm, Some(&[7u8; 32]), &resp2).unwrap();
+        let child2 = initiator_complete_rekey_with_pfs(&init_sa, &ni, 0x3333_3333, SkCipher::Aes256Gcm, Some((group, &[7u8; 32])), &resp2).unwrap();
 
         assert_ne!(child1.outbound.key_material(), child2.outbound.key_material(), "a fresh DH exchange must yield a fresh key even with identical nonces");
     }
@@ -851,9 +994,9 @@ mod tests {
             let req = peer_rekey_request(&peer_sa, vec![offer], pfs.map(|g| (g, &peer_dh[..])), &ts);
 
             let (resp, mut our_child) =
-                responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &[6u8; 32], &[2u8; 8]).unwrap();
+                responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &PfsPolicy::none(), &[6u8; 32], &[2u8; 8]).unwrap();
             let (mut peer_child, granted) =
-                initiator_complete_child(&peer_sa, &[0x33u8; 32], 0x2222_2222, SkCipher::Aes256Gcm, pfs.map(|_| &peer_dh[..]), &resp).unwrap();
+                initiator_complete_child(&peer_sa, &[0x33u8; 32], 0x2222_2222, SkCipher::Aes256Gcm, pfs.map(|g| (g, &peer_dh[..])), &resp).unwrap();
             assert_eq!(granted, Some(ts), "the peer's selectors are accepted as proposed");
 
             let pkt = peer_child.outbound.seal(b"peer -> us", next_header::IPV4).unwrap();
@@ -881,7 +1024,8 @@ mod tests {
         ];
         let req = peer_rekey_request(&peer_sa, offers, Some((DhGroup::Modp2048, &peer_dh)), &TrafficSelectors::ipv4_full_tunnel());
         let (resp, _child) =
-            responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &[6u8; 32], &[2u8; 8]).unwrap();
+            responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &PfsPolicy::none(), &[6u8; 32], &[2u8; 8])
+                .unwrap();
         let (proposal, _, _, ke) = read_rekey_response(&resp, &peer_sa);
         assert_eq!(proposal.num, 3);
         assert_eq!(proposal.spi, 0x1111_1111u32.to_be_bytes());
@@ -911,7 +1055,8 @@ mod tests {
         ];
         let req = peer_rekey_request(&peer_sa, offers, Some((DhGroup::Modp2048, &peer_dh)), &TrafficSelectors::ipv4_full_tunnel());
         let (resp, mut our_child) =
-            responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &[6u8; 32], &[2u8; 8]).unwrap();
+            responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &PfsPolicy::none(), &[6u8; 32], &[2u8; 8])
+                .unwrap();
         let (proposal, _, _, ke) = read_rekey_response(&resp, &peer_sa);
         assert_eq!(proposal.num, 3);
         assert!(!ke, "the chosen proposal has no DH, so no KE in the answer");
@@ -934,30 +1079,41 @@ mod tests {
             esp_proposal(2, 0x2222_2222, (transform_id::AES_CBC, Some(256)), Some(transform_id::AUTH_HMAC_SHA2_256_128), &[]),
         ];
         let req = peer_rekey_request(&peer_sa, offers, None, &TrafficSelectors::ipv4_full_tunnel());
-        let (resp, child) = responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], cbc, &[6u8; 32], &[2u8; 8]).unwrap();
+        let (resp, child) =
+            responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], cbc, &PfsPolicy::none(), &[6u8; 32], &[2u8; 8]).unwrap();
         let (proposal, _, _, ke) = read_rekey_response(&resp, &peer_sa);
         assert_eq!(proposal.num, 2);
         assert!(!ke);
         assert_eq!(child.inbound.cipher(), cbc);
     }
 
-    /// Nothing offered fits (no proposal with our cipher; or PFS asked for with a
-    /// KE group no proposal lists): `NoProposalChosen`, not a guess.
+    /// Nothing offered fits: refused, not a guess -- `NoProposalChosen` when no
+    /// proposal has our cipher, and the RFC 7296 answers for a KE that fits
+    /// no proposal we can take.
     #[test]
     fn a_peer_started_rekey_that_offers_nothing_usable_is_refused() {
         let (our_sa, peer_sa) = sa_pair();
         let ts = TrafficSelectors::ipv4_full_tunnel();
         let peer_dh = [5u8; 32];
         let answer = |req: &[u8]| {
-            responder_answer_child_rekey(&our_sa, req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &[6u8; 32], &[2u8; 8]).err()
+            responder_answer_child_rekey(&our_sa, req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &PfsPolicy::none(), &[6u8; 32], &[2u8; 8])
+                .err()
         };
         let other_cipher = esp_proposal(1, 0x2222_2222, (transform_id::AES_CBC, Some(128)), Some(transform_id::AUTH_HMAC_SHA1_96), &[]);
         let req = peer_rekey_request(&peer_sa, vec![other_cipher], None, &ts);
         assert!(matches!(answer(&req), Some(IkeError::NoProposalChosen)));
 
+        // A KE of a group no proposal names at all is a malformed request (RFC 7296 §3.4).
         let gcm_ecp = esp_proposal(1, 0x2222_2222, (transform_id::AES_GCM_16, Some(256)), None, &[transform_id::ECP256]);
-        let req = peer_rekey_request(&peer_sa, vec![gcm_ecp], Some((DhGroup::Modp2048, &peer_dh)), &ts);
-        assert!(matches!(answer(&req), Some(IkeError::NoProposalChosen)), "the KE's group isn't among the proposal's");
+        let req = peer_rekey_request(&peer_sa, vec![gcm_ecp.clone()], Some((DhGroup::Modp2048, &peer_dh)), &ts);
+        assert!(matches!(answer(&req), Some(IkeError::Crypto(_))), "the KE's group isn't among the proposals'");
+
+        // Named by a proposal we can't take, while the one we'd take runs another
+        // group: INVALID_KE_PAYLOAD naming that one (§1.3), for the peer to retry.
+        let cbc_modp =
+            esp_proposal(2, 0x2222_2222, (transform_id::AES_CBC, Some(128)), Some(transform_id::AUTH_HMAC_SHA1_96), &[transform_id::MODP_2048]);
+        let req = peer_rekey_request(&peer_sa, vec![gcm_ecp, cbc_modp], Some((DhGroup::Modp2048, &peer_dh)), &ts);
+        assert_eq!(answer(&req), Some(IkeError::InvalidKeGroup(transform_id::ECP256)));
     }
 
     /// The `REKEY_SA` notify names the SA the sender expects inbound ESP on.
@@ -1024,6 +1180,252 @@ mod tests {
 
         let err = initiator_complete_child(&init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, None, &resp).err().unwrap();
         assert_eq!(err, IkeError::NoProposalChosen);
+    }
+
+    /// A `CREATE_CHILD_SA` answer from `resp_sa` to our GCM-256 request, built
+    /// by hand: our offer's proposal with the DH transforms `dh` added, and
+    /// `ke` as its KE payload, if any.
+    fn hand_built_answer(resp_sa: &CompletedSaInit, dh: &[u16], ke: Option<KeyExchange>) -> Vec<u8> {
+        let mut sa = esp_offer_for_cipher(0x2222_2222, SkCipher::Aes256Gcm);
+        sa.proposals[0].transforms.extend(dh.iter().map(|&id| Transform { transform_type: transform_type::DH, transform_id: id, key_length: None }));
+        let ts = TrafficSelectors::ipv4_full_tunnel();
+        let mut inner = vec![(PayloadType::SecurityAssociation, sa.to_bytes()), (PayloadType::Nonce, vec![0x44; 32])];
+        inner.extend(ke.map(|ke| (PayloadType::KeyExchange, ke.to_bytes())));
+        inner.push((PayloadType::TrafficSelectorInitiator, ts.to_bytes()));
+        inner.push((PayloadType::TrafficSelectorResponder, ts.to_bytes()));
+        let first = first_payload_type(&inner);
+        build_encrypted(
+            resp_sa.suite.sk_cipher(),
+            create_child_header(resp_sa, 2, true),
+            first,
+            &encode_payload_chain(&inner),
+            our_sk_e(resp_sa),
+            our_sk_a(resp_sa),
+            &[2u8; 8],
+        )
+        .unwrap()
+    }
+
+    /// A KE payload of `group` from the private key `private`.
+    fn ke_of(group: DhGroup, private: &[u8]) -> KeyExchange {
+        KeyExchange { dh_group: group.transform_id(), data: group.public(private) }
+    }
+
+    /// RFC 7296 §1.3.1, §3.3: a rekey we asked PFS for is answered with our
+    /// group and a KE of it. An answer that leaves PFS out -- no DH transform
+    /// and no KE, NONE, or just no KE -- or that names another group, one we
+    /// don't know, or several, is refused, never taken as a rekey without
+    /// PFS. The untouched answer of the same shape still completes.
+    #[test]
+    fn a_pfs_rekey_answer_must_carry_the_offered_group_and_its_ke() {
+        let (init_sa, resp_sa) = sa_pair();
+        let (ni, init_dh, resp_dh) = ([0x33u8; 32], [5u8; 32], [6u8; 32]);
+        let modp2048 = DhGroup::Modp2048;
+        let complete =
+            |resp: &[u8]| initiator_complete_child(&init_sa, &ni, 0x1111_1111, SkCipher::Aes256Gcm, Some((modp2048, &init_dh)), resp).map(|_| ());
+
+        // Positive controls: the real responder's answer, and the hand-built one.
+        let req =
+            build_rekey_request_with_pfs(&init_sa, 2, 0xDEAD_BEEF, 0x1111_1111, &ni, SkCipher::Aes256Gcm, Some((modp2048, &init_dh)), &[1u8; 8])
+                .unwrap();
+        let (resp, _) =
+            responder_process_rekey_with_pfs(&resp_sa, &req, 0x2222_2222, &[0x44u8; 32], SkCipher::Aes256Gcm, Some(&resp_dh), &[2u8; 8], None)
+                .unwrap();
+        assert_eq!(complete(&resp), Ok(()));
+        assert_eq!(complete(&hand_built_answer(&resp_sa, &[transform_id::MODP_2048], Some(ke_of(modp2048, &resp_dh)))), Ok(()));
+
+        let ecp256 = ke_of(DhGroup::EcpP256, &resp_dh);
+        let unknown = KeyExchange { dh_group: 0x7777, data: vec![9; 256] };
+        let cases = [
+            ("PFS stripped: no DH transform, no KE", hand_built_answer(&resp_sa, &[], None), IkeError::NoProposalChosen),
+            ("DH NONE and no KE", hand_built_answer(&resp_sa, &[0], None), IkeError::NoProposalChosen),
+            ("our group, but no KE", hand_built_answer(&resp_sa, &[transform_id::MODP_2048], None), IkeError::MissingPayload("KE")),
+            ("ECP-256 swapped in", hand_built_answer(&resp_sa, &[transform_id::ECP256], Some(ecp256.clone())), IkeError::NoProposalChosen),
+            ("a group nobody knows", hand_built_answer(&resp_sa, &[0x7777], Some(unknown)), IkeError::NoProposalChosen),
+            (
+                "two DH transforms",
+                hand_built_answer(&resp_sa, &[transform_id::MODP_2048, transform_id::ECP256], Some(ke_of(modp2048, &resp_dh))),
+                IkeError::NoProposalChosen,
+            ),
+            (
+                "our group, a KE of another",
+                hand_built_answer(&resp_sa, &[transform_id::MODP_2048], Some(ecp256)),
+                IkeError::DhGroupMismatch { expected: transform_id::MODP_2048, got: transform_id::ECP256 },
+            ),
+        ];
+        for (what, answer, expected) in cases {
+            assert_eq!(complete(&answer), Err(expected), "{what}");
+        }
+    }
+
+    /// The other way round: a rekey we asked no PFS for is answered without
+    /// it. DH NONE, or no DH transform at all, completes; a group, or a KE,
+    /// is refused rather than half-used.
+    #[test]
+    fn a_rekey_answer_must_not_bring_pfs_we_did_not_ask_for() {
+        let (init_sa, resp_sa) = sa_pair();
+        let complete = |resp: &[u8]| initiator_complete_child(&init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, None, resp).map(|_| ());
+        let ke = ke_of(DhGroup::Modp2048, &[6u8; 32]);
+
+        assert_eq!(complete(&hand_built_answer(&resp_sa, &[], None)), Ok(()));
+        assert_eq!(complete(&hand_built_answer(&resp_sa, &[0], None)), Ok(()));
+        assert_eq!(complete(&hand_built_answer(&resp_sa, &[transform_id::MODP_2048], Some(ke.clone()))), Err(IkeError::NoProposalChosen));
+        assert!(matches!(complete(&hand_built_answer(&resp_sa, &[], Some(ke))), Err(IkeError::Crypto(_))));
+    }
+
+    /// A peer's rekey request with `proposals` and a KE payload `ke` as is --
+    /// any group id, even one no [`DhGroup`] stands for.
+    fn peer_rekey_request_with_ke(peer_sa: &CompletedSaInit, proposals: Vec<Proposal>, ke: KeyExchange) -> Vec<u8> {
+        let ts = TrafficSelectors::ipv4_full_tunnel();
+        let inner = vec![
+            (PayloadType::SecurityAssociation, SecurityAssociation { proposals }.to_bytes()),
+            (PayloadType::Nonce, vec![0x33; 32]),
+            (PayloadType::KeyExchange, ke.to_bytes()),
+            (PayloadType::TrafficSelectorInitiator, ts.to_bytes()),
+            (PayloadType::TrafficSelectorResponder, ts.to_bytes()),
+        ];
+        let first = first_payload_type(&inner);
+        build_encrypted(
+            peer_sa.suite.sk_cipher(),
+            create_child_header(peer_sa, 7, false),
+            first,
+            &encode_payload_chain(&inner),
+            our_sk_e(peer_sa),
+            our_sk_a(peer_sa),
+            &[1u8; 8],
+        )
+        .unwrap()
+    }
+
+    /// [`responder_process_rekey_with_pfs`] runs the policy its `dh_private`
+    /// states. With a key (PFS required) a request without PFS, or on a
+    /// group IKEv2 may not run (unknown, or MODP-768 per RFC 8247 §2.4), is
+    /// refused; without one, a request insisting on such a group is refused
+    /// too instead of being answered as "no PFS". A request that lists NONE
+    /// next to its group (RFC 7296 §3.3.6) is answered either way, each
+    /// side then deriving the same keys.
+    #[test]
+    fn the_rekey_responder_keeps_its_pfs_policy() {
+        let (init_sa, resp_sa) = sa_pair();
+        let (init_dh, resp_dh) = ([5u8; 32], [6u8; 32]);
+        let answer = |req: &[u8], dh_private: Option<&[u8]>| {
+            responder_process_rekey_with_pfs(&resp_sa, req, 0x2222_2222, &[0x44u8; 32], SkCipher::Aes256Gcm, dh_private, &[2u8; 8], None)
+        };
+        let gcm = (transform_id::AES_GCM_16, Some(256));
+
+        let no_pfs =
+            build_rekey_request_with_pfs(&init_sa, 2, 0xDEAD_BEEF, 0x1111_1111, &[0x33u8; 32], SkCipher::Aes256Gcm, None, &[1u8; 8]).unwrap();
+        assert_eq!(answer(&no_pfs, Some(&resp_dh)).err(), Some(IkeError::NoProposalChosen), "PFS required, none offered");
+        assert!(answer(&no_pfs, None).is_ok(), "control: no PFS either side");
+
+        let unknown = peer_rekey_request_with_ke(
+            &init_sa,
+            vec![esp_proposal(1, 0x1111_1111, gcm, None, &[0x7777])],
+            KeyExchange { dh_group: 0x7777, data: vec![9; 256] },
+        );
+        assert_eq!(answer(&unknown, Some(&resp_dh)).err(), Some(IkeError::NoProposalChosen), "unknown group, PFS required");
+        assert_eq!(answer(&unknown, None).err(), Some(IkeError::NoProposalChosen), "unknown group, no PFS: not \"no PFS\"");
+
+        let modp768 = peer_rekey_request_with_ke(
+            &init_sa,
+            vec![esp_proposal(1, 0x1111_1111, gcm, None, &[transform_id::MODP_768])],
+            ke_of(DhGroup::Modp768, &init_dh),
+        );
+        assert_eq!(answer(&modp768, Some(&resp_dh)).err(), Some(IkeError::NoProposalChosen), "MODP-768 (RFC 8247)");
+
+        // [MODP-2048, NONE]: PFS optional. Answered without it by a responder
+        // with no key, and with it by one that has one.
+        let optional = |order: &[u16]| {
+            peer_rekey_request_with_ke(&init_sa, vec![esp_proposal(1, 0x1111_1111, gcm, None, order)], ke_of(DhGroup::Modp2048, &init_dh))
+        };
+        for (order, dh_private, pfs) in [
+            (&[transform_id::MODP_2048, 0][..], None, None),
+            (&[0, transform_id::MODP_2048][..], Some(&resp_dh[..]), Some((DhGroup::Modp2048, &init_dh[..]))),
+        ] {
+            let (resp, mut resp_child) = answer(&optional(order), dh_private).unwrap();
+            let (_, _, _, ke) = read_rekey_response(&resp, &init_sa);
+            assert_eq!(ke, pfs.is_some(), "{order:?}");
+            let (mut init_child, _) = initiator_complete_child(&init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, pfs, &resp).unwrap();
+            let pkt = init_child.outbound.seal(b"optional PFS", next_header::IPV4).unwrap();
+            assert_eq!(resp_child.inbound.open(&pkt).unwrap().0, b"optional PFS", "{order:?}");
+        }
+    }
+
+    /// [`PfsPolicy::from_offer`] reads the local ESP offer's first proposal:
+    /// no DH (or just NONE) is no PFS, groups make it required unless NONE
+    /// sits next to them, and a group IKEv2 may not run is an error rather
+    /// than no PFS.
+    #[test]
+    fn the_pfs_policy_is_read_off_the_esp_offer() {
+        let gcm = (transform_id::AES_GCM_16, Some(256));
+        let policy = |dh: &[u16]| PfsPolicy::from_offer(&SecurityAssociation { proposals: vec![esp_proposal(1, 0, gcm, None, dh)] });
+        let groups = |g: &[DhGroup], optional| Ok(PfsPolicy { groups: g.to_vec(), optional });
+
+        assert_eq!(policy(&[]), Ok(PfsPolicy::none()));
+        assert_eq!(policy(&[0]), Ok(PfsPolicy::none()));
+        assert_eq!(policy(&[transform_id::MODP_2048]), groups(&[DhGroup::Modp2048], false));
+        assert_eq!(policy(&[transform_id::ECP256, transform_id::MODP_2048, 0]), groups(&[DhGroup::EcpP256, DhGroup::Modp2048], true));
+        assert_eq!(policy(&[transform_id::ECP256, 0]).unwrap().proposed(), Some(DhGroup::EcpP256));
+        assert!(policy(&[0x7777]).is_err(), "unknown group");
+        assert!(policy(&[transform_id::MODP_768]).is_err(), "MODP-768, RFC 8247 §2.4");
+        assert!(policy(&[transform_id::MODP_2048, 0x7777]).is_err(), "one bad group among good ones");
+    }
+
+    /// [`responder_answer_child_rekey`] (the session's) keeps our PFS policy:
+    /// with PFS required, the DH-less proposals strongSwan offers next to its
+    /// PFS ones don't do, and neither does a group we don't run; with PFS
+    /// optional they do. MODP-768 and unknown groups are never PFS, and never
+    /// "no PFS" either.
+    #[test]
+    fn a_peer_started_rekey_keeps_our_pfs_policy() {
+        let (our_sa, peer_sa) = sa_pair();
+        let peer_dh = [5u8; 32];
+        let (cbc, gcm) = ((transform_id::AES_CBC, Some(256)), (transform_id::AES_GCM_16, Some(256)));
+        let sha256 = Some(transform_id::AUTH_HMAC_SHA2_256_128);
+        let strongswan_like = || {
+            vec![
+                esp_proposal(1, 0x2222_2222, cbc, sha256, &[transform_id::MODP_2048]),
+                esp_proposal(2, 0x2222_2222, cbc, sha256, &[]),
+                esp_proposal(3, 0x2222_2222, gcm, None, &[]),
+            ]
+        };
+        let offer = |dh: &[u16]| SecurityAssociation { proposals: vec![esp_proposal(1, 0, gcm, None, dh)] };
+        let required = PfsPolicy::from_offer(&offer(&[transform_id::MODP_2048])).unwrap();
+        let optional = PfsPolicy::from_offer(&offer(&[transform_id::MODP_2048, 0])).unwrap();
+        let ts = TrafficSelectors::ipv4_full_tunnel();
+        let answer = |req: &[u8], pfs: &PfsPolicy| {
+            responder_answer_child_rekey(&our_sa, req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, pfs, &[6u8; 32], &[2u8; 8])
+                .map(|(resp, _)| read_rekey_response(&resp, &peer_sa))
+        };
+
+        let req = peer_rekey_request(&peer_sa, strongswan_like(), Some((DhGroup::Modp2048, &peer_dh)), &ts);
+        assert_eq!(answer(&req, &required).err(), Some(IkeError::NoProposalChosen), "PFS required: the DH-less GCM proposal won't do");
+        let (proposal, _, _, ke) = answer(&req, &optional).unwrap();
+        assert_eq!((proposal.num, ke), (3, false), "PFS optional: it will");
+
+        let gcm_modp2048 = vec![esp_proposal(1, 0x2222_2222, gcm, None, &[transform_id::MODP_2048])];
+        let req = peer_rekey_request(&peer_sa, gcm_modp2048, Some((DhGroup::Modp2048, &peer_dh)), &ts);
+        let (_, _, _, ke) = answer(&req, &required).unwrap();
+        assert!(ke, "control: our group, answered with our KE");
+
+        let gcm_ecp256 = vec![esp_proposal(1, 0x2222_2222, gcm, None, &[transform_id::ECP256])];
+        let req = peer_rekey_request(&peer_sa, gcm_ecp256, Some((DhGroup::EcpP256, &peer_dh)), &ts);
+        assert_eq!(answer(&req, &required).err(), Some(IkeError::NoProposalChosen), "a group our policy doesn't run");
+        assert!(answer(&req, &PfsPolicy::none()).unwrap().3, "no policy of our own: the peer's group stands");
+
+        // Our group offered, but the KE is of another one: INVALID_KE_PAYLOAD
+        // naming ours (§1.3), for the peer to retry with it.
+        let gcm_both = vec![esp_proposal(1, 0x2222_2222, gcm, None, &[transform_id::ECP256, transform_id::MODP_2048])];
+        let req = peer_rekey_request(&peer_sa, gcm_both, Some((DhGroup::EcpP256, &peer_dh)), &ts);
+        assert_eq!(answer(&req, &required).err(), Some(IkeError::InvalidKeGroup(transform_id::MODP_2048)));
+
+        let gcm_modp768 = vec![esp_proposal(1, 0x2222_2222, gcm, None, &[transform_id::MODP_768])];
+        let req = peer_rekey_request(&peer_sa, gcm_modp768, Some((DhGroup::Modp768, &peer_dh)), &ts);
+        assert_eq!(answer(&req, &PfsPolicy::none()).err(), Some(IkeError::NoProposalChosen), "MODP-768, RFC 8247 §2.4");
+
+        let gcm_unknown = vec![esp_proposal(1, 0x2222_2222, gcm, None, &[0x7777])];
+        let req = peer_rekey_request_with_ke(&peer_sa, gcm_unknown, KeyExchange { dh_group: 0x7777, data: vec![9; 256] });
+        assert_eq!(answer(&req, &PfsPolicy::none()).err(), Some(IkeError::NoProposalChosen), "unknown group");
     }
 
     fn extract_tsi(resp: &[u8], init_sa: &CompletedSaInit) -> Vec<u8> {

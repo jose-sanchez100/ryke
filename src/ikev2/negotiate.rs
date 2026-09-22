@@ -39,7 +39,7 @@
 //! also do not widen `esp_offer`'s ENCR/INTEG choices for the CHILD SA
 //! before `esp.rs` supports them (still not true; Phase G first).
 
-use crate::crypto::{IntegAlgorithm, KeyLengths, PrfAlgorithm};
+use crate::crypto::{DhGroup, IntegAlgorithm, KeyLengths, PrfAlgorithm};
 use crate::ikev2::payload::{protocol_id, transform_id, transform_type, Proposal, SecurityAssociation, Transform};
 
 /// The concrete suite chosen from an initiator proposal.
@@ -192,6 +192,14 @@ const DH_CANDIDATES: &[u16] = &[
     transform_id::MODP_1536,
     transform_id::MODP_1024,
 ];
+
+/// The DH group `id` names, if IKEv2 may run it: one of [`DH_CANDIDATES`], so
+/// never MODP-768, which RFC 8247 §2.4 forbids. Transform Type 4 is one
+/// registry for the IKE SA and a CHILD SA's PFS alike (RFC 7296 §3.3.2), so
+/// the same list holds for both.
+pub fn ikev2_dh_group(id: u16) -> Option<DhGroup> {
+    DH_CANDIDATES.contains(&id).then(|| DhGroup::from_transform_id(id)).flatten()
+}
 
 fn select_from_proposal(proposal: &Proposal) -> Option<ChosenSuite> {
     if proposal.protocol_id != protocol_id::IKE {

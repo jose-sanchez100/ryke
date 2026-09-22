@@ -95,6 +95,37 @@ impl ChosenSuite {
         transforms.push(Transform { transform_type: transform_type::DH, transform_id: self.dh_id, key_length: None });
         Proposal { num: self.proposal_num, protocol_id: protocol_id::IKE, spi: Vec::new(), transforms }
     }
+
+    /// Whether every transform this suite names was actually present in
+    /// `offer`'s proposal of the matching number. RFC 7296 §2.7: the
+    /// responder "MUST select a single suite... from the SA payload" the
+    /// initiator sent -- it doesn't get to synthesize a combination from
+    /// transforms we'd merely support in general (this crate's own
+    /// candidate tables) but never put in this particular offer. Without
+    /// this check, a misbehaving or on-path responder could echo back e.g.
+    /// AES-CBC-128 in response to an AES-GCM-256-only offer and we'd accept
+    /// it as if we'd proposed it -- a silent downgrade.
+    pub fn matches_offer(&self, offer: &SecurityAssociation) -> bool {
+        let Some(proposal) = offer.proposals.iter().find(|p| p.num == self.proposal_num) else {
+            return false;
+        };
+        // Fixed-key ciphers (ChaCha20-Poly1305, 3DES) carry no key-length
+        // attribute on the wire -- same "don't care" shape `has` already
+        // uses for them in `select_from_proposal`.
+        let encr_key_bits = if fixed_key_bits(self.encr_id).is_some() { None } else { Some(self.encr_key_bits) };
+        if !has(proposal, transform_type::ENCR, self.encr_id, encr_key_bits) {
+            return false;
+        }
+        if !has(proposal, transform_type::PRF, self.prf_id, None) {
+            return false;
+        }
+        if let Some(integ) = self.integ_id {
+            if !has(proposal, transform_type::INTEG, integ, None) {
+                return false;
+            }
+        }
+        has(proposal, transform_type::DH, self.dh_id, None)
+    }
 }
 
 /// Pick the first initiator proposal we fully support, or `None`.

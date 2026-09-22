@@ -517,6 +517,13 @@ pub fn initiator_complete(local: &LocalSecret, request: &[u8], response: &[u8]) 
 
     // Interpret the responder's chosen proposal; it must be a suite we support.
     let suite = negotiate::select(&payloads.sa).ok_or(IkeError::NoProposalChosen)?;
+    // ...and one we actually offered, not merely one we'd support from some
+    // other peer (RFC 7296 §2.7) -- see `ChosenSuite::matches_offer`'s doc.
+    let our_offer_header = IkeHeader::parse(request)?;
+    let our_offer = parse_sa_init(&our_offer_header, &request[IkeHeader::LEN..])?;
+    if !suite.matches_offer(&our_offer.sa) {
+        return Err(IkeError::NoProposalChosen);
+    }
     let group = DhGroup::from_transform_id(suite.dh_id).ok_or(IkeError::NoProposalChosen)?;
     let peer_public = dh_peer(&payloads.ke, group)?;
     let shared = group.shared(&local.dh_private, peer_public)?;
@@ -908,6 +915,39 @@ mod tests {
             Transform { transform_type: transform_type::DH, transform_id: 9999, key_length: None };
         let request = initiator_request(&init_secret(), &offer);
         let err = responder_respond(&request, &resp_secret()).unwrap_err();
+        assert_eq!(err, IkeError::NoProposalChosen);
+    }
+
+    #[test]
+    fn initiator_rejects_a_suite_the_responder_never_actually_offered() {
+        // A misbehaving (or on-path) responder answers with a suite this crate
+        // knows how to speak at all (so `negotiate::select` alone would happily
+        // accept it) but that was never in our `default_offer()` -- a downgrade
+        // from AES-GCM-256 to classic AES-CBC-128/PRF-MD5/HMAC-MD5-96/MODP-768.
+        // RFC 7296 §2.7: the responder MUST pick from what was actually offered.
+        let init = init_secret();
+        let resp = resp_secret();
+        let request = initiator_request(&init, &default_offer());
+
+        let downgrade = SecurityAssociation {
+            proposals: vec![Proposal {
+                num: 1,
+                protocol_id: protocol_id::IKE,
+                spi: Vec::new(),
+                transforms: vec![
+                    Transform { transform_type: transform_type::ENCR, transform_id: transform_id::AES_CBC, key_length: Some(128) },
+                    Transform { transform_type: transform_type::PRF, transform_id: transform_id::PRF_HMAC_MD5, key_length: None },
+                    Transform { transform_type: transform_type::INTEG, transform_id: transform_id::AUTH_HMAC_MD5_96, key_length: None },
+                    Transform { transform_type: transform_type::DH, transform_id: transform_id::MODP_768, key_length: None },
+                ],
+            }],
+        };
+        let group = DhGroup::Modp768;
+        let public = group.public(&resp.dh_private);
+        let header = base_header(init.spi, resp.spi, Flags { initiator: false, version: false, response: true });
+        let response = build_sa_init(header, &downgrade, group.transform_id(), &public, &resp.nonce, &[]);
+
+        let err = initiator_complete(&init, &request, &response).unwrap_err();
         assert_eq!(err, IkeError::NoProposalChosen);
     }
 

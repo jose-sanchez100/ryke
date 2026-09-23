@@ -33,7 +33,7 @@ use super::crypto1::{self, Prf};
 use super::informational;
 use super::isakmp::{self, exchange, payload, IsakmpHeader, Payload};
 use super::payloads::{
-    id_type, protocol, Attribute, Id, Proposal, SaPayload, Transform, IPSEC_DOI, SIT_IDENTITY_ONLY,
+    id_type, life, protocol, AttrValue, Attribute, Id, Proposal, SaPayload, Transform, IPSEC_DOI, SIT_IDENTITY_ONLY,
 };
 use super::phase1::Phase1State;
 use super::phase2;
@@ -108,7 +108,15 @@ const ENCAP_TUNNEL: u16 = 1;
 /// this crate only advertises the RFC 3947 Vendor ID -- see
 /// `phase1::NATT_RFC_VENDOR_ID`'s doc).
 const UDP_ENCAP_TUNNEL: u16 = 3;
-const LIFE_SECONDS: u16 = 1;
+/// RFC 2407 §4.5: the lifetime of an SA that states none.
+const DEFAULT_LIFE_SECONDS: u32 = 28_800;
+/// What a responder here grants an offer that states no lifetime in seconds --
+/// its own policy, and shorter than [`DEFAULT_LIFE_SECONDS`], which RFC 2407
+/// §4.5.4 lets it be.
+const RESPONDER_LIFE_SECONDS: u32 = 3600;
+/// The attributes a responder may change on its own (RFC 2407 §4.5.4), hence
+/// the ones an answer is not compared on.
+const LIFETIME_ATTRS: [u16; 2] = [esp_attr::LIFE_TYPE, esp_attr::LIFE_DURATION];
 
 /// This registry (RFC 2407 §4.5's ESP `AUTH_ALGORITHM` attribute values) is
 /// numbered independently of IKEv2's own INTEG transform IDs
@@ -154,19 +162,96 @@ fn find(ps: &[Payload], t: u8) -> Option<&Payload> {
     ps.iter().find(|p| p.payload_type == t)
 }
 
-/// RFC 2407 §4.5: the responder isn't bound to the initiator's offered ESP
-/// SA lifetime and may unilaterally pick a shorter one -- read whatever the
-/// responder actually put on the SA payload's ESP transform (`ps`), falling
-/// back to `offered` (what we ourselves proposed) when the responder didn't
-/// carry a LIFE_DURATION attribute at all. Mirrors
-/// `phase1::negotiated_p1_lifetime`'s exact same RFC rationale, just against
-/// the ESP DOI's attribute registry instead of the IKE DOI's.
+/// The value of an SA Life Duration attribute: a basic (two-octet) attribute
+/// or a variable-length one of up to eight octets, read as a big-endian
+/// integer (RFC 2407 §4.5: "Variable length attributes MAY be encoded as basic
+/// attributes if their value can fit into two octets"). Anything wider than
+/// 32 bits saturates -- far past any lifetime we would use -- and an empty or
+/// wider-than-eight-octet value is `None`.
+fn life_duration_value(v: &AttrValue) -> Option<u32> {
+    match v {
+        AttrValue::Short(n) => Some(u32::from(*n)),
+        AttrValue::Long(d) if (1..=8).contains(&d.len()) => {
+            let wide = d.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
+            Some(u32::try_from(wide).unwrap_or(u32::MAX))
+        }
+        AttrValue::Long(_) => None,
+    }
+}
+
+/// The SA lifetime, in seconds, that `t` states -- `None` when it states no
+/// time limit. RFC 2407 §4.5: an SA Life Duration "MUST always follow an SA
+/// Life Type which describes the units of duration" (seconds or kilobytes);
+/// §4.5.2: a list "MUST" be parsed when it carries several such pairs (e.g.
+/// 100 MB *or* 24 hours), so long as they don't conflict; §4.5.3: a Type we
+/// don't define aborts the negotiation. Errors are `MalformedPayload`: a Type
+/// that is not immediately followed by its Duration, a Duration with no Type,
+/// a Type that is not a basic attribute or not seconds/kilobytes, a Duration
+/// that is empty, wider than eight octets or zero, and two different durations
+/// for one unit. A kilobytes pair is checked and otherwise left alone -- see
+/// the module's limitations.
+fn lifetime_seconds(t: &Transform) -> Result<Option<u32>, IkeError> {
+    let (mut seconds, mut kilobytes): (Option<u32>, Option<u32>) = (None, None);
+    let mut pending: Option<u16> = None;
+    for a in &t.attributes {
+        if pending.is_some() && a.attr_type != esp_attr::LIFE_DURATION {
+            return Err(IkeError::MalformedPayload("SA Life Type not immediately followed by its SA Life Duration"));
+        }
+        match a.attr_type {
+            esp_attr::LIFE_TYPE => match a.value {
+                AttrValue::Short(kind @ (life::SECONDS | life::KILOBYTES)) => pending = Some(kind),
+                AttrValue::Short(_) => return Err(IkeError::MalformedPayload("unsupported SA Life Type")),
+                AttrValue::Long(_) => return Err(IkeError::MalformedPayload("SA Life Type sent as a variable-length attribute")),
+            },
+            esp_attr::LIFE_DURATION => {
+                let Some(kind) = pending.take() else {
+                    return Err(IkeError::MalformedPayload("SA Life Duration with no SA Life Type before it"));
+                };
+                let value = life_duration_value(&a.value).ok_or(IkeError::MalformedPayload("SA Life Duration of unusable length"))?;
+                if value == 0 {
+                    return Err(IkeError::MalformedPayload("SA Life Duration of zero"));
+                }
+                let slot = if kind == life::SECONDS { &mut seconds } else { &mut kilobytes };
+                match *slot {
+                    Some(previous) if previous != value => return Err(IkeError::MalformedPayload("conflicting SA Life Durations for one unit")),
+                    _ => *slot = Some(value),
+                }
+            }
+            _ => {}
+        }
+    }
+    if pending.is_some() {
+        return Err(IkeError::MalformedPayload("SA Life Type not immediately followed by its SA Life Duration"));
+    }
+    Ok(seconds)
+}
+
+/// The lifetime in seconds an already-validated answer (`ps`, see
+/// [`check_answer`]) leaves us with. RFC 2407 §4.5.4: the responder may
+/// complete the negotiation "using a shorter lifetime than what was offered"
+/// -- so its seconds pair (28800 seconds, the DOI default, when it states
+/// none) counts, but never beyond `offered`: what we offered is our own limit,
+/// and a longer answer only says the peer would keep the SA longer. A
+/// kilobytes pair is not a number of seconds. `offered` is also what an
+/// answer we can't read leaves us with. Mirrors
+/// `phase1::negotiated_p1_lifetime`, against the ESP DOI's attribute registry.
 fn negotiated_p2_lifetime(ps: &[Payload], offered: u32) -> u32 {
-    let Some(sa_p) = find(ps, payload::SA) else { return offered };
-    let Ok(sa) = SaPayload::parse(&sa_p.data) else { return offered };
-    let Some(prop) = sa.proposals.first() else { return offered };
-    let Some(transform) = prop.transforms.first() else { return offered };
-    transform.attr_u32(esp_attr::LIFE_DURATION).unwrap_or(offered)
+    let Ok(sa) = single_sa(ps) else { return offered };
+    let Some(transform) = sa.proposals.first().and_then(|p| p.transforms.first()) else { return offered };
+    let Ok(seconds) = lifetime_seconds(transform) else { return offered };
+    seconds.unwrap_or(DEFAULT_LIFE_SECONDS).min(offered)
+}
+
+/// The one SA payload of a Quick Mode message (RFC 2409 §5.5 carries exactly
+/// one): a message with none is `MissingPayload`, with several `NoProposalChosen`
+/// -- which of them was meant is not ours to guess.
+fn single_sa(ps: &[Payload]) -> Result<SaPayload, IkeError> {
+    let mut sas = ps.iter().filter(|p| p.payload_type == payload::SA);
+    let first = sas.next().ok_or(IkeError::MissingPayload("SA"))?;
+    if sas.next().is_some() {
+        return Err(IkeError::NoProposalChosen);
+    }
+    SaPayload::parse(&first.data)
 }
 
 fn qm_header(cky_i: [u8; 8], cky_r: [u8; 8], msgid: u32) -> IsakmpHeader {
@@ -199,9 +284,18 @@ fn qm_header(cky_i: [u8; 8], cky_r: [u8; 8], msgid: u32) -> IsakmpHeader {
 /// unaffected by this attribute's value either way.
 fn esp_sa(spi: u32, cipher: SkCipher, pfs_group: Option<DhGroup>, floated: bool, life_duration: u32) -> SaPayload {
     let encap_mode = if floated { UDP_ENCAP_TUNNEL } else { ENCAP_TUNNEL };
+    esp_sa_numbered(spi, 1, 1, cipher, pfs_group, encap_mode, life_duration)
+}
+
+/// The one ESP transform `esp_sa` proposes (and a responder here answers)
+/// for `cipher`, `pfs_group` and `encap_mode`, seconds-lifetime `life_duration`,
+/// numbered `num`. It is also what a transform must equal, lifetimes apart, for
+/// [`select_offer`] to take it: each attribute once, basic-encoded, and no
+/// attribute that isn't part of the suite.
+fn esp_transform(num: u8, cipher: SkCipher, pfs_group: Option<DhGroup>, encap_mode: u16, life_duration: u32) -> Transform {
     let mut attributes = vec![
         Attribute::short(esp_attr::ENCAP_MODE, encap_mode),
-        Attribute::short(esp_attr::LIFE_TYPE, LIFE_SECONDS),
+        Attribute::short(esp_attr::LIFE_TYPE, life::SECONDS),
         Attribute::long_u32(esp_attr::LIFE_DURATION, life_duration),
     ];
     if !matches!(cipher, SkCipher::TripleDesCbc(_)) {
@@ -213,14 +307,30 @@ fn esp_sa(spi: u32, cipher: SkCipher, pfs_group: Option<DhGroup>, floated: bool,
     if let Some(group) = pfs_group {
         attributes.push(Attribute::short(esp_attr::GROUP_DESC, group.transform_id()));
     }
+    Transform { num, transform_id: esp_transform_id(cipher), attributes }
+}
+
+/// An SA payload with the single ESP proposal `proposal_num` carrying our
+/// inbound `spi` and the single transform `transform_num` -- a responder
+/// answers with the numbers of the proposal and transform it took (RFC 2408
+/// §4.2: it "SHOULD retain the Proposal # and Transform # fields").
+fn esp_sa_numbered(
+    spi: u32,
+    proposal_num: u8,
+    transform_num: u8,
+    cipher: SkCipher,
+    pfs_group: Option<DhGroup>,
+    encap_mode: u16,
+    life_duration: u32,
+) -> SaPayload {
     SaPayload {
         doi: IPSEC_DOI,
         situation: SIT_IDENTITY_ONLY,
         proposals: vec![Proposal {
-            num: 1,
+            num: proposal_num,
             protocol_id: protocol::ESP,
             spi: spi.to_be_bytes().to_vec(),
-            transforms: vec![Transform { num: 1, transform_id: esp_transform_id(cipher), attributes }],
+            transforms: vec![esp_transform(transform_num, cipher, pfs_group, encap_mode, life_duration)],
         }],
     }
 }
@@ -244,43 +354,144 @@ fn ts_id_v6(addr: Ipv6Addr, prefix_len: u8) -> Vec<u8> {
     Id { id_type: id_type::IPV6_ADDR_SUBNET, protocol: 0, port: 0, data }.to_bytes()
 }
 
-/// Read the peer's inbound ESP SPI from the SA payload of a Quick-Mode message.
-fn peer_esp_spi(ps: &[Payload]) -> Result<u32, IkeError> {
-    let sa_p = find(ps, payload::SA).ok_or(IkeError::MissingPayload("SA"))?;
-    let sa = SaPayload::parse(&sa_p.data)?;
-    let prop = sa.proposals.first().ok_or(IkeError::NoProposalChosen)?;
-    if prop.spi.len() != 4 {
+/// The `SkCipher` an ESP transform names -- what a responder keys its own side
+/// with, rather than assuming a fixed cipher. `key_len` falls back to a
+/// sensible default (192 bits for 3DES, 256 otherwise) when KEY_LENGTH is
+/// left out; [`acceptable_transform`] then refuses such a transform, since
+/// RFC 2407 §4.5 wants the length stated for a variable-length cipher.
+fn transform_cipher(t: &Transform) -> Option<SkCipher> {
+    let encr_id = t.transform_id as u16;
+    let default_bits = if encr_id == transform_id::TRIPLE_DES { 192 } else { 256 };
+    let key_bits = t.attr(esp_attr::KEY_LENGTH).unwrap_or(default_bits);
+    let integ_id = t.attr(esp_attr::AUTH_ALGORITHM).and_then(integ_from_esp_auth_algorithm).map(IntegAlgorithm::transform_id);
+    SkCipher::from_encr_integ(encr_id, key_bits, integ_id)
+}
+
+/// What a responder here takes from one offered ESP transform, if it can honour
+/// it (RFC 2407 §4.5.3: a transform with an attribute or value it does not
+/// support is not one it can accept).
+struct AcceptableTransform {
+    cipher: SkCipher,
+    pfs_group: Option<DhGroup>,
+    encap_mode: u16,
+    life_seconds: u32,
+}
+
+/// `Some` when `t` is a transform this side can build: tunnel mode, plain or
+/// UDP-encapsulated (RFC 2407 §4.5, RFC 3947 §5.1 -- transport mode, unknown
+/// modes and a missing mode, which the DOI leaves "host-dependent", are not
+/// honoured); a cipher we implement; nothing but the attributes of that
+/// suite, each once and basic-encoded (compared with the transform
+/// [`esp_transform`] would build, lifetimes apart -- which is also what turns
+/// a PFS group we don't implement, dropped from that transform, into a
+/// mismatch rather than into "no PFS"); and lifetime pairs that parse (see
+/// [`lifetime_seconds`]).
+fn acceptable_transform(t: &Transform) -> Option<AcceptableTransform> {
+    let encap_mode = t.attr(esp_attr::ENCAP_MODE).filter(|m| matches!(*m, ENCAP_TUNNEL | UDP_ENCAP_TUNNEL))?;
+    let pfs_group = t.attr(esp_attr::GROUP_DESC).and_then(DhGroup::from_transform_id);
+    let cipher = transform_cipher(t)?;
+    if !t.matches_offer(&esp_transform(t.num, cipher, pfs_group, encap_mode, 0), &LIFETIME_ATTRS) {
+        return None;
+    }
+    let life_seconds = lifetime_seconds(t).ok()?.unwrap_or(RESPONDER_LIFE_SECONDS);
+    Some(AcceptableTransform { cipher, pfs_group, encap_mode, life_seconds })
+}
+
+/// The one ESP proposal and transform a responder takes from an initiator's
+/// offer.
+struct Selection {
+    proposal_num: u8,
+    transform_num: u8,
+    peer_spi: u32,
+    cipher: SkCipher,
+    pfs_group: Option<DhGroup>,
+    encap_mode: u16,
+    life_seconds: u32,
+}
+
+/// Pick what to answer from the SA payload of Quick Mode message 1. RFC 2408
+/// §4.2: the receiver "MUST select a single transform for each protocol" of
+/// the proposal it takes -- here the first acceptable transform of the first
+/// acceptable proposal, in the initiator's order (its own preference order,
+/// as `isakmpd`'s `message_negotiate_sa` reads it). An ESP proposal shares its
+/// Proposal # with another one when the initiator asks for both protections
+/// together (RFC 2408 §4.2: same number, AND); a suite this side cannot build
+/// is passed over. Nothing acceptable is `NoProposalChosen`, and so is an
+/// SA in another DOI or situation (RFC 2407 §4.2, §4.6.1).
+fn select_offer(ps: &[Payload]) -> Result<Selection, IkeError> {
+    let sa = single_sa(ps)?;
+    if sa.doi != IPSEC_DOI || sa.situation != SIT_IDENTITY_ONLY {
         return Err(IkeError::NoProposalChosen);
     }
-    Ok(u32::from_be_bytes([prop.spi[0], prop.spi[1], prop.spi[2], prop.spi[3]]))
+    for proposal in &sa.proposals {
+        let Ok(spi) = <[u8; 4]>::try_from(proposal.spi.as_slice()) else { continue };
+        if proposal.protocol_id != protocol::ESP || sa.proposals.iter().filter(|q| q.num == proposal.num).count() > 1 {
+            continue;
+        }
+        for transform in &proposal.transforms {
+            if let Some(a) = acceptable_transform(transform) {
+                return Ok(Selection {
+                    proposal_num: proposal.num,
+                    transform_num: transform.num,
+                    peer_spi: u32::from_be_bytes(spi),
+                    cipher: a.cipher,
+                    pfs_group: a.pfs_group,
+                    encap_mode: a.encap_mode,
+                    life_seconds: a.life_seconds,
+                });
+            }
+        }
+    }
+    Err(IkeError::NoProposalChosen)
 }
 
-/// The PFS DH group named on the SA payload's ESP transform, if any -- the
-/// signal that the peer wants PFS for this CHILD SA (see `esp_sa`'s doc).
-fn peer_pfs_group(ps: &[Payload]) -> Result<Option<DhGroup>, IkeError> {
-    let sa_p = find(ps, payload::SA).ok_or(IkeError::MissingPayload("SA"))?;
-    let sa = SaPayload::parse(&sa_p.data)?;
-    let prop = sa.proposals.first().ok_or(IkeError::NoProposalChosen)?;
-    let transform = prop.transforms.first().ok_or(IkeError::NoProposalChosen)?;
-    Ok(transform.attr(esp_attr::GROUP_DESC).and_then(DhGroup::from_transform_id))
-}
-
-/// The `SkCipher` named on the SA payload's ESP transform -- the responder's
-/// counterpart to knowing what to key its own side with, mirroring
-/// `peer_pfs_group`'s auto-detect pattern rather than assuming a fixed
-/// cipher. `key_len` falls back to a sensible default (192 bits for 3DES,
-/// 256 otherwise) when the peer omitted KEY_LENGTH (a fixed-key cipher, or a
-/// lenient peer relying on the transform ID alone).
-fn peer_esp_cipher(ps: &[Payload]) -> Result<SkCipher, IkeError> {
-    let sa_p = find(ps, payload::SA).ok_or(IkeError::MissingPayload("SA"))?;
-    let sa = SaPayload::parse(&sa_p.data)?;
-    let prop = sa.proposals.first().ok_or(IkeError::NoProposalChosen)?;
-    let transform = prop.transforms.first().ok_or(IkeError::NoProposalChosen)?;
-    let encr_id = transform.transform_id as u16;
-    let default_bits = if encr_id == transform_id::TRIPLE_DES { 192 } else { 256 };
-    let key_bits = transform.attr(esp_attr::KEY_LENGTH).unwrap_or(default_bits);
-    let integ_id = transform.attr(esp_attr::AUTH_ALGORITHM).and_then(integ_from_esp_auth_algorithm).map(IntegAlgorithm::transform_id);
-    SkCipher::from_encr_integ(encr_id, key_bits, integ_id).ok_or(IkeError::NoProposalChosen)
+/// Check the SA payload of Quick Mode message 2 against the one we sent
+/// (`offered`) and return the SPI the responder chose for its inbound ESP SA.
+/// RFC 2408 §4.2: "The initiator MUST verify that the Security Association
+/// payload received from the responder matches one of the proposals sent
+/// initially" -- an authentic HASH(2) says the message wasn't altered on the
+/// way, not that it names what we proposed. So: one SA payload, in our DOI and
+/// situation; one proposal, for ESP, with our Proposal # and a 4-octet SPI; one
+/// transform, with our Transform #, transform ID and every attribute -- the
+/// encapsulation mode (RFC 3947 §5.1 included), key length, integrity
+/// algorithm and PFS group -- exactly as offered, in any order, and nothing we
+/// didn't offer; only the lifetime pairs may differ (RFC 2407 §4.5.4), and
+/// those must parse ([`lifetime_seconds`]). `isakmpd`'s
+/// `initiator_recv_HASH_SA_NONCE` leaves "Check that the chosen transform
+/// matches an offer" as a comment, so this is stricter than that reference on
+/// purpose.
+fn check_answer(offered: &SaPayload, ps: &[Payload]) -> Result<u32, IkeError> {
+    let refuse = |why: &str| {
+        ike_debug!("Quick Mode: the answered SA is not the one offered: {why}");
+        IkeError::NoProposalChosen
+    };
+    let answer = single_sa(ps).map_err(|e| {
+        ike_debug!("Quick Mode: no single SA payload in the answer: {e}");
+        e
+    })?;
+    if answer.doi != offered.doi || answer.situation != offered.situation {
+        return Err(refuse("DOI or situation differ"));
+    }
+    let ([answered_p], [offered_p]) = (answer.proposals.as_slice(), offered.proposals.as_slice()) else {
+        return Err(refuse("not exactly one proposal"));
+    };
+    if answered_p.num != offered_p.num || answered_p.protocol_id != offered_p.protocol_id {
+        return Err(refuse("Proposal # or protocol differ"));
+    }
+    let Ok(spi) = <[u8; 4]>::try_from(answered_p.spi.as_slice()) else {
+        return Err(refuse("the ESP SPI is not four octets"));
+    };
+    let ([answered_t], [offered_t]) = (answered_p.transforms.as_slice(), offered_p.transforms.as_slice()) else {
+        return Err(refuse("not exactly one transform"));
+    };
+    if answered_t.num != offered_t.num {
+        return Err(refuse("Transform # differs"));
+    }
+    if !answered_t.matches_offer(offered_t, &LIFETIME_ATTRS) {
+        return Err(refuse(&format!("transform {:?} (id {}) against the offered {:?} (id {})", answered_t.attributes, answered_t.transform_id, offered_t.attributes, offered_t.transform_id)));
+    }
+    lifetime_seconds(answered_t)?;
+    Ok(u32::from_be_bytes(spi))
 }
 
 /// `HASH(3) = prf(SKEYID_a, 0 | M-ID | Ni_b | Nr_b)`.
@@ -359,10 +570,13 @@ pub struct QuickInitiator {
     local_spi: u32,
     ni: Vec<u8>,
     iv1: Vec<u8>,
+    /// The SA payload we sent -- the one proposal, one transform that message
+    /// 2's answer is checked against ([`check_answer`]).
+    offer: SaPayload,
     /// The ESP cipher we offered -- see `esp_sa`'s doc. A successful
-    /// `complete()` implies the peer accepted this exact (sole) proposal, so
-    /// this is trusted directly rather than re-parsed from the response, the
-    /// same precedent `pfs` below already follows.
+    /// `complete()` implies the peer accepted this exact (sole) proposal (see
+    /// `offer`), so this is trusted directly rather than re-parsed from the
+    /// response, the same precedent `pfs` below already follows.
     cipher: SkCipher,
     /// Our ephemeral PFS share, if PFS was requested: the DH group plus our
     /// private key, needed once the response's KE payload arrives.
@@ -472,10 +686,8 @@ fn initiate_quick_with_ids(
     let pfs = pfs_group.map(|group| (group, entropy.next_array32()));
 
     let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
-    let mut after = vec![
-        (payload::SA, esp_sa(local_spi, cipher, pfs_group, st.floated, life_duration).to_bytes()),
-        (payload::NONCE, ni.clone()),
-    ];
+    let offer = esp_sa(local_spi, cipher, pfs_group, st.floated, life_duration);
+    let mut after = vec![(payload::SA, offer.to_bytes()), (payload::NONCE, ni.clone())];
     if let Some((group, dh_private)) = &pfs {
         after.push((payload::KE, group.public(dh_private)));
     }
@@ -494,6 +706,7 @@ fn initiate_quick_with_ids(
         local_spi,
         ni,
         iv1,
+        offer,
         cipher,
         pfs,
         life_duration,
@@ -511,7 +724,6 @@ impl QuickInitiator {
         let (_hdr, ps, iv2) = phase2::decrypt_payloads(msg2, &self.enc_key, self.enc_block, &self.iv1)?;
         let nr = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
         isakmp::check_nonce_len(&nr)?;
-        let peer_spi = peer_esp_spi(&ps)?;
 
         // Verify HASH(2) = prf(SKEYID_a, M-ID | Ni_b | <payloads after HASH>).
         let got = find(&ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
@@ -533,15 +745,10 @@ impl QuickInitiator {
         // ESP transform and traffic selectors we offered, rather than
         // something it merely also supports (see `id_local`'s doc, and
         // `ikev2::negotiate::ChosenSuite::matches_offer`'s identical
-        // rationale on the IKEv2 side). `peer_esp_cipher`/`peer_pfs_group`
-        // are the same helpers `respond_quick` uses to read an initiator's
-        // own proposal -- reused here to read the responder's chosen one.
-        if peer_esp_cipher(&ps)? != self.cipher {
-            return Err(IkeError::NoProposalChosen);
-        }
-        if peer_pfs_group(&ps)? != self.pfs.as_ref().map(|(group, _)| *group) {
-            return Err(IkeError::NoProposalChosen);
-        }
+        // rationale on the IKEv2 side). `check_answer` compares the whole
+        // SA -- cipher, PFS group, encapsulation mode and the rest -- with
+        // the one sent.
+        let peer_spi = check_answer(&self.offer, &ps)?;
         let peer_ids: Vec<Vec<u8>> = ps.iter().filter(|p| p.payload_type == payload::ID).map(|p| p.data.clone()).collect();
         if peer_ids.len() != 2 || peer_ids[0] != self.id_local || peer_ids[1] != self.id_remote {
             return Err(IkeError::NoProposalChosen);
@@ -578,25 +785,30 @@ pub struct QuickResponder {
     ni: Vec<u8>,
     nr: Vec<u8>,
     iv2: Vec<u8>,
-    /// The cipher named on the initiator's ESP proposal (see
-    /// [`peer_esp_cipher`]) -- echoed straight back in message 2 rather than
+    /// The cipher of the transform this side selected from the initiator's
+    /// offer (see [`select_offer`]) -- answered in message 2 rather than
     /// assuming a fixed cipher, so this responder (used only as `ryke`'s own
     /// client-testing double, see `ikev1::server::Server`) can interoperate
     /// with an initiator offering any cipher this module supports.
     cipher: SkCipher,
-    /// The PFS shared secret, if the initiator's proposal asked for PFS (see
-    /// [`peer_pfs_group`]) -- computed here so [`Self::complete`] only needs
-    /// to fold it into the KEYMAT once `HASH(3)` is verified.
+    /// The PFS shared secret, if the transform selected from the initiator's
+    /// offer asked for PFS (see [`select_offer`]) -- computed here so
+    /// [`Self::complete`] only needs to fold it into the KEYMAT once
+    /// `HASH(3)` is verified.
     pfs_shared: Option<Vec<u8>>,
 }
 
 /// Process Quick-Mode message 1 (`HASH(1), SA, Ni, [KE]`) and build message 2
-/// (`HASH(2), SA, Nr, [KE]`), choosing a fresh inbound ESP SPI. PFS is
-/// automatic here (unlike the initiator's explicit `_with_pfs` entry point):
-/// whenever the initiator's ESP proposal names a GROUP DESCRIPTION (see
-/// [`peer_pfs_group`]), the responder generates its own ephemeral share in
-/// that same group and answers in kind -- there's no separate "did the
-/// responder want PFS" question, only "did the initiator ask for it".
+/// (`HASH(2), SA, Nr, [KE]`), choosing a fresh inbound ESP SPI. The SA of
+/// message 2 is the one transform [`select_offer`] took from the offer -- its
+/// Proposal #, Transform #, cipher and encapsulation mode as offered, with our
+/// own lifetime and SPI; nothing acceptable in the offer is
+/// [`IkeError::NoProposalChosen`]. PFS is automatic here (unlike the
+/// initiator's explicit `_with_pfs` entry point): whenever the selected
+/// transform names a GROUP DESCRIPTION, the responder generates its own
+/// ephemeral share in that same group and answers in kind -- there's no
+/// separate "did the responder want PFS" question, only "did the initiator ask
+/// for it".
 pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) -> Result<(Vec<u8>, QuickResponder), IkeError> {
     let hdr = IsakmpHeader::parse(msg1)?;
     if hdr.exchange_type != exchange::QUICK {
@@ -610,10 +822,7 @@ pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) 
     let (_h, ps, iv1) = phase2::parse_encrypted(msg1, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0)?; // verifies HASH(1)
     let ni = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
     isakmp::check_nonce_len(&ni)?;
-    let peer_spi = peer_esp_spi(&ps)?;
-    let pfs_group = peer_pfs_group(&ps)?;
-    let cipher = peer_esp_cipher(&ps)?;
-    let life_duration = negotiated_p2_lifetime(&ps, 3600);
+    let Selection { proposal_num, transform_num, peer_spi, cipher, pfs_group, encap_mode, life_seconds } = select_offer(&ps)?;
 
     let mut spi_b = [0u8; 4];
     entropy.fill(&mut spi_b);
@@ -621,10 +830,8 @@ pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) 
     let mut nr = vec![0u8; 16];
     entropy.fill(&mut nr);
 
-    let mut after: Vec<(u8, Vec<u8>)> = vec![
-        (payload::SA, esp_sa(local_spi, cipher, pfs_group, st.floated, life_duration).to_bytes()),
-        (payload::NONCE, nr.clone()),
-    ];
+    let answer = esp_sa_numbered(local_spi, proposal_num, transform_num, cipher, pfs_group, encap_mode, life_seconds);
+    let mut after: Vec<(u8, Vec<u8>)> = vec![(payload::SA, answer.to_bytes()), (payload::NONCE, nr.clone())];
     let pfs_shared = match pfs_group {
         Some(group) => {
             let gxi = find(&ps, payload::KE).ok_or(IkeError::MissingPayload("KE"))?.data.clone();
@@ -1065,6 +1272,13 @@ mod tests {
     /// is substituted, exactly as a genuinely different (or malicious) peer's
     /// authentic-but-unoffered answer would look.
     fn respond_quick_forging_answer(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy, sa: &SaPayload, id_payloads: &[Vec<u8>]) -> Vec<u8> {
+        forge_answer(st, msg1, entropy, &[sa], id_payloads)
+    }
+
+    /// [`respond_quick_forging_answer`] with any number of SA payloads (each
+    /// sent as its own payload, in order) -- for the answers that carry more
+    /// than the one SA payload a Quick Mode message 2 has.
+    fn forge_answer(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy, sas: &[&SaPayload], id_payloads: &[Vec<u8>]) -> Vec<u8> {
         let hdr = IsakmpHeader::parse(msg1).unwrap();
         let msgid = hdr.message_id;
         let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
@@ -1072,7 +1286,8 @@ mod tests {
         let ni = find(&ps, payload::NONCE).unwrap().data.clone();
         let mut nr = vec![0u8; 16];
         entropy.fill(&mut nr);
-        let mut after: Vec<(u8, Vec<u8>)> = vec![(payload::SA, sa.to_bytes()), (payload::NONCE, nr)];
+        let mut after: Vec<(u8, Vec<u8>)> = sas.iter().map(|sa| (payload::SA, sa.to_bytes())).collect();
+        after.push((payload::NONCE, nr));
         for id in id_payloads {
             after.push((payload::ID, id.clone()));
         }
@@ -1879,5 +2094,439 @@ mod tests {
 
         drop(pump); // the reader is gone, its sender with it
         assert!(matches!(ask(&mut ie), Err(DriverError::Io(e)) if e.kind() == std::io::ErrorKind::BrokenPipe));
+    }
+
+    // ---- What a Quick Mode answer / offer must look like (RFC 2408 §4.2, RFC 2407 §4.5) ----
+
+    const QM_TS: ([u8; 4], [u8; 4]) = ([10, 0, 99, 0], [255, 255, 255, 0]);
+    const QM_ADDRS: (&str, &str) = ("10.1.1.1:500", "192.168.0.1:500");
+
+    /// The first proposal's first transform -- the one `esp_sa` builds.
+    fn xf(sa: &mut SaPayload) -> &mut Transform {
+        &mut sa.proposals[0].transforms[0]
+    }
+
+    /// Replace the ENCAP_MODE attribute (`None` = leave it out).
+    fn set_encap(sa: &mut SaPayload, mode: Option<u16>) {
+        let t = xf(sa);
+        t.attributes.retain(|a| a.attr_type != esp_attr::ENCAP_MODE);
+        if let Some(m) = mode {
+            t.attributes.push(Attribute::short(esp_attr::ENCAP_MODE, m));
+        }
+    }
+
+    /// Replace every lifetime attribute with `attrs`, in that order.
+    fn set_life(sa: &mut SaPayload, attrs: Vec<Attribute>) {
+        let t = xf(sa);
+        t.attributes.retain(|a| a.attr_type != esp_attr::LIFE_TYPE && a.attr_type != esp_attr::LIFE_DURATION);
+        t.attributes.extend(attrs);
+    }
+
+    fn life_type(kind: u16) -> Attribute {
+        Attribute::short(esp_attr::LIFE_TYPE, kind)
+    }
+
+    fn life_dur(v: u32) -> Attribute {
+        Attribute::long_u32(esp_attr::LIFE_DURATION, v)
+    }
+
+    /// Fail, naming every case, unless each answer was refused with an error
+    /// `want` accepts.
+    fn assert_all_refused(cases: Vec<(&'static str, Result<u32, IkeError>)>, want: impl Fn(&IkeError) -> bool) {
+        let bad: Vec<String> = cases
+            .into_iter()
+            .filter_map(|(name, r)| match r {
+                Err(e) if want(&e) => None,
+                other => Some(format!("  {name}: {other:?}")),
+            })
+            .collect();
+        assert!(bad.is_empty(), "these were not refused as they must be:\n{}", bad.join("\n"));
+    }
+
+    fn no_proposal(e: &IkeError) -> bool {
+        matches!(e, IkeError::NoProposalChosen)
+    }
+
+    fn malformed(e: &IkeError) -> bool {
+        matches!(e, IkeError::MalformedPayload(_))
+    }
+
+    /// The initiator's half of a Quick Mode against an authentic message 2
+    /// carrying `sas` -- by default the one SA `esp_sa` builds for exactly
+    /// what was offered (`offered_life` seconds, NAT-T `floated` or not), which
+    /// `edit` may then alter. Yields the negotiated lifetime.
+    fn initiator_answer_sas(floated: bool, offered_life: u32, edit: impl FnOnce(&mut Vec<SaPayload>)) -> Result<u32, IkeError> {
+        let (mut istate, mut rstate, mut ie, mut re) = phase1_pair(0x5101, 0x5102, QM_ADDRS.0.parse().unwrap(), QM_ADDRS.1.parse().unwrap());
+        istate.floated = floated;
+        rstate.floated = floated;
+        let (qm1, qi) = initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, QM_TS, QM_TS, offered_life).unwrap();
+        let mut sas = vec![esp_sa(0xAAAA_BBBB, SkCipher::Aes256Gcm, None, floated, offered_life)];
+        edit(&mut sas);
+        let refs: Vec<&SaPayload> = sas.iter().collect();
+        let id = ts_id(QM_TS.0, QM_TS.1);
+        let msg2 = forge_answer(&rstate, &qm1, &mut re, &refs, &[id.clone(), id]);
+        qi.complete(&msg2).map(|(_msg3, _child, life)| life)
+    }
+
+    fn initiator_answer(floated: bool, offered_life: u32, edit: impl FnOnce(&mut SaPayload)) -> Result<u32, IkeError> {
+        initiator_answer_sas(floated, offered_life, |sas| edit(&mut sas[0]))
+    }
+
+    /// RFC 2408 §4.2: "The initiator MUST verify that the Security Association
+    /// payload received from the responder matches one of the proposals sent
+    /// initially" -- and RFC 2407 §4.5 makes ENCAP_MODE one of the attributes
+    /// that proposal is made of. An authentic answer selecting TRANSPORT (or
+    /// the UDP-encapsulated flavour we didn't ask for, or no mode at all --
+    /// "host-dependent", §4.5) for a TUNNEL offer used to be accepted.
+    #[test]
+    fn quick_mode_initiator_refuses_an_answer_with_another_encapsulation_mode() {
+        let mut cases = Vec::new();
+        for (name, mode) in [
+            ("TRANSPORT answered to a TUNNEL offer", Some(2)),
+            ("UDP-Encapsulated-Tunnel answered to a plain TUNNEL offer", Some(3)),
+            ("UDP-Encapsulated-Transport answered to a TUNNEL offer", Some(4)),
+            ("reserved mode 0", Some(0)),
+            ("private-range mode 61443", Some(61443)),
+            ("no ENCAP_MODE at all", None),
+        ] {
+            cases.push((name, initiator_answer(false, 3600, |sa| set_encap(sa, mode))));
+        }
+        // NAT-T (RFC 3947 §5.1): we offered UDP-Encapsulated-Tunnel.
+        for (name, mode) in [
+            ("plain TUNNEL answered to a UDP-Encapsulated-Tunnel offer", Some(1)),
+            ("TRANSPORT answered to a UDP-Encapsulated-Tunnel offer", Some(2)),
+            ("UDP-Encapsulated-Transport answered to a UDP-Encapsulated-Tunnel offer", Some(4)),
+            ("no ENCAP_MODE at all, NAT-T", None),
+        ] {
+            cases.push((name, initiator_answer(true, 3600, |sa| set_encap(sa, mode))));
+        }
+        assert_all_refused(cases, no_proposal);
+    }
+
+    /// The positive controls of the test above: the answer that echoes the
+    /// mode offered is accepted, plain and NAT-T.
+    #[test]
+    fn quick_mode_initiator_accepts_the_encapsulation_mode_it_offered() {
+        assert_eq!(initiator_answer(false, 3600, |_| {}).unwrap(), 3600);
+        assert_eq!(initiator_answer(true, 3600, |_| {}).unwrap(), 3600);
+        // ...whatever order the responder lists the attributes in (a Life
+        // Duration still right after its Life Type).
+        assert_eq!(initiator_answer(false, 3600, |sa| xf(sa).attributes.rotate_left(1)).unwrap(), 3600);
+        assert_eq!(initiator_answer(false, 3600, |sa| xf(sa).attributes.rotate_left(3)).unwrap(), 3600);
+    }
+
+    /// The rest of the transform: RFC 2407 §4.5 says KEY_LENGTH "must be
+    /// specified" for a variable-length cipher and AUTH_ALGORITHM "MUST NOT"
+    /// be for ESP without authentication; §4.5.3 aborts on an attribute or
+    /// value that isn't understood. An answer that drops KEY_LENGTH (which
+    /// `peer_esp_cipher` silently defaults to the very 256 we offered), adds an
+    /// attribute we never offered, or repeats one with another value is not the
+    /// transform we sent.
+    #[test]
+    fn quick_mode_initiator_refuses_an_answer_whose_attributes_differ_from_the_offer() {
+        let cases = vec![
+            ("KEY_LENGTH left out", initiator_answer(false, 3600, |sa| xf(sa).attributes.retain(|a| a.attr_type != esp_attr::KEY_LENGTH))),
+            ("KEY_LENGTH changed", initiator_answer(false, 3600, |sa| {
+                let t = xf(sa);
+                t.attributes.retain(|a| a.attr_type != esp_attr::KEY_LENGTH);
+                t.attributes.push(Attribute::short(esp_attr::KEY_LENGTH, 128));
+            })),
+            ("an AUTH_ALGORITHM on an AEAD transform", initiator_answer(false, 3600, |sa| xf(sa).attributes.push(Attribute::short(esp_attr::AUTH_ALGORITHM, 5)))),
+            ("Key Rounds (7), defined but never offered", initiator_answer(false, 3600, |sa| xf(sa).attributes.push(Attribute::short(7, 1)))),
+            ("a private-use attribute", initiator_answer(false, 3600, |sa| xf(sa).attributes.push(Attribute::short(0x7ffe, 1)))),
+            ("a GROUP_DESC we never offered", initiator_answer(false, 3600, |sa| xf(sa).attributes.push(Attribute::short(esp_attr::GROUP_DESC, 2)))),
+            ("a second, conflicting ENCAP_MODE", initiator_answer(false, 3600, |sa| xf(sa).attributes.push(Attribute::short(esp_attr::ENCAP_MODE, 2)))),
+            ("ENCAP_MODE sent as a variable-length attribute (basic attributes MUST NOT)", initiator_answer(false, 3600, |sa| {
+                set_encap(sa, None);
+                xf(sa).attributes.push(Attribute::long_bytes(esp_attr::ENCAP_MODE, vec![0, 1]));
+            })),
+        ];
+        assert_all_refused(cases, no_proposal);
+    }
+
+    /// RFC 2408 §4.2: the answer is one Proposal with one Transform (the
+    /// receiver "MUST select a single transform for each protocol"), the ones
+    /// we offered (Proposal # and Transform # are retained), in the IPsec DOI
+    /// and for ESP -- the protocol we asked about. RFC 2409 §5.5: one SA
+    /// payload.
+    #[test]
+    fn quick_mode_initiator_refuses_an_answer_with_the_wrong_shape() {
+        // The control for the whole list: the very same builder, unedited.
+        assert!(initiator_answer(false, 3600, |_| {}).is_ok());
+        let cases: Vec<(&'static str, Result<u32, IkeError>)> = vec![
+            ("DOI 0", initiator_answer(false, 3600, |sa| sa.doi = 0)),
+            ("DOI 2", initiator_answer(false, 3600, |sa| sa.doi = 2)),
+            ("situation SIT_SECRECY", initiator_answer(false, 3600, |sa| sa.situation = 2)),
+            ("proposal for AH", initiator_answer(false, 3600, |sa| sa.proposals[0].protocol_id = 2)),
+            ("proposal for ISAKMP", initiator_answer(false, 3600, |sa| sa.proposals[0].protocol_id = protocol::ISAKMP)),
+            ("proposal for IPCOMP", initiator_answer(false, 3600, |sa| sa.proposals[0].protocol_id = 4)),
+            ("another Proposal #", initiator_answer(false, 3600, |sa| sa.proposals[0].num = 2)),
+            ("another Transform #", initiator_answer(false, 3600, |sa| xf(sa).num = 2)),
+            ("a second proposal", initiator_answer(false, 3600, |sa| {
+                let mut second = sa.proposals[0].clone();
+                second.num = 2;
+                sa.proposals.push(second);
+            })),
+            ("a second transform", initiator_answer(false, 3600, |sa| {
+                let mut second = xf(sa).clone();
+                second.num = 2;
+                sa.proposals[0].transforms.push(second);
+            })),
+            ("an 8-byte SPI", initiator_answer(false, 3600, |sa| sa.proposals[0].spi = vec![1; 8])),
+            ("an empty SPI", initiator_answer(false, 3600, |sa| sa.proposals[0].spi = Vec::new())),
+            ("two SA payloads", initiator_answer_sas(false, 3600, |sas| {
+                let second = sas[0].clone();
+                sas.push(second);
+            })),
+        ];
+        assert_all_refused(cases, no_proposal);
+    }
+
+    /// RFC 2407 §4.5: "SA Life Duration MUST always follow an SA Life Type
+    /// which describes the units"; §4.5.2: a list may carry several
+    /// Type/Duration pairs (100 MB *or* 24 h), which MUST be parsed; default
+    /// 28800 seconds; §4.5.4: a responder may shorten the lifetime, never
+    /// lengthen it. What we use for the rekey schedule is the *seconds* pair --
+    /// a kilobytes duration read as seconds (as `negotiated_p2_lifetime` did:
+    /// first LIFE_DURATION, whatever its Type) is an SA that "lives" 4.6
+    /// million seconds.
+    #[test]
+    fn quick_mode_initiator_reads_the_lifetime_in_its_own_units() {
+        let ok = |offered: u32, attrs: Vec<Attribute>| initiator_answer(false, offered, |sa| set_life(sa, attrs)).unwrap();
+        // A shorter lifetime is the responder's to impose.
+        assert_eq!(ok(3600, vec![life_type(1), life_dur(900)]), 900);
+        // Kilobytes only: no time limit was stated, the offered one applies.
+        assert_eq!(ok(3600, vec![life_type(2), life_dur(4_608_000)]), 3600);
+        // Both pairs, in either order (the §4.5.2 example has seconds first).
+        assert_eq!(ok(3600, vec![life_type(1), life_dur(900), life_type(2), life_dur(100_000)]), 900);
+        assert_eq!(ok(3600, vec![life_type(2), life_dur(100_000), life_type(1), life_dur(900)]), 900);
+        // Never longer than what we offered.
+        assert_eq!(ok(3600, vec![life_type(1), life_dur(86_400)]), 3600);
+        // No lifetime at all: the DOI default, 28800 s, capped by our offer.
+        assert_eq!(ok(3600, vec![]), 3600);
+        assert_eq!(ok(86_400, vec![]), 28_800);
+        // The Duration is variable-length: two octets in the basic form, two
+        // in the long one, four as we send it.
+        assert_eq!(ok(3600, vec![life_type(1), Attribute::short(esp_attr::LIFE_DURATION, 900)]), 900);
+        assert_eq!(ok(3600, vec![life_type(1), Attribute::long_bytes(esp_attr::LIFE_DURATION, vec![0x03, 0x84])]), 900);
+        assert_eq!(ok(3600, vec![life_type(1), Attribute::long_bytes(esp_attr::LIFE_DURATION, vec![0, 0, 0x03, 0x84])]), 900);
+        // The same pair twice does not conflict.
+        assert_eq!(ok(3600, vec![life_type(1), life_dur(900), life_type(1), life_dur(900)]), 900);
+    }
+
+    /// RFC 2407 §4.5 / §4.5.2 / §4.5.3: a Duration with no Type before it, a
+    /// Type with no Duration after it, two different values for the same
+    /// unit, a Type we don't define, and an unusable (zero or absurdly wide)
+    /// duration all abort the negotiation rather than being read by luck.
+    #[test]
+    fn quick_mode_initiator_refuses_a_malformed_lifetime() {
+        let with = |attrs: Vec<Attribute>| initiator_answer(false, 3600, |sa| set_life(sa, attrs));
+        let cases = vec![
+            ("a Duration with no Type before it", with(vec![life_dur(900)])),
+            ("a Type with no Duration after it", with(vec![life_type(1)])),
+            ("two Types in a row", with(vec![life_type(1), life_type(2), life_dur(900)])),
+            ("a Duration after some other attribute", initiator_answer(false, 3600, |sa| {
+                set_life(sa, vec![life_type(1)]);
+                let key_length = xf(sa).attributes.iter().find(|a| a.attr_type == esp_attr::KEY_LENGTH).unwrap().clone();
+                xf(sa).attributes.push(key_length);
+                xf(sa).attributes.push(life_dur(900));
+            })),
+            ("two different seconds durations", with(vec![life_type(1), life_dur(900), life_type(1), life_dur(1800)])),
+            ("two different kilobytes durations", with(vec![life_type(2), life_dur(100), life_type(2), life_dur(200)])),
+            ("a zero-second lifetime", with(vec![life_type(1), life_dur(0)])),
+            ("Life Type 3, reserved", with(vec![life_type(3), life_dur(900)])),
+            ("Life Type 0, reserved", with(vec![life_type(0), life_dur(900)])),
+            ("Life Type as a variable-length attribute", with(vec![Attribute::long_bytes(esp_attr::LIFE_TYPE, vec![0, 1]), life_dur(900)])),
+            ("an empty Duration", with(vec![life_type(1), Attribute::long_bytes(esp_attr::LIFE_DURATION, Vec::new())])),
+            ("a nine-octet Duration", with(vec![life_type(1), Attribute::long_bytes(esp_attr::LIFE_DURATION, vec![0; 9])])),
+        ];
+        assert_all_refused(cases, malformed);
+    }
+
+    /// A Quick Mode message 1 as `st`'s initiator would send it -- HASH(1),
+    /// then one SA payload per entry of `sas` exactly as given, Ni, IDci,
+    /// IDcr -- for the offers `initiate_quick` never makes itself.
+    fn craft_msg1(st: &Phase1State, sas: &[&SaPayload]) -> Vec<u8> {
+        let msgid = 0x0BAD_F00D;
+        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
+        let id = ts_id(QM_TS.0, QM_TS.1);
+        let mut after: Vec<(u8, Vec<u8>)> = sas.iter().map(|sa| (payload::SA, sa.to_bytes())).collect();
+        after.push((payload::NONCE, vec![7u8; 16]));
+        after.push((payload::ID, id.clone()));
+        after.push((payload::ID, id));
+        phase2::build_encrypted(qm_header(st.cky_i, st.cky_r, msgid), st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0, &after).unwrap().0
+    }
+
+    /// Hand `sas` to a responder (NAT-T `floated` or not) as message 1 and
+    /// read the SA payload out of its message 2.
+    fn responder_answer(floated: bool, sas: &[SaPayload]) -> Result<SaPayload, IkeError> {
+        let (mut istate, mut rstate, _ie, mut re) = phase1_pair(0x5201, 0x5202, QM_ADDRS.0.parse().unwrap(), QM_ADDRS.1.parse().unwrap());
+        istate.floated = floated;
+        rstate.floated = floated;
+        let refs: Vec<&SaPayload> = sas.iter().collect();
+        let msg1 = craft_msg1(&istate, &refs);
+        let (msg2, _qr) = respond_quick(&rstate, &msg1, &mut re)?;
+        let hdr = IsakmpHeader::parse(&msg1).unwrap();
+        let iv0 = crypto1::phase2_iv(rstate.prf, &rstate.phase1_iv, hdr.message_id, rstate.enc_block);
+        let (_h, _ps, iv1) = phase2::parse_encrypted(&msg1, rstate.prf, &rstate.skeyid_a, &rstate.enc_key, rstate.enc_block, &iv0).unwrap();
+        let (_h, ps, _iv2) = phase2::decrypt_payloads(&msg2, &rstate.enc_key, rstate.enc_block, &iv1).unwrap();
+        Ok(SaPayload::parse(&find(&ps, payload::SA).unwrap().data).unwrap())
+    }
+
+    /// An honest ESP offer with the given ENCAP_MODE and lifetime pairs.
+    fn offer(edit: impl FnOnce(&mut SaPayload)) -> SaPayload {
+        let mut sa = esp_sa(0x1111_2222, SkCipher::Aes256Gcm, None, false, 3600);
+        edit(&mut sa);
+        sa
+    }
+
+    fn responder_refuses(cases: Vec<(&'static str, Result<SaPayload, IkeError>)>) {
+        let bad: Vec<String> = cases
+            .into_iter()
+            .filter_map(|(name, r)| match r {
+                Err(IkeError::NoProposalChosen) => None,
+                other => Some(format!("  {name}: {:?}", other.map(|sa| sa.proposals))),
+            })
+            .collect();
+        assert!(bad.is_empty(), "these offers were not refused as they must be:\n{}", bad.join("\n"));
+    }
+
+    /// The responder counterpart: it only ever builds tunnel-mode SAs, so an
+    /// offer whose every transform asks for TRANSPORT, an unknown mode or no
+    /// mode (RFC 2407 §4.5: "host-dependent"), in a DOI, situation or
+    /// protocol it isn't speaking, or with an attribute or value it doesn't
+    /// know (§4.5.3), is answered NO-PROPOSAL-CHOSEN -- not with a tunnel it
+    /// was never asked for.
+    #[test]
+    fn quick_mode_responder_refuses_an_offer_it_cannot_honour() {
+        let mut cases: Vec<(&'static str, Result<SaPayload, IkeError>)> = Vec::new();
+        for (name, mode) in [
+            ("TRANSPORT only", Some(2)),
+            ("UDP-Encapsulated-Transport only", Some(4)),
+            ("an unknown mode", Some(9)),
+            ("no ENCAP_MODE", None),
+        ] {
+            cases.push((name, responder_answer(false, &[offer(|sa| set_encap(sa, mode))])));
+        }
+        cases.push(("DOI 0", responder_answer(false, &[offer(|sa| sa.doi = 0)])));
+        cases.push(("situation SIT_SECRECY", responder_answer(false, &[offer(|sa| sa.situation = 2)])));
+        cases.push(("AH only", responder_answer(false, &[offer(|sa| sa.proposals[0].protocol_id = 2)])));
+        cases.push(("IPCOMP only", responder_answer(false, &[offer(|sa| sa.proposals[0].protocol_id = 4)])));
+        cases.push(("an attribute it doesn't know", responder_answer(false, &[offer(|sa| xf(sa).attributes.push(Attribute::short(7, 1)))])));
+        cases.push(("a PFS group it doesn't know", responder_answer(false, &[offer(|sa| xf(sa).attributes.push(Attribute::short(esp_attr::GROUP_DESC, 99)))])));
+        cases.push(("a cipher it doesn't know", responder_answer(false, &[offer(|sa| xf(sa).transform_id = 200)])));
+        cases.push(("an 8-byte SPI", responder_answer(false, &[offer(|sa| sa.proposals[0].spi = vec![1u8; 8])])));
+        cases.push(("an empty SPI", responder_answer(false, &[offer(|sa| sa.proposals[0].spi = Vec::new())])));
+        cases.push(("a malformed lifetime", responder_answer(false, &[offer(|sa| set_life(sa, vec![life_dur(900)]))])));
+        cases.push(("conflicting lifetimes", responder_answer(false, &[offer(|sa| set_life(sa, vec![life_type(1), life_dur(900), life_type(1), life_dur(60)]))])));
+        cases.push(("two SA payloads", responder_answer(false, &[offer(|_| {}), offer(|_| {})])));
+        // RFC 2408 §4.2: proposals sharing a Proposal # are one suite, ANDed
+        // -- ESP *and* AH -- and a suite this side can't build is no
+        // proposal it can take.
+        cases.push(("an AH+ESP suite (one Proposal #)", responder_answer(false, &[offer(|sa| {
+            let mut ah = sa.proposals[0].clone();
+            ah.protocol_id = 2;
+            ah.transforms[0].transform_id = 3;
+            ah.transforms[0].attributes = vec![Attribute::short(esp_attr::ENCAP_MODE, 1), Attribute::short(esp_attr::AUTH_ALGORITHM, 2)];
+            sa.proposals.insert(0, ah);
+        })])));
+        // KEY_LENGTH is what says which AES it is (RFC 2407 §4.5).
+        cases.push(("no KEY_LENGTH on AES", responder_answer(false, &[offer(|sa| xf(sa).attributes.retain(|a| a.attr_type != esp_attr::KEY_LENGTH))])));
+        cases.push(("KEY_LENGTH sent twice with different values", responder_answer(false, &[offer(|sa| xf(sa).attributes.push(Attribute::short(esp_attr::KEY_LENGTH, 128)))])));
+        cases.push(("ENCAP_MODE sent as a variable-length attribute", responder_answer(false, &[offer(|sa| {
+            set_encap(sa, None);
+            xf(sa).attributes.push(Attribute::long_bytes(esp_attr::ENCAP_MODE, vec![0u8, 1]));
+        })])));
+        responder_refuses(cases);
+    }
+
+    /// RFC 2408 §4.2: the responder answers with the mode that was offered
+    /// (RFC 3947 §5.1: UDP-Encapsulated-Tunnel to a UDP-Encapsulated-Tunnel
+    /// offer, Tunnel to a Tunnel offer) -- not whatever its own transport
+    /// happens to be.
+    #[test]
+    fn quick_mode_responder_answers_the_encapsulation_mode_it_was_offered() {
+        let encap = |sa: &SaPayload| sa.proposals[0].transforms[0].attr(esp_attr::ENCAP_MODE);
+        assert_eq!(encap(&responder_answer(false, &[offer(|sa| set_encap(sa, Some(1)))]).unwrap()), Some(1));
+        assert_eq!(encap(&responder_answer(true, &[offer(|sa| set_encap(sa, Some(3)))]).unwrap()), Some(3));
+        assert_eq!(encap(&responder_answer(false, &[offer(|sa| set_encap(sa, Some(3)))]).unwrap()), Some(3), "a UDP-encapsulated offer on a non-floated responder");
+        assert_eq!(encap(&responder_answer(true, &[offer(|sa| set_encap(sa, Some(1)))]).unwrap()), Some(1), "a plain tunnel offer on a floated responder");
+    }
+
+    /// RFC 2408 §4.2: the receiver picks one transform of one proposal -- not
+    /// necessarily the first -- and "SHOULD retain the Proposal # and
+    /// Transform # fields" of the offer; here the first transform is
+    /// TRANSPORT and the second the tunnel it can honour.
+    #[test]
+    fn quick_mode_responder_picks_an_acceptable_transform_and_keeps_its_numbers() {
+        let transport_first = offer(|sa| {
+            let mut transport = xf(sa).clone();
+            transport.num = 1;
+            transport.attributes.retain(|a| a.attr_type != esp_attr::ENCAP_MODE);
+            transport.attributes.push(Attribute::short(esp_attr::ENCAP_MODE, 2));
+            let mut tunnel = xf(sa).clone();
+            tunnel.num = 2;
+            sa.proposals[0].transforms = vec![transport, tunnel];
+        });
+        let ans = responder_answer(false, &[transport_first]).unwrap();
+        assert_eq!(ans.proposals.len(), 1);
+        assert_eq!(ans.proposals[0].transforms.len(), 1, "a single transform");
+        let t = &ans.proposals[0].transforms[0];
+        assert_eq!(t.num, 2, "the acceptable transform's own number");
+        assert_eq!(t.attr(esp_attr::ENCAP_MODE), Some(1));
+
+        // Numbers other than 1/1 come back as offered.
+        let renumbered = offer(|sa| {
+            sa.proposals[0].num = 5;
+            xf(sa).num = 3;
+        });
+        let ans = responder_answer(false, &[renumbered]).unwrap();
+        assert_eq!((ans.proposals[0].num, ans.proposals[0].transforms[0].num), (5, 3));
+    }
+
+    /// The same across proposals: an AH proposal first and an ESP one second;
+    /// an ESP proposal with a PFS group the responder doesn't know (it used to
+    /// be silently answered as "no PFS") ahead of one it can take.
+    #[test]
+    fn quick_mode_responder_picks_an_acceptable_proposal_and_keeps_its_number() {
+        let ah = {
+            let mut p = offer(|_| {}).proposals.remove(0);
+            p.num = 1;
+            p.protocol_id = 2;
+            p.transforms[0].transform_id = 3;
+            p.transforms[0].attributes = vec![Attribute::short(esp_attr::ENCAP_MODE, 1), Attribute::short(esp_attr::AUTH_ALGORITHM, 2)];
+            p
+        };
+        let mut esp = offer(|_| {}).proposals.remove(0);
+        esp.num = 2;
+        let both = SaPayload { doi: IPSEC_DOI, situation: SIT_IDENTITY_ONLY, proposals: vec![ah, esp.clone()] };
+        let ans = responder_answer(false, &[both]).unwrap();
+        assert_eq!(ans.proposals.len(), 1);
+        assert_eq!((ans.proposals[0].num, ans.proposals[0].protocol_id), (2, protocol::ESP));
+
+        let mut odd_group = esp.clone();
+        odd_group.num = 1;
+        odd_group.transforms[0].attributes.push(Attribute::short(esp_attr::GROUP_DESC, 99));
+        let both = SaPayload { doi: IPSEC_DOI, situation: SIT_IDENTITY_ONLY, proposals: vec![odd_group, esp] };
+        let ans = responder_answer(false, &[both]).unwrap();
+        assert_eq!(ans.proposals[0].num, 2);
+        assert_eq!(ans.proposals[0].transforms[0].attr(esp_attr::GROUP_DESC), None);
+    }
+
+    /// The responder's own lifetime handling reads the seconds pair too: a
+    /// kilobytes duration is not a number of seconds.
+    #[test]
+    fn quick_mode_responder_reads_the_offered_lifetime_in_its_own_units() {
+        let seconds = |attrs: Vec<Attribute>| {
+            let ans = responder_answer(false, &[offer(|sa| set_life(sa, attrs))]).unwrap();
+            let t = &ans.proposals[0].transforms[0];
+            assert_eq!(t.attr(esp_attr::LIFE_TYPE), Some(1), "the answer states its lifetime in seconds");
+            t.attr_u32(esp_attr::LIFE_DURATION).unwrap()
+        };
+        assert_eq!(seconds(vec![life_type(1), life_dur(900)]), 900);
+        assert_eq!(seconds(vec![life_type(2), life_dur(4_608_000)]), 3600, "kilobytes only: its own default, not 4.6 million seconds");
+        assert_eq!(seconds(vec![life_type(2), life_dur(100_000), life_type(1), life_dur(900)]), 900);
+        assert_eq!(seconds(vec![life_type(1), Attribute::long_bytes(esp_attr::LIFE_DURATION, vec![0x03, 0x84])]), 900);
+        assert_eq!(seconds(vec![]), 3600);
     }
 }

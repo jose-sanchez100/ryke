@@ -796,6 +796,9 @@ impl Configuration {
 /// ≥ 16384 are status.
 pub mod notify_type {
     // Errors
+    /// A request carried a payload of a type the receiver does not know with
+    /// the critical flag set; the data is that type, one octet (RFC 7296 §2.5).
+    pub const UNSUPPORTED_CRITICAL_PAYLOAD: u16 = 1;
     pub const INVALID_SYNTAX: u16 = 7;
     pub const INVALID_KE_PAYLOAD: u16 = 17;
     pub const NO_PROPOSAL_CHOSEN: u16 = 14;
@@ -914,7 +917,7 @@ impl Notify {
 /// debugging interop against a real gateway. Not exhaustive.
 pub fn notify_type_name(t: u16) -> &'static str {
     match t {
-        1 => "UNSUPPORTED_CRITICAL_PAYLOAD",
+        notify_type::UNSUPPORTED_CRITICAL_PAYLOAD => "UNSUPPORTED_CRITICAL_PAYLOAD",
         notify_type::INVALID_SYNTAX => "INVALID_SYNTAX",
         notify_type::INVALID_KE_PAYLOAD => "INVALID_KE_PAYLOAD",
         notify_type::NO_PROPOSAL_CHOSEN => "NO_PROPOSAL_CHOSEN",
@@ -952,26 +955,34 @@ impl Delete {
         Delete { protocol_id: protocol_id::ESP, spis }
     }
 
+    /// A Delete payload's body, checked against RFC 7296 §3.11: the Protocol
+    /// ID is IKE, AH or ESP; a Delete of the IKE SA has SPI Size 0 and names
+    /// no SPI -- the IKE SA's SPIs are the header's -- and one of AH or ESP
+    /// has SPI Size 4; the SPIs fill the rest of the payload exactly. Any
+    /// other combination is a malformed payload, never read as a Delete of
+    /// something else.
     pub fn parse(body: &[u8]) -> Result<Delete, IkeError> {
         if body.len() < 4 {
             return Err(IkeError::Truncated { need: 4, have: body.len() });
         }
         let protocol_id = body[0];
-        let spi_size = body[1] as usize;
-        let num = u16be(body, 2) as usize;
-        let mut spis = Vec::with_capacity(num);
-        match spi_size {
-            0 => {} // IKE SA delete carries no SPIs
-            4 => {
-                if 4 + num * 4 > body.len() {
-                    return Err(IkeError::BadLength { declared: 4 + num * 4, available: body.len() });
-                }
-                for i in 0..num {
-                    spis.push(u32::from_be_bytes(body[4 + i * 4..8 + i * 4].try_into().unwrap()));
-                }
-            }
-            _ => return Err(IkeError::Crypto("unsupported Delete SPI size")),
+        let spi_size = usize::from(body[1]);
+        let num = usize::from(u16be(body, 2));
+        let size_of_its_spis = match protocol_id {
+            protocol_id::IKE => 0,
+            protocol_id::AH | protocol_id::ESP => 4,
+            _ => return Err(IkeError::MalformedPayload("a Delete of a protocol other than IKE, AH or ESP")),
+        };
+        if spi_size != size_of_its_spis {
+            return Err(IkeError::MalformedPayload("a Delete whose SPI Size is not its protocol's"));
         }
+        if protocol_id == protocol_id::IKE && num != 0 {
+            return Err(IkeError::MalformedPayload("a Delete of the IKE SA naming SPIs"));
+        }
+        if body.len() != 4 + num * spi_size {
+            return Err(IkeError::MalformedPayload("a Delete whose SPIs do not fill it exactly"));
+        }
+        let spis = body[4..].chunks_exact(4).map(|spi| u32::from_be_bytes(spi.try_into().expect("four bytes"))).collect();
         Ok(Delete { protocol_id, spis })
     }
 
@@ -1337,6 +1348,36 @@ mod tests {
         assert_eq!(bytes[1], 4); // SPI size
         assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), 2); // count
         assert_eq!(Delete::parse(&bytes).unwrap(), esp);
+    }
+
+    /// RFC 7296 §3.11: SPI Size is 0 for the IKE SA, which names no SPI, and
+    /// 4 for AH and ESP, and the SPIs fill the payload exactly. A Delete of
+    /// the IKE SA with SPI Size 4 and one SPI used to parse as a Delete of
+    /// the IKE SA; one of ESP with SPI Size 0, as a Delete of no CHILD SA;
+    /// and SPIs past the count were ignored.
+    #[test]
+    fn a_delete_whose_protocol_spi_size_count_or_length_disagree_is_malformed() {
+        let malformed: [(&str, &[u8]); 9] = [
+            ("IKE, SPI Size 4, one SPI", &[1, 4, 0, 1, 0, 0, 0, 1]),
+            ("IKE, SPI Size 0, Num 1", &[1, 0, 0, 1]),
+            ("IKE, bytes past the header", &[1, 0, 0, 0, 0, 0, 0, 0]),
+            ("ESP, SPI Size 0", &[3, 0, 0, 0]),
+            ("ESP, SPI Size 8", &[3, 8, 0, 1, 0, 0, 0, 0, 0, 0, 0xAA, 0xAA]),
+            ("ESP, two SPIs announced, one there", &[3, 4, 0, 2, 0, 0, 0xAA, 0xAA]),
+            ("ESP, one SPI announced, two there", &[3, 4, 0, 1, 0, 0, 0xAA, 0xAA, 0, 0, 0x77, 0x77]),
+            ("AH, SPI Size 0", &[2, 0, 0, 0]),
+            ("Protocol ID 0", &[0, 4, 0, 1, 0, 0, 0xAA, 0xAA]),
+        ];
+        for (case, body) in malformed {
+            assert!(matches!(Delete::parse(body), Err(IkeError::MalformedPayload(_))), "{case}");
+        }
+        assert!(matches!(Delete::parse(&[1, 0, 0]), Err(IkeError::Truncated { .. })));
+
+        // Well formed: the IKE SA's, and AH's and ESP's with any number of SPIs.
+        assert_eq!(Delete::parse(&[1, 0, 0, 0]).unwrap(), Delete::ike_sa());
+        assert_eq!(Delete::parse(&[2, 4, 0, 1, 0, 0, 0xAA, 0xAA]).unwrap(), Delete { protocol_id: protocol_id::AH, spis: vec![0xAAAA] });
+        assert_eq!(Delete::parse(&[3, 4, 0, 0]).unwrap(), Delete::esp(Vec::new()));
+        assert_eq!(Delete::parse(&[3, 4, 0, 2, 0, 0, 0xAA, 0xAA, 0, 0, 0x77, 0x77]).unwrap(), Delete::esp(vec![0xAAAA, 0x7777]));
     }
 
     #[test]

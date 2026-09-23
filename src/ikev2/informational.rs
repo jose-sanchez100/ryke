@@ -10,6 +10,7 @@ use crate::ikev2::exchange::CompletedSaInit;
 use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
 };
+use crate::ikev2::payload::{notify_type, Delete, Notify};
 use crate::role::Role;
 use crate::ikev2::sk::{build_encrypted, open_encrypted};
 
@@ -103,11 +104,39 @@ pub fn payload_list(first: PayloadType, body: &[u8]) -> Result<Vec<(PayloadType,
     Ok(out)
 }
 
+/// The Delete payloads among `payloads`, each checked by [`Delete::parse`]:
+/// one malformed Delete makes the message malformed.
+pub fn deletes_in(payloads: &[(PayloadType, Vec<u8>)]) -> Result<Vec<Delete>, IkeError> {
+    payloads.iter().filter(|(t, _)| *t == PayloadType::Delete).map(|(_, body)| Delete::parse(body)).collect()
+}
+
+/// The error notify a request earns when it authenticates and is in the
+/// window but its payloads can't be taken, by what `error` went wrong
+/// reading them: `UNSUPPORTED_CRITICAL_PAYLOAD` naming the payload type, for
+/// a payload of a type we don't know with the critical flag set (RFC 7296
+/// §2.5), and `INVALID_SYNTAX` for anything else -- a malformed payload
+/// chain, or a payload whose fields don't hold together (§2.21.3).
+pub fn request_error_notify(error: &IkeError) -> Notify {
+    match error {
+        IkeError::UnsupportedCriticalPayload(payload_type) => Notify::status(notify_type::UNSUPPORTED_CRITICAL_PAYLOAD, vec![*payload_type]),
+        _ => Notify::status(notify_type::INVALID_SYNTAX, Vec::new()),
+    }
+}
+
+/// Our response on `sa` to the peer's request with header `request`, in the
+/// request's exchange, carrying `notify` alone: the answer to a request with
+/// an error (RFC 7296 §2.21.3).
+pub fn build_error_response(sa: &CompletedSaInit, request: &IkeHeader, notify: &Notify, iv: &[u8; 8]) -> Result<Vec<u8>, IkeError> {
+    let mut header = informational_header(sa, request.message_id, true);
+    header.exchange_type = request.exchange_type;
+    let inner = encode_payload_chain(&[(PayloadType::Notify, notify.to_bytes())]);
+    build_encrypted(sa.suite.sk_cipher(), header, PayloadType::Notify, &inner, our_sk_e(sa), our_sk_a(sa), iv)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ikev2::exchange::{default_offer, initiator_complete, initiator_request, responder_respond, LocalSecret};
-    use crate::ikev2::payload::Delete;
 
     fn sa_pair() -> (CompletedSaInit, CompletedSaInit) {
         let init = LocalSecret { dh_private: [7u8; 32], nonce: vec![0x11; 32], spi: 0xA1 };

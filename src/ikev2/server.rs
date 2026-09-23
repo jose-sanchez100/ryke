@@ -24,6 +24,14 @@
 //!   CHILD SA or of the IKE SA -- is refused with `NO_ADDITIONAL_SAS`
 //!   (Appendix A), so a peer replaces an expiring SA by deleting it and
 //!   connecting again;
+//! - an INFORMATIONAL or `CREATE_CHILD_SA` request that authenticates but
+//!   whose payloads can't be taken is answered with the error alone and
+//!   nothing in it is acted on (§2.21.2, §2.21.3): an unknown payload
+//!   marked critical earns `UNSUPPORTED_CRITICAL_PAYLOAD` (§2.5), and the
+//!   IKE SA goes on; anything else -- a malformed payload chain, a Delete
+//!   whose fields don't hold together (§3.11) -- `INVALID_SYNTAX`, which
+//!   deletes the IKE SA and its CHILD SA. One that does not authenticate is
+//!   dropped unanswered;
 //! - IKE fragmentation (RFC 7383), which `IKE_SA_INIT` always advertises:
 //!   a fragmented request is reassembled, each fragment authenticated
 //!   before it is kept ([`crate::ikev2::fragment::Reassembly`]), and one
@@ -44,15 +52,16 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use crate::entropy::Entropy;
+use crate::error::IkeError;
 use crate::esp::ChildSa;
 use crate::ikev2::exchange::{responder_respond, CompletedSaInit, LocalSecret};
 use crate::ikev2::fragment::{self, Accepted, MessageKey, Reassembly};
 use crate::ikev2::ike_auth::{self, AuthConfig};
-use crate::ikev2::informational::{build_informational, open_informational};
+use crate::ikev2::informational::{build_error_response, build_informational, deletes_in, open_from_peer, payload_list, request_error_notify};
 use crate::ikev2::message::{ExchangeType, IkeHeader, PayloadType};
-use crate::ikev2::payload::{protocol_id, Delete, Identification};
+use crate::ikev2::payload::{notify_type, protocol_id, Delete, Identification};
 use crate::ikev2::rekey::build_child_refusal;
-use crate::ikev2::sk::{self, open_encrypted};
+use crate::ikev2::sk;
 use crate::role::Role;
 use crate::transport::{DriverError, UdpTransport};
 
@@ -85,6 +94,11 @@ pub enum ServerEvent {
     Deleted { spi_i: u64, spi_r: u64 },
     /// Refused a `CREATE_CHILD_SA` request with `NO_ADDITIONAL_SAS`.
     Refused { spi_i: u64, spi_r: u64 },
+    /// Answered an authentic request whose payloads could not be taken with
+    /// the error notify `notify_type` alone, acting on nothing in it (RFC
+    /// 7296 §2.21.3). `INVALID_SYNTAX` also deleted the IKE SA and its CHILD
+    /// SA; `UNSUPPORTED_CRITICAL_PAYLOAD` left them up.
+    RequestError { spi_i: u64, spi_r: u64, notify_type: u16 },
     /// A datagram we don't act on: an unknown SPI pair, a request out of
     /// order or of an exchange we don't take at that point, or a response.
     Ignored,
@@ -202,8 +216,18 @@ impl<E: Entropy> Server<E> {
         let sa = fragment_size.map(|_| ike.sa.clone());
         let (response, event) = match (header.exchange_type, ike.peer_id.is_some()) {
             (ExchangeType::IkeAuth, false) => self.answer_ike_auth(key, &data)?,
-            (ExchangeType::Informational, true) => self.answer_informational(key, header.message_id, &data)?,
-            (ExchangeType::CreateChildSa, true) => self.refuse_create_child_sa(key, header.message_id, &data)?,
+            (ExchangeType::Informational | ExchangeType::CreateChildSa, true) => {
+                // Only a request the peer really sent -- it must have
+                // protected it -- is answered at all (RFC 7296 §2.21.2).
+                let (first, body) = open_from_peer(&ike.sa, &data)?;
+                match payload_list(first, &body).and_then(|inner| deletes_in(&inner)) {
+                    Err(e) => self.answer_request_error(key, header, &e)?,
+                    Ok(deletes) if header.exchange_type == ExchangeType::Informational => {
+                        self.answer_informational(key, header.message_id, deletes)?
+                    }
+                    Ok(_) => self.refuse_create_child_sa(key, header.message_id)?,
+                }
+            }
             _ => return Ok(ServerEvent::Ignored),
         };
         let response = match (sa, fragment_size) {
@@ -329,15 +353,12 @@ impl<E: Entropy> Server<E> {
     /// RFC 7296 §1.4.1: a Delete of the IKE SA is answered empty and closes it
     /// with its CHILD SA; a Delete of the CHILD SA is answered with a Delete of
     /// its other half. Nothing else needs more than an empty response.
-    fn answer_informational(&mut self, key: (u64, u64), message_id: u32, data: &[u8]) -> Result<(Vec<u8>, ServerEvent), DriverError> {
+    /// `deletes` are the request's Delete payloads, already read.
+    fn answer_informational(&mut self, key: (u64, u64), message_id: u32, deletes: Vec<Delete>) -> Result<(Vec<u8>, ServerEvent), DriverError> {
         let ike = self.sessions.get_mut(&key).expect("looked up by the caller");
         let mut ike_deleted = false;
         let mut child_deleted = None;
-        for (payload_type, body) in open_informational(&ike.sa, data)? {
-            if payload_type != PayloadType::Delete {
-                continue;
-            }
-            let delete = Delete::parse(&body)?;
+        for delete in deletes {
             match (delete.protocol_id, ike.child_spis) {
                 (protocol_id::IKE, _) => ike_deleted = true,
                 (protocol_id::ESP, Some((ours, theirs))) if delete.spis.contains(&theirs) => child_deleted = Some(ours),
@@ -366,14 +387,31 @@ impl<E: Entropy> Server<E> {
 
     /// RFC 7296 Appendix A: a minimal responder recognises `CREATE_CHILD_SA`
     /// requests and refuses every one with `NO_ADDITIONAL_SAS` -- but only a
-    /// request the peer really sent, which it must have protected.
-    fn refuse_create_child_sa(&mut self, key: (u64, u64), message_id: u32, data: &[u8]) -> Result<(Vec<u8>, ServerEvent), DriverError> {
+    /// request the peer really sent, which the caller has checked.
+    fn refuse_create_child_sa(&mut self, key: (u64, u64), message_id: u32) -> Result<(Vec<u8>, ServerEvent), DriverError> {
         let sa = &self.sessions[&key].sa;
-        open_encrypted(sa.suite.sk_cipher(), data, &sa.keys.sk_ei, &sa.keys.sk_ai)?;
         let mut iv = [0u8; 8];
         self.entropy.fill(&mut iv);
         let response = build_child_refusal(sa, message_id, &iv)?;
         Ok((response, ServerEvent::Refused { spi_i: key.0, spi_r: key.1 }))
+    }
+
+    /// RFC 7296 §2.21.3: an authentic request on the IKE SA `key` whose
+    /// payloads can't be taken -- `error` says why -- is answered, in its
+    /// exchange, with the error notify alone, and nothing in it is acted on
+    /// (§2.21.2). `INVALID_SYNTAX` is "fatal in both peers": the IKE SA and
+    /// its CHILD SA go, with no INFORMATIONAL exchange of their own.
+    /// `UNSUPPORTED_CRITICAL_PAYLOAD` (§2.5) is not made fatal, and they stay.
+    fn answer_request_error(&mut self, key: (u64, u64), header: &IkeHeader, error: &IkeError) -> Result<(Vec<u8>, ServerEvent), DriverError> {
+        let notify = request_error_notify(error);
+        let mut iv = [0u8; 8];
+        self.entropy.fill(&mut iv);
+        let response = build_error_response(&self.sessions[&key].sa, header, &notify, &iv)?;
+        if notify.notify_type == notify_type::INVALID_SYNTAX {
+            self.sessions.remove(&key);
+            self.children.remove(&key);
+        }
+        Ok((response, ServerEvent::RequestError { spi_i: key.0, spi_r: key.1, notify_type: notify.notify_type }))
     }
 }
 
@@ -388,7 +426,8 @@ mod tests {
     use crate::ikev2::informational::dpd_request;
     use crate::ikev2::payload::{notify_type, Identification, Notify, TrafficSelectors};
     use crate::ikev2::rekey::build_child_request;
-    use crate::ikev2::sk::SkCipher;
+    use crate::ikev2::message::Flags;
+    use crate::ikev2::sk::{open_encrypted, SkCipher};
     use std::net::UdpSocket;
     use std::thread;
 
@@ -744,6 +783,139 @@ mod tests {
             let notifies: Vec<u16> = payloads.iter().filter(|p| p.0 == PayloadType::Notify).map(|p| Notify::parse(&p.1).unwrap().notify_type).collect();
             assert_eq!(notifies, vec![notify_type::NO_ADDITIONAL_SAS]);
         }
+    }
+
+    /// A request of the peer's on `sa`, Message ID `mid`, whose SK payload
+    /// holds `inner` as it stands: a payload chain of any shape, authentic.
+    fn raw_request(sa: &CompletedSaInit, mid: u32, exchange_type: ExchangeType, first: PayloadType, inner: &[u8]) -> Vec<u8> {
+        let header = IkeHeader {
+            initiator_spi: sa.spi_i,
+            responder_spi: sa.spi_r,
+            next_payload: PayloadType::NoNext,
+            major_version: 2,
+            minor_version: 0,
+            exchange_type,
+            flags: Flags { initiator: true, version: false, response: false },
+            message_id: mid,
+            length: 0,
+        };
+        sk::build_encrypted(sa.suite.sk_cipher(), header, first, inner, &sa.keys.sk_ei, &sa.keys.sk_ai, &[15u8; 8]).unwrap()
+    }
+
+    /// The server's `reply` to the request `mid` of `exchange`, which must
+    /// carry a single Notify and nothing else: its type and data.
+    fn error_reply(peer: &Peer, reply: &[u8], exchange: ExchangeType, mid: u32) -> (u16, Vec<u8>) {
+        let (header, payloads) = peer.open(reply);
+        assert_eq!((header.exchange_type, header.message_id, header.flags.response), (exchange, mid, true));
+        assert_eq!(payloads.len(), 1, "the error notify alone: {payloads:?}");
+        assert_eq!(payloads[0].0, PayloadType::Notify);
+        let notify = Notify::parse(&payloads[0].1).unwrap();
+        (notify.notify_type, notify.data)
+    }
+
+    /// RFC 7296 §2.21.3: an authentic request in the window that is badly
+    /// formatted -- here, a first payload declaring a length shorter than its
+    /// own header -- is answered `INVALID_SYNTAX` in its own exchange, which
+    /// is fatal: the IKE SA and its CHILD SA are gone. An INFORMATIONAL used
+    /// to go unanswered, the Message ID unused; a `CREATE_CHILD_SA` was
+    /// refused `NO_ADDITIONAL_SAS` as if it had been read.
+    #[test]
+    fn a_request_with_a_malformed_payload_chain_is_answered_invalid_syntax_and_ends_the_ike_sa() {
+        for exchange in [ExchangeType::Informational, ExchangeType::CreateChildSa] {
+            let (mut server, addr) = server();
+            let peer = establish(&mut server, addr);
+            let (spi_i, spi_r) = peer.key();
+            let request = raw_request(&peer.sa, 2, exchange, PayloadType::Delete, &[0, 0, 0, 3]);
+            let (event, reply) = peer.send(&mut server, &request);
+            assert_eq!(event.unwrap(), ServerEvent::RequestError { spi_i, spi_r, notify_type: notify_type::INVALID_SYNTAX }, "{exchange:?}");
+            let reply = reply.expect("answered");
+            assert_eq!(error_reply(&peer, &reply, exchange, 2), (notify_type::INVALID_SYNTAX, Vec::new()), "{exchange:?}");
+            assert!(server.session(spi_i, spi_r).is_none() && server.child(spi_i, spi_r).is_none(), "{exchange:?}");
+
+            // ...but one that does not authenticate is dropped unanswered.
+            let (mut server, addr) = self::server();
+            let peer = establish(&mut server, addr);
+            let mut forged = raw_request(&peer.sa, 2, exchange, PayloadType::Delete, &[0, 0, 0, 3]);
+            *forged.last_mut().unwrap() ^= 1;
+            let (event, reply) = peer.send(&mut server, &forged);
+            assert!(event.is_err(), "{exchange:?}");
+            assert_eq!(reply, None, "{exchange:?}");
+            assert!(server.session(peer.key().0, peer.key().1).is_some(), "{exchange:?}");
+        }
+    }
+
+    /// RFC 7296 §2.5: a payload of a type we don't know with the critical
+    /// flag set makes us reject the whole message, answered with
+    /// `UNSUPPORTED_CRITICAL_PAYLOAD` naming the type -- here ahead of a
+    /// Delete of the IKE SA, which is not acted on. It used to be skipped
+    /// silently and the Delete taken. The RFC doesn't make this error fatal:
+    /// the IKE SA goes on, and a retransmission gets the same answer.
+    #[test]
+    fn an_unknown_critical_payload_is_answered_unsupported_critical_payload_and_nothing_else_is_acted_on() {
+        let (mut server, addr) = server();
+        let peer = establish(&mut server, addr);
+        let (spi_i, spi_r) = peer.key();
+        let chain = [PayloadType::Delete.to_u8(), 0x80, 0, 4, 0, 0, 0, 8, protocol_id::IKE, 0, 0, 0];
+        let request = raw_request(&peer.sa, 2, ExchangeType::Informational, PayloadType::from_u8(250), &chain);
+        let (event, reply) = peer.send(&mut server, &request);
+        let unsupported = ServerEvent::RequestError { spi_i, spi_r, notify_type: notify_type::UNSUPPORTED_CRITICAL_PAYLOAD };
+        assert_eq!(event.unwrap(), unsupported);
+        let reply = reply.expect("answered");
+        assert_eq!(error_reply(&peer, &reply, ExchangeType::Informational, 2), (notify_type::UNSUPPORTED_CRITICAL_PAYLOAD, vec![250]));
+        assert!(server.session(spi_i, spi_r).is_some(), "the Delete is not acted on");
+        let (event, again) = peer.send(&mut server, &request);
+        assert_eq!(event.unwrap(), ServerEvent::Retransmitted { spi_i, spi_r });
+        assert_eq!(again, Some(reply));
+        let (event, _) = peer.send(&mut server, &dpd_request(&peer.sa, 3, &[3u8; 8]).unwrap());
+        assert_eq!(event.unwrap(), ServerEvent::Informational { spi_i, spi_r }, "the IKE SA goes on");
+
+        // Control: not critical, the unknown payload is ignored (§2.5) and
+        // the Delete after it closes the IKE SA.
+        let mut chain = chain;
+        chain[1] = 0;
+        let request = raw_request(&peer.sa, 4, ExchangeType::Informational, PayloadType::from_u8(250), &chain);
+        let (event, _) = peer.send(&mut server, &request);
+        assert_eq!(event.unwrap(), ServerEvent::Deleted { spi_i, spi_r });
+    }
+
+    /// RFC 7296 §3.11: a Delete whose Protocol ID, SPI Size, number of SPIs
+    /// and length don't hold together is badly formatted -- `INVALID_SYNTAX`,
+    /// fatal (§2.21.3) -- and is not taken as naming anything. A Delete of
+    /// the IKE SA with an SPI Size of 4 used to close it as a well-formed one
+    /// would, answered empty.
+    #[test]
+    fn a_malformed_delete_is_answered_invalid_syntax() {
+        let child = PEER_CHILD_SPI.to_be_bytes();
+        let cases: [(&str, Vec<u8>); 4] = [
+            ("IKE, SPI Size 4, one SPI", [&[protocol_id::IKE, 4, 0, 1][..], &child].concat()),
+            ("ESP, SPI Size 8", [&[protocol_id::ESP, 8, 0, 1][..], &[0; 4], &child].concat()),
+            ("ESP, two SPIs announced, one there", [&[protocol_id::ESP, 4, 0, 2][..], &child].concat()),
+            ("Protocol ID 0", [&[0, 4, 0, 1][..], &child].concat()),
+        ];
+        for (what, body) in cases {
+            let (mut server, addr) = server();
+            let peer = establish(&mut server, addr);
+            let (spi_i, spi_r) = peer.key();
+            let request = build_informational(&peer.sa, 2, false, &[(PayloadType::Delete, body)], &[9u8; 8]).unwrap();
+            let (event, reply) = peer.send(&mut server, &request);
+            assert_eq!(event.unwrap(), ServerEvent::RequestError { spi_i, spi_r, notify_type: notify_type::INVALID_SYNTAX }, "{what}");
+            assert_eq!(
+                error_reply(&peer, &reply.expect("answered"), ExchangeType::Informational, 2),
+                (notify_type::INVALID_SYNTAX, Vec::new()),
+                "{what}"
+            );
+        }
+
+        // Control: a well-formed Delete of an AH SA we don't have is passed over.
+        let (mut server, addr) = server();
+        let peer = establish(&mut server, addr);
+        let (spi_i, spi_r) = peer.key();
+        let ah = [&[protocol_id::AH, 4, 0, 1][..], &child].concat();
+        let request = build_informational(&peer.sa, 2, false, &[(PayloadType::Delete, ah)], &[9u8; 8]).unwrap();
+        let (event, reply) = peer.send(&mut server, &request);
+        assert_eq!(event.unwrap(), ServerEvent::Informational { spi_i, spi_r });
+        assert!(peer.open(&reply.unwrap()).1.is_empty());
+        assert!(server.child(spi_i, spi_r).is_some());
     }
 
     /// `msg`, a request the peer (the IKE SA's initiator) built on `sa`, as

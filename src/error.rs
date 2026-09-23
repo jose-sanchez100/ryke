@@ -23,6 +23,13 @@ pub enum IkeError {
     #[error("unrecognized payload type {0} with the critical bit set")]
     UnsupportedCriticalPayload(u8),
 
+    /// A payload's fields contradict each other or a value the RFC fixes --
+    /// a Delete of the IKE SA with an SPI Size other than 0, say (RFC 7296
+    /// §3.11). The message is badly formatted: a request carrying one is
+    /// answered INVALID_SYNTAX (§2.21.3).
+    #[error("malformed payload: {0}")]
+    MalformedPayload(&'static str),
+
     /// The header's major version isn't one this crate speaks (RFC 7296
     /// §3.1: a responder MUST reject a higher major version with
     /// INVALID_MAJOR_VERSION; we reject any non-2 major version outright

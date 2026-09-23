@@ -18,6 +18,8 @@ pub mod payloads;
 pub mod phase1;
 pub mod phase2;
 pub mod quick;
+#[cfg(test)]
+mod retransmit_tests;
 pub mod server;
 pub mod xauth;
 

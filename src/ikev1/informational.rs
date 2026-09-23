@@ -322,7 +322,11 @@ enum Seen {
 /// requires answering one whenever seen, regardless of whether this call is
 /// a passive `peek` or an active `probe`) and the wait continues; an
 /// R-U-THERE-ACK matching `expect_ack_seq` ends the wait as
-/// [`Seen::AckMatched`]; anything else (garbage, a message for a different
+/// [`Seen::AckMatched`]; a peer message that one of our final messages
+/// answered, repeated bit for bit (the gateway re-sending its Quick Mode
+/// message 2 because our message 3 never arrived), gets that final message
+/// sent again ([`super::quick::resend_final_if_repeat`]) and the wait
+/// continues; anything else (garbage, a message for a different
 /// exchange/SA, a decrypt/HASH failure, a stale/mismatched ack, a failed
 /// auto-ack send) is silently skipped rather than surfaced as an error, same
 /// best-effort stance this module has always taken for Delete detection. A
@@ -366,8 +370,14 @@ fn watch(
             &buf[..n]
         };
         let Ok(header) = IsakmpHeader::parse(datagram) else { continue };
-        if header.exchange_type != exchange::INFORMATIONAL || header.init_cookie != st.cky_i || header.resp_cookie != st.cky_r {
-            continue; // not an Informational for this ISAKMP SA -- ignore, keep waiting out the timeout
+        if header.init_cookie != st.cky_i || header.resp_cookie != st.cky_r {
+            continue; // not for this ISAKMP SA -- ignore, keep waiting out the timeout
+        }
+        if header.exchange_type != exchange::INFORMATIONAL {
+            // A repeat of the message a final message of ours answered (the
+            // gateway never got our Quick Mode message 3): send that again.
+            super::quick::resend_final_if_repeat(sock, st, peer, datagram);
+            continue;
         }
         let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, header.message_id, st.enc_block);
         let Ok((_h, payloads, _next)) = phase2::parse_encrypted(datagram, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0) else {

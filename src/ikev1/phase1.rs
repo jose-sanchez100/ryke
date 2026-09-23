@@ -287,6 +287,58 @@ pub struct Phase1State {
     /// `LIFE_DURATION` attribute at all. See [`negotiated_p1_lifetime`].
     #[zeroize(skip)]
     pub negotiated_lifetime_secs: u32,
+    /// Final messages of ours that nothing answers, kept to be sent again
+    /// when the peer repeats what they answered -- see [`RetainedFinals`].
+    /// Shared by every clone of this state (a caller that keeps a copy for
+    /// later liveness checks and rekeys still sees what `connect` retained),
+    /// and empty after [`Phase1State::resume`].
+    #[zeroize(skip)]
+    pub(crate) finals: RetainedFinals,
+}
+
+/// The final message of an exchange -- Aggressive Mode message 3, the XAUTH
+/// ACK, Quick Mode message 3 -- is answered by nothing, so a peer that never
+/// received it can only say so by repeating the message before it. RFC 2408
+/// §3.1 (Commit Bit NOTE) describes that recovery: "retransmit the last
+/// ISAKMP message to force the other entity to retransmit the final message".
+/// This keeps each such pair (the peer's message, our final answer to it, both
+/// exactly as they were on the wire) so the answer can be sent again untouched:
+/// no IV, cookie or exchange state moves for a retransmission (RFC 2409 §5,
+/// end: implementations "SHOULD NOT update their running IV until the decrypted
+/// message ... has been determined to actually advance the IKE state machine --
+/// i.e. it is not a retransmission").
+///
+/// Only the newest [`Self::KEPT`] pairs are kept; a peer that repeats a message
+/// older than that is treated as any other stray datagram.
+#[derive(Clone, Default)]
+pub(crate) struct RetainedFinals(Arc<std::sync::Mutex<FinalPairs>>);
+
+/// Each pair is (the peer's message, our final message answering it).
+type FinalPairs = std::collections::VecDeque<(Vec<u8>, Vec<u8>)>;
+
+impl RetainedFinals {
+    const KEPT: usize = 8;
+
+    fn pairs(&self) -> std::sync::MutexGuard<'_, FinalPairs> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Remember that `ours` is the final message we answered `theirs` with.
+    pub(crate) fn retain(&self, theirs: &[u8], ours: &[u8]) {
+        let mut pairs = self.pairs();
+        if pairs.len() == Self::KEPT {
+            pairs.pop_front();
+        }
+        pairs.push_back((theirs.to_vec(), ours.to_vec()));
+    }
+
+    /// Our final message that answered `datagram`, when `datagram` is, bit for
+    /// bit, the peer message it answered. A repeat that is not identical (a
+    /// gateway that re-encrypts what it sends again) is not recognised: without
+    /// the exchange's state there is no way to tell it from a different message.
+    pub(crate) fn answer_to(&self, datagram: &[u8]) -> Option<Vec<u8>> {
+        self.pairs().iter().find(|(theirs, _)| theirs == datagram).map(|(_, ours)| ours.clone())
+    }
 }
 
 /// Pick the first offered transform we support: AES-CBC (128/192/256-bit,
@@ -516,6 +568,7 @@ pub fn respond_aggressive(
         peer_supports_dpd,
         floated,
         negotiated_lifetime_secs: initiator_offered_lifetime,
+        finals: RetainedFinals::default(),
     };
     Ok((msg2, state))
 }
@@ -560,6 +613,7 @@ impl Phase1State {
             peer_supports_dpd: false,
             floated: false,
             negotiated_lifetime_secs: 0,
+            finals: RetainedFinals::default(),
         }
     }
 
@@ -908,6 +962,7 @@ impl AggressiveInitiator {
             peer_supports_dpd,
             floated,
             negotiated_lifetime_secs,
+            finals: RetainedFinals::default(),
         };
         Ok((msg3, state))
     }
@@ -1362,6 +1417,7 @@ impl MainIdSent {
             peer_supports_dpd: self.peer_supports_dpd,
             floated: self.floated,
             negotiated_lifetime_secs: self.negotiated_p1_lifetime_secs,
+            finals: RetainedFinals::default(),
         };
         match verify {
             Ok(()) => Ok(state),
@@ -1648,6 +1704,7 @@ impl MainRespKeSent {
             peer_supports_dpd: self.peer_supports_dpd,
             floated: self.floated,
             negotiated_lifetime_secs: self.initiator_offered_lifetime,
+            finals: RetainedFinals::default(),
         };
         Ok((msg6, state))
     }
@@ -1683,6 +1740,7 @@ mod tests {
             peer_supports_dpd: true,
             floated: false,
             negotiated_lifetime_secs: 28800,
+            finals: RetainedFinals::default(),
         };
         zeroize::Zeroize::zeroize(&mut state);
         assert!(state.skeyid.is_empty());
@@ -1694,6 +1752,37 @@ mod tests {
         assert_eq!(state.cky_i, [1u8; 8]);
         assert_eq!(state.gxi, vec![4u8; 16]);
         assert_eq!(state.negotiated_lifetime_secs, 28800);
+    }
+
+    #[test]
+    fn retained_finals_answer_only_the_exact_message_they_were_kept_for() {
+        let finals = RetainedFinals::default();
+        assert_eq!(finals.answer_to(b"their message"), None, "nothing is retained yet");
+        finals.retain(b"their message", b"our final message");
+        assert_eq!(finals.answer_to(b"their message"), Some(b"our final message".to_vec()));
+        assert_eq!(finals.answer_to(b"their messagf"), None, "one differing byte is another message");
+        assert_eq!(finals.answer_to(b"their messag"), None, "a truncated repeat is another message");
+        assert_eq!(finals.answer_to(b""), None);
+    }
+
+    #[test]
+    fn retained_finals_keep_the_newest_pairs_and_drop_the_oldest() {
+        let finals = RetainedFinals::default();
+        for i in 0..(RetainedFinals::KEPT as u8 + 1) {
+            finals.retain(&[i], &[i, 0xFF]);
+        }
+        assert_eq!(finals.answer_to(&[0]), None, "the oldest pair fell out");
+        for i in 1..(RetainedFinals::KEPT as u8 + 1) {
+            assert_eq!(finals.answer_to(&[i]), Some(vec![i, 0xFF]), "pair {i} is still kept");
+        }
+    }
+
+    #[test]
+    fn retained_finals_are_shared_by_every_clone_of_the_phase1_state() {
+        let finals = RetainedFinals::default();
+        let copy = finals.clone();
+        finals.retain(b"theirs", b"ours");
+        assert_eq!(copy.answer_to(b"theirs"), Some(b"ours".to_vec()));
     }
 
     #[test]

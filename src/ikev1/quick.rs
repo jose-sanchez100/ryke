@@ -1001,6 +1001,23 @@ fn send_ike(sock: &dyn IkeSocket, st: &Phase1State, peer: SocketAddr, msg: &[u8]
     Ok(())
 }
 
+/// When `datagram` (already stripped of the non-ESP marker, if any) is, bit for
+/// bit, a peer message that one of our final messages answered -- the peer
+/// repeating its message 2 because our message 3 never reached it (RFC 2408
+/// §3.1, Commit Bit NOTE) -- sends that final message again, untouched. Nothing
+/// else moves: the retained bytes are sent as they were, so no IV or exchange
+/// state advances for a retransmission (RFC 2409 §5). Any other datagram is left
+/// to the caller, and so is a repeat, which it drops like any message that is
+/// not the one it waits for (the repeat is another exchange's, by Message ID or
+/// by exchange type).
+pub(crate) fn resend_final_if_repeat(sock: &dyn IkeSocket, st: &Phase1State, peer: SocketAddr, datagram: &[u8]) {
+    let Some(final_message) = st.finals.answer_to(datagram) else { return };
+    ike_debug!("the peer repeated a message our final message answered -- sending that final message again ({} bytes) to {peer}", final_message.len());
+    if let Err(e) = send_ike(sock, st, peer, &final_message) {
+        ike_debug!("failed to send the final message again: {e}");
+    }
+}
+
 /// Best-effort Delete for the CHILD SA a rekey just superseded -- a failure to
 /// build or send it never fails the rekey (the new SA is already live and the
 /// old one will expire on its own lifetime either way).
@@ -1031,9 +1048,13 @@ const QUICK_MODE_ATTEMPTS: u32 = 3;
 /// [`IkeError::PeerRejected`], and a Delete of the ISAKMP SA
 /// ([`IkeError::PeerTornDown`]).
 ///
-/// Message 3 is sent once: nothing answers it. If it is lost, the gateway's
-/// retransmitted message 2 arrives after this has returned, and goes
-/// unanswered.
+/// Message 3 is sent once, since nothing answers it, and kept with the
+/// message 2 it answers in [`Phase1State::finals`]: if it is lost, the
+/// gateway's retransmitted message 2 arrives after this has returned, and the
+/// next look at the socket that sees it ([`await_quick_reply`],
+/// [`informational::peek`] / [`informational::probe`]) sends the same message 3
+/// again ([`resend_final_if_repeat`]). Until then the gateway has no
+/// established Quick Mode SA, and nothing here notices.
 fn quick_exchange(
     sock: &dyn IkeSocket,
     st: &Phase1State,
@@ -1052,7 +1073,7 @@ fn quick_exchange(
             ike_debug!("Quick Mode ({what}): no reply within {timeout:?}, retransmitting msg1 (attempt {attempt}/{QUICK_MODE_ATTEMPTS})");
         }
         send_ike(sock, st, peer, &msg1)?;
-        msg2 = await_quick_reply(sock, st, msgid, timeout, what)?;
+        msg2 = await_quick_reply(sock, st, peer, msgid, timeout, what)?;
         if msg2.is_some() {
             break;
         }
@@ -1063,6 +1084,7 @@ fn quick_exchange(
     };
 
     let (msg3, child, negotiated_lifetime) = qi.complete(&msg2)?;
+    st.finals.retain(&msg2, &msg3);
     send_ike(sock, st, peer, &msg3)?;
 
     let key_out = ChildKeyMaterial {
@@ -1084,10 +1106,13 @@ fn quick_exchange(
 }
 
 /// Wait up to `timeout` for message 2 of the Quick Mode `msgid`, for
-/// [`quick_exchange`]: `None` when none came in time.
+/// [`quick_exchange`]: `None` when none came in time. A peer message that an
+/// earlier exchange's final message answered (a repeated message 2 of the last
+/// rekey) gets that final message sent again on the way.
 fn await_quick_reply(
     sock: &dyn IkeSocket,
     st: &Phase1State,
+    peer: SocketAddr,
     msgid: u32,
     timeout: Duration,
     what: &str,
@@ -1116,6 +1141,7 @@ fn await_quick_reply(
             raw.to_vec()
         };
         let Ok(hdr) = IsakmpHeader::parse(&msg) else { continue };
+        resend_final_if_repeat(sock, st, peer, &msg);
         if let Some((notify_type, name)) = informational::peer_error_notify(st, &msg) {
             ike_debug!("Quick Mode ({what}): gateway rejected the proposal with {name} (notify type {notify_type})");
             return Err(IkeError::PeerRejected { notify_type, name }.into());
@@ -2528,5 +2554,42 @@ mod tests {
         assert_eq!(seconds(vec![life_type(2), life_dur(100_000), life_type(1), life_dur(900)]), 900);
         assert_eq!(seconds(vec![life_type(1), Attribute::long_bytes(esp_attr::LIFE_DURATION, vec![0x03, 0x84])]), 900);
         assert_eq!(seconds(vec![]), 3600);
+    }
+
+    fn message_of(cky_i: [u8; 8], cky_r: [u8; 8], message_id: u32) -> Vec<u8> {
+        let mut m = vec![0u8; IsakmpHeader::LEN];
+        m[..8].copy_from_slice(&cky_i);
+        m[8..16].copy_from_slice(&cky_r);
+        m[17] = IsakmpHeader::VERSION_1_0;
+        m[18] = exchange::QUICK;
+        m[20..24].copy_from_slice(&message_id.to_be_bytes());
+        m[24..28].copy_from_slice(&(IsakmpHeader::LEN as u32).to_be_bytes());
+        m
+    }
+
+    /// While a rekey waits for its message 2, the gateway repeats the message 2
+    /// of the exchange before it (our message 3 for that one was lost): that
+    /// message 3 is sent again, byte for byte, and the wait goes on for the
+    /// message 2 it is really waiting for (RFC 2408 §3.1, RFC 2409 §5).
+    #[test]
+    fn a_rekey_waiting_for_message_2_answers_a_repeat_of_the_previous_message_2() {
+        let (cky_i, cky_r) = ([0xAA; 8], [0xBB; 8]);
+        let st = Phase1State::resume(crate::ikev1::crypto1::Prf::Sha256, DhGroup::Modp2048, cky_i, cky_r, vec![], vec![], vec![], vec![], 16, vec![]);
+        let previous_msg2 = message_of(cky_i, cky_r, 0x1111);
+        let previous_msg3 = [message_of(cky_i, cky_r, 0x1111), b"message 3".to_vec()].concat();
+        st.finals.retain(&previous_msg2, &previous_msg3);
+        let awaited = message_of(cky_i, cky_r, 0x2222);
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        gateway.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        gateway.send_to(&previous_msg2, client.local_addr().unwrap()).unwrap();
+        gateway.send_to(&awaited, client.local_addr().unwrap()).unwrap();
+
+        let got = await_quick_reply(&client, &st, gateway.local_addr().unwrap(), 0x2222, Duration::from_secs(2), "test").unwrap();
+        assert_eq!(got, Some(awaited));
+        let mut buf = [0u8; 256];
+        let (n, _) = gateway.recv_from(&mut buf).expect("the previous exchange's message 3 must have been sent again");
+        assert_eq!(&buf[..n], &previous_msg3[..]);
     }
 }

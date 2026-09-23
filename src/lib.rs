@@ -56,11 +56,27 @@
 //! liveness check, [`ikev1::informational::probe`], sends one R-U-THERE per
 //! call: repeating it, with a new sequence number (RFC 3706), is the
 //! caller's. Neither runs in the background: the peer's requests are
-//! answered only while the caller is inside one of these calls. Not done in
-//! IKEv1: the last message of an exchange (Aggressive Mode's third, Quick
-//! Mode's third) is sent once, so if it is lost the gateway's retransmission
-//! of the message before it goes unanswered; a Quick Mode or a Phase 1 the
-//! gateway starts goes unanswered; and the ISAKMP SA is never rekeyed --
+//! answered only while the caller is inside one of these calls.
+//!
+//! IKEv1's retransmissions are the same bytes each time, but at a fixed
+//! interval (the read timeout), where RFC 2408 §5.1 says "MUST NOT use a
+//! fixed timer" and asks for a growing one. The messages that nothing
+//! answers -- Aggressive Mode's third, the XAUTH ACK, Quick Mode's third --
+//! are kept, and sent again untouched when the gateway repeats the message
+//! before them (RFC 2408 §3.1, Commit Bit NOTE; RFC 2409 §5: no IV or state
+//! moves for a retransmission), and a gateway's repeat of a message the
+//! handshake already took is never read as the next one. That last-message
+//! recovery has limits: it recognises only a repeat identical to what the
+//! gateway sent first (one that is re-encrypted is not recognised); Quick
+//! Mode's third, sent by [`ikev1::Client::connect`] or a rekey, is sent again
+//! only when the caller next reads the socket ([`ikev1::informational::peek`],
+//! [`ikev1::informational::probe`], the next rekey), not in the background;
+//! and an Aggressive Mode third message lost after NAT-T floated is not
+//! recovered, since the gateway repeats its second message to port 500 while
+//! the client listens on 4500. Not done in IKEv1: a Quick Mode or a Phase 1
+//! the gateway starts goes unanswered (the client is an initiator only;
+//! answering one would be a Quick Mode responder driven from the caller's
+//! loop, which nothing here does yet), and the ISAKMP SA is never rekeyed --
 //! once its lifetime is up, a new `connect` is the way on.
 //!
 //! IKEv2 fragmentation (RFC 7383), which every `IKE_SA_INIT` advertises:

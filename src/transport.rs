@@ -243,6 +243,11 @@ impl UdpTransport {
         self.socket.set_read_timeout(dur)
     }
 
+    /// The bound [`Self::recv_from`] currently waits for (`None`: no bound).
+    pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
+        self.socket.read_timeout()
+    }
+
     /// See [`enable_udp_encap`]'s doc -- same "only once floating is
     /// confirmed" caveat applies here, this is just the `UdpTransport`-typed
     /// entry point for callers that only ever see the wrapped socket.

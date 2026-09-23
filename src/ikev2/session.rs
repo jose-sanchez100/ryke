@@ -374,6 +374,59 @@ struct CrossedRekey {
     lowest_nonce: Vec<u8>,
 }
 
+/// The traffic selectors a CHILD SA was negotiated with, by side: `ours` is
+/// this end's (the TSi of a request we send), `theirs` the gateway's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChildTs {
+    ours: TrafficSelectors,
+    theirs: TrafficSelectors,
+}
+
+impl ChildTs {
+    /// Whether `self`, a rekey's selectors, cover every selector of `old`,
+    /// those of the SA it replaces (RFC 7296 §2.9.2: "the new SA MUST NOT
+    /// have narrower selectors than the original").
+    fn covers(&self, old: &ChildTs) -> bool {
+        old.ours.is_within(&self.ours) && old.theirs.is_within(&self.theirs)
+    }
+}
+
+/// The traffic selectors of each of the tunnel's CHILD SAs, for RFC 7296
+/// §2.9.2's rule that a rekey never narrows them. `None` where they are not
+/// known, and then no rekey of that CHILD SA is held to them.
+#[derive(Debug, Clone, Default)]
+struct ChildScopes {
+    primary: Option<ChildTs>,
+    ipv6: Option<ChildTs>,
+}
+
+impl ChildScopes {
+    fn get(&self, kind: ChildKind) -> Option<&ChildTs> {
+        match kind {
+            ChildKind::Primary => self.primary.as_ref(),
+            ChildKind::Ipv6 => self.ipv6.as_ref(),
+        }
+    }
+
+    fn set(&mut self, kind: ChildKind, ts: Option<ChildTs>) {
+        match kind {
+            ChildKind::Primary => self.primary = ts,
+            ChildKind::Ipv6 => self.ipv6 = ts,
+        }
+    }
+}
+
+/// What our side of a CHILD SA from `CREATE_CHILD_SA` or `IKE_AUTH` holds,
+/// read from the gateway's answer `msg` to a request of ours: TSi is ours.
+fn granted_child_ts(sa: &CompletedSaInit, msg: &[u8]) -> Option<ChildTs> {
+    rekey::peer_child_ts(sa, msg).map(|(tsi, tsr)| ChildTs { ours: tsi, theirs: tsr })
+}
+
+/// A `CREATE_CHILD_SA` exchange of ours, answered: the new SA, the `TSr`
+/// granted, the lower of the exchange's two nonces, and the traffic
+/// selectors the SA was granted.
+type ChildExchanged = (ChildSa, Option<TrafficSelectors>, Vec<u8>, Option<ChildTs>);
+
 /// The key material of `child`'s two directions, as a caller installs it.
 fn rekeyed_child(child: &ChildSa) -> RekeyedChild {
     RekeyedChild {
@@ -458,6 +511,9 @@ pub struct LivenessSession {
     /// [`Self::rekey_child`] then keeps proposing both, and
     /// [`Self::create_child_ipv6`] has nothing to add.
     child_carries_ipv6: bool,
+    /// The traffic selectors each CHILD SA carries, which none of its rekeys
+    /// may narrow (RFC 7296 §2.9.2).
+    child_ts: ChildScopes,
     /// The IKE SA's age and, after a peer-started rekey, the SA it replaced.
     ike: IkeSaState,
     /// CHILD SA rekeys the peer started -- see [`Self::take_peer_rekeys`].
@@ -674,7 +730,7 @@ impl LivenessSession {
         // A unified SA keeps being proposed as one: rekeying it IPv4-only would
         // silently drop IPv6 at the first rekey.
         let ts = if self.child_carries_ipv6 { TrafficSelectors::unified_full_tunnel() } else { TrafficSelectors::ipv4_full_tunnel() };
-        let (rekeyed, tsr) = self.child_exchange(Some((ChildKind::Primary, old)), &ts, "rekey", timeout)?;
+        let (rekeyed, tsr, _) = self.child_exchange(Some((ChildKind::Primary, old)), &ts, "rekey", timeout)?;
         if self.child_carries_ipv6 && !tsr.as_ref().is_some_and(|t| t.has_ipv6()) {
             ike_debug!("CREATE_CHILD_SA (rekey): the unified CHILD SA's rekey came back without IPv6 (TSr={tsr:?})");
         }
@@ -703,7 +759,7 @@ impl LivenessSession {
         if self.child_carries_ipv6 {
             return Err(IkeError::Crypto("the tunnel's CHILD SA already carries IPv6").into());
         }
-        let (child, tsr) = self.child_exchange(None, &TrafficSelectors::ipv6_full_tunnel(), "new IPv6 CHILD SA", timeout)?;
+        let (child, tsr, granted) = self.child_exchange(None, &TrafficSelectors::ipv6_full_tunnel(), "new IPv6 CHILD SA", timeout)?;
         let granted_subnets6 = granted_subnets_v6(tsr.as_ref(), &self.cfg_subnets6);
         // The CFG ranges alone don't prove the gateway granted this SA any
         // IPv6: it has to have granted an IPv6 selector too.
@@ -721,6 +777,7 @@ impl LivenessSession {
         }
         ike_debug!("CREATE_CHILD_SA (new IPv6 CHILD SA): granted TSr={tsr:?} -> routing {granted_subnets6:?}");
         self.child6 = Some(ChildSpis { local: child.local_spi, peer: child.peer_spi });
+        self.child_ts.ipv6 = granted;
         Ok(Ipv6Child { child, granted_subnets6 })
     }
 
@@ -738,9 +795,10 @@ impl LivenessSession {
     /// [`Self::create_child_ipv6`] already takes towards a gateway that
     /// momentarily refuses.
     pub fn create_child_primary(&mut self, timeout: Duration) -> Result<RekeyedChild, DriverError> {
-        let (child, _tsr) = self.child_exchange(None, &TrafficSelectors::ipv4_full_tunnel(), "new primary CHILD SA", timeout)?;
+        let (child, _tsr, granted) = self.child_exchange(None, &TrafficSelectors::ipv4_full_tunnel(), "new primary CHILD SA", timeout)?;
         self.child_local_spi = child.local_spi;
         self.child_peer_spi = child.peer_spi;
+        self.child_ts.primary = granted;
         self.primary_child_alive = true;
         Ok(child)
     }
@@ -763,38 +821,42 @@ impl LivenessSession {
     /// Errors if there is no IPv6 CHILD SA.
     pub fn rekey_child_ipv6(&mut self, timeout: Duration) -> Result<RekeyedChild, DriverError> {
         let old = self.child6.ok_or(IkeError::Crypto("no IPv6 CHILD SA to rekey"))?;
-        let (rekeyed, _tsr) = self.child_exchange(Some((ChildKind::Ipv6, old)), &TrafficSelectors::ipv6_full_tunnel(), "rekey IPv6", timeout)?;
+        let (rekeyed, _tsr, _) = self.child_exchange(Some((ChildKind::Ipv6, old)), &TrafficSelectors::ipv6_full_tunnel(), "rekey IPv6", timeout)?;
         Ok(rekeyed)
     }
 
     /// One `CREATE_CHILD_SA` exchange creating a CHILD SA proposing `ts` as
     /// both TSi and TSr: a rekey of `kind`'s CHILD SA `old` when `replaces` is
     /// `Some((kind, old))`, a brand-new CHILD SA otherwise. Returns the new SA
-    /// and the `TSr` the gateway granted. `what` only labels the debug output.
-    /// A rekey is settled by [`Self::settle_rekey`], which records the SA that
-    /// ends up replacing `old` as `kind`'s; a brand-new CHILD SA isn't recorded
-    /// anywhere -- the callers own which SA that is.
+    /// the `TSr` the gateway granted and all the traffic selectors it granted.
+    /// `what` only labels the debug output. A rekey is settled by
+    /// [`Self::settle_rekey`], which records the SA that ends up replacing
+    /// `old` as `kind`'s, and is refused if it narrows what `old` carries
+    /// (RFC 7296 §2.9.2); a brand-new CHILD SA isn't recorded anywhere -- the
+    /// callers own which SA that is.
     fn child_exchange(
         &mut self,
         replaces: Option<(ChildKind, ChildSpis)>,
         ts: &TrafficSelectors,
         what: &str,
         timeout: Duration,
-    ) -> Result<(RekeyedChild, Option<TrafficSelectors>), DriverError> {
+    ) -> Result<(RekeyedChild, Option<TrafficSelectors>, Option<ChildTs>), DriverError> {
         let op = replaces.map_or(ChildOp::Create, |(_, old)| ChildOp::Rekey(old));
+        let keep = replaces.and_then(|(kind, _)| self.child_ts.get(kind).cloned());
         self.peer_child.in_flight = Some(OwnChildOp { op, crossed: None, old_deleted: false });
-        let exchanged = self.child_request(replaces.map(|(_, old)| old), ts, what, timeout);
+        let exchanged = self.child_request(replaces.map(|(_, old)| old), keep, ts, what, timeout);
         let own = self.peer_child.in_flight.take();
         match (replaces, own) {
             (Some((kind, old)), Some(own)) => self.settle_rekey(kind, old, own, exchanged, what),
-            _ => exchanged.map(|(child, tsr, _)| (rekeyed_child(&child), tsr)),
+            _ => exchanged.map(|(child, tsr, _, granted)| (rekeyed_child(&child), tsr, granted)),
         }
     }
 
     /// Where a rekey of `kind`'s CHILD SA `old` leaves things, once our own
     /// `CREATE_CHILD_SA` exchange for it (`exchanged`: the new SA, the `TSr`
-    /// granted and the lower of the exchange's two nonces) is over. Records the
-    /// SA replacing `old` as `kind`'s, deletes what is left over, and returns
+    /// granted, the lower of the exchange's two nonces and the traffic
+    /// selectors granted) is over. Records the SA replacing `old`, and its
+    /// traffic selectors, as `kind`'s, deletes what is left over, and returns
     /// the SA the caller installs.
     ///
     /// The peer may have rekeyed `old` too while ours was in flight
@@ -821,12 +883,14 @@ impl LivenessSession {
         kind: ChildKind,
         old: ChildSpis,
         own: OwnChildOp,
-        exchanged: Result<(ChildSa, Option<TrafficSelectors>, Vec<u8>), DriverError>,
+        exchanged: Result<ChildExchanged, DriverError>,
         what: &str,
-    ) -> Result<(RekeyedChild, Option<TrafficSelectors>), DriverError> {
-        let (child, tsr) = match (exchanged, own.crossed) {
-            (Ok((child, tsr, _)), None) => (child, tsr),
-            (Ok((child, tsr, our_lowest)), Some(crossed)) => {
+    ) -> Result<(RekeyedChild, Option<TrafficSelectors>, Option<ChildTs>), DriverError> {
+        // A peer rekey answered meanwhile has already recorded its SA, and
+        // its traffic selectors, as `kind`'s.
+        let (child, tsr, granted) = match (exchanged, own.crossed) {
+            (Ok((child, tsr, _, granted)), None) => (child, tsr, granted),
+            (Ok((child, tsr, our_lowest, granted)), Some(crossed)) => {
                 let ours = rekeyed_child(&child);
                 if our_lowest < crossed.lowest_nonce {
                     ike_debug!(
@@ -836,7 +900,7 @@ impl LivenessSession {
                     if let Err(e) = self.delete_child_sa(ChildSpis::of(&ours)) {
                         ike_debug!("CREATE_CHILD_SA ({what}): failed to send Delete for the redundant CHILD SA spi_in={:08x}: {e}", ours.local_spi);
                     }
-                    return Ok((crossed.child, tsr));
+                    return Ok((crossed.child, tsr, self.child_ts.get(kind).cloned()));
                 }
                 ike_debug!(
                     "CREATE_CHILD_SA ({what}): the peer rekeyed the same CHILD SA -- its SA (spi_in={:08x}) holds the lowest nonce, the peer deletes it; keeping ours (spi_in={:08x})",
@@ -847,7 +911,7 @@ impl LivenessSession {
                 // `old` went into `superseded` when the peer's rekey was answered,
                 // for the peer to delete; now it's ours to delete.
                 self.peer_child.superseded.retain(|s| s.peer_spi != old.peer);
-                (child, tsr)
+                (child, tsr, granted)
             }
             (Err(DriverError::Ike(IkeError::PeerTornDown)), _) => return Err(IkeError::PeerTornDown.into()),
             (Err(e), Some(crossed)) => {
@@ -855,13 +919,16 @@ impl LivenessSession {
                     "CREATE_CHILD_SA ({what}): failed ({e}), but the peer rekeyed the same CHILD SA meanwhile -- keeping its SA (spi_in={:08x})",
                     crossed.child.local_spi
                 );
-                return Ok((crossed.child, None));
+                return Ok((crossed.child, None, self.child_ts.get(kind).cloned()));
             }
             (Err(e), None) if own.old_deleted => return Err(self.lost_child(kind, e)),
             (Err(e), None) => return Err(e),
         };
         let rekeyed = rekeyed_child(&child);
         self.set_child_spis(kind, &rekeyed);
+        if granted.is_some() {
+            self.child_ts.set(kind, granted.clone());
+        }
         // RFC 7296 §2.8's own worked example ends a rekey with the initiator
         // explicitly deleting the SA it just replaced -- without this, a real
         // gateway (confirmed live against a FortiGate) has no way to know the
@@ -878,7 +945,7 @@ impl LivenessSession {
                 );
             }
         }
-        Ok((rekeyed, tsr))
+        Ok((rekeyed, tsr, granted))
     }
 
     /// Record `child` as `kind`'s CHILD SA.
@@ -923,15 +990,19 @@ impl LivenessSession {
     }
 
     /// The `CREATE_CHILD_SA` exchange itself, for [`Self::child_exchange`]:
-    /// the new SA, the `TSr` granted, and the lower of the exchange's two
-    /// nonces (for [`Self::settle_rekey`]).
+    /// the new SA, the `TSr` granted, the lower of the exchange's two nonces
+    /// (for [`Self::settle_rekey`]) and the traffic selectors granted. `keep`
+    /// is what the SA a rekey replaces carries, when known: an answer
+    /// granting less is refused (RFC 7296 §2.9.2) and its SA deleted, which
+    /// leaves the old one in use.
     fn child_request(
         &mut self,
         replaces: Option<ChildSpis>,
+        keep: Option<ChildTs>,
         ts: &TrafficSelectors,
         what: &str,
         timeout: Duration,
-    ) -> Result<(ChildSa, Option<TrafficSelectors>, Vec<u8>), DriverError> {
+    ) -> Result<ChildExchanged, DriverError> {
         let mut entropy = OsEntropy::new()?;
         let mut ni = vec![0u8; NONCE_LEN];
         entropy.fill(&mut ni);
@@ -1002,9 +1073,23 @@ impl LivenessSession {
             }
             Err(e) => return Err(e.into()),
         };
+        let granted = granted_child_ts(&self.sa, &response);
+        // RFC 7296 §2.9.2: "the new SA MUST NOT have narrower selectors than
+        // the original". The peer made it, so it is deleted, not used.
+        if let (Some(keep), Some(granted)) = (&keep, &granted) {
+            if !granted.covers(keep) {
+                ike_debug!(
+                    "CREATE_CHILD_SA ({what}): the answer narrows the traffic selectors of the CHILD SA it replaces ({keep:?} -> {granted:?}) -- deleting the CHILD SA spi_in={new_local_spi:08x}"
+                );
+                if let Err(e) = self.delete_child_sa(ChildSpis::of(&rekeyed_child(&child))) {
+                    ike_debug!("CREATE_CHILD_SA ({what}): failed to delete it: {e}");
+                }
+                return Err(IkeError::TsNarrowedOnRekey.into());
+            }
+        }
         ike_debug!("CREATE_CHILD_SA ({what}): complete -- new spi_in={:08x} spi_out={:08x}", child.inbound.spi(), child.outbound.spi());
         let nr = rekey::peer_child_nonce(&self.sa, &response).unwrap_or_default();
-        Ok((child, Some(tsr), ni.min(nr)))
+        Ok((child, Some(tsr), ni.min(nr), granted))
     }
 
     /// The next IKE datagram, waiting at most `timeout`: from `external_rx`
@@ -1642,6 +1727,21 @@ impl LivenessSession {
                 &format!("no CHILD SA with spi {rekeyed_spi:08x}"),
             );
         };
+        // The peer's TSi is its side. What the answer grants: the proposal, less
+        // any selector of a type this crate does not know (RFC 7296 §2.9).
+        let any = TrafficSelectors::unified_full_tunnel();
+        let proposed = rekey::peer_child_ts(&self.sa, msg)
+            .and_then(|(tsi, tsr)| Some(ChildTs { ours: tsr.narrowed_to(&any)?, theirs: tsi.narrowed_to(&any)? }));
+        // RFC 7296 §2.9.2: the rekey's selectors "SHOULD be either the same as, or
+        // a superset of" the old SA's, and the new SA "MUST NOT have narrower
+        // selectors than the original" -- a proposal narrower than what the SA
+        // carries is refused, and the SA stays as it is.
+        if let (Some(keep), Some(proposed)) = (self.child_ts.get(kind), &proposed) {
+            if !proposed.covers(keep) {
+                let why = format!("it narrows the {kind:?} CHILD SA's traffic selectors ({keep:?} -> {proposed:?})");
+                return self.refuse_peer_child_request(current, header, msg, iv, notify_type::TS_UNACCEPTABLE, &why);
+            }
+        }
         let mut entropy = OsEntropy::new()?;
         let mut nr = vec![0u8; NONCE_LEN];
         entropy.fill(&mut nr);
@@ -1662,6 +1762,9 @@ impl LivenessSession {
                     header.message_id, rekeyed.local_spi, rekeyed.peer_spi
                 );
                 self.set_child_spis(kind, &rekeyed);
+                if proposed.is_some() {
+                    self.child_ts.set(kind, proposed);
+                }
                 self.peer_child.superseded.push(SupersededChild { local_spi: old.local, peer_spi: old.peer, since: Instant::now() });
                 match self.peer_child.in_flight.as_mut().filter(|_| crossed) {
                     Some(own) => {
@@ -2530,6 +2633,7 @@ impl<E: Entropy> Ikev2Session<E> {
             child6: None,
             cfg_subnets6: info.subnets6.clone(),
             child_carries_ipv6: false,
+            child_ts: ChildScopes::default(),
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
         };
@@ -2544,7 +2648,7 @@ impl<E: Entropy> Ikev2Session<E> {
             return Err(rejection.into());
         }
         ike_debug!("IKE_AUTH: CHILD SA refused ({rejection}) -- keeping the IKE SA, creating the IPv4 CHILD SA with CREATE_CHILD_SA");
-        let (child, tsr) = match liveness.child_exchange(
+        let (child, tsr, granted) = match liveness.child_exchange(
             None,
             &TrafficSelectors::ipv4_full_tunnel(),
             "IPv4 CHILD SA after a refused IKE_AUTH offer",
@@ -2569,6 +2673,7 @@ impl<E: Entropy> Ikev2Session<E> {
         }
         liveness.child_local_spi = child.local_spi;
         liveness.child_peer_spi = child.peer_spi;
+        liveness.child_ts.primary = granted;
         Ok(ConnectedTunnel {
             local_spi: child.local_spi,
             peer_spi: child.peer_spi,
@@ -2722,6 +2827,7 @@ impl<E: Entropy> Ikev2Session<E> {
         let cipher = resolve_esp_cipher(esp_suite)?;
         let (key_out, key_in) = Self::derive_keys(&sa, cipher);
         let pfs = PfsPolicy::from_offer(esp_offer)?;
+        let child_ts = ChildScopes { primary: granted_child_ts(&sa, &response), ipv6: None };
         let liveness = LivenessSession {
             sock,
             sa,
@@ -2736,6 +2842,7 @@ impl<E: Entropy> Ikev2Session<E> {
             child6: None,
             cfg_subnets6: info.subnets6.clone(),
             child_carries_ipv6: !child_subnets6.is_empty(),
+            child_ts,
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
         };
@@ -3024,6 +3131,7 @@ impl<E: Entropy> Ikev2Session<E> {
         // requests and the peer's share one strictly-increasing sequence.
         let next_message_id = IkeHeader::parse(&last_message)?.message_id + 1;
         let pfs = PfsPolicy::from_offer(esp_offer)?;
+        let child_ts = ChildScopes { primary: granted_child_ts(sa, &last_message), ipv6: None };
         let liveness = LivenessSession {
             sock,
             sa: sa.clone(),
@@ -3038,6 +3146,7 @@ impl<E: Entropy> Ikev2Session<E> {
             child6: None,
             cfg_subnets6: info.subnets6.clone(),
             child_carries_ipv6: !child_subnets6.is_empty(),
+            child_ts,
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
         };
@@ -3154,7 +3263,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
@@ -3192,7 +3301,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         // Must NOT report Alive on the forged datagram -- with no genuine
         // reply arriving, the probe times out instead.
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::NoReply);
@@ -3223,7 +3332,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
@@ -3253,7 +3362,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -3280,7 +3389,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         liveness.close().unwrap();
         responder.join().unwrap();
     }
@@ -3294,7 +3403,7 @@ mod tests {
         let (init_sa, _resp_sa) = liveness_sa_pair();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         liveness.close().unwrap();
     }
 
@@ -3309,7 +3418,7 @@ mod tests {
         let unreachable: SocketAddr = silent_peer.local_addr().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::NoReply);
     }
 
@@ -3319,7 +3428,7 @@ mod tests {
         let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         // Unlike probe(), silence on a peek is Alive (nothing new to
         // report), not NoReply -- peek never asked anything.
         assert_eq!(liveness.peek(Duration::from_millis(50)).unwrap(), Liveness::Alive);
@@ -3353,7 +3462,7 @@ mod tests {
         probe_sock.send_to(b"hello", bind).unwrap();
 
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -3418,6 +3527,7 @@ mod tests {
             child6,
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
+            child_ts: ChildScopes::default(),
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
         };
@@ -3462,12 +3572,14 @@ mod tests {
         proposals: Vec<crate::ikev2::payload::Proposal>,
         ke: Option<crate::ikev2::payload::KeyExchange>,
     ) -> Vec<u8> {
-        hand_built_peer_rekey_with_ts(sa, proposals, ke, &TrafficSelectors::ipv4_full_tunnel())
+        hand_built_peer_rekey_with_ts(sa, 0xAAAA, proposals, ke, &TrafficSelectors::ipv4_full_tunnel())
     }
 
-    /// [`hand_built_peer_rekey`] proposing `ts` as both TSi and TSr.
+    /// [`hand_built_peer_rekey`] of the CHILD SA whose inbound SPI on the
+    /// peer's side is `rekeyed_spi`, proposing `ts` as both TSi and TSr.
     fn hand_built_peer_rekey_with_ts(
         sa: &CompletedSaInit,
+        rekeyed_spi: u32,
         proposals: Vec<crate::ikev2::payload::Proposal>,
         ke: Option<crate::ikev2::payload::KeyExchange>,
         ts: &TrafficSelectors,
@@ -3476,7 +3588,7 @@ mod tests {
         use crate::ikev2::payload::Notify;
 
         let rekey_sa =
-            Notify { protocol_id: protocol_id::ESP, spi: 0xAAAAu32.to_be_bytes().to_vec(), notify_type: notify_type::REKEY_SA, data: Vec::new() };
+            Notify { protocol_id: protocol_id::ESP, spi: rekeyed_spi.to_be_bytes().to_vec(), notify_type: notify_type::REKEY_SA, data: Vec::new() };
         let mut inner = vec![
             (PayloadType::Notify, rekey_sa.to_bytes()),
             (PayloadType::SecurityAssociation, SecurityAssociation { proposals }.to_bytes()),
@@ -3581,7 +3693,7 @@ mod tests {
 
         let unknown = t.unknown.clone();
         let unknown =
-            move |sa: &CompletedSaInit| hand_built_peer_rekey_with_ts(sa, gcm_esp_offer_with_dh(PEER_NEW_SPI, &[]).proposals, None, &unknown);
+            move |sa: &CompletedSaInit| hand_built_peer_rekey_with_ts(sa, 0xAAAA, gcm_esp_offer_with_dh(PEER_NEW_SPI, &[]).proposals, None, &unknown);
         let (response, resp_sa, mut liveness) = peer_child_request_answered_with(PfsPolicy::none(), None, unknown);
         assert_eq!(refusal_notify(&resp_sa, &response), (notify_type::TS_UNACCEPTABLE, Vec::new()));
         assert!(liveness.take_peer_rekeys().is_empty());
@@ -3589,7 +3701,9 @@ mod tests {
 
         // Control: an IPv4 selector behind the unknown one.
         let mixed = t.unknown_then_v4.clone();
-        let mixed = move |sa: &CompletedSaInit| hand_built_peer_rekey_with_ts(sa, gcm_esp_offer_with_dh(PEER_NEW_SPI, &[]).proposals, None, &mixed);
+        let mixed = move |sa: &CompletedSaInit| {
+            hand_built_peer_rekey_with_ts(sa, 0xAAAA, gcm_esp_offer_with_dh(PEER_NEW_SPI, &[]).proposals, None, &mixed)
+        };
         let (response, resp_sa, mut liveness) = peer_child_request_answered_with(PfsPolicy::none(), None, mixed);
         let (_, granted) =
             rekey::initiator_complete_child(&resp_sa, &PEER_NI, PEER_NEW_SPI, SkCipher::Aes256Gcm, None, &t.unknown_then_v4, &response)
@@ -3654,6 +3768,7 @@ mod tests {
             child6: None,
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
+            child_ts: ChildScopes::default(),
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(),
             primary_child_alive: true,
@@ -3806,6 +3921,7 @@ mod tests {
             child6: None,
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
+            child_ts: ChildScopes::default(),
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
         };
@@ -3850,6 +3966,7 @@ mod tests {
             child6: None,
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
+            child_ts: ChildScopes::default(),
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
         };
@@ -3899,6 +4016,7 @@ mod tests {
             child6: Some(ChildSpis { local: 0x6666, peer: 0x7777 }),
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
+            child_ts: ChildScopes::default(),
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(),
             primary_child_alive: true, peer_requests: PeerRequests::default(),
@@ -3949,6 +4067,7 @@ mod tests {
             child6: Some(ChildSpis { local: 0x6666, peer: 0x7777 }),
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
+            child_ts: ChildScopes::default(),
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(),
             primary_child_alive: true, peer_requests: PeerRequests::default(),
@@ -4059,6 +4178,7 @@ mod tests {
             child6: None,
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
+            child_ts: ChildScopes::default(),
             ike: IkeSaState::new(),
             peer_child: PeerChildState {
                 superseded: vec![SupersededChild { local_spi: 0x9999, peer_spi: 0x7777, since: Instant::now() }],
@@ -4091,6 +4211,7 @@ mod tests {
             child6,
             cfg_subnets6: Vec::new(),
             child_carries_ipv6: false,
+            child_ts: ChildScopes::default(),
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(),
             primary_child_alive: true,
@@ -7044,7 +7165,7 @@ mod tests {
         let (init_sa, _resp_sa) = liveness_sa_pair();
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let dest = sock.local_addr().unwrap();
-        LivenessSession { sock, sa: init_sa, dest, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() }
+        LivenessSession { sock, sa: init_sa, dest, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() }
     }
 
     #[test]
@@ -7352,6 +7473,13 @@ mod tests {
         GrantBoth,
         /// [`Self::GrantBoth`], then answers one rekey of that CHILD SA.
         GrantBothThenRekey,
+        /// [`Self::GrantBoth`], then answers one rekey of that CHILD SA with
+        /// less than it granted: IPv4 alone, and on the client's side only
+        /// the address it assigned.
+        GrantBothThenNarrowedRekey,
+        /// [`Self::GrantBoth`], then rekeys that CHILD SA itself proposing
+        /// IPv4 and IPv6 again if `both_families`, IPv4 alone otherwise.
+        GrantBothThenPeerRekeys { both_families: bool },
         /// Narrows the reply to IPv4 (RFC 7296 §2.9), as a per-family peer might.
         NarrowToIpv4,
         /// Grants IPv6 alone.
@@ -7372,6 +7500,13 @@ mod tests {
         created_child_tsi: Option<TrafficSelectors>,
         /// Whether the client then sent an IKE SA Delete.
         client_deleted_ike_sa: bool,
+        /// Whether the client deleted the CHILD SA a narrowed rekey had just
+        /// made ([`UnifiedReply::GrantBothThenNarrowedRekey`]).
+        deleted_rekeyed_child: bool,
+        /// How the client answered the gateway's own rekey
+        /// ([`UnifiedReply::GrantBothThenPeerRekeys`]): the error Notify it
+        /// refused it with, or `0` if it took it.
+        peer_rekey_answer: Option<u16>,
     }
 
     /// Rewrites an honest `IKE_AUTH` response (`resp`, from `responder_process_auth`
@@ -7388,7 +7523,11 @@ mod tests {
         let is_ts = |t: PayloadType| matches!(t, PayloadType::TrafficSelectorInitiator | PayloadType::TrafficSelectorResponder);
         let answer: Vec<(PayloadType, Vec<u8>)> = match reply {
             UnifiedReply::NarrowToIpv4 => honest,
-            UnifiedReply::GrantBoth | UnifiedReply::GrantBothThenRekey | UnifiedReply::Ipv6Only => {
+            UnifiedReply::GrantBoth
+            | UnifiedReply::GrantBothThenRekey
+            | UnifiedReply::GrantBothThenNarrowedRekey
+            | UnifiedReply::GrantBothThenPeerRekeys { .. }
+            | UnifiedReply::Ipv6Only => {
                 let ts = if !matches!(reply, UnifiedReply::Ipv6Only) {
                     offered_tsi.clone()
                 } else {
@@ -7457,6 +7596,40 @@ mod tests {
         asked
     }
 
+    /// Answer the client's next `CREATE_CHILD_SA` as a gateway narrowing it to
+    /// the IPv4 address it `assigned` and IPv4 on its own side. Returns the
+    /// TSi the client asked for, and whether the client's next message is a
+    /// Delete of the CHILD SA that answer made (and of nothing else).
+    fn answer_rekey_narrowed(sock: &UdpSocket, sa: &CompletedSaInit, assigned: Ipv4Addr) -> (Option<TrafficSelectors>, bool) {
+        let mut buf = [0u8; 4096];
+        let (n, from) = sock.recv_from(&mut buf).unwrap();
+        let (first, inner) = open_encrypted(sa.suite.sk_cipher(), &buf[..n], &sa.keys.sk_ei, &sa.keys.sk_ai).unwrap();
+        let payload = |ty| payloads(first, &inner).map(|p| p.unwrap()).find(|p| p.payload_type == ty).map(|p| p.data.to_vec());
+        let asked = payload(PayloadType::TrafficSelectorInitiator).map(|ts| TrafficSelectors::parse(&ts).unwrap());
+        let client_spi = crate::ikev2::ike_auth::esp_spi_from_sa(&payload(PayloadType::SecurityAssociation).unwrap()).unwrap();
+        let (resp, _) =
+            rekey::responder_process_rekey_with_pfs(sa, &buf[..n], 0xFEED_FACE, &[0x77u8; 32], SkCipher::Aes256Gcm, None, &[8u8; 8], Some(assigned))
+                .unwrap();
+        sock.send_to(&resp, from).unwrap();
+
+        let deleted = match sock.recv_from(&mut buf) {
+            Ok((n, from)) => {
+                let deleted = open_informational(sa, &buf[..n]).unwrap().iter().any(|(t, body)| {
+                    *t == PayloadType::Delete && {
+                        let del = crate::ikev2::payload::Delete::parse(body).unwrap();
+                        del.protocol_id == protocol_id::ESP && del.spis == [client_spi]
+                    }
+                });
+                // Answered, as a gateway would, so it is not retransmitted.
+                let mid = IkeHeader::parse(&buf[..n]).unwrap().message_id;
+                sock.send_to(&build_informational(sa, mid, true, &[], &[9u8; 8]).unwrap(), from).unwrap();
+                deleted
+            }
+            Err(_) => false,
+        };
+        (asked, deleted)
+    }
+
     /// Whether the next datagram on `sock` is an IKE SA Delete from the client.
     fn client_closes_ike_sa(sock: &UdpSocket, sa: &CompletedSaInit) -> bool {
         let mut buf = [0u8; 4096];
@@ -7502,14 +7675,32 @@ mod tests {
         sock.send_to(&rebuilt, from).unwrap();
 
         sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let created_child_tsi = match reply {
-            UnifiedReply::Refuse { serve_child, .. } => answer_recovery_child(&sock, &sa, serve_child),
-            UnifiedReply::GrantBothThenRekey => answer_recovery_child(&sock, &sa, true),
+        let (created_child_tsi, deleted_rekeyed_child) = match reply {
+            UnifiedReply::Refuse { serve_child, .. } => (answer_recovery_child(&sock, &sa, serve_child), false),
+            UnifiedReply::GrantBothThenRekey => (answer_recovery_child(&sock, &sa, true), false),
+            UnifiedReply::GrantBothThenNarrowedRekey => answer_rekey_narrowed(&sock, &sa, assigned.ip),
+            _ => (None, false),
+        };
+        let peer_rekey_ts = match reply {
+            UnifiedReply::GrantBothThenPeerRekeys { both_families: true } => Some(TrafficSelectors::unified_full_tunnel()),
+            UnifiedReply::GrantBothThenPeerRekeys { both_families: false } => Some(TrafficSelectors::ipv4_full_tunnel()),
             _ => None,
         };
+        let peer_rekey_answer = peer_rekey_ts.map(|ts| {
+            let request = hand_built_peer_rekey_with_ts(&sa, 0xC0FFEE, gcm_esp_offer_with_dh(PEER_NEW_SPI, &[]).proposals, None, &ts);
+            sock.send_to(&request, from).unwrap();
+            let mut buf = [0u8; 4096];
+            let (n, _) = sock.recv_from(&mut buf).unwrap();
+            let answer = open_informational(&sa, &buf[..n]).unwrap();
+            answer
+                .iter()
+                .find(|(t, _)| *t == PayloadType::Notify)
+                .map(|(_, body)| crate::ikev2::payload::Notify::parse(body).unwrap().notify_type)
+                .unwrap_or(0)
+        });
         // Whatever comes next is either the client closing the IKE SA or nothing.
         let client_deleted_ike_sa = client_closes_ike_sa(&sock, &sa);
-        UnifiedObserved { offered_tsi, created_child_tsi, client_deleted_ike_sa }
+        UnifiedObserved { offered_tsi, created_child_tsi, client_deleted_ike_sa, deleted_rekeyed_child, peer_rekey_answer }
     }
 
     fn connect_unified_direct(bind: SocketAddr, psk: &[u8]) -> Result<ConnectedTunnel, DriverError> {
@@ -7534,6 +7725,8 @@ mod tests {
         assert_eq!(tunnel.child_subnets6, vec![(Ipv6Addr::UNSPECIFIED, 0)]);
         assert_eq!(tunnel.granted_subnets, vec![(Ipv4Addr::UNSPECIFIED, 0)]);
         assert_eq!(tunnel.peer_spi, 0xC0FFEE);
+        let both = TrafficSelectors::unified_full_tunnel();
+        assert_eq!(tunnel.liveness.child_ts.primary, Some(ChildTs { ours: both.clone(), theirs: both }), "what a rekey must keep");
         assert!(
             tunnel.liveness.create_child_ipv6(Duration::from_millis(200)).is_err(),
             "no separate IPv6 CHILD SA next to one that already carries it"
@@ -7554,6 +7747,79 @@ mod tests {
             Some(TrafficSelectors::unified_full_tunnel()),
             "an IPv4-only rekey would silently drop IPv6"
         );
+    }
+
+    /// RFC 7296 §2.9.2: "the new SA MUST NOT have narrower selectors than the
+    /// original", and "The responder MUST NOT narrow down the Traffic
+    /// Selectors narrower than the scope currently in use". A gateway that
+    /// granted IPv4 and IPv6 and answers the rekey with IPv4 alone -- and one
+    /// address on our side -- would have the new SA drop traffic the old one
+    /// carried: the rekey fails, the new SA is deleted, and the one in place
+    /// is kept, still carrying both families.
+    #[test]
+    fn a_rekey_answered_narrower_than_the_child_sa_it_replaces_is_refused() {
+        let (bind, responder) = spawn_unified_responder(UnifiedReply::GrantBothThenNarrowedRekey, b"shared-secret");
+        let mut tunnel = connect_unified_direct(bind, b"shared-secret").unwrap();
+        let Err(err) = tunnel.liveness.rekey_child(Duration::from_secs(5)) else { panic!("a narrower rekey is refused") };
+        assert!(matches!(err, DriverError::Ike(IkeError::TsNarrowedOnRekey)), "got {err:?}");
+        assert_eq!(
+            (tunnel.liveness.child_local_spi, tunnel.liveness.child_peer_spi),
+            (tunnel.local_spi, tunnel.peer_spi),
+            "the CHILD SA in place is kept"
+        );
+        assert!(tunnel.liveness.child_carries_ipv6(), "still one SA for both families");
+        let observed = responder.join().unwrap();
+        assert_eq!(observed.created_child_tsi, Some(TrafficSelectors::unified_full_tunnel()), "the rekey proposed both families");
+        assert!(observed.deleted_rekeyed_child, "the CHILD SA the narrowed answer made is deleted");
+        assert!(!observed.client_deleted_ike_sa, "the IKE SA stays up");
+    }
+
+    /// RFC 7296 §2.9.2, the other way round: a gateway that granted IPv4 and
+    /// IPv6 in one CHILD SA and then rekeys it proposing IPv4 alone asks for
+    /// an SA narrower than the one it replaces, which no answer (a subset of
+    /// the proposal, §2.9) can put right. It is refused `TS_UNACCEPTABLE` and
+    /// the CHILD SA in place is kept.
+    #[test]
+    fn a_peer_rekey_proposing_less_than_the_child_sa_carries_is_refused_ts_unacceptable() {
+        let (bind, responder) = spawn_unified_responder(UnifiedReply::GrantBothThenPeerRekeys { both_families: false }, b"shared-secret");
+        let mut tunnel = connect_unified_direct(bind, b"shared-secret").unwrap();
+        assert_eq!(tunnel.liveness.peek(Duration::from_millis(1500)).unwrap(), Liveness::Alive);
+        assert!(tunnel.liveness.take_peer_rekeys().is_empty(), "nothing to install");
+        assert_eq!((tunnel.liveness.child_local_spi, tunnel.liveness.child_peer_spi), (tunnel.local_spi, tunnel.peer_spi));
+        assert_eq!(responder.join().unwrap().peer_rekey_answer, Some(notify_type::TS_UNACCEPTABLE));
+    }
+
+    /// The positive control of the test above: the gateway's rekey of the
+    /// unified CHILD SA proposing both families again is taken on.
+    #[test]
+    fn a_peer_rekey_proposing_what_the_child_sa_carries_is_taken_on() {
+        let (bind, responder) = spawn_unified_responder(UnifiedReply::GrantBothThenPeerRekeys { both_families: true }, b"shared-secret");
+        let mut tunnel = connect_unified_direct(bind, b"shared-secret").unwrap();
+        assert_eq!(tunnel.liveness.peek(Duration::from_millis(1500)).unwrap(), Liveness::Alive);
+        let rekeys = tunnel.liveness.take_peer_rekeys();
+        assert_eq!(rekeys.len(), 1, "the new SA is handed over");
+        assert_eq!(rekeys[0].kind, ChildKind::Primary);
+        assert_eq!(tunnel.liveness.child_peer_spi, PEER_NEW_SPI);
+        assert!(tunnel.liveness.child_carries_ipv6());
+        assert_eq!(responder.join().unwrap().peer_rekey_answer, Some(0), "answered without an error Notify");
+    }
+
+    /// RFC 7296 §2.9.2 compares a rekey's selectors with those of the SA it
+    /// replaces: the same or a superset passes, anything narrower -- a
+    /// family, or part of a range, left out on either side -- does not.
+    #[test]
+    fn a_child_sa_s_traffic_selectors_are_covered_only_by_the_same_or_wider() {
+        let scope = |ours: TrafficSelectors, theirs: TrafficSelectors| ChildTs { ours, theirs };
+        let host = |a| TrafficSelectors { selectors: vec![crate::ikev2::payload::TrafficSelector::ipv4_host(a)] };
+        let unified = scope(TrafficSelectors::unified_full_tunnel(), TrafficSelectors::unified_full_tunnel());
+        let ipv4 = scope(TrafficSelectors::ipv4_full_tunnel(), TrafficSelectors::ipv4_full_tunnel());
+        let one_address = scope(host(Ipv4Addr::new(10, 9, 8, 7)), TrafficSelectors::ipv4_full_tunnel());
+        assert!(unified.covers(&unified) && ipv4.covers(&ipv4), "the same");
+        assert!(unified.covers(&ipv4) && ipv4.covers(&one_address), "wider");
+        assert!(!ipv4.covers(&unified), "IPv6 dropped");
+        assert!(!one_address.covers(&ipv4), "our side narrowed to one address");
+        let theirs_narrowed = scope(TrafficSelectors::ipv4_full_tunnel(), host(Ipv4Addr::new(192, 0, 2, 1)));
+        assert!(!theirs_narrowed.covers(&ipv4), "the gateway's side narrowed");
     }
 
     #[test]
@@ -7599,6 +7865,8 @@ mod tests {
             assert_eq!(tunnel.dns, vec![Ipv4Addr::new(10, 9, 8, 1)]);
             assert_eq!(tunnel.granted_subnets, vec![(Ipv4Addr::UNSPECIFIED, 0)]);
             assert!(!tunnel.liveness.child_carries_ipv6() && tunnel.child_subnets6.is_empty());
+            let scope = tunnel.liveness.child_ts.primary.as_ref().expect("the CREATE_CHILD_SA's selectors are what a rekey must keep");
+            assert_eq!(scope.theirs, TrafficSelectors::ipv4_full_tunnel());
             let observed = responder.join().unwrap();
             assert_eq!(observed.offered_tsi, TrafficSelectors::unified_full_tunnel());
             assert_eq!(
@@ -7731,7 +7999,13 @@ mod tests {
             _ => None,
         };
         let client_deleted_ike_sa = client_closes_ike_sa(&sock, &sa);
-        UnifiedObserved { offered_tsi: offered_tsi.expect("TSi"), created_child_tsi, client_deleted_ike_sa }
+        UnifiedObserved {
+            offered_tsi: offered_tsi.expect("TSi"),
+            created_child_tsi,
+            client_deleted_ike_sa,
+            deleted_rekeyed_child: false,
+            peer_rekey_answer: None,
+        }
     }
 
     fn connect_unified_eap(reply: UnifiedReply) -> (Result<ConnectedTunnel, DriverError>, UnifiedObserved) {
@@ -7763,6 +8037,8 @@ mod tests {
         assert!(tunnel.liveness.child_carries_ipv6());
         assert_eq!(tunnel.child_subnets6, vec![(Ipv6Addr::UNSPECIFIED, 0)]);
         assert_eq!(tunnel.peer_spi, 0xBEEF);
+        let both = TrafficSelectors::unified_full_tunnel();
+        assert_eq!(tunnel.liveness.child_ts.primary, Some(ChildTs { ours: both.clone(), theirs: both }), "what a rekey must keep");
         assert_eq!(observed.offered_tsi, TrafficSelectors::unified_full_tunnel());
     }
 
@@ -7780,6 +8056,8 @@ mod tests {
             connect_unified_eap(UnifiedReply::Refuse { error: notify_type::TS_UNACCEPTABLE, serve_child: true });
         let tunnel = tunnel.unwrap();
         assert_ne!(tunnel.peer_spi, 0xBEEF, "the IKE_AUTH SPI belongs to a CHILD SA that never existed");
+        let scope = tunnel.liveness.child_ts.primary.as_ref().expect("the CREATE_CHILD_SA's selectors are what a rekey must keep");
+        assert_eq!(scope.theirs, TrafficSelectors::ipv4_full_tunnel());
         assert_eq!(tunnel.assigned_ip4, Some(Ipv4Addr::new(10, 9, 8, 7)));
         assert_eq!(tunnel.dns, vec![Ipv4Addr::new(10, 9, 8, 1)]);
         assert_eq!(observed.created_child_tsi, Some(TrafficSelectors::ipv4_full_tunnel()));

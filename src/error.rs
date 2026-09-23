@@ -67,6 +67,12 @@ pub enum IkeError {
     #[error("the peer's traffic selectors leave nothing our policy accepts")]
     TsUnacceptable,
 
+    /// A rekeyed CHILD SA's traffic selectors do not cover those of the SA it
+    /// replaces (RFC 7296 §2.9.2: "the new SA MUST NOT have narrower
+    /// selectors than the original"). The new SA is not used.
+    #[error("the rekeyed CHILD SA's traffic selectors are narrower than those of the SA it replaces")]
+    TsNarrowedOnRekey,
+
     /// The peer's Key Exchange used a DH group other than the negotiated one.
     #[error("DH group mismatch: expected {expected}, got {got}")]
     DhGroupMismatch { expected: u16, got: u16 },

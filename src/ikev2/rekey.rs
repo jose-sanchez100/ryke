@@ -357,6 +357,17 @@ pub(crate) fn peer_child_spi(sa: &CompletedSaInit, msg: &[u8]) -> Option<u32> {
     esp_spi_from_sa(&sa_bytes).ok()
 }
 
+/// The TSi and TSr a message of the peer's creating a CHILD SA carries --
+/// a `CREATE_CHILD_SA` or `IKE_AUTH` request or response -- both present and
+/// well-formed, or `None`.
+pub(crate) fn peer_child_ts(sa: &CompletedSaInit, msg: &[u8]) -> Option<(TrafficSelectors, TrafficSelectors)> {
+    let (first, inner) = open_encrypted(sa.suite.sk_cipher(), msg, peer_sk_e(sa), peer_sk_a(sa)).ok()?;
+    match requested_ts(first, &inner).ok()? {
+        (Some(tsi), Some(tsr)) => Some((tsi, tsr)),
+        _ => None,
+    }
+}
+
 /// The TSi and TSr payloads of a CHILD SA request, each parsed whole
 /// (RFC 7296 §3.13) -- a malformed one fails the request -- or `None` when absent.
 fn requested_ts(first: PayloadType, inner: &[u8]) -> Result<(Option<TrafficSelectors>, Option<TrafficSelectors>), IkeError> {

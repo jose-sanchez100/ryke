@@ -61,6 +61,12 @@ pub enum IkeError {
     #[error("the peer's traffic selectors are not a subset of the ones we proposed")]
     TsOutsideOffer,
 
+    /// The peer asked for a CHILD SA whose traffic selectors leave nothing
+    /// our policy takes, once narrowed to it (RFC 7296 §2.9): the request is
+    /// answered with `TS_UNACCEPTABLE` and no CHILD SA is created.
+    #[error("the peer's traffic selectors leave nothing our policy accepts")]
+    TsUnacceptable,
+
     /// The peer's Key Exchange used a DH group other than the negotiated one.
     #[error("DH group mismatch: expected {expected}, got {got}")]
     DhGroupMismatch { expected: u16, got: u16 },

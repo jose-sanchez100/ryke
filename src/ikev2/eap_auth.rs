@@ -41,9 +41,9 @@ use crate::entropy::Entropy;
 use crate::error::IkeError;
 use crate::ikev2::exchange::CompletedSaInit;
 use crate::ikev2::ike_auth::{
-    check_granted_ts, child_sa_error_of, esp_offer, esp_spi_from_sa, initiator_eap_request,
-    initiator_eap_request_with_certreq, initiator_eap_request_with_certs, AssignedConfig,
-    ChildTsOffer,
+    assigned_ipv4_policy, check_granted_ts, child_sa_error_of, esp_offer, esp_spi_from_sa,
+    initiator_eap_request, initiator_eap_request_with_certreq, initiator_eap_request_with_certs,
+    narrow_requested_ts, AssignedConfig, ChildTsOffer,
 };
 use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
@@ -51,8 +51,8 @@ use crate::ikev2::message::{
 use crate::ikev2::mschapv2;
 use crate::ikev2::negotiate::{self, ChosenEspSuite};
 use crate::ikev2::payload::{
-    auth_method, notify_type_name, Authentication, Certificate, Configuration, Identification,
-    SecurityAssociation, TrafficSelector, TrafficSelectors,
+    auth_method, notify_type, notify_type_name, Authentication, Certificate, Configuration,
+    Identification, Notify, SecurityAssociation, TrafficSelectors,
 };
 use crate::role::Role;
 use crate::ikev2::sign::SigningKey;
@@ -166,8 +166,9 @@ fn peer_sk_a(sa: &CompletedSaInit) -> &[u8] {
     }
 }
 
+#[cfg(test)]
 fn full_tunnel_ts() -> Vec<u8> {
-    TrafficSelectors { selectors: vec![TrafficSelector::ipv4_any()] }.to_bytes()
+    TrafficSelectors::ipv4_full_tunnel().to_bytes()
 }
 
 fn build_sk(sa: &CompletedSaInit, msg_id: u32, is_response: bool, inner: &[(PayloadType, Vec<u8>)], iv: &[u8; 8]) -> Result<Vec<u8>, IkeError> {
@@ -762,8 +763,11 @@ pub struct EapResponder {
     auth_challenge: [u8; 16],
     nt_response: [u8; 24],
     peer_idi: Vec<u8>,
-    /// The initiator's ESP SPI (from SAi2 in msg-1), needed to derive the CHILD SA.
+    /// The initiator's ESP SPI (from SAi2 in msg-1), needed to derive the CHILD
+    /// SA -- dropped when the final message refuses it (`TS_UNACCEPTABLE`).
     peer_child_spi: Option<u32>,
+    /// The TSi and TSr of msg-1, answered narrowed in the final message.
+    peer_ts: Option<(TrafficSelectors, TrafficSelectors)>,
     /// Inner-network assignment for this client's Configuration Payload (CFG_REPLY)
     /// in the final message — so the cascade's per-client inner IP is handed out
     /// over EAP just like the PSK path.
@@ -809,6 +813,7 @@ impl EapResponder {
             nt_response: [0u8; 24],
             peer_idi: Vec::new(),
             peer_child_spi: None,
+            peer_ts: None,
             assigned: None,
             mobike: false,
             peer_mobike: false,
@@ -840,7 +845,10 @@ impl EapResponder {
     }
 
     /// The initiator's ESP SPI (captured from SAi2), for deriving the CHILD SA
-    /// after [`EapEvent::Established`].
+    /// after [`EapEvent::Established`] -- `None` then if the final message
+    /// refused the CHILD SA with `TS_UNACCEPTABLE` (the IKE SA stands, RFC
+    /// 7296 §1.2): the initiator's selectors left nothing the address it is
+    /// assigned, or IPv4 without one, can carry (§2.9).
     pub fn peer_child_spi(&self) -> Option<u32> {
         self.peer_child_spi
     }
@@ -876,6 +884,10 @@ impl EapResponder {
             // Capture the initiator's ESP SPI (for the CHILD SA) and its IDi
             // verbatim (its final AUTH signs over it).
             self.peer_child_spi = esp_spi_from_sa(sai2);
+            // RFC 7296 §1.2, §3.13: the request for a CHILD SA carries TSi and TSr.
+            let tsi = find(ps, PayloadType::TrafficSelectorInitiator).ok_or(IkeError::MissingPayload("TSi"))?;
+            let tsr = find(ps, PayloadType::TrafficSelectorResponder).ok_or(IkeError::MissingPayload("TSr"))?;
+            self.peer_ts = Some((TrafficSelectors::parse(tsi)?, TrafficSelectors::parse(tsr)?));
             self.peer_idi = find(ps, PayloadType::IdInitiator).unwrap_or(&[]).to_vec();
             let idr = self.id.to_bytes();
             let algo = self.sa.suite.prf_algorithm();
@@ -942,21 +954,28 @@ impl EapResponder {
                     (PayloadType::IdResponder, idr),
                     (PayloadType::Authentication, our_auth.to_bytes()),
                 ];
-                let tsi = match &self.assigned {
-                    Some(a) => {
-                        let dns = a.dns.first().copied();
-                        inner.push((
-                            PayloadType::Configuration,
-                            Configuration::reply_ipv4(a.ip, None, dns).to_bytes(),
-                        ));
-                        TrafficSelectors { selectors: vec![TrafficSelector::ipv4_host(a.ip)] }
-                            .to_bytes()
+                let (policy_i, policy_r) = assigned_ipv4_policy(self.assigned.as_ref().map(|a| a.ip));
+                let (tsi, tsr) = self.peer_ts.as_ref().map(|(tsi, tsr)| (tsi, tsr)).unzip();
+                match narrow_requested_ts(tsi, tsr, &policy_i, &policy_r) {
+                    Ok((tsi, tsr)) => {
+                        if let Some(a) = &self.assigned {
+                            let dns = a.dns.first().copied();
+                            inner.push((
+                                PayloadType::Configuration,
+                                Configuration::reply_ipv4(a.ip, None, dns).to_bytes(),
+                            ));
+                        }
+                        inner.push((PayloadType::SecurityAssociation, esp_offer(self.child_spi).to_bytes()));
+                        inner.push((PayloadType::TrafficSelectorInitiator, tsi.to_bytes()));
+                        inner.push((PayloadType::TrafficSelectorResponder, tsr.to_bytes()));
                     }
-                    None => full_tunnel_ts(),
-                };
-                inner.push((PayloadType::SecurityAssociation, esp_offer(self.child_spi).to_bytes()));
-                inner.push((PayloadType::TrafficSelectorInitiator, tsi));
-                inner.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+                    // RFC 7296 §1.2, §2.9: the IKE SA stands, the CHILD SA is refused.
+                    Err(IkeError::TsUnacceptable) => {
+                        self.peer_child_spi = None;
+                        inner.push((PayloadType::Notify, Notify::status(notify_type::TS_UNACCEPTABLE, Vec::new()).to_bytes()));
+                    }
+                    Err(e) => return Err(e),
+                }
                 // Advertise MOBIKE -- so the client migrates the SA across network
                 // changes (Wi-Fi↔cellular / NAT rebind) via UPDATE_SA_ADDRESSES
                 // instead of reconnecting -- only when the consumer follows it
@@ -1042,7 +1061,7 @@ mod tests {
     use super::*;
     use crate::entropy::SeedEntropy;
     use crate::ikev2::exchange::{default_offer, initiator_complete, initiator_request, responder_respond, LocalSecret};
-    use crate::ikev2::payload::{notify_type, protocol_id, transform_id, transform_type, Notify, Proposal, Transform};
+    use crate::ikev2::payload::{protocol_id, transform_id, transform_type, Proposal, TrafficSelector, Transform};
     use crate::test_certs::{CA_CERT_DER, LEAF_CERT_DER, LEAF_SCALAR, RSA_KEY_PK8};
 
     #[derive(PartialEq, Eq, Debug)]
@@ -1299,6 +1318,78 @@ mod tests {
             assert!(matches!(initiator.handle(&edited, &mut SeedEntropy::new(1)), Ok(EapEvent::Established(None))), "{offer:?}");
             assert_eq!(initiator.granted_ts(), Some(&tsr));
         }
+    }
+
+    /// EAP run to the responder's final message, msg-1's TSi/TSr replaced by
+    /// `tsi`/`tsr` (left out when `None`) and the client `assigned` an
+    /// address -- or the error the responder met on the way.
+    fn final_message_for_ts(
+        tsi: Option<&TrafficSelectors>,
+        tsr: Option<&TrafficSelectors>,
+        assigned: Option<AssignedConfig>,
+    ) -> Result<(EapInitiator, EapResponder, Vec<u8>), IkeError> {
+        use crate::ikev2::ike_auth::tests::with_ts;
+        let (init_sa, resp_sa) = sa_pair();
+        let mut initiator =
+            EapInitiator::new(init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111, ServerVerify::Insecure);
+        let mut responder =
+            EapResponder::new(resp_sa, Identification::fqdn("gw"), ServerAuth::Psk(b"psk".to_vec()), b"alice".to_vec(), "s3cret".into(), 0x2222);
+        responder.set_assigned(assigned);
+        let (mut ie, mut re) = (SeedEntropy::new(1), SeedEntropy::new(2));
+        let (msg_id, ps) = decrypt(&responder.sa, &initiator.start(&mut ie).unwrap()).unwrap();
+        let ps = with_ts(ps, tsi.map(TrafficSelectors::to_bytes), tsr.map(TrafficSelectors::to_bytes));
+        let mut in_flight = build_sk(&initiator.sa, msg_id, false, &ps, &[4u8; 8]).unwrap();
+        loop {
+            match responder.handle(&in_flight, &mut re)? {
+                EapEvent::Reply(m) => match initiator.handle(&m, &mut ie).unwrap() {
+                    EapEvent::Reply(m2) => in_flight = m2,
+                    other => panic!("the initiator ended early: {other:?}"),
+                },
+                EapEvent::Established(Some(f)) => return Ok((initiator, responder, f)),
+                other => panic!("unexpected responder event: {other:?}"),
+            }
+        }
+    }
+
+    /// RFC 7296 §2.9 at the EAP responder: its final message answers msg-1's
+    /// TSi and TSr narrowed to IPv4 and the address it assigns, or refuses
+    /// the CHILD SA with `TS_UNACCEPTABLE` when either comes to nothing --
+    /// the IKE SA standing (§1.2).
+    #[test]
+    fn eap_responder_answers_a_subset_of_msg1_ts_or_ts_unacceptable() {
+        use crate::ikev2::ike_auth::tests::{answered_ts, sample_ts};
+        let t = sample_ts();
+        let assigned = || AssignedConfig { ip: std::net::Ipv4Addr::new(10, 8, 0, 4), dns: vec![] };
+        let at_10_8_0_4 = TrafficSelectors { selectors: vec![TrafficSelector::ipv4_host(assigned().ip)] };
+
+        let granted = [
+            ("a host and a subnet, not the whole of IPv4", &t.host, &t.subnet, None, &t.host, &t.subnet),
+            ("the IPv4 part of a unified proposal", &t.unified, &t.unified, None, &t.v4, &t.v4),
+            ("a type no RFC defines is ignored", &t.v4, &t.unknown_then_v4, None, &t.v4, &t.v4),
+            ("0.0.0.0/0 narrowed to the address assigned", &t.v4, &t.v4, Some(assigned()), &at_10_8_0_4, &t.v4),
+        ];
+        for (what, tsi, tsr, assigned, want_tsi, want_tsr) in granted {
+            let (initiator, responder, final_msg) = final_message_for_ts(Some(tsi), Some(tsr), assigned).unwrap();
+            assert_eq!(answered_ts(&initiator.sa, &final_msg), (Some(want_tsi.clone()), Some(want_tsr.clone()), vec![]), "{what}");
+            assert_eq!(responder.peer_child_spi(), Some(0x1111), "{what}");
+        }
+
+        let refused = [
+            ("IPv6 only", &t.v6, &t.v6, None),
+            ("an address other than the one assigned", &t.other_host, &t.v4, Some(assigned())),
+            ("a TSr of a type no RFC defines", &t.v4, &t.unknown, None),
+        ];
+        for (what, tsi, tsr, assigned) in refused {
+            let (mut initiator, responder, final_msg) = final_message_for_ts(Some(tsi), Some(tsr), assigned).unwrap();
+            assert_eq!(answered_ts(&initiator.sa, &final_msg), (None, None, vec![notify_type::TS_UNACCEPTABLE]), "{what}");
+            assert_eq!(responder.peer_child_spi(), None, "{what}: no CHILD SA");
+            let got = initiator.handle(&final_msg, &mut SeedEntropy::new(1)).unwrap_err();
+            assert_eq!(got, IkeError::PeerRejected { notify_type: notify_type::TS_UNACCEPTABLE, name: "TS_UNACCEPTABLE" }, "{what}");
+        }
+
+        // msg-1 asks for a CHILD SA, so it carries both (RFC 7296 §1.2).
+        assert_eq!(final_message_for_ts(None, Some(&t.v4), None).err(), Some(IkeError::MissingPayload("TSi")));
+        assert_eq!(final_message_for_ts(Some(&t.v4), None, None).err(), Some(IkeError::MissingPayload("TSr")));
     }
 
     #[test]

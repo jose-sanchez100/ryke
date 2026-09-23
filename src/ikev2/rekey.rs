@@ -27,7 +27,7 @@ use crate::debug::ike_debug;
 use crate::error::IkeError;
 use crate::esp::ChildSa;
 use crate::ikev2::exchange::CompletedSaInit;
-use crate::ikev2::ike_auth::{check_granted_ts, esp_offer_for_cipher};
+use crate::ikev2::ike_auth::{assigned_ipv4_policy, check_granted_ts, esp_offer_for_cipher, narrow_requested_ts};
 use crate::ikev2::message::{encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType};
 use crate::ikev2::negotiate;
 use crate::ikev2::payload::{
@@ -61,6 +61,7 @@ fn peer_sk_a(sa: &CompletedSaInit) -> &[u8] {
     }
 }
 
+#[cfg(test)]
 fn full_tunnel_ts() -> Vec<u8> {
     TrafficSelectors { selectors: vec![TrafficSelector::ipv4_any()] }.to_bytes()
 }
@@ -356,8 +357,28 @@ pub(crate) fn peer_child_spi(sa: &CompletedSaInit, msg: &[u8]) -> Option<u32> {
     esp_spi_from_sa(&sa_bytes).ok()
 }
 
+/// The TSi and TSr payloads of a CHILD SA request, each parsed whole
+/// (RFC 7296 §3.13) -- a malformed one fails the request -- or `None` when absent.
+fn requested_ts(first: PayloadType, inner: &[u8]) -> Result<(Option<TrafficSelectors>, Option<TrafficSelectors>), IkeError> {
+    let (mut tsi, mut tsr) = (None, None);
+    for payload in payloads(first, inner) {
+        let p = payload?;
+        match p.payload_type {
+            PayloadType::TrafficSelectorInitiator => tsi = Some(TrafficSelectors::parse(p.data)?),
+            PayloadType::TrafficSelectorResponder => tsr = Some(TrafficSelectors::parse(p.data)?),
+            _ => {}
+        }
+    }
+    Ok((tsi, tsr))
+}
+
 /// Responder: process a rekey request, derive the new CHILD SA, and build the
-/// response. Returns `(response_bytes, ChildSa)`.
+/// response. Returns `(response_bytes, ChildSa)`. The request's TSi and TSr,
+/// which it must carry, are answered narrowed (RFC 7296 §2.9): with an
+/// `assigned_ip`, TSi to that address and TSr to IPv4, as at `IKE_AUTH`;
+/// without one, to what they propose of either family. When either comes to
+/// nothing the rekey is refused with `TsUnacceptable`, for the caller to
+/// answer `TS_UNACCEPTABLE`.
 pub fn responder_process_rekey(
     sa: &CompletedSaInit,
     request: &[u8],
@@ -406,26 +427,15 @@ pub fn responder_process_rekey_with_pfs(
     // TSi and expect the responder to re-narrow — as at AUTH. Echoing the wide TSi
     // back yields a rekeyed child whose selectors disagree with the /32 iOS holds, so
     // iOS deletes the whole IKE SA (~1s after the rekey). When we have an assignment,
-    // re-narrow to that /32; with none (local egress), fall back to echoing.
-    let (mut echo_tsi, mut echo_tsr) = (None, None);
-    for payload in payloads(first, &inner) {
-        let p = payload?;
-        match p.payload_type {
-            PayloadType::TrafficSelectorInitiator => echo_tsi = Some(p.data.to_vec()),
-            PayloadType::TrafficSelectorResponder => echo_tsr = Some(p.data.to_vec()),
-            _ => {}
-        }
-    }
-    let (tsi, tsr) = match assigned_ip {
-        Some(ip) => (
-            TrafficSelectors { selectors: vec![TrafficSelector::ipv4_host(ip)] }.to_bytes(),
-            full_tunnel_ts(),
-        ),
-        None => (
-            echo_tsi.unwrap_or_else(full_tunnel_ts),
-            echo_tsr.unwrap_or_else(full_tunnel_ts),
-        ),
+    // re-narrow to that /32 (and IPv4 on our side); with none (local egress), take
+    // what the peer proposes of either family. Either way the answer is a subset of
+    // the proposal, or TS_UNACCEPTABLE (RFC 7296 §2.9).
+    let (tsi, tsr) = requested_ts(first, &inner)?;
+    let (policy_i, policy_r) = match assigned_ip {
+        Some(ip) => assigned_ipv4_policy(Some(ip)),
+        None => (TrafficSelectors::unified_full_tunnel(), TrafficSelectors::unified_full_tunnel()),
     };
+    let (tsi, tsr) = narrow_requested_ts(tsi.as_ref(), tsr.as_ref(), &policy_i, &policy_r)?;
 
     // `requested_pfs` only settles on a group from the KE, with our key in hand.
     let pfs_secret = match (pfs_group, &peer_ke, dh_private) {
@@ -450,8 +460,8 @@ pub fn responder_process_rekey_with_pfs(
         inner_out.push((PayloadType::SecurityAssociation, sa_out.to_bytes()));
         inner_out.push((PayloadType::Nonce, nr.to_vec()));
     }
-    inner_out.push((PayloadType::TrafficSelectorInitiator, tsi));
-    inner_out.push((PayloadType::TrafficSelectorResponder, tsr));
+    inner_out.push((PayloadType::TrafficSelectorInitiator, tsi.to_bytes()));
+    inner_out.push((PayloadType::TrafficSelectorResponder, tsr.to_bytes()));
     let header = create_child_header(sa, message_id, true);
     let first_out = first_payload_type(&inner_out);
     let bytes = encode_payload_chain(&inner_out);
@@ -556,8 +566,10 @@ fn choose_child_proposal(
 /// and, for PFS, name a DH group), derives the new CHILD SA from the peer's
 /// nonce, ours (`nr`) and, with PFS, a fresh DH secret from `dh_private` (only
 /// used when the request carries a KE payload), and builds the response, which
-/// accepts the traffic selectors exactly as the peer proposed them: that is
-/// what its SA being replaced already carries. `new_spi` is the inbound SPI we
+/// accepts the traffic selectors as the peer proposed them, less any of a type
+/// this crate does not know (RFC 7296 §2.9) -- that is what its SA being
+/// replaced already carries. A request whose TSi or TSr has none of a known
+/// type is refused with `TsUnacceptable`. `new_spi` is the inbound SPI we
 /// choose for the new SA; `cipher` the one running on the SA being rekeyed;
 /// `pfs` our side's PFS policy, which the rekey must keep (see
 /// [`choose_child_proposal`]).
@@ -580,17 +592,9 @@ pub fn responder_answer_child_rekey(
     let (sa_bytes, ni) = find_sa_and_nonce(first, &inner)?;
     let peer_sa = SecurityAssociation::parse(&sa_bytes)?;
     let peer_ke = find_ke(first, &inner)?;
-    let (mut tsi, mut tsr) = (None, None);
-    for payload in payloads(first, &inner) {
-        let p = payload?;
-        match p.payload_type {
-            PayloadType::TrafficSelectorInitiator => tsi = Some(p.data.to_vec()),
-            PayloadType::TrafficSelectorResponder => tsr = Some(p.data.to_vec()),
-            _ => {}
-        }
-    }
-    let tsi = tsi.ok_or(IkeError::MissingPayload("TSi"))?;
-    let tsr = tsr.ok_or(IkeError::MissingPayload("TSr"))?;
+    let (tsi, tsr) = requested_ts(first, &inner)?;
+    let any = TrafficSelectors::unified_full_tunnel();
+    let (tsi, tsr) = narrow_requested_ts(tsi.as_ref(), tsr.as_ref(), &any, &any)?;
 
     let (proposal, peer_spi, group) = choose_child_proposal(&peer_sa, cipher, new_spi, peer_ke.as_ref().map(|k| k.dh_group), pfs)?;
     let prf = sa.suite.prf_algorithm();
@@ -610,8 +614,8 @@ pub fn responder_answer_child_rekey(
     if let Some(ke) = ke_out {
         inner_out.push((PayloadType::KeyExchange, ke.to_bytes()));
     }
-    inner_out.push((PayloadType::TrafficSelectorInitiator, tsi));
-    inner_out.push((PayloadType::TrafficSelectorResponder, tsr));
+    inner_out.push((PayloadType::TrafficSelectorInitiator, tsi.to_bytes()));
+    inner_out.push((PayloadType::TrafficSelectorResponder, tsr.to_bytes()));
     let header = create_child_header(sa, message_id, true);
     let first_out = first_payload_type(&inner_out);
     let bytes = encode_payload_chain(&inner_out);
@@ -973,6 +977,98 @@ mod tests {
             &[1u8; 8],
         )
         .unwrap()
+    }
+
+    /// A peer's CHILD SA rekey request (no PFS) whose TSi/TSr payloads carry
+    /// `tsi`/`tsr` as they are, or are left out when `None`.
+    fn peer_rekey_request_with_raw_ts(peer_sa: &CompletedSaInit, tsi: Option<Vec<u8>>, tsr: Option<Vec<u8>>) -> Vec<u8> {
+        let notify = Notify {
+            protocol_id: protocol_id::ESP,
+            spi: 0xAAAA_AAAAu32.to_be_bytes().to_vec(),
+            notify_type: notify_type::REKEY_SA,
+            data: Vec::new(),
+        };
+        let mut inner = vec![
+            (PayloadType::Notify, notify.to_bytes()),
+            (PayloadType::SecurityAssociation, esp_offer_for_cipher(0x2222_2222, SkCipher::Aes256Gcm).to_bytes()),
+            (PayloadType::Nonce, vec![0x33; 32]),
+        ];
+        inner.extend(tsi.map(|ts| (PayloadType::TrafficSelectorInitiator, ts)));
+        inner.extend(tsr.map(|ts| (PayloadType::TrafficSelectorResponder, ts)));
+        let first = first_payload_type(&inner);
+        let header = create_child_header(peer_sa, 7, false);
+        build_encrypted(peer_sa.suite.sk_cipher(), header, first, &encode_payload_chain(&inner), our_sk_e(peer_sa), our_sk_a(peer_sa), &[1u8; 8])
+            .unwrap()
+    }
+
+    /// Both rekey responders answer a subset of the TSi/TSr proposed, keeping
+    /// the proposal's own ranges where the policy allows them, and refuse with
+    /// `TsUnacceptable` what leaves nothing (RFC 7296 §2.9): the gateway one
+    /// narrows to the address it assigned and IPv4 when it has one, and takes
+    /// either family otherwise; the client one takes either family. Selectors
+    /// of an unknown type are dropped; missing or malformed TS fail the request.
+    #[test]
+    fn rekey_responders_answer_a_subset_of_the_proposal_or_ts_unacceptable() {
+        use crate::ikev2::ike_auth::tests::sample_ts;
+        let t = sample_ts();
+        let (our_sa, peer_sa) = sa_pair(); // `our_sa` answers, `peer_sa` asks
+        let assigned = Ipv4Addr::new(10, 8, 0, 4);
+        let at_assigned = TrafficSelectors { selectors: vec![TrafficSelector::ipv4_host(assigned)] };
+        let gateway = |req: &[u8], assigned_ip| {
+            responder_process_rekey_with_pfs(&our_sa, req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, None, &[2u8; 8], assigned_ip)
+                .map(|(r, _)| r)
+        };
+        let client = |req: &[u8]| {
+            responder_answer_child_rekey(&our_sa, req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &PfsPolicy::none(), &[6u8; 32], &[2u8; 8])
+                .map(|(r, _)| r)
+        };
+        let ask =
+            |tsi: &TrafficSelectors, tsr: &TrafficSelectors| peer_rekey_request_with_raw_ts(&peer_sa, Some(tsi.to_bytes()), Some(tsr.to_bytes()));
+        let answer = |resp: Result<Vec<u8>, IkeError>| {
+            let (_, tsi, tsr, _) = read_rekey_response(&resp.expect("the rekey is answered"), &peer_sa);
+            (tsi, tsr)
+        };
+
+        // Without an assignment, and on the client side: the proposal itself, less unknown types.
+        let echoed = [
+            ("a host and a subnet", &t.host, &t.subnet, &t.host, &t.subnet),
+            ("IPv6", &t.v6, &t.v6, &t.v6, &t.v6),
+            ("IPv4 and IPv6", &t.unified, &t.unified, &t.unified, &t.unified),
+            ("an unknown type ahead of IPv4", &t.unknown_then_v4, &t.unknown_then_v4, &t.v4, &t.v4),
+        ];
+        for (case, tsi, tsr, want_i, want_r) in echoed {
+            let req = ask(tsi, tsr);
+            assert_eq!(answer(gateway(&req, None)), (want_i.clone(), want_r.clone()), "gateway without assignment, {case}");
+            assert_eq!(answer(client(&req)), (want_i.clone(), want_r.clone()), "client, {case}");
+        }
+        // With an assignment: the assigned /32 and IPv4, whatever wider the peer proposes.
+        for (case, tsi, tsr) in [("IPv4", &t.v4, &t.v4), ("IPv4 and IPv6", &t.unified, &t.unified), ("the assigned host", &at_assigned, &t.unified)] {
+            assert_eq!(answer(gateway(&ask(tsi, tsr), Some(assigned))), (at_assigned.clone(), t.v4.clone()), "gateway with assignment, {case}");
+        }
+
+        // Nothing left of the proposal: refused.
+        for (case, tsi, tsr) in [("IPv6", &t.v6, &t.v6), ("another host", &t.other_host, &t.v4), ("only an unknown TSr", &t.v4, &t.unknown)] {
+            assert_eq!(gateway(&ask(tsi, tsr), Some(assigned)), Err(IkeError::TsUnacceptable), "gateway with assignment, {case}");
+        }
+        let req = ask(&t.v4, &t.unknown);
+        assert_eq!(gateway(&req, None), Err(IkeError::TsUnacceptable), "gateway without assignment, only an unknown TSr");
+        assert_eq!(client(&req), Err(IkeError::TsUnacceptable), "client, only an unknown TSr");
+
+        // Missing or malformed TS: the request itself fails.
+        let v4 = || Some(t.v4.to_bytes());
+        let empty = || Some(TrafficSelectors { selectors: vec![] }.to_bytes());
+        for (case, tsi, tsr, want) in [
+            ("no TSi", None, v4(), IkeError::MissingPayload("TSi")),
+            ("no TSr", v4(), None, IkeError::MissingPayload("TSr")),
+        ] {
+            let req = peer_rekey_request_with_raw_ts(&peer_sa, tsi, tsr);
+            assert_eq!(gateway(&req, None), Err(want.clone()), "gateway, {case}");
+            assert_eq!(gateway(&req, Some(assigned)), Err(want.clone()), "gateway with assignment, {case}");
+            assert_eq!(client(&req), Err(want), "client, {case}");
+        }
+        let req = peer_rekey_request_with_raw_ts(&peer_sa, v4(), empty());
+        assert!(matches!(gateway(&req, None), Err(IkeError::MalformedPayload(_))), "gateway, a TSr with no selector");
+        assert!(matches!(client(&req), Err(IkeError::MalformedPayload(_))), "client, a TSr with no selector");
     }
 
     /// The `(proposal, spi, TSi, TSr)` of a rekey response a peer gets back.

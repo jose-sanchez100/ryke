@@ -11,7 +11,9 @@
 //!
 //! - one IKE SA and one ESP CHILD SA per `IKE_SA_INIT` + `IKE_AUTH`, and
 //!   nothing else: no EAP, no NAT traversal, no configuration payload, no
-//!   cookies;
+//!   cookies. The CHILD SA carries IPv4, the initiator's traffic selectors
+//!   narrowed to it (RFC 7296 §2.9); when they leave nothing, the IKE SA is
+//!   created without it and the response says `TS_UNACCEPTABLE` (§1.2);
 //! - window size 1 (§2.3): a request is taken only with the next Message ID
 //!   (§2.2); a retransmission of the last one gets the response already sent,
 //!   unchanged, never a new one (§2.1); any other request is dropped
@@ -341,12 +343,16 @@ impl<E: Entropy> Server<E> {
                 self.children.remove(&k);
             }
         }
-        let child =
-            ChildSa::derive(sa.suite.prf_algorithm(), &sa.keys.sk_d, &sa.ni, &sa.nr, Role::Responder, child_spi, peer_child_spi);
-        self.children.insert(key, child);
+        // `None`: the peer's traffic selectors left nothing IPv4 to carry, and
+        // the IKE SA stands without a CHILD SA (RFC 7296 §1.2, §2.9).
+        if let Some(peer_child_spi) = peer_child_spi {
+            let child =
+                ChildSa::derive(sa.suite.prf_algorithm(), &sa.keys.sk_d, &sa.ni, &sa.nr, Role::Responder, child_spi, peer_child_spi);
+            self.children.insert(key, child);
+        }
         let ike = self.sessions.get_mut(&key).expect("looked up by the caller");
         ike.peer_id = Some(peer_id.clone());
-        ike.child_spis = Some((child_spi, peer_child_spi));
+        ike.child_spis = peer_child_spi.map(|peer| (child_spi, peer));
         Ok((response, ServerEvent::Established { spi_i: key.0, spi_r: key.1, peer_id }))
     }
 
@@ -632,6 +638,40 @@ mod tests {
         assert_eq!(event.unwrap(), ServerEvent::Retransmitted { spi_i, spi_r });
         assert_eq!(reply.as_deref(), Some(&peer.auth_response[..]));
         assert_eq!(server.child(spi_i, spi_r).unwrap().inbound.spi(), peer.server_child_spi);
+    }
+
+    /// RFC 7296 §1.2, §2.9: a peer whose traffic selectors leave nothing
+    /// IPv4 for the CHILD SA -- IPv6 only here -- gets the IKE SA all the same,
+    /// with `TS_UNACCEPTABLE` and no SA/TSi/TSr in the answer, and no CHILD SA;
+    /// the IKE SA goes on answering.
+    #[test]
+    fn an_ike_auth_with_nothing_ipv4_to_carry_gets_the_ike_sa_but_no_child_sa() {
+        use crate::ikev2::ike_auth::tests::{answered_ts, request_with_ts, sample_ts};
+        let (mut server, addr) = server();
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let local = LocalSecret::generate(&mut SeedEntropy::new(0xC11E), NONCE_LEN);
+        let request = initiator_request(&local, &default_offer());
+        let mut buf = vec![0u8; 65535];
+        sock.send_to(&request, addr).unwrap();
+        server.handle_one().unwrap();
+        let n = sock.recv(&mut buf).unwrap();
+        let sa = initiator_complete(&local, &request, &buf[..n]).unwrap();
+
+        let v6 = sample_ts().v6;
+        let cfg = AuthConfig::psk(Identification::fqdn("client.test"), PSK.to_vec());
+        let auth = initiator_auth_request(&sa, &cfg, PEER_CHILD_SPI, &esp_offer(0), &[1u8; 8]).unwrap();
+        sock.send_to(&request_with_ts(&sa, &auth, Some(&v6), Some(&v6)), addr).unwrap();
+        assert!(matches!(server.handle_one().unwrap(), ServerEvent::Established { .. }));
+        let n = sock.recv(&mut buf).unwrap();
+        let (tsi, tsr, notifies) = answered_ts(&sa, &buf[..n]);
+        assert_eq!((tsi, tsr, notifies), (None, None, vec![notify_type::TS_UNACCEPTABLE]));
+        assert!(server.child(sa.spi_i, sa.spi_r).is_none(), "no CHILD SA");
+        assert_eq!(server.sessions[&(sa.spi_i, sa.spi_r)].child_spis, None);
+
+        sock.send_to(&dpd_request(&sa, 2, &[2u8; 8]).unwrap(), addr).unwrap();
+        assert!(matches!(server.handle_one().unwrap(), ServerEvent::Informational { .. }), "the IKE SA stands");
+        assert!(sock.recv(&mut buf).is_ok(), "the liveness check is answered");
     }
 
     /// RFC 7296 §1.4 / Appendix A: every INFORMATIONAL request gets a

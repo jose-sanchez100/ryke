@@ -1678,6 +1678,7 @@ impl LivenessSession {
                 // the peer to retry its rekey with a KE of it.
                 let (reason, data) = match e {
                     IkeError::NoProposalChosen => (notify_type::NO_PROPOSAL_CHOSEN, Vec::new()),
+                    IkeError::TsUnacceptable => (notify_type::TS_UNACCEPTABLE, Vec::new()),
                     IkeError::InvalidKeGroup(group) => (notify_type::INVALID_KE_PAYLOAD, group.to_be_bytes().to_vec()),
                     _ => (notify_type::INVALID_SYNTAX, Vec::new()),
                 };
@@ -3461,10 +3462,19 @@ mod tests {
         proposals: Vec<crate::ikev2::payload::Proposal>,
         ke: Option<crate::ikev2::payload::KeyExchange>,
     ) -> Vec<u8> {
+        hand_built_peer_rekey_with_ts(sa, proposals, ke, &TrafficSelectors::ipv4_full_tunnel())
+    }
+
+    /// [`hand_built_peer_rekey`] proposing `ts` as both TSi and TSr.
+    fn hand_built_peer_rekey_with_ts(
+        sa: &CompletedSaInit,
+        proposals: Vec<crate::ikev2::payload::Proposal>,
+        ke: Option<crate::ikev2::payload::KeyExchange>,
+        ts: &TrafficSelectors,
+    ) -> Vec<u8> {
         use crate::ikev2::message::{encode_payload_chain, first_payload_type};
         use crate::ikev2::payload::Notify;
 
-        let ts = TrafficSelectors::ipv4_full_tunnel();
         let rekey_sa =
             Notify { protocol_id: protocol_id::ESP, spi: 0xAAAAu32.to_be_bytes().to_vec(), notify_type: notify_type::REKEY_SA, data: Vec::new() };
         let mut inner = vec![
@@ -3557,6 +3567,34 @@ mod tests {
             &response,
         )
         .expect("answered without PFS");
+        assert_eq!(liveness.take_peer_rekeys().len(), 1);
+    }
+
+    /// RFC 7296 §2.9: a gateway's rekey proposing only selectors of a type we
+    /// do not know leaves nothing to carry; it is refused `TS_UNACCEPTABLE`
+    /// and the CHILD SA stays as it was. The same rekey with IPv4 selectors
+    /// behind the unknown one is answered with just those.
+    #[test]
+    fn a_peer_rekey_leaving_no_traffic_selector_is_refused_ts_unacceptable() {
+        use crate::ikev2::ike_auth::tests::sample_ts;
+        let t = sample_ts();
+
+        let unknown = t.unknown.clone();
+        let unknown =
+            move |sa: &CompletedSaInit| hand_built_peer_rekey_with_ts(sa, gcm_esp_offer_with_dh(PEER_NEW_SPI, &[]).proposals, None, &unknown);
+        let (response, resp_sa, mut liveness) = peer_child_request_answered_with(PfsPolicy::none(), None, unknown);
+        assert_eq!(refusal_notify(&resp_sa, &response), (notify_type::TS_UNACCEPTABLE, Vec::new()));
+        assert!(liveness.take_peer_rekeys().is_empty());
+        assert_eq!((liveness.child_local_spi, liveness.child_peer_spi), (0xBBBB, 0xAAAA), "nothing changed");
+
+        // Control: an IPv4 selector behind the unknown one.
+        let mixed = t.unknown_then_v4.clone();
+        let mixed = move |sa: &CompletedSaInit| hand_built_peer_rekey_with_ts(sa, gcm_esp_offer_with_dh(PEER_NEW_SPI, &[]).proposals, None, &mixed);
+        let (response, resp_sa, mut liveness) = peer_child_request_answered_with(PfsPolicy::none(), None, mixed);
+        let (_, granted) =
+            rekey::initiator_complete_child(&resp_sa, &PEER_NI, PEER_NEW_SPI, SkCipher::Aes256Gcm, None, &t.unknown_then_v4, &response)
+                .expect("answered, not refused");
+        assert_eq!(granted, t.v4, "the unknown selector is dropped");
         assert_eq!(liveness.take_peer_rekeys().len(), 1);
     }
 
@@ -5761,7 +5799,7 @@ mod tests {
         // expects on inbound ESP -- the one it put in its own SA payload at
         // IKE_AUTH -- which a responder such as strongSwan looks the old CHILD
         // SA up by (it answers CHILD_SA_NOT_FOUND for the other one).
-        assert_eq!(rekey::rekey_sa_spi(&sa, &buf[..n]), Some(client_spi), "REKEY_SA must name the initiator's inbound SPI");
+        assert_eq!(rekey::rekey_sa_spi(&sa, &buf[..n]), client_spi, "REKEY_SA must name the initiator's inbound SPI");
         let dh_private = pfs_group.map(|_| [6u8; 32]);
         let (resp2, child) = rekey::responder_process_rekey_with_pfs(
             &sa,
@@ -5912,7 +5950,7 @@ mod tests {
         let rcfg = AuthConfig::psk(Identification::fqdn("responder.test"), psk);
         let (resp, _peer_id, client_spi, _ic) = responder_process_auth(&sa, &buf[..n], &rcfg, RESPONDER_CHILD_SPI, &[9u8; 8], None).unwrap();
         sock.send_to(&resp, from).unwrap();
-        (sock, sa, from, client_spi)
+        (sock, sa, from, client_spi.expect("the CHILD SA was created"))
     }
 
     fn deletes_ike_sa(sa: &CompletedSaInit, msg: &[u8]) -> bool {

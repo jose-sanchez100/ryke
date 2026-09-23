@@ -487,6 +487,46 @@ impl TrafficSelector {
             && self.end_addr <= outer.end_addr
     }
 
+    /// The traffic matched by both this selector and `other`, as one
+    /// selector, or `None` when they share none: what a responder narrows a
+    /// proposed selector to under a selector of its policy (RFC 7296 §2.9).
+    /// The protocol is the one they name, any protocol (0) giving way to
+    /// the other's; the ports and addresses the overlap of their ranges,
+    /// where `ANY` ports (0-65535) meet `OPAQUE` (65535-0, §3.13.1) in
+    /// `OPAQUE` and `OPAQUE` meets nothing else. A selector of a type this
+    /// crate does not know shares nothing -- §2.9 has the responder ignore it.
+    pub fn intersection(&self, other: &TrafficSelector) -> Option<TrafficSelector> {
+        const ANY: (u16, u16) = (0, 65535);
+        const OPAQUE: (u16, u16) = (65535, 0);
+        if !matches!(self.ts_type, ts_type::IPV4_ADDR_RANGE | ts_type::IPV6_ADDR_RANGE) || self.ts_type != other.ts_type {
+            return None;
+        }
+        let ip_protocol = match (self.ip_protocol, other.ip_protocol) {
+            (0, p) | (p, 0) => p,
+            (a, b) if a == b => a,
+            _ => return None,
+        };
+        let (a, b) = ((self.start_port, self.end_port), (other.start_port, other.end_port));
+        let (start_port, end_port) = match (a, b) {
+            (OPAQUE, OPAQUE) | (OPAQUE, ANY) | (ANY, OPAQUE) => OPAQUE,
+            (OPAQUE, _) | (_, OPAQUE) => return None,
+            _ => {
+                let ports = (a.0.max(b.0), a.1.min(b.1));
+                if a.0 > a.1 || b.0 > b.1 || ports.0 > ports.1 {
+                    return None;
+                }
+                ports
+            }
+        };
+        let start_addr = self.start_addr.as_slice().max(other.start_addr.as_slice()).to_vec();
+        let end_addr = self.end_addr.as_slice().min(other.end_addr.as_slice()).to_vec();
+        let lens = [&self.start_addr, &self.end_addr, &other.start_addr, &other.end_addr].map(|a| a.len());
+        if lens.iter().any(|&len| len != lens[0]) || start_addr > end_addr {
+            return None;
+        }
+        Some(TrafficSelector { ts_type: self.ts_type, ip_protocol, start_port, end_port, start_addr, end_addr })
+    }
+
     fn parse(buf: &[u8]) -> Result<(TrafficSelector, usize), IkeError> {
         if buf.len() < 8 {
             return Err(IkeError::Truncated { need: 8, have: buf.len() });
@@ -587,6 +627,25 @@ impl TrafficSelectors {
     /// no offer this crate makes has selectors that adjoin.
     pub fn is_within(&self, offer: &TrafficSelectors) -> bool {
         !self.selectors.is_empty() && self.selectors.iter().all(|s| offer.selectors.iter().any(|o| s.is_within(o)))
+    }
+
+    /// These selectors narrowed to `policy` (RFC 7296 §2.9): each one's
+    /// [`intersection`](TrafficSelector::intersection) with each of
+    /// `policy`'s, in the proposal's order -- so a first selector the policy
+    /// takes whole, the initiator's "first choice", comes back whole and
+    /// first -- or `None` when nothing is left, the case §2.9 answers with
+    /// `TS_UNACCEPTABLE` rather than a null set. Selectors of a type this
+    /// crate does not know are left out (§2.9: the responder ignores them).
+    pub fn narrowed_to(&self, policy: &TrafficSelectors) -> Option<TrafficSelectors> {
+        let mut selectors: Vec<TrafficSelector> = Vec::new();
+        for proposed in &self.selectors {
+            for narrowed in policy.selectors.iter().filter_map(|p| proposed.intersection(p)) {
+                if !selectors.contains(&narrowed) {
+                    selectors.push(narrowed);
+                }
+            }
+        }
+        (!selectors.is_empty()).then_some(TrafficSelectors { selectors })
     }
 
     pub fn parse(body: &[u8]) -> Result<TrafficSelectors, IkeError> {
@@ -1344,6 +1403,69 @@ mod tests {
         assert!(!unified.is_within(&ipv4), "IPv6 granted to an IPv4 offer");
         assert!(!TrafficSelectors { selectors: vec![host, unknown] }.is_within(&ipv4), "one selector outside is enough");
         assert!(!TrafficSelectors { selectors: vec![] }.is_within(&ipv4), "the null set");
+    }
+
+    #[test]
+    fn a_proposal_narrowed_to_a_policy_keeps_only_the_traffic_both_match() {
+        let v4 = |proto: u8, ports: (u16, u16), start: [u8; 4], end: [u8; 4]| TrafficSelector {
+            ts_type: ts_type::IPV4_ADDR_RANGE,
+            ip_protocol: proto,
+            start_port: ports.0,
+            end_port: ports.1,
+            start_addr: start.to_vec(),
+            end_addr: end.to_vec(),
+        };
+        let any = TrafficSelector::ipv4_any();
+        let host = TrafficSelector::ipv4_host(Ipv4Addr::new(10, 0, 0, 7));
+        let low = v4(0, (0, 65535), [10, 0, 0, 0], [10, 0, 0, 127]);
+        let high = v4(0, (0, 65535), [10, 0, 0, 64], [10, 0, 0, 255]);
+        let tcp = v4(6, (0, 65535), [0, 0, 0, 0], [255, 255, 255, 255]);
+        let web = v4(0, (80, 443), [0, 0, 0, 0], [255, 255, 255, 255]);
+        let alt = v4(0, (443, 8443), [0, 0, 0, 0], [255, 255, 255, 255]);
+        let opaque = v4(0, (65535, 0), [0, 0, 0, 0], [255, 255, 255, 255]);
+        let both = [
+            (&any, &host, host.clone()),
+            (&low, &high, v4(0, (0, 65535), [10, 0, 0, 64], [10, 0, 0, 127])),
+            (&tcp, &any, tcp.clone()), // any protocol gives way to TCP
+            (&web, &alt, v4(0, (443, 443), [0, 0, 0, 0], [255, 255, 255, 255])),
+            (&opaque, &any, opaque.clone()), // ANY ports include OPAQUE
+            (&any, &opaque, opaque.clone()),
+            (&opaque, &opaque, opaque.clone()),
+        ];
+        for (a, b, expected) in both {
+            assert_eq!(a.intersection(b), Some(expected.clone()), "{a:?} with {b:?}");
+            assert_eq!(b.intersection(a), Some(expected), "{b:?} with {a:?}");
+        }
+        let udp = v4(17, (0, 65535), [0, 0, 0, 0], [255, 255, 255, 255]);
+        let elsewhere = TrafficSelector::ipv4_host(Ipv4Addr::new(10, 0, 1, 1));
+        let unknown = TrafficSelector { ts_type: 9, ..any.clone() };
+        let none = [
+            (&tcp, &udp),         // two protocols
+            (&low, &elsewhere),   // disjoint addresses
+            (&opaque, &web),      // OPAQUE meets only ANY and itself
+            (&web, &v4(0, (8444, 9000), [0, 0, 0, 0], [255, 255, 255, 255])),
+            (&any, &TrafficSelector::ipv6_any()),
+            (&unknown, &unknown), // a type this crate does not know
+        ];
+        for (a, b) in none {
+            assert_eq!(a.intersection(b), None, "{a:?} with {b:?}");
+            assert_eq!(b.intersection(a), None, "{b:?} with {a:?}");
+        }
+
+        let set = |selectors: Vec<TrafficSelector>| TrafficSelectors { selectors };
+        let ipv4 = TrafficSelectors::ipv4_full_tunnel();
+        let unified = TrafficSelectors::unified_full_tunnel();
+        // The initiator's first choice, taken whole, stays first.
+        assert_eq!(set(vec![host.clone(), low.clone()]).narrowed_to(&ipv4), Some(set(vec![host.clone(), low.clone()])));
+        assert_eq!(unified.narrowed_to(&ipv4), Some(ipv4.clone()), "the family the policy has");
+        assert_eq!(ipv4.narrowed_to(&unified), Some(ipv4.clone()));
+        assert_eq!(unified.narrowed_to(&unified), Some(unified.clone()));
+        assert_eq!(ipv4.narrowed_to(&set(vec![host.clone()])), Some(set(vec![host.clone()])), "a wide proposal to a host policy");
+        assert_eq!(set(vec![unknown.clone(), any.clone()]).narrowed_to(&ipv4), Some(ipv4.clone()), "an unknown type is ignored");
+        assert_eq!(set(vec![low.clone(), low.clone()]).narrowed_to(&ipv4), Some(set(vec![low])), "no selector twice");
+        assert_eq!(TrafficSelectors::ipv6_full_tunnel().narrowed_to(&ipv4), None, "nothing left: TS_UNACCEPTABLE");
+        assert_eq!(set(vec![unknown]).narrowed_to(&unified), None);
+        assert_eq!(set(vec![elsewhere]).narrowed_to(&set(vec![host])), None);
     }
 
     #[test]

@@ -131,6 +131,7 @@ pub fn esp_offer_for_cipher(spi: u32, cipher: SkCipher) -> SecurityAssociation {
     }
 }
 
+#[cfg(test)]
 fn full_tunnel_ts() -> Vec<u8> {
     TrafficSelectors { selectors: vec![TrafficSelector::ipv4_any()] }.to_bytes()
 }
@@ -592,8 +593,14 @@ pub fn initiator_eap_request_with_certs(
 }
 
 /// Responder: decrypt + verify the initiator's `IKE_AUTH` request, then build
-/// the encrypted response `SK { IDr, AUTH, SAr2, TSi, TSr }`. Returns the
-/// response bytes, the initiator's verified identity, its CHILD SA SPI, and
+/// the encrypted response `SK { IDr, AUTH, SAr2, TSi, TSr }`. TSi and TSr are
+/// the request's narrowed to what this responder carries (RFC 7296 §2.9): on
+/// the initiator's side the address it is `assigned`, or any IPv4 address
+/// without one, and any IPv4 address on ours. When either comes to nothing
+/// the IKE SA is still created, the CHILD SA not: the response is
+/// `SK { IDr, AUTH, N(TS_UNACCEPTABLE) }` (§1.2), and the initiator's CHILD SA
+/// SPI is returned as `None`. Returns the response bytes, the initiator's
+/// verified identity, its CHILD SA SPI, and
 /// whether it sent `N(INITIAL_CONTACT)` (RFC 7296 §2.4) -- the caller should
 /// tear down any prior IKE/CHILD SA it holds for the same peer identity when
 /// this is set, since it only has meaning once AUTH has verified.
@@ -606,11 +613,17 @@ pub fn responder_process_auth(
     child_spi: u32,
     iv: &[u8; 8],
     assigned: Option<&AssignedConfig>,
-) -> Result<(Vec<u8>, Identification, u32, bool), IkeError> {
+) -> Result<(Vec<u8>, Identification, Option<u32>, bool), IkeError> {
     let (response, peer_id, peer_child_spi, initial_contact, _mobike) =
         responder_process_auth_with_mobike(sa, request, cfg, child_spi, iv, assigned, false)?;
     Ok((response, peer_id, peer_child_spi, initial_contact))
 }
+
+/// What [`responder_process_auth_with_mobike`] returns: the response, the
+/// peer's identity, the peer's ESP SPI for the CHILD SA (`None` when the
+/// traffic selectors left no CHILD SA), whether it sent `INITIAL_CONTACT`, and
+/// whether MOBIKE is in force.
+pub type AuthAnswer = (Vec<u8>, Identification, Option<u32>, bool, bool);
 
 /// Like [`responder_process_auth`], but `mobike` states whether the caller
 /// implements MOBIKE (RFC 4555): it answers an INFORMATIONAL carrying
@@ -629,7 +642,7 @@ pub fn responder_process_auth_with_mobike(
     iv: &[u8; 8],
     assigned: Option<&AssignedConfig>,
     mobike: bool,
-) -> Result<(Vec<u8>, Identification, u32, bool, bool), IkeError> {
+) -> Result<AuthAnswer, IkeError> {
     // The initiator encrypts with SK_ei.
     let (first, inner) = open_encrypted(sa.suite.sk_cipher(), request, &sa.keys.sk_ei, &sa.keys.sk_ai)?;
     let got = parse_auth_inner(first, &inner)?;
@@ -638,6 +651,12 @@ pub fn responder_process_auth_with_mobike(
     verify_peer_auth(sa.suite.prf_algorithm(), cfg, &got, &octets)?;
     let peer_id = Identification::parse(&got.id_body)?;
     let peer_child_spi = got.child_spi.ok_or(IkeError::MissingPayload("SA"))?;
+    let (policy_i, policy_r) = assigned_ipv4_policy(assigned.map(|a| a.ip));
+    let child_ts = match narrow_requested_ts(got.tsi.as_ref(), got.tsr.as_ref(), &policy_i, &policy_r) {
+        Ok(ts) => Some(ts),
+        Err(IkeError::TsUnacceptable) => None,
+        Err(e) => return Err(e),
+    };
 
     // Our AUTH signs resp_message | Ni | prf(SK_pr, IDr) — it does NOT cover the
     // CP/SA/TS payloads, so adding a CFG_REPLY below needs no AUTH recomputation.
@@ -648,21 +667,23 @@ pub fn responder_process_auth_with_mobike(
     let mut inner_out = vec![(PayloadType::IdResponder, idr_body)];
     inner_out.extend(cert_payloads);
     inner_out.push((PayloadType::Authentication, auth.to_bytes()));
-    // CP(CFG_REPLY) with the assigned inner IP (+ DNS) — a native client needs
-    // this to configure its tunnel interface. RFC 7296 §2.19: after AUTH, before
-    // SA/TS. When we assign an address we also narrow TSi to that /32.
-    let tsi = match assigned {
-        Some(a) => {
-            let dns = if a.dns.is_empty() { None } else { Some(a.dns[0]) };
-            let cp = Configuration::reply_ipv4(a.ip, None, dns);
-            inner_out.push((PayloadType::Configuration, cp.to_bytes()));
-            TrafficSelectors { selectors: vec![TrafficSelector::ipv4_host(a.ip)] }.to_bytes()
+    match &child_ts {
+        Some((tsi, tsr)) => {
+            // CP(CFG_REPLY) with the assigned inner IP (+ DNS) — a native client needs
+            // this to configure its tunnel interface. RFC 7296 §2.19: after AUTH, before
+            // SA/TS. The assigned address is also the only one TSi is narrowed to.
+            if let Some(a) = assigned {
+                let dns = if a.dns.is_empty() { None } else { Some(a.dns[0]) };
+                let cp = Configuration::reply_ipv4(a.ip, None, dns);
+                inner_out.push((PayloadType::Configuration, cp.to_bytes()));
+            }
+            inner_out.push((PayloadType::SecurityAssociation, esp_offer(child_spi).to_bytes()));
+            inner_out.push((PayloadType::TrafficSelectorInitiator, tsi.to_bytes()));
+            inner_out.push((PayloadType::TrafficSelectorResponder, tsr.to_bytes()));
         }
-        None => full_tunnel_ts(),
-    };
-    inner_out.push((PayloadType::SecurityAssociation, esp_offer(child_spi).to_bytes()));
-    inner_out.push((PayloadType::TrafficSelectorInitiator, tsi));
-    inner_out.push((PayloadType::TrafficSelectorResponder, full_tunnel_ts()));
+        // RFC 7296 §1.2, §2.9: the IKE SA stands, the CHILD SA is refused.
+        None => inner_out.push((PayloadType::Notify, Notify::status(notify_type::TS_UNACCEPTABLE, Vec::new()).to_bytes())),
+    }
     // RFC 4555 §3.1: the responder includes MOBIKE_SUPPORTED only if the
     // initiator did, and we only when the caller actually follows the client
     // across address changes -- then it migrates instead of reconnecting.
@@ -673,7 +694,7 @@ pub fn responder_process_auth_with_mobike(
     let first_out = first_payload_type(&inner_out);
     let inner_bytes = encode_payload_chain(&inner_out);
     let response = build_encrypted(sa.suite.sk_cipher(), ike_auth_header(sa, true), first_out, &inner_bytes, &sa.keys.sk_er, &sa.keys.sk_ar, iv)?;
-    Ok((response, peer_id, peer_child_spi, got.initial_contact, mobike))
+    Ok((response, peer_id, child_ts.map(|_| peer_child_spi), got.initial_contact, mobike))
 }
 
 /// Decrypt an `IKE_AUTH` request and return the peer's claimed identity (`IDi`)
@@ -789,6 +810,39 @@ pub(crate) fn check_granted_ts(offer: &TrafficSelectors, tsi: Option<&TrafficSel
     Ok(())
 }
 
+/// The selectors a responder answers a CHILD SA request with (RFC 7296
+/// §2.9): the request's TSi and TSr, which it must carry, narrowed to
+/// `policy_i` (the initiator's side) and `policy_r` (ours) --
+/// [`TrafficSelectors::narrowed_to`]. When either comes to nothing the
+/// request is refused with `TsUnacceptable`, answered `TS_UNACCEPTABLE`.
+pub(crate) fn narrow_requested_ts(
+    tsi: Option<&TrafficSelectors>,
+    tsr: Option<&TrafficSelectors>,
+    policy_i: &TrafficSelectors,
+    policy_r: &TrafficSelectors,
+) -> Result<(TrafficSelectors, TrafficSelectors), IkeError> {
+    let tsi = tsi.ok_or(IkeError::MissingPayload("TSi"))?;
+    let tsr = tsr.ok_or(IkeError::MissingPayload("TSr"))?;
+    match (tsi.narrowed_to(policy_i), tsr.narrowed_to(policy_r)) {
+        (Some(tsi), Some(tsr)) => Ok((tsi, tsr)),
+        _ => {
+            ike_debug!("CHILD SA: requested TSi={tsi:?} TSr={tsr:?}, nothing within our TSi={policy_i:?} TSr={policy_r:?}");
+            Err(IkeError::TsUnacceptable)
+        }
+    }
+}
+
+/// The traffic this crate's responders carry for a client: on its side the
+/// IPv4 address it is `assigned`, or any IPv4 address without one; on ours
+/// any IPv4 address.
+pub(crate) fn assigned_ipv4_policy(assigned: Option<Ipv4Addr>) -> (TrafficSelectors, TrafficSelectors) {
+    let client = match assigned {
+        Some(ip) => TrafficSelectors { selectors: vec![TrafficSelector::ipv4_host(ip)] },
+        None => TrafficSelectors::ipv4_full_tunnel(),
+    };
+    (client, TrafficSelectors::ipv4_full_tunnel())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -835,7 +889,7 @@ pub(crate) mod tests {
         let (resp, learned_initiator, init_spi, _ic) = responder_process_auth(&resp_sa, &req, &rcfg, 0xCAFEBABE, &[2u8; 8], None).unwrap();
         // The responder decrypted the initiator's SK{} — proves the keys agree.
         assert_eq!(learned_initiator, Identification::fqdn("client.example"));
-        assert_eq!(init_spi, 0xDEADBEEF); // and learned its CHILD SA SPI
+        assert_eq!(init_spi, Some(0xDEADBEEF)); // and learned its CHILD SA SPI
 
         let (learned_responder, resp_spi, _esp_suite, _assigned, _tsr) =
             initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0), ChildTsOffer::Ipv4).unwrap();
@@ -988,6 +1042,130 @@ pub(crate) mod tests {
         out.extend(tsi.map(|b| (PayloadType::TrafficSelectorInitiator, b)));
         out.extend(tsr.map(|b| (PayloadType::TrafficSelectorResponder, b)));
         out
+    }
+
+    /// Traffic selectors the responder tests propose -- shared with
+    /// `eap_auth` and `rekey`'s.
+    pub(crate) struct SampleTs {
+        pub v4: TrafficSelectors,
+        pub v6: TrafficSelectors,
+        pub unified: TrafficSelectors,
+        /// 10.0.0.5, alone.
+        pub host: TrafficSelectors,
+        /// 10.9.9.9, alone.
+        pub other_host: TrafficSelectors,
+        /// 10.1.0.0/16.
+        pub subnet: TrafficSelectors,
+        /// A lone selector of TS Type 9, which no RFC defines.
+        pub unknown: TrafficSelectors,
+        /// That one, then `0.0.0.0/0`.
+        pub unknown_then_v4: TrafficSelectors,
+    }
+
+    pub(crate) fn sample_ts() -> SampleTs {
+        let unknown = TrafficSelector { ts_type: 9, ..TrafficSelector::ipv4_any() };
+        SampleTs {
+            v4: TrafficSelectors::ipv4_full_tunnel(),
+            v6: TrafficSelectors::ipv6_full_tunnel(),
+            unified: TrafficSelectors::unified_full_tunnel(),
+            host: TrafficSelectors { selectors: vec![TrafficSelector::ipv4_host(Ipv4Addr::new(10, 0, 0, 5))] },
+            other_host: TrafficSelectors { selectors: vec![TrafficSelector::ipv4_host(Ipv4Addr::new(10, 9, 9, 9))] },
+            subnet: TrafficSelectors {
+                selectors: vec![TrafficSelector { start_addr: vec![10, 1, 0, 0], end_addr: vec![10, 1, 255, 255], ..TrafficSelector::ipv4_any() }],
+            },
+            unknown: TrafficSelectors { selectors: vec![unknown.clone()] },
+            unknown_then_v4: TrafficSelectors { selectors: vec![unknown, TrafficSelector::ipv4_any()] },
+        }
+    }
+
+    /// The initiator's request `req` with its TSi/TSr replaced by `tsi`/`tsr`
+    /// (left out when `None`). Its AUTH does not cover them, so it still verifies.
+    pub(crate) fn request_with_ts(init_sa: &CompletedSaInit, req: &[u8], tsi: Option<&TrafficSelectors>, tsr: Option<&TrafficSelectors>) -> Vec<u8> {
+        let cipher = init_sa.suite.sk_cipher();
+        let chain = sk_chain(cipher, req, &init_sa.keys.sk_ei, &init_sa.keys.sk_ai);
+        let chain = with_ts(chain, tsi.map(TrafficSelectors::to_bytes), tsr.map(TrafficSelectors::to_bytes));
+        let header = IkeHeader::parse(req).unwrap();
+        build_encrypted(
+            cipher,
+            header,
+            first_payload_type(&chain),
+            &encode_payload_chain(&chain),
+            &init_sa.keys.sk_ei,
+            &init_sa.keys.sk_ai,
+            &[1u8; 8],
+        )
+        .unwrap()
+    }
+
+    /// What a responder answered the initiator of `init_sa`: its TSi, its
+    /// TSr, and the types of its Notify payloads.
+    pub(crate) fn answered_ts(init_sa: &CompletedSaInit, resp: &[u8]) -> (Option<TrafficSelectors>, Option<TrafficSelectors>, Vec<u16>) {
+        let (mut tsi, mut tsr, mut notifies) = (None, None, Vec::new());
+        for (payload_type, body) in sk_chain(init_sa.suite.sk_cipher(), resp, &init_sa.keys.sk_er, &init_sa.keys.sk_ar) {
+            match payload_type {
+                PayloadType::TrafficSelectorInitiator => tsi = Some(TrafficSelectors::parse(&body).unwrap()),
+                PayloadType::TrafficSelectorResponder => tsr = Some(TrafficSelectors::parse(&body).unwrap()),
+                PayloadType::Notify => notifies.push(Notify::parse(&body).unwrap().notify_type),
+                _ => {}
+            }
+        }
+        (tsi, tsr, notifies)
+    }
+
+    /// RFC 7296 §2.9: the responder answers TSi and TSr narrowed to what it
+    /// carries -- here IPv4, and on the initiator's side the address it is
+    /// assigned -- never wider than proposed nor of another family; when
+    /// either comes to nothing, `TS_UNACCEPTABLE` and no CHILD SA, the IKE SA
+    /// standing (§1.2).
+    #[test]
+    fn ike_auth_responder_answers_a_subset_of_the_proposal_or_ts_unacceptable() {
+        let (init_sa, resp_sa) = run_sa_init();
+        let psk = b"pw".to_vec();
+        let icfg = AuthConfig::psk(Identification::fqdn("client.example"), psk.clone());
+        let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), psk);
+        let req = initiator_auth_request(&init_sa, &icfg, 1, &esp_offer(0), &[1u8; 8]).unwrap();
+        let assigned = AssignedConfig { ip: Ipv4Addr::new(10, 8, 0, 4), dns: vec![] };
+        let at_10_8_0_4 = TrafficSelectors { selectors: vec![TrafficSelector::ipv4_host(assigned.ip)] };
+        let t = sample_ts();
+        let answer = |tsi: &TrafficSelectors, tsr: &TrafficSelectors, assigned: Option<&AssignedConfig>| {
+            let req = request_with_ts(&init_sa, &req, Some(tsi), Some(tsr));
+            let (resp, _, peer_child_spi, _) = responder_process_auth(&resp_sa, &req, &rcfg, 2, &[2u8; 8], assigned).unwrap();
+            (resp, peer_child_spi)
+        };
+
+        let granted = [
+            ("a host and a subnet, not the whole of IPv4", &t.host, &t.subnet, None, &t.host, &t.subnet),
+            ("the IPv4 part of a unified proposal", &t.unified, &t.unified, None, &t.v4, &t.v4),
+            ("a type no RFC defines is ignored", &t.v4, &t.unknown_then_v4, None, &t.v4, &t.v4),
+            ("0.0.0.0/0 narrowed to the address assigned", &t.v4, &t.v4, Some(&assigned), &at_10_8_0_4, &t.v4),
+        ];
+        for (what, tsi, tsr, assigned, want_tsi, want_tsr) in granted {
+            let (resp, peer_child_spi) = answer(tsi, tsr, assigned);
+            assert_eq!(answered_ts(&init_sa, &resp), (Some(want_tsi.clone()), Some(want_tsr.clone()), vec![]), "{what}");
+            assert_eq!(peer_child_spi, Some(1), "{what}");
+        }
+
+        let refused = [
+            ("IPv6 only", &t.v6, &t.v6, None),
+            ("IPv6 only, with an address assigned", &t.v6, &t.v6, Some(&assigned)),
+            ("an address other than the one assigned", &t.other_host, &t.v4, Some(&assigned)),
+            ("a TSr of a type no RFC defines", &t.v4, &t.unknown, None),
+        ];
+        for (what, tsi, tsr, assigned) in refused {
+            let (resp, peer_child_spi) = answer(tsi, tsr, assigned);
+            assert_eq!(answered_ts(&init_sa, &resp), (None, None, vec![notify_type::TS_UNACCEPTABLE]), "{what}");
+            assert_eq!(peer_child_spi, None, "{what}: no CHILD SA");
+            // Authentic, and read by our initiator as the refusal it is.
+            let got = initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0), ChildTsOffer::Ipv4).unwrap_err();
+            assert_eq!(got, IkeError::PeerRejected { notify_type: notify_type::TS_UNACCEPTABLE, name: "TS_UNACCEPTABLE" }, "{what}");
+        }
+
+        // A request for a CHILD SA carries both (RFC 7296 §1.2).
+        for (what, tsi, tsr, missing) in [("no TSi", None, Some(&t.v4), "TSi"), ("no TSr", Some(&t.v4), None, "TSr")] {
+            let req = request_with_ts(&init_sa, &req, tsi, tsr);
+            let got = responder_process_auth(&resp_sa, &req, &rcfg, 2, &[2u8; 8], None).err();
+            assert_eq!(got, Some(IkeError::MissingPayload(missing)), "{what}");
+        }
     }
 
     #[test]

@@ -41,8 +41,9 @@ use crate::entropy::Entropy;
 use crate::error::IkeError;
 use crate::ikev2::exchange::CompletedSaInit;
 use crate::ikev2::ike_auth::{
-    child_sa_error_of, esp_offer, esp_spi_from_sa, initiator_eap_request, initiator_eap_request_with_certreq,
-    initiator_eap_request_with_certs, AssignedConfig, ChildTsOffer,
+    check_granted_ts, child_sa_error_of, esp_offer, esp_spi_from_sa, initiator_eap_request,
+    initiator_eap_request_with_certreq, initiator_eap_request_with_certs, AssignedConfig,
+    ChildTsOffer,
 };
 use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
@@ -582,15 +583,17 @@ impl EapInitiator {
                         return Err(IkeError::NoProposalChosen);
                     }
                 }
+                // RFC 7296 §2.9: both TS payloads, each within what we proposed.
+                let tsi = find(&ps, PayloadType::TrafficSelectorInitiator).map(TrafficSelectors::parse).transpose()?;
+                let tsr = find(&ps, PayloadType::TrafficSelectorResponder).map(TrafficSelectors::parse).transpose()?;
+                check_granted_ts(&self.ts_offer.selectors(), tsi.as_ref(), tsr.as_ref())?;
                 self.peer_child_spi = esp_spi_from_sa(sar2);
                 self.peer_esp_suite = esp_suite;
                 if let Some(cp) = find(&ps, PayloadType::Configuration).and_then(|d| Configuration::parse(d).ok()) {
                     self.assigned_ip4 = cp.assigned_ipv4();
                     self.configuration = Some(cp);
                 }
-                if let Some(ts) = find(&ps, PayloadType::TrafficSelectorResponder).and_then(|d| TrafficSelectors::parse(d).ok()) {
-                    self.granted_ts = Some(ts);
-                }
+                self.granted_ts = tsr;
             }
             return Ok(if verified { EapEvent::Established(None) } else { EapEvent::Failed(None) });
         };
@@ -1270,6 +1273,32 @@ mod tests {
         let tampered = build_sk(&responder.sa, msg_id, true, &inner, &[3u8; 8]).unwrap();
         let err = initiator.handle(&tampered, &mut SeedEntropy::new(1)).unwrap_err();
         assert_eq!(err, IkeError::NoProposalChosen);
+    }
+
+    #[test]
+    fn eap_final_message_must_answer_both_ts_within_the_offer() {
+        use crate::ikev2::ike_auth::tests::{ts_answers_outside_an_ipv4_offer, with_ts};
+        for (what, tsi, tsr, expected) in ts_answers_outside_an_ipv4_offer() {
+            let (mut initiator, responder, final_msg) = run_to_final_message();
+            let (msg_id, ps) = decrypt(&initiator.sa, &final_msg).unwrap();
+            let edited = build_sk(&responder.sa, msg_id, true, &with_ts(ps, tsi, tsr), &[3u8; 8]).unwrap();
+            assert_eq!(initiator.handle(&edited, &mut SeedEntropy::new(1)).err(), Some(expected), "{what}");
+        }
+
+        // Positive controls: TSi narrowed to one address, and both families
+        // granted to a unified offer.
+        let host = TrafficSelectors { selectors: vec![TrafficSelector::ipv4_host(std::net::Ipv4Addr::new(10, 8, 0, 4))] };
+        let unified = TrafficSelectors::unified_full_tunnel();
+        for (offer, tsi, tsr) in
+            [(ChildTsOffer::Ipv4, &host, TrafficSelectors::ipv4_full_tunnel()), (ChildTsOffer::Unified, &unified, unified.clone())]
+        {
+            let (mut initiator, responder, final_msg) = run_to_final_message();
+            initiator.set_ts_offer(offer);
+            let (msg_id, ps) = decrypt(&initiator.sa, &final_msg).unwrap();
+            let edited = build_sk(&responder.sa, msg_id, true, &with_ts(ps, Some(tsi.to_bytes()), Some(tsr.to_bytes())), &[3u8; 8]).unwrap();
+            assert!(matches!(initiator.handle(&edited, &mut SeedEntropy::new(1)), Ok(EapEvent::Established(None))), "{offer:?}");
+            assert_eq!(initiator.granted_ts(), Some(&tsr));
+        }
     }
 
     #[test]

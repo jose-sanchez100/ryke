@@ -54,6 +54,13 @@ pub enum IkeError {
     #[error("peer rejected the exchange: {name} (notify type {notify_type})")]
     PeerRejected { notify_type: u16, name: &'static str },
 
+    /// The responder created the CHILD SA for traffic we never proposed: its
+    /// TSi or TSr is not a subset of ours (RFC 7296 §2.9 -- a responder may
+    /// narrow the proposal, not widen it or swap it for another). The SA
+    /// exists on the peer's side, so it is deleted rather than used.
+    #[error("the peer's traffic selectors are not a subset of the ones we proposed")]
+    TsOutsideOffer,
+
     /// The peer's Key Exchange used a DH group other than the negotiated one.
     #[error("DH group mismatch: expected {expected}, got {got}")]
     DhGroupMismatch { expected: u16, got: u16 },

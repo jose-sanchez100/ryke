@@ -17,6 +17,7 @@
 //! the userspace ESP data plane ([`crate::esp`] / [`crate::tunnel`]) follow.
 
 use crate::ikev2::auth::{initiator_signed_octets, psk_auth, responder_signed_octets};
+use crate::debug::ike_debug;
 use crate::error::IkeError;
 use crate::ikev2::exchange::CompletedSaInit;
 use crate::ikev2::negotiate::{self, ChosenEspSuite};
@@ -212,10 +213,12 @@ struct AuthPayloads {
     /// (CFG_REPLY, INTERNAL_IP4_ADDRESS) — set only on the initiator's parse of
     /// the responder's response.
     assigned_ip4: Option<Ipv4Addr>,
+    /// The TSi payload, if present (a malformed one fails the parse).
+    tsi: Option<TrafficSelectors>,
     /// The responder's actual granted `TSr` — what the negotiated CHILD_SA
     /// really covers, independent of (and often more authoritative than) any
     /// CFG_REPLY `INTERNAL_IP4_SUBNET`. `None` only if the payload is missing
-    /// or malformed, not if it narrows to nothing.
+    /// (a malformed one fails the parse).
     tsr: Option<TrafficSelectors>,
     /// Whether the peer sent `N(INITIAL_CONTACT)` (RFC 7296 §2.4) — this is
     /// the initiator's first SA with us since it last restarted, so any prior
@@ -257,7 +260,7 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
     let mut child_spi = None;
     let mut esp_suite = None;
     let mut assigned_ip4 = None;
-    let mut tsr = None;
+    let (mut tsi, mut tsr) = (None, None);
     let mut initial_contact = false;
     let mut child_error = None;
     let mut mobike_supported = false;
@@ -280,11 +283,8 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
                     assigned_ip4 = cp.assigned_ipv4();
                 }
             }
-            PayloadType::TrafficSelectorResponder => {
-                if let Ok(ts) = TrafficSelectors::parse(payload.data) {
-                    tsr = Some(ts);
-                }
-            }
+            PayloadType::TrafficSelectorInitiator => tsi = Some(TrafficSelectors::parse(payload.data)?),
+            PayloadType::TrafficSelectorResponder => tsr = Some(TrafficSelectors::parse(payload.data)?),
             PayloadType::Notify => {
                 if let Ok(n) = Notify::parse(payload.data) {
                     if n.notify_type == notify_type::INITIAL_CONTACT {
@@ -296,7 +296,7 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
                     }
                 }
             }
-            _ => {} // TSi / CERTREQ not needed here
+            _ => {} // CERTREQ not needed here
         }
     }
     Ok(AuthPayloads {
@@ -306,6 +306,7 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
         child_spi,
         esp_suite,
         assigned_ip4,
+        tsi,
         tsr,
         initial_contact,
         child_error,
@@ -727,9 +728,10 @@ pub fn client_sent_certreq(sa: &CompletedSaInit, request: &[u8]) -> bool {
 /// The responder's verified identity, its chosen CHILD SA SPI, the ESP cipher
 /// it named (parsed from the same SA payload, `None` only if that payload was
 /// malformed), the assigned inner IPv4 (if any), and its actual granted `TSr`
-/// (if any) -- see [`AuthPayloads::tsr`] for why this is often more
-/// authoritative than the CFG_REPLY subnet for deciding what to route through
-/// the tunnel. Returned by [`initiator_verify_auth`].
+/// (always `Some` since [`initiator_verify_auth`] requires it) -- see
+/// [`AuthPayloads::tsr`] for why this is often more authoritative than the
+/// CFG_REPLY subnet for deciding what to route through the tunnel. Returned by
+/// [`initiator_verify_auth`].
 pub type VerifiedAuth = (Identification, u32, Option<ChosenEspSuite>, Option<Ipv4Addr>, Option<TrafficSelectors>);
 
 /// Initiator: decrypt + verify the responder's `IKE_AUTH` response. `esp_offer`
@@ -737,13 +739,16 @@ pub type VerifiedAuth = (Identification, u32, Option<ChosenEspSuite>, Option<Ipv
 /// [`initiator_auth_request_with_cfg`]'s doc) -- the responder's SAr2 is
 /// checked against it (RFC 7296 §2.7) so a peer can't answer with an
 /// ENCR/INTEG/ESN combination it never actually saw offered (see
-/// [`ChosenEspSuite::matches_offer`]'s doc for why that matters). See
-/// [`VerifiedAuth`] for the returned fields.
+/// [`ChosenEspSuite::matches_offer`]'s doc for why that matters). `ts_offer`
+/// must be the one the request proposed: the TSi and TSr answered are
+/// checked against it ([`check_granted_ts`]). See [`VerifiedAuth`] for the
+/// returned fields.
 pub fn initiator_verify_auth(
     sa: &CompletedSaInit,
     response: &[u8],
     cfg: &AuthConfig,
     esp_offer: &SecurityAssociation,
+    ts_offer: ChildTsOffer,
 ) -> Result<VerifiedAuth, IkeError> {
     // The responder encrypts with SK_er.
     let (first, inner) = open_encrypted(sa.suite.sk_cipher(), response, &sa.keys.sk_er, &sa.keys.sk_ar)?;
@@ -763,15 +768,31 @@ pub fn initiator_verify_auth(
             return Err(IkeError::NoProposalChosen);
         }
     }
+    check_granted_ts(&ts_offer.selectors(), got.tsi.as_ref(), got.tsr.as_ref())?;
     Ok((Identification::parse(&got.id_body)?, peer_child_spi, got.esp_suite, got.assigned_ip4, got.tsr))
 }
 
+/// The traffic selectors a response creating a CHILD SA answered a request
+/// proposing `offer` as both TSi and TSr with: both present (RFC 7296 §2.9:
+/// "Two TS payloads appear in each of the messages in the exchange that
+/// creates a Child SA pair"), and each a subset of `offer` -- the responder
+/// narrows "to some subset of the initiator's proposal"
+/// ([`TrafficSelectors::is_within`]). Anything else is
+/// [`IkeError::MissingPayload`] or [`IkeError::TsOutsideOffer`].
+pub(crate) fn check_granted_ts(offer: &TrafficSelectors, tsi: Option<&TrafficSelectors>, tsr: Option<&TrafficSelectors>) -> Result<(), IkeError> {
+    let tsi = tsi.ok_or(IkeError::MissingPayload("TSi"))?;
+    let tsr = tsr.ok_or(IkeError::MissingPayload("TSr"))?;
+    if !(tsi.is_within(offer) && tsr.is_within(offer)) {
+        ike_debug!("CHILD SA: offered TS {offer:?}, answered TSi={tsi:?} TSr={tsr:?}");
+        return Err(IkeError::TsOutsideOffer);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::ikev2::exchange::{
-        default_offer, initiator_complete, initiator_request, responder_respond, LocalSecret,
-    };
+    use crate::ikev2::exchange::{default_offer, initiator_complete, initiator_request, responder_respond, LocalSecret};
 
     fn run_sa_init() -> (CompletedSaInit, CompletedSaInit) {
         let init = LocalSecret { dh_private: [7u8; 32], nonce: vec![0x11; 32], spi: 0xA1 };
@@ -816,7 +837,8 @@ mod tests {
         assert_eq!(learned_initiator, Identification::fqdn("client.example"));
         assert_eq!(init_spi, 0xDEADBEEF); // and learned its CHILD SA SPI
 
-        let (learned_responder, resp_spi, _esp_suite, _assigned, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0)).unwrap();
+        let (learned_responder, resp_spi, _esp_suite, _assigned, _tsr) =
+            initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0), ChildTsOffer::Ipv4).unwrap();
         assert_eq!(learned_responder, Identification::fqdn("gw.example"));
         assert_eq!(resp_spi, 0xCAFEBABE); // initiator learned the responder's CHILD SA SPI
     }
@@ -871,7 +893,7 @@ mod tests {
         let (resp, learned_i, _spi, _ic) =
             responder_process_auth(&resp_sa, &req, &rcfg, 0xCAFEBABE, &[2u8; 8], Some(&assigned)).unwrap();
         assert_eq!(learned_i, Identification::fqdn("client.example"));
-        let (_learned_r, _rspi, _esp_suite, got_ip, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0)).unwrap();
+        let (_learned_r, _rspi, _esp_suite, got_ip, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0), ChildTsOffer::Ipv4).unwrap();
         assert_eq!(got_ip, Some(Ipv4Addr::new(10, 8, 0, 4)));
     }
 
@@ -883,7 +905,7 @@ mod tests {
         let rcfg = AuthConfig::psk(Identification::fqdn("s"), psk);
         let req = initiator_auth_request(&init_sa, &icfg, 1, &esp_offer(0), &[1u8; 8]).unwrap();
         let (resp, _, _, _ic) = responder_process_auth(&resp_sa, &req, &rcfg, 2, &[2u8; 8], None).unwrap();
-        let (_, _, _esp_suite, got_ip, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0)).unwrap();
+        let (_, _, _esp_suite, got_ip, _tsr) = initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0), ChildTsOffer::Ipv4).unwrap();
         assert_eq!(got_ip, None);
     }
 
@@ -920,7 +942,7 @@ mod tests {
                 responder_process_auth_with_mobike(&resp_sa, req, &rcfg, 2, &[2u8; 8], None, mobike).unwrap();
             assert_eq!(peer, Identification::fqdn("c"));
             // Whatever it says about MOBIKE, the response is a valid one.
-            initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0)).unwrap();
+            initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0), ChildTsOffer::Ipv4).unwrap();
             (response_advertises_mobike(&init_sa, &resp), in_force)
         };
 
@@ -935,6 +957,89 @@ mod tests {
         assert_eq!(with_mobike(&plain, true), (false, false));
         // Opted in and offered: advertised, and reported as in force.
         assert_eq!(with_mobike(&offered, true), (true, true));
+    }
+
+    /// One edit: what it is, the TSi and TSr bodies it answers with (left
+    /// out when `None`), and the error it must be refused with.
+    pub(crate) type TsAnswer = (&'static str, Option<Vec<u8>>, Option<Vec<u8>>, IkeError);
+
+    /// The traffic selector edits a response creating a CHILD SA must not get
+    /// past the initiator (RFC 7296 §2.9, §3.13) -- shared with `eap_auth` and
+    /// `rekey`'s tests -- and what it fails with, the proposal being
+    /// `0.0.0.0/0` for both TSi and TSr.
+    pub(crate) fn ts_answers_outside_an_ipv4_offer() -> Vec<TsAnswer> {
+        let v4 = TrafficSelectors::ipv4_full_tunnel().to_bytes();
+        let v6 = TrafficSelectors::ipv6_full_tunnel().to_bytes();
+        let unified = TrafficSelectors::unified_full_tunnel().to_bytes();
+        vec![
+            ("no TSi", None, Some(v4.clone()), IkeError::MissingPayload("TSi")),
+            ("no TSr", Some(v4.clone()), None, IkeError::MissingPayload("TSr")),
+            ("IPv6 TSr for an IPv4 offer", Some(v4.clone()), Some(v6.clone()), IkeError::TsOutsideOffer),
+            ("IPv6 TSi for an IPv4 offer", Some(v6), Some(v4.clone()), IkeError::TsOutsideOffer),
+            ("an IPv6 selector added to TSr", Some(v4.clone()), Some(unified), IkeError::TsOutsideOffer),
+            ("an empty TSr", Some(v4), Some(vec![0, 0, 0, 0]), IkeError::MalformedPayload("TS payload with no Traffic Selector")),
+        ]
+    }
+
+    /// `chain` with its TSi/TSr replaced by `tsi`/`tsr` (left out when `None`).
+    pub(crate) fn with_ts(chain: Vec<(PayloadType, Vec<u8>)>, tsi: Option<Vec<u8>>, tsr: Option<Vec<u8>>) -> Vec<(PayloadType, Vec<u8>)> {
+        let mut out: Vec<_> =
+            chain.into_iter().filter(|(t, _)| !matches!(t, PayloadType::TrafficSelectorInitiator | PayloadType::TrafficSelectorResponder)).collect();
+        out.extend(tsi.map(|b| (PayloadType::TrafficSelectorInitiator, b)));
+        out.extend(tsr.map(|b| (PayloadType::TrafficSelectorResponder, b)));
+        out
+    }
+
+    #[test]
+    fn ike_auth_response_must_answer_both_ts_within_the_offer() {
+        let (init_sa, resp_sa) = run_sa_init();
+        let psk = b"pw".to_vec();
+        let icfg = AuthConfig::psk(Identification::fqdn("client.example"), psk.clone());
+        let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), psk);
+        let req = initiator_auth_request(&init_sa, &icfg, 1, &esp_offer(0), &[1u8; 8]).unwrap();
+        let (resp, ..) = responder_process_auth(&resp_sa, &req, &rcfg, 2, &[2u8; 8], None).unwrap();
+        let chain = sk_chain(init_sa.suite.sk_cipher(), &resp, &init_sa.keys.sk_er, &init_sa.keys.sk_ar);
+        // The responder's AUTH does not cover SA/TS, so an edited response still authenticates.
+        let edited = |tsi: Option<Vec<u8>>, tsr: Option<Vec<u8>>| {
+            let chain = with_ts(chain.clone(), tsi, tsr);
+            let bytes = encode_payload_chain(&chain);
+            build_encrypted(
+                resp_sa.suite.sk_cipher(),
+                ike_auth_header(&resp_sa, true),
+                first_payload_type(&chain),
+                &bytes,
+                &resp_sa.keys.sk_er,
+                &resp_sa.keys.sk_ar,
+                &[2u8; 8],
+            )
+            .unwrap()
+        };
+        for (what, tsi, tsr, expected) in ts_answers_outside_an_ipv4_offer() {
+            let got = initiator_verify_auth(
+                &init_sa,
+                &edited(tsi, tsr),
+                &icfg,
+                &esp_offer(0),
+                ChildTsOffer::Ipv4,
+            );
+            assert_eq!(got.err(), Some(expected), "{what}");
+        }
+
+        // Positive controls: the response as sent, TSi narrowed to the one
+        // address handed out, TSr to a subnet, and both families granted to a
+        // unified offer.
+        let host = TrafficSelectors { selectors: vec![TrafficSelector::ipv4_host(Ipv4Addr::new(10, 8, 0, 4))] };
+        let subnet = TrafficSelectors {
+            selectors: vec![TrafficSelector { start_addr: vec![10, 0, 0, 0], end_addr: vec![10, 0, 0, 255], ..TrafficSelector::ipv4_any() }],
+        };
+        let unified = TrafficSelectors::unified_full_tunnel();
+        assert!(initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0), ChildTsOffer::Ipv4).is_ok());
+        let narrowed = edited(Some(host.to_bytes()), Some(subnet.to_bytes()));
+        let (.., tsr) = initiator_verify_auth(&init_sa, &narrowed, &icfg, &esp_offer(0), ChildTsOffer::Ipv4).unwrap();
+        assert_eq!(tsr, Some(subnet));
+        let both = edited(Some(unified.to_bytes()), Some(unified.to_bytes()));
+        let (.., tsr) = initiator_verify_auth(&init_sa, &both, &icfg, &esp_offer(0), ChildTsOffer::Unified).unwrap();
+        assert_eq!(tsr, Some(unified));
     }
 
     /// An `IKE_AUTH` response the way a responder sends it when only the CHILD
@@ -973,7 +1078,7 @@ mod tests {
             let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), psk);
             let resp = child_rejected_response(&resp_sa, &rcfg, error);
             assert_eq!(
-                initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0)).unwrap_err(),
+                initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0), ChildTsOffer::Ipv4).unwrap_err(),
                 IkeError::PeerRejected { notify_type: error, name: notify_type_name(error) },
             );
         }
@@ -987,7 +1092,7 @@ mod tests {
         let icfg = AuthConfig::psk(Identification::fqdn("client.example"), b"right".to_vec());
         let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), b"wrong".to_vec());
         let resp = child_rejected_response(&resp_sa, &rcfg, notify_type::TS_UNACCEPTABLE);
-        assert_eq!(initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0)).unwrap_err(), IkeError::AuthFailed);
+        assert_eq!(initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0), ChildTsOffer::Ipv4).unwrap_err(), IkeError::AuthFailed);
     }
 
     #[test]
@@ -999,7 +1104,7 @@ mod tests {
         let icfg = AuthConfig::psk(Identification::fqdn("client.example"), psk.clone());
         let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), psk);
         let resp = child_rejected_response(&resp_sa, &rcfg, notify_type::AUTHENTICATION_FAILED);
-        assert_eq!(initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0)).unwrap_err(), IkeError::MissingPayload("SA"));
+        assert_eq!(initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0), ChildTsOffer::Ipv4).unwrap_err(), IkeError::MissingPayload("SA"));
     }
 
     #[test]
@@ -1038,7 +1143,7 @@ mod tests {
         let bytes = encode_payload_chain(&inner);
         let response = build_encrypted(resp_sa.suite.sk_cipher(), ike_auth_header(&resp_sa, true), first, &bytes, &resp_sa.keys.sk_er, &resp_sa.keys.sk_ar, &[2u8; 8]).unwrap();
 
-        let err = initiator_verify_auth(&init_sa, &response, &icfg, &esp_offer(0)).unwrap_err();
+        let err = initiator_verify_auth(&init_sa, &response, &icfg, &esp_offer(0), ChildTsOffer::Ipv4).unwrap_err();
         assert_eq!(err, IkeError::NoProposalChosen);
     }
 
@@ -1093,7 +1198,8 @@ mod tests {
         let req = initiator_auth_request(&init_sa, &cert_config(), 0xDEADBEEF, &esp_offer(0), &[1u8; 8]).unwrap();
         let (resp, learned_i, _init_spi, _ic) = responder_process_auth(&resp_sa, &req, &cert_config(), 0xCAFEBABE, &[2u8; 8], None).unwrap();
         assert_eq!(learned_i, Identification::fqdn("vpn.example.com"));
-        let (learned_r, _resp_spi, _esp_suite, _assigned, _tsr) = initiator_verify_auth(&init_sa, &resp, &cert_config(), &esp_offer(0)).unwrap();
+        let (learned_r, _resp_spi, _esp_suite, _assigned, _tsr) =
+            initiator_verify_auth(&init_sa, &resp, &cert_config(), &esp_offer(0), ChildTsOffer::Ipv4).unwrap();
         assert_eq!(learned_r, Identification::fqdn("vpn.example.com"));
     }
 
@@ -1197,13 +1303,13 @@ mod tests {
             let (init_sa, resp_sa) = run_sa_init();
             let req = initiator_auth_request(&init_sa, &good(), 1, &esp_offer(0), &[1u8; 8]).unwrap();
             let (resp, ..) = responder_process_auth(&resp_sa, &req, &forged_cert_config(vec![ext]), 2, &[2u8; 8], None).unwrap();
-            assert!(initiator_verify_auth(&init_sa, &resp, &good(), &esp_offer(0)).is_err(), "{oid}");
+            assert!(initiator_verify_auth(&init_sa, &resp, &good(), &esp_offer(0), ChildTsOffer::Ipv4).is_err(), "{oid}");
         }
         // Control: the same exchange with digitalSignature both ways.
         let (init_sa, resp_sa) = run_sa_init();
         let req = initiator_auth_request(&init_sa, &good(), 1, &esp_offer(0), &[1u8; 8]).unwrap();
         let (resp, ..) = responder_process_auth(&resp_sa, &req, &good(), 2, &[2u8; 8], None).unwrap();
-        initiator_verify_auth(&init_sa, &resp, &good(), &esp_offer(0)).unwrap();
+        initiator_verify_auth(&init_sa, &resp, &good(), &esp_offer(0), ChildTsOffer::Ipv4).unwrap();
     }
 
     // `initiator_eap_request_with_certs` (the "Certificate + EAP" hybrid a

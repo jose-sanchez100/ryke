@@ -14,7 +14,7 @@ use std::time::Duration;
 use ryke::{
     default_offer, esp_offer, initiator_auth_request, initiator_complete, initiator_request,
     initiator_verify_auth, is_ike_on_4500, notify_type, payloads, unwrap_ike_4500, wrap_ike_4500,
-    AuthConfig, ChildSa, Entropy, Identification, IkeHeader, LocalSecret, Notify, OsEntropy,
+    AuthConfig, ChildSa, ChildTsOffer, Entropy, Identification, IkeHeader, LocalSecret, Notify, OsEntropy,
     PayloadType, Role,
 };
 
@@ -113,7 +113,7 @@ fn main() {
     let (n, _) = sock.recv_from(&mut buf).expect("no IKE_AUTH response on :4500");
     let auth_resp = unwrap_ike_4500(&buf[..n]).expect("IKE_AUTH reply lacked non-ESP marker");
     let (got_server_id, peer_child_spi, _esp_suite, assigned, _tsr) =
-        initiator_verify_auth(&sa, auth_resp, &auth, &esp_offer(0)).expect("IKE_AUTH verify");
+        initiator_verify_auth(&sa, auth_resp, &auth, &esp_offer(0), ChildTsOffer::Ipv4).expect("IKE_AUTH verify");
     println!("✅ IKE_AUTH answered on :4500 (NAT-T float works) — server_id={got_server_id:?}");
     if got_server_id != Identification::fqdn(server_id) {
         eprintln!("⚠️  server identity mismatch (expected fqdn({server_id}))");

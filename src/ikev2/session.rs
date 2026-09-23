@@ -988,13 +988,23 @@ impl LivenessSession {
                 return Err(io::Error::from(io::ErrorKind::TimedOut).into());
             }
         };
-        let (child, tsr) = rekey::initiator_complete_child(&self.sa, &ni, new_local_spi, self.cipher, pfs, &response)?;
-        ike_debug!(
-            "CREATE_CHILD_SA ({what}): complete -- new spi_in={:08x} spi_out={:08x}",
-            child.inbound.spi(), child.outbound.spi()
-        );
+        let (child, tsr) = match rekey::initiator_complete_child(&self.sa, &ni, new_local_spi, self.cipher, pfs, ts, &response) {
+            Ok(done) => done,
+            // The peer made the SA, for traffic we never proposed (RFC 7296
+            // §2.9): it is deleted, not used.
+            Err(IkeError::TsOutsideOffer) => {
+                ike_debug!("CREATE_CHILD_SA ({what}): the answer's traffic selectors are not within ours -- deleting the CHILD SA spi_in={new_local_spi:08x}");
+                let peer = rekey::peer_child_spi(&self.sa, &response).unwrap_or(0);
+                if let Err(e) = self.delete_child_sa(ChildSpis { local: new_local_spi, peer }) {
+                    ike_debug!("CREATE_CHILD_SA ({what}): failed to delete it: {e}");
+                }
+                return Err(IkeError::TsOutsideOffer.into());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        ike_debug!("CREATE_CHILD_SA ({what}): complete -- new spi_in={:08x} spi_out={:08x}", child.inbound.spi(), child.outbound.spi());
         let nr = rekey::peer_child_nonce(&self.sa, &response).unwrap_or_default();
-        Ok((child, tsr, ni.min(nr)))
+        Ok((child, Some(tsr), ni.min(nr)))
     }
 
     /// The next IKE datagram, waiting at most `timeout`: from `external_rx`
@@ -2671,7 +2681,7 @@ impl<E: Entropy> Ikev2Session<E> {
         let response =
             send_and_retry_reassembling(&sock, dest, &wire, float, sa.suite.sk_cipher(), &sa.keys.sk_er, &sa.keys.sk_ar)?;
 
-        let (_peer_id, peer_spi, esp_suite, assigned_ip4, tsr) = match ike_auth::initiator_verify_auth(&sa, &response, cfg, esp_offer) {
+        let (_peer_id, peer_spi, esp_suite, assigned_ip4, tsr) = match ike_auth::initiator_verify_auth(&sa, &response, cfg, esp_offer, ts_offer) {
             Ok(v) => v,
             Err(e) => {
                 // RFC 7296 §1.2: an authenticated peer that refused only the
@@ -2957,6 +2967,12 @@ impl<E: Entropy> Ikev2Session<E> {
                         return self.recover_child_after_rejection(ike, want_cfg, cfg_reply, esp_offer, e);
                     }
                     notify_ike_sa_delete_on_failed_auth(&sock, initiator.ike_sa(), dest, float, &ike_msg, "CHILD SA rejected");
+                    return Err(e.into());
+                }
+                // EAP finished and the AUTH verified, but the CHILD SA was made
+                // for traffic we never proposed (RFC 7296 §2.9).
+                Err(e @ IkeError::TsOutsideOffer) => {
+                    notify_ike_sa_delete_on_failed_auth(&sock, initiator.ike_sa(), dest, float, &ike_msg, "CHILD SA outside our traffic selectors");
                     return Err(e.into());
                 }
                 Err(e) => return Err(e.into()),
@@ -3522,7 +3538,7 @@ mod tests {
         };
         let (response, resp_sa, mut liveness) = peer_child_request_answered_with(required(), None, ours);
         let (peer_child, _) =
-            rekey::initiator_complete_child(&resp_sa, &PEER_NI, PEER_NEW_SPI, SkCipher::Aes256Gcm, Some((DhGroup::Modp2048, &PEER_DH)), &response)
+            rekey::initiator_complete_child(&resp_sa, &PEER_NI, PEER_NEW_SPI, SkCipher::Aes256Gcm, Some((DhGroup::Modp2048, &PEER_DH)), &TrafficSelectors::ipv4_full_tunnel(), &response)
                 .expect("a PFS rekey answer, not a refusal");
         let taken = liveness.take_peer_rekeys();
         assert_eq!(taken.len(), 1);
@@ -3531,7 +3547,16 @@ mod tests {
         // And a session whose offer leaves PFS optional ([MODP-2048, NONE]) takes the rekey without.
         let optional = PfsPolicy::from_offer(&gcm_esp_offer_with_dh(0, &[MODP_2048, 0])).unwrap();
         let (response, resp_sa, mut liveness) = peer_child_request_answered_with(optional, None, no_pfs);
-        rekey::initiator_complete_child(&resp_sa, &PEER_NI, PEER_NEW_SPI, SkCipher::Aes256Gcm, None, &response).expect("answered without PFS");
+        rekey::initiator_complete_child(
+            &resp_sa,
+            &PEER_NI,
+            PEER_NEW_SPI,
+            SkCipher::Aes256Gcm,
+            None,
+            &TrafficSelectors::ipv4_full_tunnel(),
+            &response,
+        )
+        .expect("answered without PFS");
         assert_eq!(liveness.take_peer_rekeys().len(), 1);
     }
 
@@ -3664,7 +3689,7 @@ mod tests {
     fn a_peer_rekey_of_the_primary_child_sa_is_answered_and_handed_over() {
         let (response, resp_sa, mut liveness) = peer_child_request_answered(Some(0xAAAA), Some(ChildSpis { local: 0x6666, peer: 0x7777 }));
         let (peer_child, _) =
-            rekey::initiator_complete_child(&resp_sa, &PEER_NI, PEER_NEW_SPI, SkCipher::Aes256Gcm, None, &response).expect("a rekey answer, not a refusal");
+            rekey::initiator_complete_child(&resp_sa, &PEER_NI, PEER_NEW_SPI, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), &response).expect("a rekey answer, not a refusal");
 
         let mut taken = liveness.take_peer_rekeys();
         assert_eq!(taken.len(), 1);
@@ -3684,7 +3709,16 @@ mod tests {
     #[test]
     fn a_peer_rekey_of_the_ipv6_child_sa_replaces_only_that_one() {
         let (response, resp_sa, mut liveness) = peer_child_request_answered(Some(0x7777), Some(ChildSpis { local: 0x6666, peer: 0x7777 }));
-        rekey::initiator_complete_child(&resp_sa, &PEER_NI, PEER_NEW_SPI, SkCipher::Aes256Gcm, None, &response).expect("a rekey answer, not a refusal");
+        rekey::initiator_complete_child(
+            &resp_sa,
+            &PEER_NI,
+            PEER_NEW_SPI,
+            SkCipher::Aes256Gcm,
+            None,
+            &TrafficSelectors::ipv4_full_tunnel(),
+            &response,
+        )
+        .expect("a rekey answer, not a refusal");
 
         let taken = liveness.take_peer_rekeys();
         assert_eq!(taken.iter().map(|t| t.kind).collect::<Vec<_>>(), [ChildKind::Ipv6]);
@@ -6074,7 +6108,7 @@ mod tests {
                 let (n, _) = sock.recv_from(&mut buf).unwrap();
                 let first_answer = buf[..n].to_vec();
                 let (new_child, _) =
-                    rekey::initiator_complete_child(&sa, &ni, new_spi, SkCipher::Aes256Gcm, Some((DhGroup::Modp2048, &dh)), &first_answer)
+                    rekey::initiator_complete_child(&sa, &ni, new_spi, SkCipher::Aes256Gcm, Some((DhGroup::Modp2048, &dh)), &TrafficSelectors::ipv4_full_tunnel(), &first_answer)
                         .expect("a rekey answer");
 
                 // The same request again -- as if the answer had been lost.
@@ -6214,7 +6248,8 @@ mod tests {
                 sock.send_to(&gateway_child_rekey(&sa, 0, RESPONDER_CHILD_SPI, PEER_P_SPI, &ni), from).unwrap();
                 let answer = recv_from_client(&sock);
                 let (theirs, _) =
-                    rekey::initiator_complete_child(&sa, &ni, PEER_P_SPI, SkCipher::Aes256Gcm, None, &answer).expect("answered as usual");
+                    rekey::initiator_complete_child(&sa, &ni, PEER_P_SPI, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), &answer)
+                        .expect("answered as usual");
                 let (response, ours_sa) = gateway_answers_rekey(&sa, &ours, &[0x80u8; 32]);
                 sock.send_to(&response, from).unwrap();
 
@@ -6266,7 +6301,8 @@ mod tests {
                 sock.send_to(&gateway_child_rekey(&sa, 0, RESPONDER_CHILD_SPI, PEER_P_SPI, &ni), from).unwrap();
                 let answer = recv_from_client(&sock);
                 let (theirs, _) =
-                    rekey::initiator_complete_child(&sa, &ni, PEER_P_SPI, SkCipher::Aes256Gcm, None, &answer).expect("answered as usual");
+                    rekey::initiator_complete_child(&sa, &ni, PEER_P_SPI, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), &answer)
+                        .expect("answered as usual");
                 let (response, ours_sa) = gateway_answers_rekey(&sa, &ours, &[0x00u8; 32]);
                 sock.send_to(&response, from).unwrap();
 
@@ -6309,7 +6345,8 @@ mod tests {
                 sock.send_to(&gateway_child_rekey(&sa, 0, RESPONDER_CHILD_SPI, PEER_P_SPI, &ni), from).unwrap();
                 let answer = recv_from_client(&sock);
                 let (theirs, _) =
-                    rekey::initiator_complete_child(&sa, &ni, PEER_P_SPI, SkCipher::Aes256Gcm, None, &answer).expect("answered as usual");
+                    rekey::initiator_complete_child(&sa, &ni, PEER_P_SPI, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), &answer)
+                        .expect("answered as usual");
                 sock.send_to(&esp_delete_request(&sa, 1, RESPONDER_CHILD_SPI), from).unwrap();
                 let answer = recv_from_client(&sock);
                 let mid = IkeHeader::parse(&ours).unwrap().message_id;
@@ -7005,6 +7042,70 @@ mod tests {
         drop(tx);
         let e = session.recv_datagram(&mut buf, Duration::from_millis(50)).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// RFC 7296 §2.9: a rekey answered for traffic we never proposed (IPv6
+    /// selectors to our IPv4 offer) is not taken. The SA the peer made for it
+    /// is deleted -- naming our inbound SPI of it -- and the CHILD SA it was
+    /// to replace stays in place.
+    #[test]
+    fn a_child_sa_answered_outside_our_selectors_is_deleted_not_installed() {
+        use crate::ikev2::message::{encode_payload_chain, first_payload_type};
+
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let responder = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, _client_spi) = responder_through_auth_spis(bind, psk);
+                let mut buf = [0u8; 4096];
+                let (n, from2) = sock.recv_from(&mut buf).unwrap();
+                assert_eq!(from, from2);
+                let request = buf[..n].to_vec();
+                let (resp, _child) =
+                    rekey::responder_process_rekey_with_pfs(&sa, &request, 0xD00D_0002, &[0x77u8; 32], SkCipher::Aes256Gcm, None, &[8u8; 8], None)
+                        .unwrap();
+                let (first, inner) = open_encrypted(sa.suite.sk_cipher(), &resp, &sa.keys.sk_er, &sa.keys.sk_ar).unwrap();
+                let v6 = TrafficSelectors::ipv6_full_tunnel().to_bytes();
+                let answer: Vec<(PayloadType, Vec<u8>)> = payloads(first, &inner)
+                    .map(|p| p.unwrap())
+                    .map(|p| match p.payload_type {
+                        PayloadType::TrafficSelectorInitiator | PayloadType::TrafficSelectorResponder => (p.payload_type, v6.clone()),
+                        t => (t, p.data.to_vec()),
+                    })
+                    .collect();
+                let widened = sk::build_encrypted(
+                    sa.suite.sk_cipher(),
+                    IkeHeader::parse(&resp).unwrap(),
+                    first_payload_type(&answer),
+                    &encode_payload_chain(&answer),
+                    &sa.keys.sk_er,
+                    &sa.keys.sk_ar,
+                    &[8u8; 8],
+                )
+                .unwrap();
+                sock.send_to(&widened, from).unwrap();
+                let (n, _) = sock.recv_from(&mut buf).unwrap();
+                let deleted = open_informational(&sa, &buf[..n])
+                    .ok()
+                    .and_then(|ps| ps.into_iter().find(|(t, _)| *t == PayloadType::Delete))
+                    .map(|(_, body)| Delete::parse(&body).unwrap());
+                (rekey::peer_child_spi(&sa, &request), deleted)
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+        let cfg = AuthConfig::psk(Identification::fqdn("client.test"), psk);
+        let mut tunnel = session.connect_direct_on_port(bind, &default_ike_offer(), &cfg, false, &default_esp_offer(), next_addr().port()).unwrap();
+        let before = (tunnel.liveness.child_local_spi, tunnel.liveness.child_peer_spi);
+        let err = tunnel.liveness.rekey_child(Duration::from_secs(2)).unwrap_err();
+        assert!(matches!(err, DriverError::Ike(IkeError::TsOutsideOffer)), "{err:?}");
+        assert_eq!((tunnel.liveness.child_local_spi, tunnel.liveness.child_peer_spi), before, "the old CHILD SA is kept");
+        let (proposed_spi, deleted) = responder.join().unwrap();
+        let proposed_spi = proposed_spi.expect("the rekey request names our new inbound SPI");
+        assert_ne!(proposed_spi, before.0);
+        assert_eq!(deleted, Some(Delete::esp(vec![proposed_spi])), "the SA made for it is deleted");
     }
 
     /// Responder for the IPv6 CHILD SA flow: the same handshake, then a

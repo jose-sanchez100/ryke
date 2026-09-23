@@ -459,6 +459,34 @@ impl TrafficSelector {
         None
     }
 
+    /// Whether every packet this selector matches is matched by `outer` too:
+    /// the same address family, `outer`'s protocol or any protocol, and a
+    /// port and address range inside `outer`'s -- what RFC 7296 §2.9 allows a
+    /// responder to answer with, a subset of what was proposed. `ANY` ports
+    /// (0-65535) include `OPAQUE` (65535-0, §3.13.1); `OPAQUE` includes
+    /// only itself. A selector of a type this crate does not know is inside
+    /// nothing.
+    pub fn is_within(&self, outer: &TrafficSelector) -> bool {
+        const ANY: (u16, u16) = (0, 65535);
+        const OPAQUE: (u16, u16) = (65535, 0);
+        let (ports, outer_ports) = ((self.start_port, self.end_port), (outer.start_port, outer.end_port));
+        let ports_within = outer_ports == ANY
+            || if ports == OPAQUE || outer_ports == OPAQUE {
+                ports == outer_ports
+            } else {
+                outer_ports.0 <= ports.0 && ports.0 <= ports.1 && ports.1 <= outer_ports.1
+            };
+        matches!(self.ts_type, ts_type::IPV4_ADDR_RANGE | ts_type::IPV6_ADDR_RANGE)
+            && self.ts_type == outer.ts_type
+            && (outer.ip_protocol == 0 || outer.ip_protocol == self.ip_protocol)
+            && ports_within
+            && self.start_addr.len() == outer.start_addr.len()
+            && self.end_addr.len() == outer.end_addr.len()
+            && outer.start_addr <= self.start_addr
+            && self.start_addr <= self.end_addr
+            && self.end_addr <= outer.end_addr
+    }
+
     fn parse(buf: &[u8]) -> Result<(TrafficSelector, usize), IkeError> {
         if buf.len() < 8 {
             return Err(IkeError::Truncated { need: 8, have: buf.len() });
@@ -468,6 +496,23 @@ impl TrafficSelector {
             return Err(IkeError::BadLength { declared: length, available: buf.len() });
         }
         let addr_len = (length - 8) / 2;
+        // RFC 7296 §3.13.1: the TS Type fixes the address size, and the
+        // Starting Address is the smallest address in the range, the Ending
+        // Address the largest. A type this crate does not know keeps the
+        // generic shape: §2.9 has the responder ignore it, not the message.
+        let family_len = match buf[0] {
+            ts_type::IPV4_ADDR_RANGE => Some(4),
+            ts_type::IPV6_ADDR_RANGE => Some(16),
+            _ => None,
+        };
+        if let Some(family_len) = family_len {
+            if addr_len != family_len {
+                return Err(IkeError::MalformedPayload("Traffic Selector length does not match its TS Type"));
+            }
+            if buf[8..8 + addr_len] > buf[8 + addr_len..length] {
+                return Err(IkeError::MalformedPayload("Traffic Selector ends before it starts"));
+            }
+        }
         Ok((
             TrafficSelector {
                 ts_type: buf[0],
@@ -534,17 +579,34 @@ impl TrafficSelectors {
         self.selectors.iter().any(|s| s.ts_type == ts_type::IPV6_ADDR_RANGE)
     }
 
+    /// Whether these selectors are a subset of `offer` (RFC 7296 §2.9: the
+    /// responder narrows "to some subset of the initiator's proposal
+    /// (provided the set does not become the null set)"): at least one, and
+    /// each inside one of `offer`'s ([`TrafficSelector::is_within`]). A
+    /// selector covered only by two of `offer`'s together does not count --
+    /// no offer this crate makes has selectors that adjoin.
+    pub fn is_within(&self, offer: &TrafficSelectors) -> bool {
+        !self.selectors.is_empty() && self.selectors.iter().all(|s| offer.selectors.iter().any(|o| s.is_within(o)))
+    }
+
     pub fn parse(body: &[u8]) -> Result<TrafficSelectors, IkeError> {
         if body.len() < 4 {
             return Err(IkeError::Truncated { need: 4, have: body.len() });
         }
         let count = body[0] as usize;
+        // §3.13: the payload holds "one or more individual Traffic Selectors".
+        if count == 0 {
+            return Err(IkeError::MalformedPayload("TS payload with no Traffic Selector"));
+        }
         let mut off = 4; // skip Number of TSs (1) + RESERVED (3)
         let mut selectors = Vec::with_capacity(count);
         for _ in 0..count {
             let (ts, consumed) = TrafficSelector::parse(&body[off..])?;
             selectors.push(ts);
             off += consumed;
+        }
+        if off != body.len() {
+            return Err(IkeError::MalformedPayload("TS payload longer than its Traffic Selectors"));
         }
         Ok(TrafficSelectors { selectors })
     }
@@ -1209,6 +1271,114 @@ mod tests {
             end_addr: vec![0xFF; 16],
         };
         assert_eq!(ipv6.to_ipv4_cidr(), None);
+    }
+
+    /// A TS payload body (RFC 7296 §3.13) declaring `count` selectors, followed by `selectors`.
+    fn ts_body(count: u8, selectors: &[&[u8]]) -> Vec<u8> {
+        let mut body = vec![count, 0, 0, 0];
+        for s in selectors {
+            body.extend_from_slice(s);
+        }
+        body
+    }
+
+    /// One Traffic Selector substructure (RFC 7296 §3.13.1), its Selector Length computed.
+    fn ts_bytes(ts_type: u8, start_port: u16, end_port: u16, start: &[u8], end: &[u8]) -> Vec<u8> {
+        let mut out = vec![ts_type, 0];
+        out.extend_from_slice(&((8 + start.len() + end.len()) as u16).to_be_bytes());
+        out.extend_from_slice(&start_port.to_be_bytes());
+        out.extend_from_slice(&end_port.to_be_bytes());
+        out.extend_from_slice(start);
+        out.extend_from_slice(end);
+        out
+    }
+
+    #[test]
+    fn a_selector_is_within_another_only_when_it_matches_no_more_traffic() {
+        let v4 = |proto: u8, ports: (u16, u16), start: [u8; 4], end: [u8; 4]| TrafficSelector {
+            ts_type: ts_type::IPV4_ADDR_RANGE,
+            ip_protocol: proto,
+            start_port: ports.0,
+            end_port: ports.1,
+            start_addr: start.to_vec(),
+            end_addr: end.to_vec(),
+        };
+        let any = TrafficSelector::ipv4_any();
+        let net = v4(0, (0, 65535), [10, 0, 0, 0], [10, 0, 0, 255]);
+        let host = TrafficSelector::ipv4_host(Ipv4Addr::new(10, 0, 0, 7));
+        let tcp_net = v4(6, (0, 65535), [10, 0, 0, 0], [10, 0, 0, 255]);
+        let https = v4(6, (443, 443), [10, 0, 0, 0], [10, 0, 0, 255]);
+        let opaque = v4(0, (65535, 0), [10, 0, 0, 0], [10, 0, 0, 255]);
+        let within = [
+            (&host, &net),
+            (&net, &any),
+            (&any, &any),
+            (&tcp_net, &net),   // any protocol covers TCP
+            (&https, &tcp_net), // all ports cover one
+            (&opaque, &net),    // ANY includes OPAQUE
+            (&opaque, &opaque),
+        ];
+        for (inner, outer) in within {
+            assert!(inner.is_within(outer), "{inner:?} not within {outer:?}");
+        }
+        let outside = [
+            (&net, &host),
+            (&any, &net),
+            (&net, &tcp_net),   // any protocol is more than TCP
+            (&tcp_net, &https), // all ports are more than one
+            (&https, &opaque),  // OPAQUE includes only itself
+            (&opaque, &https),
+        ];
+        for (inner, outer) in outside {
+            assert!(!inner.is_within(outer), "{inner:?} within {outer:?}");
+        }
+        assert!(!TrafficSelector::ipv6_any().is_within(&any), "another family");
+        let unknown = TrafficSelector { ts_type: 9, ..any.clone() };
+        assert!(!unknown.is_within(&TrafficSelector { ts_type: 9, ..any.clone() }), "a type this crate does not know");
+
+        let ipv4 = TrafficSelectors::ipv4_full_tunnel();
+        let unified = TrafficSelectors::unified_full_tunnel();
+        assert!(ipv4.is_within(&unified));
+        assert!(unified.is_within(&unified));
+        assert!(TrafficSelectors { selectors: vec![host.clone(), TrafficSelector::ipv6_any()] }.is_within(&unified));
+        assert!(!unified.is_within(&ipv4), "IPv6 granted to an IPv4 offer");
+        assert!(!TrafficSelectors { selectors: vec![host, unknown] }.is_within(&ipv4), "one selector outside is enough");
+        assert!(!TrafficSelectors { selectors: vec![] }.is_within(&ipv4), "the null set");
+    }
+
+    #[test]
+    fn ts_payloads_are_taken_only_with_a_consistent_structure() {
+        let v4 = ts_bytes(ts_type::IPV4_ADDR_RANGE, 0, 65535, &[10, 0, 0, 0], &[10, 0, 0, 255]);
+        let v6 = ts_bytes(ts_type::IPV6_ADDR_RANGE, 0, 65535, &[0; 16], &[0xff; 16]);
+        let rejected: [(&str, Vec<u8>); 7] = [
+            // §3.13: "One or more individual Traffic Selectors".
+            ("no selector", ts_body(0, &[])),
+            ("octets past the last selector", [ts_body(1, &[&v4]), vec![0]].concat()),
+            ("fewer selectors than counted", ts_body(2, &[&v4])),
+            // §3.13.1: type 7 carries two four-octet addresses, type 8 two sixteen-octet ones.
+            ("IPv4 range with IPv6-sized addresses", ts_body(1, &[&ts_bytes(ts_type::IPV4_ADDR_RANGE, 0, 65535, &[0; 16], &[0xff; 16])])),
+            ("IPv6 range with IPv4-sized addresses", ts_body(1, &[&ts_bytes(ts_type::IPV6_ADDR_RANGE, 0, 65535, &[0; 4], &[0xff; 4])])),
+            // §3.13.1: the Starting Address is the smallest, the Ending Address the largest.
+            ("IPv4 range ending before it starts", ts_body(1, &[&ts_bytes(ts_type::IPV4_ADDR_RANGE, 0, 65535, &[10, 0, 0, 9], &[10, 0, 0, 1])])),
+            ("IPv6 range ending before it starts", ts_body(1, &[&ts_bytes(ts_type::IPV6_ADDR_RANGE, 0, 65535, &[0xff; 16], &[0; 16])])),
+        ];
+        for (what, body) in rejected {
+            assert!(TrafficSelectors::parse(&body).is_err(), "{what} was taken");
+        }
+
+        // Positive controls: what ryke offers, a host range, OPAQUE ports
+        // (§3.13.1: start 65535, end 0), and a type this crate does not know,
+        // which is kept for the caller to leave out (§2.9) rather than refused.
+        for ts in [TrafficSelectors::ipv4_full_tunnel(), TrafficSelectors::unified_full_tunnel()] {
+            assert_eq!(TrafficSelectors::parse(&ts.to_bytes()).unwrap(), ts);
+        }
+        let host = ts_bytes(ts_type::IPV4_ADDR_RANGE, 0, 65535, &[10, 0, 0, 1], &[10, 0, 0, 1]);
+        let opaque = ts_bytes(ts_type::IPV4_ADDR_RANGE, 65535, 0, &[10, 0, 0, 0], &[10, 0, 0, 255]);
+        let unknown = ts_bytes(9, 0, 65535, &[0, 0, 0, 1, 0, 0, 0, 0], &[0, 0, 0, 1, 0, 0, 0, 0]);
+        let got = TrafficSelectors::parse(&ts_body(5, &[&v4, &v6, &host, &opaque, &unknown])).unwrap();
+        assert_eq!(got.selectors.len(), 5);
+        assert_eq!((got.selectors[3].start_port, got.selectors[3].end_port), (65535, 0));
+        assert_eq!(got.selectors[4].ts_type, 9);
     }
 
     #[test]

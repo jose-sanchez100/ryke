@@ -212,7 +212,7 @@ impl<E: Entropy> Client<E> {
         let request = ike_auth::initiator_auth_request(sa, cfg, child_spi, &esp_offer, &iv)?;
         self.send_step(&request, server, floated)?;
         let response = self.recv_response(sa, &request, floated)?;
-        let (id, spi, _esp_suite, ip4, _tsr) = ike_auth::initiator_verify_auth(sa, &response, cfg, &esp_offer)?;
+        let (id, spi, _esp_suite, ip4, _tsr) = ike_auth::initiator_verify_auth(sa, &response, cfg, &esp_offer, ike_auth::ChildTsOffer::Ipv4)?;
         Ok((id, spi, ip4))
     }
 

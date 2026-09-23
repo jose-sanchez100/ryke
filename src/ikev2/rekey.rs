@@ -27,17 +27,14 @@ use crate::debug::ike_debug;
 use crate::error::IkeError;
 use crate::esp::ChildSa;
 use crate::ikev2::exchange::CompletedSaInit;
-use crate::ikev2::ike_auth::esp_offer_for_cipher;
+use crate::ikev2::ike_auth::{check_granted_ts, esp_offer_for_cipher};
+use crate::ikev2::message::{encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType};
 use crate::ikev2::negotiate;
-use crate::ikev2::message::{
-    encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
-};
 use crate::ikev2::payload::{
-    notify_type, protocol_id, transform_type, KeyExchange, Notify, Proposal, SecurityAssociation, Transform, TrafficSelector,
-    TrafficSelectors,
+    notify_type, protocol_id, transform_type, KeyExchange, Notify, Proposal, SecurityAssociation, TrafficSelector, TrafficSelectors, Transform,
 };
-use crate::role::Role;
 use crate::ikev2::sk::{build_encrypted, open_encrypted, SkCipher};
+use crate::role::Role;
 
 fn our_sk_e(sa: &CompletedSaInit) -> &[u8] {
     match sa.role {
@@ -351,6 +348,14 @@ pub fn peer_child_nonce(sa: &CompletedSaInit, msg: &[u8]) -> Option<Vec<u8>> {
     payloads(first, &inner).filter_map(Result::ok).find(|p| p.payload_type == PayloadType::Nonce).map(|p| p.data.to_vec())
 }
 
+/// The SPI the peer chose for the CHILD SA a `CREATE_CHILD_SA` answer
+/// creates (its SA payload's), if the answer has one.
+pub(crate) fn peer_child_spi(sa: &CompletedSaInit, msg: &[u8]) -> Option<u32> {
+    let (first, inner) = open_encrypted(sa.suite.sk_cipher(), msg, peer_sk_e(sa), peer_sk_a(sa)).ok()?;
+    let (sa_bytes, _) = find_sa_and_nonce(first, &inner).ok()?;
+    esp_spi_from_sa(&sa_bytes).ok()
+}
+
 /// Responder: process a rekey request, derive the new CHILD SA, and build the
 /// response. Returns `(response_bytes, ChildSa)`.
 pub fn responder_process_rekey(
@@ -638,13 +643,18 @@ pub fn initiator_complete_rekey_with_pfs(
     pfs: Option<PfsKeyExchange>,
     response: &[u8],
 ) -> Result<ChildSa, IkeError> {
-    initiator_complete_child(sa, ni, new_spi, cipher, pfs, response).map(|(child, _tsr)| child)
+    // `build_rekey_request_with_pfs` proposes 0.0.0.0/0 as both TSi and TSr.
+    initiator_complete_child(sa, ni, new_spi, cipher, pfs, &TrafficSelectors::ipv4_full_tunnel(), response).map(|(child, _tsr)| child)
 }
 
 /// Like [`initiator_complete_rekey_with_pfs`], for either kind of
 /// `CREATE_CHILD_SA` request [`build_child_request`] builds, and also returns
-/// the `TSr` the responder granted (`None` if it sent none) -- for a newly
-/// created CHILD SA that is what decides what the caller routes into it. A
+/// the `TSr` the responder granted -- for a newly created CHILD SA that is
+/// what decides what the caller routes into it. `offered` is the `ts` the
+/// request proposed: the answer must carry TSi and TSr, each a subset of it
+/// (RFC 7296 §2.9), or this fails with [`IkeError::MissingPayload`] /
+/// [`IkeError::TsOutsideOffer`] -- in the second case the peer has made the
+/// SA (on our `new_spi`), which is the caller's to delete. A
 /// response carrying an error Notify (`NO_PROPOSAL_CHOSEN`, `TS_UNACCEPTABLE`,
 /// ...) is [`IkeError::PeerRejected`] rather than a confusing missing-payload
 /// error.
@@ -661,10 +671,11 @@ pub fn initiator_complete_child(
     new_spi: u32,
     cipher: SkCipher,
     pfs: Option<PfsKeyExchange>,
+    offered: &TrafficSelectors,
     response: &[u8],
-) -> Result<(ChildSa, Option<TrafficSelectors>), IkeError> {
+) -> Result<(ChildSa, TrafficSelectors), IkeError> {
     let (first, inner) = open_encrypted(sa.suite.sk_cipher(), response, peer_sk_e(sa), peer_sk_a(sa))?;
-    let mut tsr = None;
+    let (mut tsi, mut tsr) = (None, None);
     for payload in payloads(first, &inner) {
         let p = payload?;
         match p.payload_type {
@@ -678,6 +689,7 @@ pub fn initiator_complete_child(
                     }
                 }
             }
+            PayloadType::TrafficSelectorInitiator => tsi = Some(TrafficSelectors::parse(p.data)?),
             PayloadType::TrafficSelectorResponder => tsr = Some(TrafficSelectors::parse(p.data)?),
             _ => {}
         }
@@ -733,6 +745,8 @@ pub fn initiator_complete_child(
         Some(secret) => ChildSa::derive_with_cipher_pfs(sa.suite.prf_algorithm(), cipher, secret, &sa.keys.sk_d, ni, &nr, Role::Initiator, new_spi, peer_spi),
         None => ChildSa::derive_with_cipher(sa.suite.prf_algorithm(), cipher, &sa.keys.sk_d, ni, &nr, Role::Initiator, new_spi, peer_spi),
     };
+    let tsr = tsr.ok_or(IkeError::MissingPayload("TSr"))?;
+    check_granted_ts(offered, tsi.as_ref(), Some(&tsr))?;
     Ok((child, tsr))
 }
 
@@ -907,8 +921,8 @@ mod tests {
         // With no assignment the responder echoes the initiator's selectors.
         let (resp, mut resp_child) = responder_process_rekey(&resp_sa, &req, 0x2222_2222, &[0x44u8; 32], &[2u8; 8], None).unwrap();
         let (mut init_child, granted) =
-            initiator_complete_child(&init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, None, &resp).unwrap();
-        assert_eq!(granted, Some(v6));
+            initiator_complete_child(&init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, None, &v6, &resp).unwrap();
+        assert_eq!(granted, v6);
 
         let pkt = init_child.outbound.seal(b"v6 child A->B", next_header::IPV6).unwrap();
         assert_eq!(resp_child.inbound.open(&pkt).unwrap().0, b"v6 child A->B");
@@ -996,8 +1010,8 @@ mod tests {
             let (resp, mut our_child) =
                 responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &PfsPolicy::none(), &[6u8; 32], &[2u8; 8]).unwrap();
             let (mut peer_child, granted) =
-                initiator_complete_child(&peer_sa, &[0x33u8; 32], 0x2222_2222, SkCipher::Aes256Gcm, pfs.map(|g| (g, &peer_dh[..])), &resp).unwrap();
-            assert_eq!(granted, Some(ts), "the peer's selectors are accepted as proposed");
+                initiator_complete_child(&peer_sa, &[0x33u8; 32], 0x2222_2222, SkCipher::Aes256Gcm, pfs.map(|g| (g, &peer_dh[..])), &ts, &resp).unwrap();
+            assert_eq!(granted, ts, "the peer's selectors are accepted as proposed");
 
             let pkt = peer_child.outbound.seal(b"peer -> us", next_header::IPV4).unwrap();
             assert_eq!(our_child.inbound.open(&pkt).unwrap().0, b"peer -> us");
@@ -1063,7 +1077,8 @@ mod tests {
         assert!(proposal.transforms.iter().all(|t| t.transform_type != transform_type::DH));
 
         let (mut peer_child, _) =
-            initiator_complete_child(&peer_sa, &[0x33u8; 32], 0x2222_2222, SkCipher::Aes256Gcm, None, &resp).unwrap();
+            initiator_complete_child(&peer_sa, &[0x33u8; 32], 0x2222_2222, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), &resp)
+                .unwrap();
         let pkt = peer_child.outbound.seal(b"peer -> us", next_header::IPV4).unwrap();
         assert_eq!(our_child.inbound.open(&pkt).unwrap().0, b"peer -> us");
     }
@@ -1143,7 +1158,10 @@ mod tests {
             &[2u8; 8],
         )
         .unwrap();
-        let err = initiator_complete_child(&init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, None, &reply).err().unwrap();
+        let err =
+            initiator_complete_child(&init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), &reply)
+                .err()
+                .unwrap();
         assert!(
             matches!(err, IkeError::PeerRejected { notify_type: notify_type::TS_UNACCEPTABLE, .. }),
             "expected PeerRejected(TS_UNACCEPTABLE), got {err:?}"
@@ -1178,8 +1196,57 @@ mod tests {
         )
         .unwrap();
 
-        let err = initiator_complete_child(&init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, None, &resp).err().unwrap();
+        let err =
+            initiator_complete_child(&init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), &resp)
+                .err()
+                .unwrap();
         assert_eq!(err, IkeError::NoProposalChosen);
+    }
+
+    #[test]
+    fn a_create_child_sa_answer_must_carry_both_ts_within_the_offer() {
+        use crate::ikev2::ike_auth::tests::{ts_answers_outside_an_ipv4_offer, with_ts};
+        let answer = |resp_sa: &CompletedSaInit, tsi: Option<Vec<u8>>, tsr: Option<Vec<u8>>| {
+            let inner = with_ts(
+                vec![
+                    (PayloadType::SecurityAssociation, esp_offer_for_cipher(0x2222_2222, SkCipher::Aes256Gcm).to_bytes()),
+                    (PayloadType::Nonce, vec![0x44; 32]),
+                ],
+                tsi,
+                tsr,
+            );
+            let header = create_child_header(resp_sa, 2, true);
+            build_encrypted(
+                resp_sa.suite.sk_cipher(),
+                header,
+                first_payload_type(&inner),
+                &encode_payload_chain(&inner),
+                our_sk_e(resp_sa),
+                our_sk_a(resp_sa),
+                &[2u8; 8],
+            )
+            .unwrap()
+        };
+        let complete = |init_sa: &CompletedSaInit, offered: &TrafficSelectors, resp: &[u8]| {
+            initiator_complete_child(init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, None, offered, resp).map(|(_, tsr)| tsr)
+        };
+        let v4 = TrafficSelectors::ipv4_full_tunnel();
+        let v6 = TrafficSelectors::ipv6_full_tunnel();
+        for (what, tsi, tsr, expected) in ts_answers_outside_an_ipv4_offer() {
+            let (init_sa, resp_sa) = sa_pair();
+            assert_eq!(complete(&init_sa, &v4, &answer(&resp_sa, tsi, tsr)).err(), Some(expected), "{what}");
+        }
+        // A new IPv6 CHILD SA answered with IPv4 selectors.
+        let (init_sa, resp_sa) = sa_pair();
+        let got = complete(&init_sa, &v6, &answer(&resp_sa, Some(v4.to_bytes()), Some(v4.to_bytes())));
+        assert_eq!(got.err(), Some(IkeError::TsOutsideOffer));
+
+        // Positive controls: narrowed IPv4, and IPv6 as proposed.
+        let host = TrafficSelectors { selectors: vec![TrafficSelector::ipv4_host(Ipv4Addr::new(10, 8, 0, 4))] };
+        let (init_sa, resp_sa) = sa_pair();
+        assert_eq!(complete(&init_sa, &v4, &answer(&resp_sa, Some(host.to_bytes()), Some(v4.to_bytes()))), Ok(v4.clone()));
+        let (init_sa, resp_sa) = sa_pair();
+        assert_eq!(complete(&init_sa, &v6, &answer(&resp_sa, Some(v6.to_bytes()), Some(v6.to_bytes()))), Ok(v6));
     }
 
     /// A `CREATE_CHILD_SA` answer from `resp_sa` to our GCM-256 request, built
@@ -1222,7 +1289,7 @@ mod tests {
         let (ni, init_dh, resp_dh) = ([0x33u8; 32], [5u8; 32], [6u8; 32]);
         let modp2048 = DhGroup::Modp2048;
         let complete =
-            |resp: &[u8]| initiator_complete_child(&init_sa, &ni, 0x1111_1111, SkCipher::Aes256Gcm, Some((modp2048, &init_dh)), resp).map(|_| ());
+            |resp: &[u8]| initiator_complete_child(&init_sa, &ni, 0x1111_1111, SkCipher::Aes256Gcm, Some((modp2048, &init_dh)), &TrafficSelectors::ipv4_full_tunnel(), resp).map(|_| ());
 
         // Positive controls: the real responder's answer, and the hand-built one.
         let req =
@@ -1264,7 +1331,10 @@ mod tests {
     #[test]
     fn a_rekey_answer_must_not_bring_pfs_we_did_not_ask_for() {
         let (init_sa, resp_sa) = sa_pair();
-        let complete = |resp: &[u8]| initiator_complete_child(&init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, None, resp).map(|_| ());
+        let complete = |resp: &[u8]| {
+            initiator_complete_child(&init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), resp)
+                .map(|_| ())
+        };
         let ke = ke_of(DhGroup::Modp2048, &[6u8; 32]);
 
         assert_eq!(complete(&hand_built_answer(&resp_sa, &[], None)), Ok(()));
@@ -1345,7 +1415,16 @@ mod tests {
             let (resp, mut resp_child) = answer(&optional(order), dh_private).unwrap();
             let (_, _, _, ke) = read_rekey_response(&resp, &init_sa);
             assert_eq!(ke, pfs.is_some(), "{order:?}");
-            let (mut init_child, _) = initiator_complete_child(&init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, pfs, &resp).unwrap();
+            let (mut init_child, _) = initiator_complete_child(
+                &init_sa,
+                &[0x33u8; 32],
+                0x1111_1111,
+                SkCipher::Aes256Gcm,
+                pfs,
+                &TrafficSelectors::ipv4_full_tunnel(),
+                &resp,
+            )
+            .unwrap();
             let pkt = init_child.outbound.seal(b"optional PFS", next_header::IPV4).unwrap();
             assert_eq!(resp_child.inbound.open(&pkt).unwrap().0, b"optional PFS", "{order:?}");
         }

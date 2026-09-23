@@ -549,7 +549,7 @@ mod tests {
         assert!(matches!(server.handle_one().unwrap(), ServerEvent::Established { .. }));
         let n = sock.recv(&mut buf).unwrap();
         let auth_response = buf[..n].to_vec();
-        let (_, server_child_spi, ..) = initiator_verify_auth(&sa, &auth_response, &cfg, &esp_offer(0)).unwrap();
+        let (_, server_child_spi, ..) = initiator_verify_auth(&sa, &auth_response, &cfg, &esp_offer(0), ike_auth::ChildTsOffer::Ipv4).unwrap();
         Peer { sock, server: addr, sa, init_request, auth_request, auth_response, server_child_spi }
     }
 
@@ -997,7 +997,8 @@ mod tests {
             assert!(f.len() <= largest, "no fragment of the response is larger than those of the request");
             assert_eq!(IkeHeader::parse(f).unwrap().next_payload, PayloadType::EncryptedFragment);
         }
-        let (_, server_child_spi, ..) = initiator_verify_auth(&sa, &reassembled(&sa, &answer), &cfg, &esp_offer(0)).unwrap();
+        let (_, server_child_spi, ..) =
+            initiator_verify_auth(&sa, &reassembled(&sa, &answer), &cfg, &esp_offer(0), ike_auth::ChildTsOffer::Ipv4).unwrap();
         assert_eq!(server.child(spi_i, spi_r).unwrap().inbound.spi(), server_child_spi);
 
         for other in [fragments[2].clone(), forged(fragments[0].clone())] {

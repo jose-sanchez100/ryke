@@ -26,7 +26,12 @@ Whatever the part, the consumer supplies:
   routes the gateway assigns;
 - **credentials and trust**: keys, certificates, EAP credentials, trusted
   CAs, the name the gateway's certificate must carry, and the current time
-  for certificate validity;
+  for certificate validity. ryke builds the path to a trusted CA (unless
+  the certificate is pinned), checks each certificate's extensions (RFC 5280
+  §4.2) and the leaf's KeyUsage (RFC 4945 §5.1.3.2), and rejects a critical
+  extension it does not process. Revocation (CRL, OCSP), ExtendedKeyUsage,
+  certificate policies and any binding of the peer's ID to the certificate
+  beyond that name are left to the consumer;
 - **sockets and randomness**, where asked for.
 
 [`docs/implementation-plan.md`](docs/implementation-plan.md) is the original

@@ -629,3 +629,153 @@ pub(crate) const EXCLUDED_LEAF_DER: &[u8] = &[
     0xe9, 0x9f, 0xe5, 0xdc, 0x84, 0xf5, 0xeb, 0x3b, 0x10, 0x57, 0x5d, 0x69,
     0xad, 0xa2, 0xb7, 0x02, 0x5a, 0x2f, 0x7b,
 ];
+
+/// Certificates built at test time with exactly the extensions a test needs
+/// -- the x509-cert builder always adds its own BasicConstraints and
+/// KeyUsage, so it cannot make a leaf whose only KeyUsage is
+/// keyEncipherment, a repeated extension, or one that does not decode.
+/// Validity is fixed rather than read from the clock: tests validate at
+/// [`forge::NOW`].
+pub(crate) mod forge {
+    use crate::ikev2::sign::SigningKey;
+    use der::asn1::{BitString, Ia5String, ObjectIdentifier, OctetString};
+    use der::Encode;
+    use std::str::FromStr;
+    use x509_cert::ext::pkix::constraints::name::GeneralSubtree;
+    use x509_cert::ext::pkix::name::GeneralName;
+    use x509_cert::ext::pkix::{BasicConstraints, KeyUsage, NameConstraints, SubjectAltName};
+    use x509_cert::ext::Extension;
+    use x509_cert::name::Name;
+
+    /// 2026-01-01T00:00:00Z and 2036-01-01T00:00:00Z.
+    pub(crate) const NOT_BEFORE: u64 = 1_767_225_600;
+    pub(crate) const NOT_AFTER: u64 = 2_082_758_400;
+    pub(crate) const NOW: u64 = NOT_BEFORE + 86_400;
+
+    /// A P-256 key whose scalar is `seed` repeated, one per seed.
+    pub(crate) fn ec_key(seed: u8) -> SigningKey {
+        SigningKey::EcdsaP256(p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap())
+    }
+
+    /// The crate's one RSA test key.
+    pub(crate) fn rsa_key() -> SigningKey {
+        SigningKey::rsa_from_pkcs8_der(super::RSA_KEY_PK8).unwrap()
+    }
+
+    /// An extension whose extnValue is `value`, taken as it is.
+    pub(crate) fn raw_ext(oid: &str, critical: bool, value: &[u8]) -> Extension {
+        Extension { extn_id: ObjectIdentifier::new_unwrap(oid), critical, extn_value: OctetString::new(value).unwrap() }
+    }
+
+    fn ext(oid: &str, critical: bool, value: &impl Encode) -> Extension {
+        raw_ext(oid, critical, &value.to_der().unwrap())
+    }
+
+    pub(crate) fn basic_constraints(ca: bool, path_len_constraint: Option<u8>) -> Extension {
+        ext("2.5.29.19", true, &BasicConstraints { ca, path_len_constraint })
+    }
+
+    pub(crate) fn key_usage(usage: KeyUsage) -> Extension {
+        ext("2.5.29.15", true, &usage)
+    }
+
+    pub(crate) fn subject_alt_name(names: &[GeneralName]) -> Extension {
+        ext("2.5.29.17", false, &SubjectAltName(names.to_vec()))
+    }
+
+    pub(crate) fn name_constraints(permitted: &[GeneralName], excluded: &[GeneralName]) -> Extension {
+        let subtrees = |names: &[GeneralName]| {
+            (!names.is_empty()).then(|| names.iter().map(|base| GeneralSubtree { base: base.clone(), minimum: 0, maximum: None }).collect())
+        };
+        ext("2.5.29.30", true, &NameConstraints { permitted_subtrees: subtrees(permitted), excluded_subtrees: subtrees(excluded) })
+    }
+
+    pub(crate) fn dns(name: &str) -> GeneralName {
+        GeneralName::DnsName(Ia5String::new(name).unwrap())
+    }
+
+    pub(crate) fn email(mailbox: &str) -> GeneralName {
+        GeneralName::Rfc822Name(Ia5String::new(mailbox).unwrap())
+    }
+
+    pub(crate) fn uri(uri: &str) -> GeneralName {
+        GeneralName::UniformResourceIdentifier(Ia5String::new(uri).unwrap())
+    }
+
+    /// An iPAddress: 4 or 16 octets for a name, 8 or 32 (address, then
+    /// mask) for a NameConstraints subtree.
+    pub(crate) fn ip(octets: &[u8]) -> GeneralName {
+        GeneralName::IpAddress(OctetString::new(octets).unwrap())
+    }
+
+    /// A directoryName from an RFC 4514 string, most specific RDN first.
+    pub(crate) fn directory(dn: &str) -> GeneralName {
+        GeneralName::DirectoryName(Name::from_str(dn).unwrap())
+    }
+
+    fn spki(key: &SigningKey) -> x509_cert::spki::SubjectPublicKeyInfoOwned {
+        use der::Decode;
+        let der = match key {
+            SigningKey::EcdsaP256(k) => {
+                use p256::pkcs8::EncodePublicKey;
+                k.verifying_key().to_public_key_der().unwrap()
+            }
+            SigningKey::RsaSha256(k) => {
+                use rsa::pkcs8::EncodePublicKey;
+                k.to_public_key().to_public_key_der().unwrap()
+            }
+        };
+        x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(der.as_bytes()).unwrap()
+    }
+
+    /// A v3 certificate for `subject` (an RFC 4514 string) and `key`,
+    /// issued by `issuer` and signed with `issuer_key`, carrying
+    /// `extensions` as given, in order.
+    pub(crate) fn cert(serial: u32, subject: &str, key: &SigningKey, issuer: &str, issuer_key: &SigningKey, extensions: Vec<Extension>) -> Vec<u8> {
+        cert_with_names(serial, Name::from_str(subject).unwrap(), key, Name::from_str(issuer).unwrap(), issuer_key, extensions)
+    }
+
+    /// [`cert`], with the subject and issuer given as built names.
+    pub(crate) fn cert_with_names(
+        serial: u32,
+        subject: Name,
+        key: &SigningKey,
+        issuer: Name,
+        issuer_key: &SigningKey,
+        extensions: Vec<Extension>,
+    ) -> Vec<u8> {
+        use std::time::Duration;
+        use x509_cert::certificate::{Certificate, TbsCertificate, Version};
+        use x509_cert::spki::AlgorithmIdentifierOwned;
+        use x509_cert::time::{Time, Validity};
+        let (oid, parameters) = match issuer_key {
+            SigningKey::EcdsaP256(_) => ("1.2.840.10045.4.3.2", None),
+            SigningKey::RsaSha256(_) => ("1.2.840.113549.1.1.11", Some(der::asn1::Null.into())),
+        };
+        let algorithm = AlgorithmIdentifierOwned { oid: ObjectIdentifier::new_unwrap(oid), parameters };
+        let time = |secs| Time::UtcTime(der::asn1::UtcTime::from_unix_duration(Duration::from_secs(secs)).unwrap());
+        let tbs = TbsCertificate {
+            version: Version::V3,
+            serial_number: serial.into(),
+            signature: algorithm.clone(),
+            issuer,
+            validity: Validity { not_before: time(NOT_BEFORE), not_after: time(NOT_AFTER) },
+            subject,
+            subject_public_key_info: spki(key),
+            issuer_unique_id: None,
+            subject_unique_id: None,
+            extensions: (!extensions.is_empty()).then_some(extensions),
+        };
+        let tbs_der = tbs.to_der().unwrap();
+        let signature = match issuer_key {
+            SigningKey::EcdsaP256(k) => {
+                use p256::ecdsa::signature::Signer;
+                let sig: p256::ecdsa::Signature = k.sign(&tbs_der);
+                sig.to_der().as_bytes().to_vec()
+            }
+            SigningKey::RsaSha256(_) => issuer_key.sign_classic_rsa_auth_data(&tbs_der).unwrap(),
+        };
+        let cert = Certificate { tbs_certificate: tbs, signature_algorithm: algorithm, signature: BitString::from_bytes(&signature).unwrap() };
+        cert.to_der().unwrap()
+    }
+}

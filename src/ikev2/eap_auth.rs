@@ -1403,6 +1403,35 @@ mod tests {
     }
 
     #[test]
+    fn eap_rejects_a_server_cert_that_may_not_sign_or_has_an_unprocessed_critical_extension() {
+        // RFC 4945 §5.1.3.2 and RFC 5280 §4.2 on the EAP client's check of
+        // the server: a leaf whose KeyUsage is keyEncipherment only, and one
+        // with a critical extension this crate does not process, both with a
+        // valid chain and a valid AUTH signature. No name is expected, so
+        // nothing else can refuse them.
+        use crate::test_certs::forge;
+        use x509_cert::ext::pkix::{KeyUsage, KeyUsages};
+        const ROOT: &str = "CN=Forge Root";
+        let root_key = forge::ec_key(1);
+        let ca = vec![forge::basic_constraints(true, None), forge::key_usage(KeyUsage(KeyUsages::KeyCertSign.into()))];
+        let root = forge::cert(1, ROOT, &root_key, ROOT, &root_key, ca);
+        let run = |leaf_extension| {
+            let (init_sa, resp_sa) = sa_pair();
+            let leaf = forge::cert(2, "CN=vpn.example.com", &forge::ec_key(2), ROOT, &root_key, vec![leaf_extension]);
+            let verify = ServerVerify::TrustedCas { cas: vec![root.clone()], expected_dns: None, now_unix: forge::NOW };
+            let initiator = EapInitiator::new(init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111, verify);
+            let server = ServerAuth::Cert { key: forge::ec_key(2), chain: vec![leaf] };
+            let responder = EapResponder::new(resp_sa, Identification::fqdn("vpn.example.com"), server, b"alice".to_vec(), "s3cret".into(), 0x2222);
+            drive(initiator, responder)
+        };
+        assert_eq!(run(forge::key_usage(KeyUsage(KeyUsages::KeyEncipherment.into()))), Outcome::Failed);
+        assert_eq!(run(forge::raw_ext("1.3.6.1.4.1.55555.123", true, &[0x05, 0x00])), Outcome::Failed);
+        // Controls: digitalSignature, and the extension not critical.
+        assert_eq!(run(forge::key_usage(KeyUsage(KeyUsages::DigitalSignature.into()))), Outcome::Established);
+        assert_eq!(run(forge::raw_ext("1.3.6.1.4.1.55555.123", false, &[0x05, 0x00])), Outcome::Established);
+    }
+
+    #[test]
     fn cert_server_falls_back_to_classic_ecdsa_without_a_hash_offer() {
         // A native EAP client (iOS) sends no SIGNATURE_HASH_ALGORITHMS. Rather
         // than fail, the ECDSA cert server emits the classic method-9 AUTH

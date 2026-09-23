@@ -93,6 +93,14 @@
 //! - **Credentials and trust.** Pre-shared keys, certificates and private
 //!   keys, EAP credentials, the trusted CAs, the name the gateway's
 //!   certificate must carry, and the time its validity is checked against.
+//!   [`ikev2::sign::verify_cert_auth`] builds the path to a trusted CA
+//!   (unless the certificate is pinned), checks the extensions of each
+//!   certificate in it (RFC 5280 §4.2), and checks that the leaf's KeyUsage
+//!   allows signing (RFC 4945 §5.1.3.2). A critical extension it does not
+//!   process rejects the certificate. It does not check revocation (CRL,
+//!   OCSP), ExtendedKeyUsage or certificate policies, and it ties the
+//!   peer's ID to the certificate only through the DNS name it is given, if
+//!   any. Any of those checks a deployment needs is the consumer's.
 //! - **Sockets and randomness.** The UDP sockets, if the caller binds them
 //!   itself (both 500 and 4500 for NAT-T), and an [`Entropy`] source where
 //!   one is asked for ([`OsEntropy`] outside tests).

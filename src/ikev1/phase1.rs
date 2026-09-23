@@ -21,7 +21,7 @@ use crate::crypto::DhGroup;
 use crate::entropy::Entropy;
 use crate::error::IkeError;
 use crate::debug::ike_debug;
-use crate::ikev2::sign::{cert_subject_dn, cert_subject_issuer_display, validate_chain, SigningKey, VerifyingKey};
+use crate::ikev2::sign::{cert_subject_dn, cert_subject_issuer_display, check_signing_key_usage, validate_chain, SigningKey, VerifyingKey};
 use crate::ikev2::sk::SkCipher;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1312,6 +1312,10 @@ impl MainIdSent {
                     );
                     return Err(e);
                 }
+                if let Err(e) = check_signing_key_usage(&certs[0]) {
+                    ike_debug!("Main Mode: gateway certificate's KeyUsage does not allow signing (RFC 4945 §5.1.3.2): {e}");
+                    return Err(e);
+                }
                 if let Err(e) = VerifyingKey::from_cert_der(&certs[0])?.verify_classic_rsa_raw(&sig, &expect_hr) {
                     ike_debug!("Main Mode: gateway certificate chain is trusted, but its SIG payload did not verify: {e}");
                     return Err(e);
@@ -1574,6 +1578,7 @@ impl MainRespKeSent {
             let certs = collect_certs(&ps)?;
             let sig = find(&ps, payload::SIG).ok_or(IkeError::MissingPayload("SIG"))?.data.clone();
             validate_chain(&certs[0], &certs[1..], &self.trusted_cas, self.now_unix)?;
+            check_signing_key_usage(&certs[0])?;
             VerifyingKey::from_cert_der(&certs[0])?.verify_classic_rsa_raw(&sig, &expect_hi)?;
         } else {
             let hash_i_got = find(&ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
@@ -1653,6 +1658,7 @@ mod tests {
     use super::*;
     use super::super::payloads::{id_type, AttrValue};
     use crate::entropy::SeedEntropy;
+    use x509_cert::ext::pkix::{KeyUsage, KeyUsages};
 
     #[test]
     fn phase1_state_zeroize_wipes_the_derived_key_material_but_not_public_fields() {
@@ -2595,40 +2601,21 @@ mod tests {
     /// its own anchor, so `validate_chain(leaf, [], [leaf], now)` succeeds.
     /// `serial` must be distinct across calls within the same test (it's the
     /// only thing that varies): two certs built with the same key, subject
-    /// and serial within the same wall-clock second are byte-identical DER,
-    /// which silently defeats an "untrusted cert" test. Returns the cert DER
-    /// and the wall-clock time it's valid at.
+    /// and serial are byte-identical DER, which silently defeats an
+    /// "untrusted cert" test. Its KeyUsage has digitalSignature, which RFC
+    /// 4945 §5.1.3.2 requires of a signing key, beside keyCertSign. Returns
+    /// the cert DER and a time it's valid at.
     fn self_signed_rsa_test_cert(serial: u32) -> (Vec<u8>, u64) {
-        use der::Encode;
-        use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey};
-        use sha2::Sha256;
-        use std::str::FromStr;
-        use std::time::{Duration, SystemTime, UNIX_EPOCH};
-        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
-        use x509_cert::name::Name;
-        use x509_cert::serial_number::SerialNumber;
-        use x509_cert::spki::SubjectPublicKeyInfoOwned;
-        use x509_cert::time::Validity;
+        self_signed_rsa_cert_with_key_usage(serial, KeyUsage(KeyUsages::DigitalSignature | KeyUsages::KeyCertSign))
+    }
 
-        let priv_key = rsa::RsaPrivateKey::from_pkcs8_der(crate::test_certs::RSA_KEY_PK8).unwrap();
-        let pub_key_der = priv_key.to_public_key().to_public_key_der().unwrap();
-        let pub_key = SubjectPublicKeyInfoOwned::try_from(pub_key_der.as_bytes()).unwrap();
-        let subject = Name::from_str("CN=ryke-ikev1-sig-test").unwrap();
-        let signer = rsa::pkcs1v15::SigningKey::<Sha256>::new(priv_key);
-        let validity = Validity::from_now(Duration::new(300, 0)).unwrap();
-        let builder = CertificateBuilder::new(
-            Profile::Root,
-            SerialNumber::from(serial),
-            validity,
-            subject,
-            pub_key,
-            &signer,
-        )
-        .unwrap();
-        let cert = builder.build::<rsa::pkcs1v15::Signature>().unwrap();
-        let der = cert.to_der().unwrap();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        (der, now)
+    /// [`self_signed_rsa_test_cert`] with a KeyUsage of `usage`.
+    fn self_signed_rsa_cert_with_key_usage(serial: u32, usage: KeyUsage) -> (Vec<u8>, u64) {
+        use crate::test_certs::forge;
+        const NAME: &str = "CN=ryke-ikev1-sig-test";
+        let key = forge::rsa_key();
+        let extensions = vec![forge::basic_constraints(true, None), forge::key_usage(usage)];
+        (forge::cert(serial, NAME, &key, NAME, &key, extensions), forge::NOW)
     }
 
     /// The RSA-signature analog of `full_main_phase1_against_an_in_process_responder`
@@ -2750,6 +2737,65 @@ mod tests {
             failure.teardown.is_some(),
             "SKEYID_a/e come from the DH exchange alone, so a Delete should still be buildable even though AUTH failed"
         );
+    }
+
+    /// RFC 4945 §5.1.3.2: a certificate whose KeyUsage has neither
+    /// digitalSignature nor nonRepudiation must not authenticate Main Mode,
+    /// whichever side sends it -- even trusted as its own anchor, so that
+    /// nothing but its KeyUsage is wrong.
+    #[test]
+    fn main_mode_sig_auth_rejects_a_cert_whose_key_usage_forbids_signing() {
+        let (good, now_unix) = self_signed_rsa_test_cert(1);
+        let (no_signing, _) = self_signed_rsa_cert_with_key_usage(2, KeyUsage(KeyUsages::KeyCertSign | KeyUsages::KeyEncipherment));
+        let (non_repudiation, _) = self_signed_rsa_cert_with_key_usage(3, KeyUsage(KeyUsages::NonRepudiation | KeyUsages::KeyCertSign));
+        // Main Mode up to the responder's msg6, each side sending its cert
+        // and trusting the other's.
+        let run = |icert: &[u8], rcert: &[u8]| {
+            let key = || Arc::new(SigningKey::rsa_from_pkcs8_der(crate::test_certs::RSA_KEY_PK8).unwrap());
+            let icfg = InitiatorConfig {
+                local_auth: Ikev1LocalAuth::Sig { key: key(), chain: vec![icert.to_vec()] },
+                trusted_cas: vec![rcert.to_vec()],
+                now_unix,
+                key_len: 32,
+                our_id: Id::ipv4([10, 1, 1, 1]),
+                group: DhGroup::Modp1024,
+                xauth: false,
+                xauth_creds: None,
+                ts_local: ([0, 0, 0, 0], [0, 0, 0, 0]),
+                ts_remote: ([0, 0, 0, 0], [0, 0, 0, 0]),
+                esp_cipher: crate::ikev2::sk::SkCipher::Aes256Gcm,
+                pfs_group: None,
+                mode_cfg: false,
+                ipv6: false,
+                mode: Ikev1ExchangeMode::Main,
+                p1_lifetime_secs: 28800,
+                p2_lifetime_secs: 3600,
+                force_natt: false,
+            };
+            let rcfg = Phase1Config {
+                local_auth: Ikev1LocalAuth::Sig { key: key(), chain: vec![rcert.to_vec()] },
+                trusted_cas: vec![icert.to_vec()],
+                now_unix,
+                our_id: Id::ipv4([192, 168, 0, 1]),
+            };
+            let mut ie = SeedEntropy::new(0x1234);
+            let mut re = SeedEntropy::new(0x5678);
+            let (i_addr, r_addr) = ("10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+            let (msg1, sa_sent) = initiate_main(&icfg, &mut ie);
+            let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re, r_addr, i_addr).unwrap();
+            let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie, i_addr, r_addr).unwrap();
+            let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
+            let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
+            (r2.complete_id(&msg5).map(|(msg6, _)| msg6), id_sent, ie)
+        };
+        // The responder refuses the initiator's cert.
+        assert!(run(&no_signing, &good).0.is_err());
+        // The initiator refuses the responder's.
+        let (msg6, id_sent, mut ie) = run(&good, &no_signing);
+        assert!(id_sent.complete_id(&msg6.unwrap(), &mut ie).is_err());
+        // nonRepudiation is enough, either way.
+        let (msg6, id_sent, mut ie) = run(&non_repudiation, &non_repudiation);
+        id_sent.complete_id(&msg6.unwrap(), &mut ie).unwrap();
     }
 
     fn natd_msg(vid: bool, natd: &[(u8, Vec<u8>)]) -> Vec<isakmp::Payload> {

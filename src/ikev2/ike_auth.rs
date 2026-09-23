@@ -1158,6 +1158,54 @@ mod tests {
         );
     }
 
+    /// `cert_config` over certificates made at test time: a root, and a
+    /// leaf under it for vpn.example.com with `leaf_extensions` after its
+    /// SubjectAltName.
+    fn forged_cert_config(leaf_extensions: Vec<x509_cert::ext::Extension>) -> AuthConfig {
+        use crate::test_certs::forge;
+        use x509_cert::ext::pkix::{KeyUsage, KeyUsages};
+        const ROOT: &str = "CN=Forge Root";
+        let root_key = forge::ec_key(1);
+        let ca = vec![forge::basic_constraints(true, None), forge::key_usage(KeyUsage(KeyUsages::KeyCertSign.into()))];
+        let root = forge::cert(1, ROOT, &root_key, ROOT, &root_key, ca);
+        let extensions = [vec![forge::subject_alt_name(&[forge::dns("vpn.example.com")])], leaf_extensions].concat();
+        let leaf = forge::cert(2, "CN=vpn.example.com", &forge::ec_key(2), ROOT, &root_key, extensions);
+        AuthConfig {
+            id: Identification::fqdn("vpn.example.com"),
+            local: LocalAuth::Cert { key: forge::ec_key(2), chain: vec![leaf] },
+            peer: PeerAuth::Cert { cas: vec![root], expected_dns: Some("vpn.example.com".into()), now_unix: forge::NOW },
+        }
+    }
+
+    #[test]
+    fn ike_auth_refuses_a_certificate_that_may_not_sign_or_has_an_unprocessed_critical_extension() {
+        // RFC 4945 §5.1.3.2 and RFC 5280 §4.2 on direct certificate
+        // authentication, each way: a leaf whose KeyUsage is keyEncipherment
+        // only, and one with a critical extension this crate does not
+        // process, both with a valid chain and a valid AUTH signature.
+        use crate::test_certs::forge;
+        use x509_cert::ext::pkix::{KeyUsage, KeyUsages};
+        let good = || forged_cert_config(vec![forge::key_usage(KeyUsage(KeyUsages::DigitalSignature.into()))]);
+        let bad = [forge::key_usage(KeyUsage(KeyUsages::KeyEncipherment.into())), forge::raw_ext("1.3.6.1.4.1.55555.123", true, &[0x05, 0x00])];
+        for ext in bad {
+            let oid = ext.extn_id;
+            // The responder refuses the initiator's certificate.
+            let (init_sa, resp_sa) = run_sa_init();
+            let req = initiator_auth_request(&init_sa, &forged_cert_config(vec![ext.clone()]), 1, &esp_offer(0), &[1u8; 8]).unwrap();
+            assert!(responder_process_auth(&resp_sa, &req, &good(), 2, &[2u8; 8], None).is_err(), "{oid}");
+            // The initiator refuses the responder's.
+            let (init_sa, resp_sa) = run_sa_init();
+            let req = initiator_auth_request(&init_sa, &good(), 1, &esp_offer(0), &[1u8; 8]).unwrap();
+            let (resp, ..) = responder_process_auth(&resp_sa, &req, &forged_cert_config(vec![ext]), 2, &[2u8; 8], None).unwrap();
+            assert!(initiator_verify_auth(&init_sa, &resp, &good(), &esp_offer(0)).is_err(), "{oid}");
+        }
+        // Control: the same exchange with digitalSignature both ways.
+        let (init_sa, resp_sa) = run_sa_init();
+        let req = initiator_auth_request(&init_sa, &good(), 1, &esp_offer(0), &[1u8; 8]).unwrap();
+        let (resp, ..) = responder_process_auth(&resp_sa, &req, &good(), 2, &[2u8; 8], None).unwrap();
+        initiator_verify_auth(&init_sa, &resp, &good(), &esp_offer(0)).unwrap();
+    }
+
     // `initiator_eap_request_with_certs` (the "Certificate + EAP" hybrid a
     // FortiGate dialup policy can require, per eap_auth::EapInitiator's
     // `set_client_certs`) carries no AUTH -- verified here by decrypting the

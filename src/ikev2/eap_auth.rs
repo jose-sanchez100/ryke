@@ -41,7 +41,7 @@ use crate::entropy::Entropy;
 use crate::error::IkeError;
 use crate::ikev2::exchange::CompletedSaInit;
 use crate::ikev2::ike_auth::{
-    assigned_ipv4_policy, check_granted_ts, child_sa_error_of, esp_offer, esp_spi_from_sa,
+    answer_esp_offer, assigned_ipv4_policy, check_granted_ts, child_sa_error_of, esp_offer, esp_spi, sai2,
     initiator_eap_request, initiator_eap_request_with_certreq, initiator_eap_request_with_certs,
     narrow_requested_ts, AssignedConfig, ChildTsOffer,
 };
@@ -52,7 +52,7 @@ use crate::ikev2::mschapv2;
 use crate::ikev2::negotiate::{self, ChosenEspSuite};
 use crate::ikev2::payload::{
     auth_method, notify_type, notify_type_name, Authentication, Certificate, Configuration,
-    Identification, Notify, SecurityAssociation, TrafficSelectors,
+    Identification, Notify, Proposal, SecurityAssociation, TrafficSelectors,
 };
 use crate::role::Role;
 use crate::ikev2::sign::SigningKey;
@@ -572,15 +572,19 @@ impl EapInitiator {
                 return Ok(EapEvent::Failed(None));
             };
             if verified {
-                let esp_suite = SecurityAssociation::parse(sar2).ok().and_then(|sa| negotiate::select_esp(&sa));
-                // RFC 7296 §2.7: the responder's SAr2 must be built from the
-                // ESP proposal we actually offered, not merely one
-                // `select_esp` knows how to decode -- see
+                // RFC 7296 §2.7: the responder's SAr2 must be one of the ESP
+                // proposals we actually sent -- by its number, with one
+                // transform of each of its types (§3.3.1, §3.3.6) -- not
+                // merely one `select_esp` knows how to decode; see
                 // ChosenEspSuite::matches_offer's doc. Once the MSK-keyed
                 // AUTH above has verified, a mismatch here is a downgrade
                 // attempt, not a malformed message.
+                let sar2 = SecurityAssociation::parse(sar2)?;
+                let sent = sai2(&self.esp_offer, 0);
+                let peer_child_spi = esp_spi(negotiate::accepted_proposal(&sar2, &sent)?)?;
+                let esp_suite = negotiate::select_esp(&sar2);
                 if let Some(suite) = &esp_suite {
-                    if !suite.matches_offer(&self.esp_offer) {
+                    if !suite.matches_offer(&sent) {
                         return Err(IkeError::NoProposalChosen);
                     }
                 }
@@ -588,7 +592,7 @@ impl EapInitiator {
                 let tsi = find(&ps, PayloadType::TrafficSelectorInitiator).map(TrafficSelectors::parse).transpose()?;
                 let tsr = find(&ps, PayloadType::TrafficSelectorResponder).map(TrafficSelectors::parse).transpose()?;
                 check_granted_ts(&self.ts_offer.selectors(), tsi.as_ref(), tsr.as_ref())?;
-                self.peer_child_spi = esp_spi_from_sa(sar2);
+                self.peer_child_spi = Some(peer_child_spi);
                 self.peer_esp_suite = esp_suite;
                 if let Some(cp) = find(&ps, PayloadType::Configuration).and_then(|d| Configuration::parse(d).ok()) {
                     self.assigned_ip4 = cp.assigned_ipv4();
@@ -763,9 +767,13 @@ pub struct EapResponder {
     auth_challenge: [u8; 16],
     nt_response: [u8; 24],
     peer_idi: Vec<u8>,
-    /// The initiator's ESP SPI (from SAi2 in msg-1), needed to derive the CHILD
-    /// SA -- dropped when the final message refuses it (`TS_UNACCEPTABLE`).
+    /// The initiator's ESP SPI (from the SAi2 proposal of msg-1 we take),
+    /// needed to derive the CHILD SA -- `None` when no proposal fits, and
+    /// dropped when the final message refuses the CHILD SA.
     peer_child_spi: Option<u32>,
+    /// The SAr2 proposal the final message answers msg-1's SAi2 with, if one
+    /// fits ([`answer_esp_offer`]).
+    child_answer: Option<Proposal>,
     /// The TSi and TSr of msg-1, answered narrowed in the final message.
     peer_ts: Option<(TrafficSelectors, TrafficSelectors)>,
     /// Inner-network assignment for this client's Configuration Payload (CFG_REPLY)
@@ -813,6 +821,7 @@ impl EapResponder {
             nt_response: [0u8; 24],
             peer_idi: Vec::new(),
             peer_child_spi: None,
+            child_answer: None,
             peer_ts: None,
             assigned: None,
             mobike: false,
@@ -881,9 +890,12 @@ impl EapResponder {
             let Some(sai2) = find(ps, PayloadType::SecurityAssociation) else {
                 return Ok(EapEvent::Failed(None));
             };
-            // Capture the initiator's ESP SPI (for the CHILD SA) and its IDi
-            // verbatim (its final AUTH signs over it).
-            self.peer_child_spi = esp_spi_from_sa(sai2);
+            // Pick the SAi2 proposal to answer and the initiator's ESP SPI
+            // from it (for the CHILD SA), and keep its IDi verbatim (its final
+            // AUTH signs over it).
+            let answer = answer_esp_offer(&SecurityAssociation::parse(sai2)?, self.child_spi);
+            self.peer_child_spi = answer.as_ref().map(|(_, peer_spi)| *peer_spi);
+            self.child_answer = answer.map(|(proposal, _)| proposal);
             // RFC 7296 §1.2, §3.13: the request for a CHILD SA carries TSi and TSr.
             let tsi = find(ps, PayloadType::TrafficSelectorInitiator).ok_or(IkeError::MissingPayload("TSi"))?;
             let tsr = find(ps, PayloadType::TrafficSelectorResponder).ok_or(IkeError::MissingPayload("TSr"))?;
@@ -956,8 +968,14 @@ impl EapResponder {
                 ];
                 let (policy_i, policy_r) = assigned_ipv4_policy(self.assigned.as_ref().map(|a| a.ip));
                 let (tsi, tsr) = self.peer_ts.as_ref().map(|(tsi, tsr)| (tsi, tsr)).unzip();
-                match narrow_requested_ts(tsi, tsr, &policy_i, &policy_r) {
-                    Ok((tsi, tsr)) => {
+                // RFC 7296 §1.2: either failing, the IKE SA stands and the CHILD
+                // SA is refused with the reason -- the proposals weighed first (§2.7).
+                let child = match &self.child_answer {
+                    None => Err(IkeError::NoProposalChosen),
+                    Some(sar2) => narrow_requested_ts(tsi, tsr, &policy_i, &policy_r).map(|ts| (sar2.clone(), ts)),
+                };
+                match child {
+                    Ok((sar2, (tsi, tsr))) => {
                         if let Some(a) = &self.assigned {
                             let dns = a.dns.first().copied();
                             inner.push((
@@ -965,14 +983,15 @@ impl EapResponder {
                                 Configuration::reply_ipv4(a.ip, None, dns).to_bytes(),
                             ));
                         }
-                        inner.push((PayloadType::SecurityAssociation, esp_offer(self.child_spi).to_bytes()));
+                        inner.push((PayloadType::SecurityAssociation, SecurityAssociation { proposals: vec![sar2] }.to_bytes()));
                         inner.push((PayloadType::TrafficSelectorInitiator, tsi.to_bytes()));
                         inner.push((PayloadType::TrafficSelectorResponder, tsr.to_bytes()));
                     }
-                    // RFC 7296 §1.2, §2.9: the IKE SA stands, the CHILD SA is refused.
-                    Err(IkeError::TsUnacceptable) => {
+                    // RFC 7296 §1.2, §2.7, §2.9: the IKE SA stands, the CHILD SA is refused.
+                    Err(refusal @ (IkeError::NoProposalChosen | IkeError::TsUnacceptable)) => {
                         self.peer_child_spi = None;
-                        inner.push((PayloadType::Notify, Notify::status(notify_type::TS_UNACCEPTABLE, Vec::new()).to_bytes()));
+                        let error = if refusal == IkeError::NoProposalChosen { notify_type::NO_PROPOSAL_CHOSEN } else { notify_type::TS_UNACCEPTABLE };
+                        inner.push((PayloadType::Notify, Notify::status(error, Vec::new()).to_bytes()));
                     }
                     Err(e) => return Err(e),
                 }
@@ -1390,6 +1409,94 @@ mod tests {
         // msg-1 asks for a CHILD SA, so it carries both (RFC 7296 §1.2).
         assert_eq!(final_message_for_ts(None, Some(&t.v4), None).err(), Some(IkeError::MissingPayload("TSi")));
         assert_eq!(final_message_for_ts(Some(&t.v4), None, None).err(), Some(IkeError::MissingPayload("TSr")));
+    }
+
+    /// EAP run to the responder's final message, the initiator offering
+    /// `offer` as its SAi2 template.
+    fn final_message_for_offer(offer: SecurityAssociation) -> (EapInitiator, EapResponder, Vec<u8>, Vec<u8>) {
+        let (init_sa, resp_sa) = sa_pair();
+        let mut initiator = EapInitiator::new_with_esp_offer(
+            init_sa,
+            Identification::fqdn("alice"),
+            b"alice".to_vec(),
+            "s3cret".into(),
+            0x1111,
+            offer,
+            ServerVerify::Insecure,
+        );
+        let mut responder =
+            EapResponder::new(resp_sa, Identification::fqdn("gw"), ServerAuth::Psk(b"psk".to_vec()), b"alice".to_vec(), "s3cret".into(), 0x2222);
+        let (mut ie, mut re) = (SeedEntropy::new(1), SeedEntropy::new(2));
+        let msg1 = initiator.start(&mut ie).unwrap();
+        let mut in_flight = msg1.clone();
+        loop {
+            match responder.handle(&in_flight, &mut re).unwrap() {
+                EapEvent::Reply(m) => match initiator.handle(&m, &mut ie).unwrap() {
+                    EapEvent::Reply(m2) => in_flight = m2,
+                    other => panic!("the initiator ended early: {other:?}"),
+                },
+                EapEvent::Established(Some(f)) => return (initiator, responder, msg1, f),
+                other => panic!("unexpected responder event: {other:?}"),
+            }
+        }
+    }
+
+    /// RFC 7296 §2.7 and §1.2 at the EAP responder, as at the PSK/cert one
+    /// (`ike_auth`'s `the_ike_auth_responder_answers_a_proposal_it_can_run_
+    /// or_no_proposal_chosen`): the final message answers the first SAi2
+    /// proposal it can run, by its number, or refuses the CHILD SA with
+    /// `NO_PROPOSAL_CHOSEN`, the IKE SA standing. And msg-1's SAi2 carries no
+    /// DH group, whatever PFS groups the initiator's offer names.
+    #[test]
+    fn eap_responder_answers_a_proposal_it_can_run_or_no_proposal_chosen() {
+        use crate::ikev2::ike_auth::tests::{answered_ts, esp_proposal, sa_of, CBC256, ESN_NONE, GCM256, MODP2048, SHA256};
+        let sa_of_final = |initiator: &EapInitiator, msg: &[u8]| sa_of(initiator.sa.suite.sk_cipher(), msg, &initiator.sa.keys.sk_er, &initiator.sa.keys.sk_ar);
+
+        let offer = SecurityAssociation {
+            proposals: vec![esp_proposal(1, 0, &[CBC256, SHA256, MODP2048, ESN_NONE]), esp_proposal(2, 0, &[GCM256, MODP2048, ESN_NONE])],
+        };
+        let (mut initiator, responder, msg1, final_msg) = final_message_for_offer(offer);
+        let sai2 = sa_of(initiator.sa.suite.sk_cipher(), &msg1, &initiator.sa.keys.sk_ei, &initiator.sa.keys.sk_ai).unwrap();
+        assert!(sai2.proposals.iter().flat_map(|p| &p.transforms).all(|t| t.transform_type != transform_type::DH), "no DH in SAi2");
+        assert_eq!(sa_of_final(&initiator, &final_msg), Some(SecurityAssociation { proposals: vec![esp_proposal(2, 0x2222, &[GCM256, ESN_NONE])] }));
+        assert_eq!(responder.peer_child_spi(), Some(0x1111));
+        assert!(matches!(initiator.handle(&final_msg, &mut SeedEntropy::new(1)), Ok(EapEvent::Established(None))));
+        assert_eq!(initiator.peer_child_spi(), Some(0x2222));
+
+        let (mut initiator, responder, _, final_msg) =
+            final_message_for_offer(SecurityAssociation { proposals: vec![esp_proposal(1, 0, &[CBC256, SHA256, ESN_NONE])] });
+        assert_eq!(sa_of_final(&initiator, &final_msg), None);
+        assert_eq!(answered_ts(&initiator.sa, &final_msg), (None, None, vec![notify_type::NO_PROPOSAL_CHOSEN]));
+        assert_eq!(responder.peer_child_spi(), None, "no CHILD SA");
+        let got = initiator.handle(&final_msg, &mut SeedEntropy::new(1)).unwrap_err();
+        assert_eq!(got, IkeError::PeerRejected { notify_type: notify_type::NO_PROPOSAL_CHOSEN, name: "NO_PROPOSAL_CHOSEN" });
+    }
+
+    /// RFC 7296 §3.3.6, §2.7, §3.3.1 at the EAP initiator: the final
+    /// message's SAr2 is one of our proposals -- a single one, by its number,
+    /// one transform of each type -- or the exchange fails; one that does not
+    /// parse too (it used to skip the check and take the SPI anyway).
+    #[test]
+    fn eap_final_message_must_take_one_of_our_proposals_back() {
+        use crate::ikev2::ike_auth::tests::{esp_proposal, ESN_NONE, GCM256};
+        let ours = esp_proposal(1, 0x2222, &[GCM256, ESN_NONE]);
+        let mut malformed = SecurityAssociation { proposals: vec![ours.clone()] }.to_bytes();
+        malformed[3] += 4; // the proposal claims four octets more than the payload has
+        let cases = [
+            ("control", SecurityAssociation { proposals: vec![ours.clone()] }.to_bytes(), true),
+            ("two proposals", SecurityAssociation { proposals: vec![ours.clone(), ours.clone()] }.to_bytes(), false),
+            ("two ENCR transforms", SecurityAssociation { proposals: vec![esp_proposal(1, 0x2222, &[GCM256, GCM256, ESN_NONE])] }.to_bytes(), false),
+            ("a proposal number we never sent", SecurityAssociation { proposals: vec![Proposal { num: 2, ..ours.clone() }] }.to_bytes(), false),
+            ("an SA payload that does not parse", malformed, false),
+        ];
+        for (what, sar2, ok) in cases {
+            let (mut initiator, responder, final_msg) = run_to_final_message();
+            let (msg_id, mut ps) = decrypt(&initiator.sa, &final_msg).unwrap();
+            ps.iter_mut().find(|(t, _)| *t == PayloadType::SecurityAssociation).unwrap().1 = sar2;
+            let edited = build_sk(&responder.sa, msg_id, true, &ps, &[3u8; 8]).unwrap();
+            let got = initiator.handle(&edited, &mut SeedEntropy::new(1));
+            assert_eq!(matches!(got, Ok(EapEvent::Established(None))), ok, "{what}: {got:?}");
+        }
     }
 
     #[test]

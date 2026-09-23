@@ -21,6 +21,7 @@ use crate::debug::ike_debug;
 use crate::error::IkeError;
 use crate::ikev2::exchange::CompletedSaInit;
 use crate::ikev2::negotiate::{self, ChosenEspSuite};
+use crate::ikev2::rekey;
 use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
 };
@@ -168,15 +169,47 @@ impl ChildTsOffer {
     }
 }
 
-/// Stamp `spi` onto every proposal in `offer` — the SPI is ours to choose
-/// per-connection, so a caller-supplied `esp_offer` template's own SPI value
-/// (if any) is always overwritten here rather than sent as-is.
-fn with_spi(offer: &SecurityAssociation, spi: u32) -> SecurityAssociation {
+/// The SAi2 an `IKE_AUTH` request carries for the caller's `offer`: `spi`
+/// stamped onto every proposal -- the SPI is ours to choose per-connection, so
+/// a caller-supplied `esp_offer` template's own SPI value (if any) is always
+/// overwritten here rather than sent as-is -- and no DH transform. RFC 7296
+/// §1.2: the SA payloads of `IKE_AUTH` "cannot contain Transform Type 4
+/// (Diffie-Hellman group) with any value other than NONE. Implementations
+/// SHOULD omit the whole transform substructure"; the groups a caller's offer
+/// names are its PFS policy for the CHILD SA's rekeys (`rekey::PfsPolicy::
+/// from_offer` reads them from the offer, not from here).
+pub(crate) fn sai2(offer: &SecurityAssociation, spi: u32) -> SecurityAssociation {
     let mut offer = offer.clone();
     for p in &mut offer.proposals {
         p.spi = spi.to_be_bytes().to_vec();
+        p.transforms.retain(|t| t.transform_type != transform_type::DH);
     }
     offer
+}
+
+/// The 4-octet SPI of an ESP proposal (RFC 7296 §3.3.1).
+pub(crate) fn esp_spi(proposal: &Proposal) -> Result<u32, IkeError> {
+    let spi: [u8; 4] = proposal.spi.as_slice().try_into().map_err(|_| IkeError::Crypto("expected a 4-byte ESP SPI"))?;
+    Ok(u32::from_be_bytes(spi))
+}
+
+/// Responder: the proposal to answer an initiator's SAi2 with, and the
+/// initiator's SPI from it -- `None` when none fits, to be answered
+/// `NO_PROPOSAL_CHOSEN` (RFC 7296 §1.2, §2.7). The CHILD SA this side derives
+/// runs AES-GCM-16/256 (`esp::ChildSa::derive`), so that is what is taken:
+/// the first ESP proposal offering it without ESN, with one transform of each
+/// type the proposal included, numbered as the peer did and carrying our
+/// `child_spi` ([`rekey::choose_child_proposal`], as for a CHILD SA rekey the
+/// peer starts). A DH group in SAi2 -- which §1.2 rules out, and older
+/// versions of this crate sent -- is passed over rather than run: there is no
+/// KE in `IKE_AUTH`.
+pub(crate) fn answer_esp_offer(sai2: &SecurityAssociation, child_spi: u32) -> Option<(Proposal, u32)> {
+    let mut sai2 = sai2.clone();
+    for p in &mut sai2.proposals {
+        p.transforms.retain(|t| t.transform_type != transform_type::DH || t.transform_id == 0);
+    }
+    let (proposal, peer_spi, _) = rekey::choose_child_proposal(&sai2, SkCipher::Aes256Gcm, child_spi, None, &rekey::PfsPolicy::none()).ok()?;
+    Some((proposal, peer_spi))
 }
 
 fn ike_auth_header(sa: &CompletedSaInit, is_response: bool) -> IkeHeader {
@@ -203,13 +236,9 @@ struct AuthPayloads {
     auth: Authentication,
     /// Any CERT payloads, in order: `[0]` is the leaf, the rest intermediates.
     certs: Vec<Vec<u8>>,
-    /// The peer's CHILD SA SPI from the SA payload (SAi2 / SAr2), if present.
-    child_spi: Option<u32>,
-    /// The ESP cipher the peer's SA payload named, if it parsed as a
-    /// well-formed ESP proposal (RFC 7296 §3.3) — `None` for a malformed
-    /// payload, not necessarily for an unsupported cipher (see
-    /// [`ChosenEspSuite::sk_cipher`] for that distinction).
-    esp_suite: Option<ChosenEspSuite>,
+    /// The peer's SA payload (SAi2 / SAr2), if present (a malformed one fails
+    /// the parse).
+    child_sa: Option<SecurityAssociation>,
     /// The inner IPv4 the peer assigned us via a Configuration Payload
     /// (CFG_REPLY, INTERNAL_IP4_ADDRESS) — set only on the initiator's parse of
     /// the responder's response.
@@ -242,24 +271,11 @@ pub(crate) fn child_sa_error_of(body: &[u8]) -> Option<u16> {
     Notify::parse(body).ok().map(|n| n.notify_type).filter(|t| notify_type::is_child_sa_error(*t))
 }
 
-/// The ESP CHILD SA SPI carried by an IKE_AUTH SA payload — the 4-byte SPI of the
-/// first proposal (RFC 7296 §3.3: proposal substructure, SPI at offset 8 when the
-/// SPI size byte is 4). This is the SPI the peer expects stamped on its inbound
-/// ESP.
-pub(crate) fn esp_spi_from_sa(sa: &[u8]) -> Option<u32> {
-    if sa.len() >= 12 && sa[6] == 4 {
-        Some(u32::from_be_bytes([sa[8], sa[9], sa[10], sa[11]]))
-    } else {
-        None
-    }
-}
-
 fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, IkeError> {
     let mut id_body = None;
     let mut auth = None;
     let mut certs = Vec::new();
-    let mut child_spi = None;
-    let mut esp_suite = None;
+    let mut child_sa = None;
     let mut assigned_ip4 = None;
     let (mut tsi, mut tsr) = (None, None);
     let mut initial_contact = false;
@@ -275,10 +291,7 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
                     certs.push(c.data);
                 }
             }
-            PayloadType::SecurityAssociation => {
-                child_spi = esp_spi_from_sa(payload.data);
-                esp_suite = SecurityAssociation::parse(payload.data).ok().and_then(|sa| negotiate::select_esp(&sa));
-            }
+            PayloadType::SecurityAssociation => child_sa = Some(SecurityAssociation::parse(payload.data)?),
             PayloadType::Configuration => {
                 if let Ok(cp) = Configuration::parse(payload.data) {
                     assigned_ip4 = cp.assigned_ipv4();
@@ -304,8 +317,7 @@ fn parse_auth_inner(first: PayloadType, inner: &[u8]) -> Result<AuthPayloads, Ik
         id_body: id_body.ok_or(IkeError::MissingPayload("ID"))?,
         auth: auth.ok_or(IkeError::MissingPayload("AUTH"))?,
         certs,
-        child_spi,
-        esp_suite,
+        child_sa,
         assigned_ip4,
         tsi,
         tsr,
@@ -451,8 +463,8 @@ pub fn initiator_auth_request(
 /// (e.g. a pure-certificate profile with mode-config enabled). Placed right
 /// after IDi, matching [`initiator_eap_request`]'s payload order. `esp_offer`
 /// is the CHILD SA proposal template (see [`self::esp_offer`] for the
-/// default AES-GCM-256 one) — its own SPI field is ignored; [`with_spi`]
-/// always overwrites it with `child_spi`. `ts_offer` picks the TSi/TSr this
+/// default AES-GCM-256 one) — its own SPI field is ignored; [`sai2`]
+/// always overwrites it with `child_spi`, and leaves its DH groups out. `ts_offer` picks the TSi/TSr this
 /// CHILD SA is offered with (see [`ChildTsOffer`]); every other builder below
 /// takes it the same way.
 pub fn initiator_auth_request_with_cfg(
@@ -483,7 +495,7 @@ pub fn initiator_auth_request_with_cfg(
         inner.push((PayloadType::CertRequest, CertRequest::x509(hashes).to_bytes()));
     }
     inner.push((PayloadType::Authentication, auth.to_bytes()));
-    inner.push((PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()));
+    inner.push((PayloadType::SecurityAssociation, sai2(esp_offer, child_spi).to_bytes()));
     inner.push((PayloadType::TrafficSelectorInitiator, ts_offer.to_bytes()));
     inner.push((PayloadType::TrafficSelectorResponder, ts_offer.to_bytes()));
     let first = first_payload_type(&inner);
@@ -513,7 +525,7 @@ pub fn initiator_eap_request(
     if want_cfg {
         inner.push((PayloadType::Configuration, Configuration::request_ipv4().to_bytes()));
     }
-    inner.push((PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()));
+    inner.push((PayloadType::SecurityAssociation, sai2(esp_offer, child_spi).to_bytes()));
     inner.push((PayloadType::TrafficSelectorInitiator, ts_offer.to_bytes()));
     inner.push((PayloadType::TrafficSelectorResponder, ts_offer.to_bytes()));
     inner.push((PayloadType::Notify, Notify::status(notify_type::INITIAL_CONTACT, Vec::new()).to_bytes()));
@@ -540,7 +552,7 @@ pub fn initiator_eap_request_with_certreq(
     if want_cfg {
         inner.push((PayloadType::Configuration, Configuration::request_ipv4().to_bytes()));
     }
-    inner.push((PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()));
+    inner.push((PayloadType::SecurityAssociation, sai2(esp_offer, child_spi).to_bytes()));
     inner.push((PayloadType::TrafficSelectorInitiator, ts_offer.to_bytes()));
     inner.push((PayloadType::TrafficSelectorResponder, ts_offer.to_bytes()));
     inner.push((PayloadType::CertRequest, CertRequest::x509(ca_hashes).to_bytes()));
@@ -583,7 +595,7 @@ pub fn initiator_eap_request_with_certs(
     if let Some(hashes) = ca_hashes {
         inner.push((PayloadType::CertRequest, CertRequest::x509(hashes).to_bytes()));
     }
-    inner.push((PayloadType::SecurityAssociation, with_spi(esp_offer, child_spi).to_bytes()));
+    inner.push((PayloadType::SecurityAssociation, sai2(esp_offer, child_spi).to_bytes()));
     inner.push((PayloadType::TrafficSelectorInitiator, ts_offer.to_bytes()));
     inner.push((PayloadType::TrafficSelectorResponder, ts_offer.to_bytes()));
     inner.push((PayloadType::Notify, Notify::status(notify_type::INITIAL_CONTACT, Vec::new()).to_bytes()));
@@ -650,12 +662,19 @@ pub fn responder_process_auth_with_mobike(
     let octets = initiator_signed_octets(sa.suite.prf_algorithm(), &sa.init_message, &sa.nr, &sa.keys.sk_pi, &got.id_body);
     verify_peer_auth(sa.suite.prf_algorithm(), cfg, &got, &octets)?;
     let peer_id = Identification::parse(&got.id_body)?;
-    let peer_child_spi = got.child_spi.ok_or(IkeError::MissingPayload("SA"))?;
+    let sai2 = got.child_sa.as_ref().ok_or(IkeError::MissingPayload("SA"))?;
     let (policy_i, policy_r) = assigned_ipv4_policy(assigned.map(|a| a.ip));
     let child_ts = match narrow_requested_ts(got.tsi.as_ref(), got.tsr.as_ref(), &policy_i, &policy_r) {
         Ok(ts) => Some(ts),
         Err(IkeError::TsUnacceptable) => None,
         Err(e) => return Err(e),
+    };
+    // RFC 7296 §1.2: either failing, the IKE SA stands and the CHILD SA is
+    // refused with the reason -- the proposals weighed first, as §2.7 has it.
+    let child = match (answer_esp_offer(sai2, child_spi), child_ts) {
+        (None, _) => Err(notify_type::NO_PROPOSAL_CHOSEN),
+        (Some(_), None) => Err(notify_type::TS_UNACCEPTABLE),
+        (Some((sar2, peer_child_spi)), Some(ts)) => Ok((sar2, peer_child_spi, ts)),
     };
 
     // Our AUTH signs resp_message | Ni | prf(SK_pr, IDr) — it does NOT cover the
@@ -667,8 +686,8 @@ pub fn responder_process_auth_with_mobike(
     let mut inner_out = vec![(PayloadType::IdResponder, idr_body)];
     inner_out.extend(cert_payloads);
     inner_out.push((PayloadType::Authentication, auth.to_bytes()));
-    match &child_ts {
-        Some((tsi, tsr)) => {
+    match &child {
+        Ok((sar2, _, (tsi, tsr))) => {
             // CP(CFG_REPLY) with the assigned inner IP (+ DNS) — a native client needs
             // this to configure its tunnel interface. RFC 7296 §2.19: after AUTH, before
             // SA/TS. The assigned address is also the only one TSi is narrowed to.
@@ -677,12 +696,12 @@ pub fn responder_process_auth_with_mobike(
                 let cp = Configuration::reply_ipv4(a.ip, None, dns);
                 inner_out.push((PayloadType::Configuration, cp.to_bytes()));
             }
-            inner_out.push((PayloadType::SecurityAssociation, esp_offer(child_spi).to_bytes()));
+            inner_out.push((PayloadType::SecurityAssociation, SecurityAssociation { proposals: vec![sar2.clone()] }.to_bytes()));
             inner_out.push((PayloadType::TrafficSelectorInitiator, tsi.to_bytes()));
             inner_out.push((PayloadType::TrafficSelectorResponder, tsr.to_bytes()));
         }
-        // RFC 7296 §1.2, §2.9: the IKE SA stands, the CHILD SA is refused.
-        None => inner_out.push((PayloadType::Notify, Notify::status(notify_type::TS_UNACCEPTABLE, Vec::new()).to_bytes())),
+        // RFC 7296 §1.2, §2.7, §2.9: the IKE SA stands, the CHILD SA is refused.
+        Err(error) => inner_out.push((PayloadType::Notify, Notify::status(*error, Vec::new()).to_bytes())),
     }
     // RFC 4555 §3.1: the responder includes MOBIKE_SUPPORTED only if the
     // initiator did, and we only when the caller actually follows the client
@@ -694,7 +713,7 @@ pub fn responder_process_auth_with_mobike(
     let first_out = first_payload_type(&inner_out);
     let inner_bytes = encode_payload_chain(&inner_out);
     let response = build_encrypted(sa.suite.sk_cipher(), ike_auth_header(sa, true), first_out, &inner_bytes, &sa.keys.sk_er, &sa.keys.sk_ar, iv)?;
-    Ok((response, peer_id, child_ts.map(|_| peer_child_spi), got.initial_contact, mobike))
+    Ok((response, peer_id, child.ok().map(|(_, peer_child_spi, _)| peer_child_spi), got.initial_contact, mobike))
 }
 
 /// Decrypt an `IKE_AUTH` request and return the peer's claimed identity (`IDi`)
@@ -747,8 +766,9 @@ pub fn client_sent_certreq(sa: &CompletedSaInit, request: &[u8]) -> bool {
 }
 
 /// The responder's verified identity, its chosen CHILD SA SPI, the ESP cipher
-/// it named (parsed from the same SA payload, `None` only if that payload was
-/// malformed), the assigned inner IPv4 (if any), and its actual granted `TSr`
+/// it named (from the same SA payload -- one of our proposals, so `None` only
+/// if the caller offered a combination [`negotiate::select_esp`] cannot
+/// decode), the assigned inner IPv4 (if any), and its actual granted `TSr`
 /// (always `Some` since [`initiator_verify_auth`] requires it) -- see
 /// [`AuthPayloads::tsr`] for why this is often more authoritative than the
 /// CFG_REPLY subnet for deciding what to route through the tunnel. Returned by
@@ -780,17 +800,22 @@ pub fn initiator_verify_auth(
     // Only once the AUTH has verified: a peer that authenticated but refused
     // the CHILD SA (RFC 7296 §1.2) is a rejection with a stated reason, not a
     // "missing SA payload".
-    if let (None, Some(t)) = (got.child_spi, got.child_error) {
-        return Err(IkeError::PeerRejected { notify_type: t, name: notify_type_name(t) });
-    }
-    let peer_child_spi = got.child_spi.ok_or(IkeError::MissingPayload("SA"))?;
-    if let Some(suite) = &got.esp_suite {
-        if !suite.matches_offer(esp_offer) {
+    let sar2 = match (&got.child_sa, got.child_error) {
+        (None, Some(t)) => return Err(IkeError::PeerRejected { notify_type: t, name: notify_type_name(t) }),
+        (sar2, _) => sar2.as_ref().ok_or(IkeError::MissingPayload("SA"))?,
+    };
+    // One of the proposals we sent, by its number, with one transform of each
+    // of its types (RFC 7296 §2.7, §3.3.1, §3.3.6) -- carrying the peer's SPI.
+    let sent = sai2(esp_offer, 0);
+    let peer_child_spi = esp_spi(negotiate::accepted_proposal(sar2, &sent)?)?;
+    let esp_suite = negotiate::select_esp(sar2);
+    if let Some(suite) = &esp_suite {
+        if !suite.matches_offer(&sent) {
             return Err(IkeError::NoProposalChosen);
         }
     }
     check_granted_ts(&ts_offer.selectors(), got.tsi.as_ref(), got.tsr.as_ref())?;
-    Ok((Identification::parse(&got.id_body)?, peer_child_spi, got.esp_suite, got.assigned_ip4, got.tsr))
+    Ok((Identification::parse(&got.id_body)?, peer_child_spi, esp_suite, got.assigned_ip4, got.tsr))
 }
 
 /// The traffic selectors a response creating a CHILD SA answered a request
@@ -1323,6 +1348,135 @@ pub(crate) mod tests {
 
         let err = initiator_verify_auth(&init_sa, &response, &icfg, &esp_offer(0), ChildTsOffer::Ipv4).unwrap_err();
         assert_eq!(err, IkeError::NoProposalChosen);
+    }
+
+    /// `msg`, an `IKE_AUTH` message sealed with `sk_e`/`sk_a`, with its SA
+    /// payload's body replaced by `sa` in place. Neither side's AUTH covers
+    /// it, so the message still verifies. Shared with `eap_auth`'s tests.
+    pub(crate) fn with_sa_body(cipher: SkCipher, msg: &[u8], sk_e: &[u8], sk_a: &[u8], sa: Vec<u8>) -> Vec<u8> {
+        let mut chain = sk_chain(cipher, msg, sk_e, sk_a);
+        chain.iter_mut().find(|(t, _)| *t == PayloadType::SecurityAssociation).expect("an SA payload to replace").1 = sa;
+        let header = IkeHeader::parse(msg).unwrap();
+        build_encrypted(cipher, header, first_payload_type(&chain), &encode_payload_chain(&chain), sk_e, sk_a, &[3u8; 8]).unwrap()
+    }
+
+    /// The SA payload of `msg` (sealed with `sk_e`/`sk_a`), if it has one.
+    pub(crate) fn sa_of(cipher: SkCipher, msg: &[u8], sk_e: &[u8], sk_a: &[u8]) -> Option<SecurityAssociation> {
+        let chain = sk_chain(cipher, msg, sk_e, sk_a);
+        chain.into_iter().find(|(t, _)| *t == PayloadType::SecurityAssociation).map(|(_, body)| SecurityAssociation::parse(&body).unwrap())
+    }
+
+    /// An ESP proposal numbered `num`, with SPI `spi` and `transforms`.
+    pub(crate) fn esp_proposal(num: u8, spi: u32, transforms: &[(u8, u16, Option<u16>)]) -> Proposal {
+        let transforms = transforms.iter().map(|&(transform_type, transform_id, key_length)| Transform { transform_type, transform_id, key_length }).collect();
+        Proposal { num, protocol_id: protocol_id::ESP, spi: spi.to_be_bytes().to_vec(), transforms }
+    }
+
+    pub(crate) const GCM256: (u8, u16, Option<u16>) = (transform_type::ENCR, transform_id::AES_GCM_16, Some(256));
+    pub(crate) const CBC256: (u8, u16, Option<u16>) = (transform_type::ENCR, transform_id::AES_CBC, Some(256));
+    pub(crate) const SHA256: (u8, u16, Option<u16>) = (transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, None);
+    pub(crate) const ESN_NONE: (u8, u16, Option<u16>) = (transform_type::ESN, transform_id::ESN_NONE, None);
+    pub(crate) const MODP2048: (u8, u16, Option<u16>) = (transform_type::DH, transform_id::MODP_2048, None);
+
+    /// RFC 7296 §1.2: the SA payloads of `IKE_AUTH` "cannot contain Transform
+    /// Type 4 (Diffie-Hellman group) with any value other than NONE.
+    /// Implementations SHOULD omit the whole transform substructure" -- there is
+    /// no KE there to run it with. A caller's offer carrying PFS groups (they
+    /// are for the CHILD SA's rekeys) goes out without them.
+    #[test]
+    fn the_ike_auth_sai2_carries_no_dh_group() {
+        let (init_sa, _) = run_sa_init();
+        let icfg = AuthConfig::psk(Identification::fqdn("client.example"), b"pw".to_vec());
+        let offer = SecurityAssociation { proposals: vec![esp_proposal(1, 0, &[GCM256, MODP2048, ESN_NONE]), esp_proposal(2, 0, &[CBC256, SHA256, MODP2048, ESN_NONE])] };
+        let req = initiator_auth_request(&init_sa, &icfg, 7, &offer, &[1u8; 8]).unwrap();
+        let sai2 = sa_of(init_sa.suite.sk_cipher(), &req, &init_sa.keys.sk_ei, &init_sa.keys.sk_ai).unwrap();
+        assert_eq!(sai2, SecurityAssociation { proposals: vec![esp_proposal(1, 7, &[GCM256, ESN_NONE]), esp_proposal(2, 7, &[CBC256, SHA256, ESN_NONE])] });
+    }
+
+    /// RFC 7296 §2.7 and §1.2: the responder answers the first proposal of
+    /// SAi2 it can run (here: AES-GCM-16/256, what its data plane runs), by its
+    /// number and with the SPI of that proposal as the peer's; when none fits,
+    /// `NO_PROPOSAL_CHOSEN` and no CHILD SA, the IKE SA standing. Before, it
+    /// sent its own fixed offer back, whatever the peer had proposed.
+    #[test]
+    fn the_ike_auth_responder_answers_a_proposal_it_can_run_or_no_proposal_chosen() {
+        let (init_sa, resp_sa) = run_sa_init();
+        let psk = b"pw".to_vec();
+        let icfg = AuthConfig::psk(Identification::fqdn("client.example"), psk.clone());
+        let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), psk);
+        let req = initiator_auth_request(&init_sa, &icfg, 1, &esp_offer(0), &[1u8; 8]).unwrap();
+        let answer = |proposals: Vec<Proposal>| {
+            let sai2 = SecurityAssociation { proposals }.to_bytes();
+            let req = with_sa_body(init_sa.suite.sk_cipher(), &req, &init_sa.keys.sk_ei, &init_sa.keys.sk_ai, sai2);
+            let (resp, _, peer_child_spi, _) = responder_process_auth(&resp_sa, &req, &rcfg, 0xCAFE_BABE, &[2u8; 8], None).unwrap();
+            let sar2 = sa_of(init_sa.suite.sk_cipher(), &resp, &init_sa.keys.sk_er, &init_sa.keys.sk_ar);
+            (resp, sar2, peer_child_spi)
+        };
+
+        let taken = [
+            ("the second proposal, the first one's cipher is not ours", vec![esp_proposal(1, 0x1111, &[CBC256, SHA256, ESN_NONE]), esp_proposal(2, 0x2222, &[GCM256, ESN_NONE])], 2, 0x2222, vec![GCM256, ESN_NONE]),
+            ("no ESN offered, none answered", vec![esp_proposal(1, 0x1111, &[GCM256])], 1, 0x1111, vec![GCM256]),
+            ("a DH group, which IKE_AUTH does not run, is left out", vec![esp_proposal(1, 0x1111, &[GCM256, MODP2048, ESN_NONE])], 1, 0x1111, vec![GCM256, ESN_NONE]),
+            ("a proposal with an unknown type is passed over", vec![esp_proposal(1, 0x1111, &[GCM256, ESN_NONE, (6, 14, None)]), esp_proposal(2, 0x2222, &[GCM256, ESN_NONE])], 2, 0x2222, vec![GCM256, ESN_NONE]),
+        ];
+        for (what, proposals, num, peer_spi, transforms) in taken {
+            let offered = SecurityAssociation { proposals: proposals.clone() };
+            let (resp, sar2, peer_child_spi) = answer(proposals);
+            assert_eq!(sar2, Some(SecurityAssociation { proposals: vec![esp_proposal(num, 0xCAFE_BABE, &transforms)] }), "{what}");
+            assert_eq!(peer_child_spi, Some(peer_spi), "{what}");
+            // And our initiator, had it sent that SAi2, takes the answer.
+            let (_, spi, ..) = initiator_verify_auth(&init_sa, &resp, &icfg, &offered, ChildTsOffer::Ipv4).unwrap();
+            assert_eq!(spi, 0xCAFE_BABE, "{what}");
+        }
+
+        let refused = [
+            ("only AES-CBC", vec![esp_proposal(1, 0x1111, &[CBC256, SHA256, ESN_NONE])]),
+            ("AES-GCM-128", vec![esp_proposal(1, 0x1111, &[(transform_type::ENCR, transform_id::AES_GCM_16, Some(128)), ESN_NONE])]),
+            ("ESN required", vec![esp_proposal(1, 0x1111, &[GCM256, (transform_type::ESN, transform_id::ESN_ENABLED, None)])]),
+            ("an integrity algorithm forced onto AES-GCM", vec![esp_proposal(1, 0x1111, &[GCM256, SHA256, ESN_NONE])]),
+            ("an unknown transform type", vec![esp_proposal(1, 0x1111, &[GCM256, ESN_NONE, (6, 14, None)])]),
+        ];
+        for (what, proposals) in refused {
+            let (resp, sar2, peer_child_spi) = answer(proposals);
+            assert_eq!(sar2, None, "{what}");
+            assert_eq!(peer_child_spi, None, "{what}: no CHILD SA");
+            assert_eq!(answered_ts(&init_sa, &resp), (None, None, vec![notify_type::NO_PROPOSAL_CHOSEN]), "{what}");
+            let got = initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0), ChildTsOffer::Ipv4).unwrap_err();
+            assert_eq!(got, IkeError::PeerRejected { notify_type: notify_type::NO_PROPOSAL_CHOSEN, name: "NO_PROPOSAL_CHOSEN" }, "{what}");
+        }
+    }
+
+    /// RFC 7296 §3.3.6, §2.7, §3.3.1: the initiator takes back one of its SAi2
+    /// proposals -- a single one, by its number, one transform of each type --
+    /// or nothing: each forged SAr2 below names the very suite we offered and
+    /// must still be refused, and so must one that does not even parse (it
+    /// used to skip the check altogether).
+    #[test]
+    fn the_ike_auth_initiator_takes_only_one_of_its_proposals_back() {
+        let (init_sa, resp_sa) = run_sa_init();
+        let psk = b"pw".to_vec();
+        let icfg = AuthConfig::psk(Identification::fqdn("client.example"), psk.clone());
+        let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), psk);
+        let req = initiator_auth_request(&init_sa, &icfg, 1, &esp_offer(0), &[1u8; 8]).unwrap();
+        let (resp, ..) = responder_process_auth(&resp_sa, &req, &rcfg, 0xCAFE_BABE, &[2u8; 8], None).unwrap();
+        let verify = |sar2: Vec<u8>| {
+            let resp = with_sa_body(resp_sa.suite.sk_cipher(), &resp, &resp_sa.keys.sk_er, &resp_sa.keys.sk_ar, sar2);
+            initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0), ChildTsOffer::Ipv4).map(|(_, spi, ..)| spi)
+        };
+        let ours = esp_proposal(1, 0xCAFE_BABE, &[GCM256, ESN_NONE]);
+        assert_eq!(verify(SecurityAssociation { proposals: vec![ours.clone()] }.to_bytes()), Ok(0xCAFE_BABE), "control");
+
+        let mut malformed = SecurityAssociation { proposals: vec![ours.clone()] }.to_bytes();
+        malformed[3] += 4; // the proposal claims four octets more than the payload has
+        let cases = [
+            ("two proposals", SecurityAssociation { proposals: vec![ours.clone(), ours.clone()] }.to_bytes()),
+            ("two ENCR transforms", SecurityAssociation { proposals: vec![esp_proposal(1, 0xCAFE_BABE, &[GCM256, GCM256, ESN_NONE])] }.to_bytes()),
+            ("a proposal number we never sent", SecurityAssociation { proposals: vec![Proposal { num: 2, ..ours.clone() }] }.to_bytes()),
+            ("an SA payload that does not parse", malformed),
+        ];
+        for (what, sar2) in cases {
+            assert!(verify(sar2).is_err(), "{what}");
+        }
     }
 
     #[test]

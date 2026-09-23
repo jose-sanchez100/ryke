@@ -40,6 +40,7 @@
 //! before `esp.rs` supports them (still not true; Phase G first).
 
 use crate::crypto::{DhGroup, IntegAlgorithm, KeyLengths, PrfAlgorithm};
+use crate::error::IkeError;
 use crate::ikev2::payload::{protocol_id, transform_id, transform_type, Proposal, SecurityAssociation, Transform};
 
 /// The concrete suite chosen from an initiator proposal.
@@ -91,9 +92,14 @@ impl ChosenSuite {
 
     /// Re-express as a single-transform-per-type proposal to echo in the
     /// `IKE_SA_INIT` response (ENCR, PRF, INTEG when non-AEAD, D-H — no ESN).
+    /// A fixed-key cipher (ChaCha20-Poly1305, 3DES) goes without a Key Length:
+    /// RFC 7296 §3.3.5, "The Key Length attribute MUST NOT be used with
+    /// transforms that use a fixed-length key", and §3.3.6, the attributes of
+    /// the selected transform "MUST be returned unmodified" -- it had none.
     pub fn to_proposal(&self) -> Proposal {
+        let encr_key_length = if fixed_key_bits(self.encr_id).is_some() { None } else { Some(self.encr_key_bits) };
         let mut transforms = vec![
-            Transform { transform_type: transform_type::ENCR, transform_id: self.encr_id, key_length: Some(self.encr_key_bits) },
+            Transform { transform_type: transform_type::ENCR, transform_id: self.encr_id, key_length: encr_key_length },
             Transform { transform_type: transform_type::PRF, transform_id: self.prf_id, key_length: None },
         ];
         if let Some(integ) = self.integ_id {
@@ -117,8 +123,7 @@ impl ChosenSuite {
             return false;
         };
         // Fixed-key ciphers (ChaCha20-Poly1305, 3DES) carry no key-length
-        // attribute on the wire -- same "don't care" shape `has` already
-        // uses for them in `select_from_proposal`.
+        // attribute on the wire (RFC 7296 §3.3.5) -- `has` with `None`.
         let encr_key_bits = if fixed_key_bits(self.encr_id).is_some() { None } else { Some(self.encr_key_bits) };
         if !has(proposal, transform_type::ENCR, self.encr_id, encr_key_bits) {
             return false;
@@ -135,14 +140,71 @@ impl ChosenSuite {
     }
 }
 
+/// The one proposal of `answer`, the SA payload a responder took our `offer`
+/// with, provided the answer is "consistent with one of [our] proposals" --
+/// RFC 7296 §3.3.6: "The initiator of an exchange MUST check that the
+/// accepted offer is consistent with one of its proposals, and if not MUST
+/// terminate the exchange." That is:
+///
+/// - a single proposal: the responder "MUST accept a single proposal or
+///   reject them all" (§2.7);
+/// - numbered and of the protocol of the one of ours it accepts: "the
+///   proposal number in the SA payload MUST match the number on the proposal
+///   sent that was accepted" (§3.3.1), "the SA response MUST contain the same
+///   protocol" (§2.7);
+/// - "exactly one transform of each type included in the proposal" (§2.7),
+///   each one we offered in it, attributes and all ("Any attributes of a
+///   selected transform MUST be returned unmodified", §3.3.6).
+///
+/// Two leniencies, both meaning "nothing" in an ESP answer: one that leaves
+/// out the ESN transform of a proposal offering `ESN_NONE` is taken as "no
+/// ESN" -- some peers omit it, the convention [`select_esp`] and
+/// `rekey::choose_child_proposal` follow too; and one that adds a single DH
+/// `NONE` to an ESP proposal offered without any DH transform is taken as "no
+/// PFS", as asked (`NONE` is what §1.2 lets an `IKE_AUTH` SA carry for DH, and
+/// the CHILD SA rekey already took it so). The SPI isn't compared: the answer
+/// carries the responder's own.
+///
+/// `NoProposalChosen` when the answer is anything else.
+pub(crate) fn accepted_proposal<'a>(answer: &'a SecurityAssociation, offer: &SecurityAssociation) -> Result<&'a Proposal, IkeError> {
+    let [answered] = answer.proposals.as_slice() else {
+        return Err(IkeError::NoProposalChosen);
+    };
+    let offered = offer
+        .proposals
+        .iter()
+        .find(|p| p.num == answered.num && p.protocol_id == answered.protocol_id)
+        .ok_or(IkeError::NoProposalChosen)?;
+    let answered_of = |ty: u8| answered.transforms.iter().filter(move |t| t.transform_type == ty).count();
+    let esn_none = Transform { transform_type: transform_type::ESN, transform_id: transform_id::ESN_NONE, key_length: None };
+    let offered_of = |ty: u8| offered.transforms.iter().filter(move |t| t.transform_type == ty).count();
+    let dh_none = Transform { transform_type: transform_type::DH, transform_id: 0, key_length: None };
+    let no_pfs = |t: &Transform| answered.protocol_id == protocol_id::ESP && *t == dh_none && offered_of(transform_type::DH) == 0;
+    let consistent = answered.transforms.iter().all(|t| (offered.transforms.contains(t) || no_pfs(t)) && answered_of(t.transform_type) == 1)
+        && offered.transforms.iter().all(|t| {
+            answered_of(t.transform_type) == 1 || (t.transform_type == transform_type::ESN && offered.transforms.contains(&esn_none))
+        });
+    if consistent {
+        Ok(answered)
+    } else {
+        Err(IkeError::NoProposalChosen)
+    }
+}
+
 /// Pick the first initiator proposal we fully support, or `None`.
 pub fn select(sa: &SecurityAssociation) -> Option<ChosenSuite> {
-    sa.proposals.iter().find_map(select_from_proposal)
+    select_with_proposal(sa).map(|(_, suite)| suite)
+}
+
+/// [`select`], also returning the proposal the suite was picked from -- whose
+/// SPI is the one the peer wants if that proposal is chosen (RFC 7296 §3.3.1).
+pub(crate) fn select_with_proposal(sa: &SecurityAssociation) -> Option<(&Proposal, ChosenSuite)> {
+    sa.proposals.iter().find_map(|p| select_from_proposal(p).map(|suite| (p, suite)))
 }
 
 /// `(transform_id, key_bits, is_aead)`, strongest first. `key_bits: None`
-/// means "don't care" (fixed-key ciphers like 3DES/ChaCha20-Poly1305 don't
-/// carry a key-length attribute on the wire).
+/// means no Key Length attribute: fixed-key ciphers like 3DES and
+/// ChaCha20-Poly1305 must not carry one (RFC 7296 §3.3.5).
 const ENCR_CANDIDATES: &[(u16, Option<u16>, bool)] = &[
     (transform_id::CHACHA20_POLY1305, None, true),
     (transform_id::AES_GCM_16, Some(256), true),
@@ -201,10 +263,29 @@ pub fn ikev2_dh_group(id: u16) -> Option<DhGroup> {
     DH_CANDIDATES.contains(&id).then(|| DhGroup::from_transform_id(id)).flatten()
 }
 
+/// The Transform Types an IKE proposal may carry for us to answer it: ENCR,
+/// PRF, INTEG and D-H (RFC 7296 §3.3.3), plus ESN, which some initiators add
+/// to it by mistake and is ignored (see `ignores_esn_if_present`).
+const IKE_TRANSFORM_TYPES: &[u8] = &[transform_type::ENCR, transform_type::PRF, transform_type::INTEG, transform_type::DH, transform_type::ESN];
+
 fn select_from_proposal(proposal: &Proposal) -> Option<ChosenSuite> {
     if proposal.protocol_id != protocol_id::IKE {
         return None;
     }
+    // RFC 7296 §3.3.6: "If the responder receives a proposal that contains a
+    // Transform Type it does not understand ... it MUST consider this proposal
+    // unacceptable; however, other proposals in the same SA payload are
+    // processed as usual" -- answering it would leave that type out (RFC 9370
+    // §2.2.2 relies on this for its ADDKE types without IKE_INTERMEDIATE).
+    if proposal.transforms.iter().any(|t| !IKE_TRANSFORM_TYPES.contains(&t.transform_type)) {
+        return None;
+    }
+    // §2.7: the accepted suite "MUST contain exactly one transform of each
+    // type included in the proposal", so one that lists integrity algorithms
+    // needs one of them answered -- which a combined-mode cipher can't take
+    // (§3.3: those "MUST either offer no integrity algorithm or a single
+    // integrity algorithm of NONE").
+    let offers_integ = proposal.transforms.iter().any(|t| t.transform_type == transform_type::INTEG);
     let dh_id = DH_CANDIDATES.iter().copied().find(|&g| has(proposal, transform_type::DH, g, None))?;
 
     for &(encr_id, key_bits, aead) in ENCR_CANDIDATES {
@@ -214,6 +295,9 @@ fn select_from_proposal(proposal: &Proposal) -> Option<ChosenSuite> {
         let encr_key_bits = key_bits.or_else(|| fixed_key_bits(encr_id)).expect("every candidate has a key size");
 
         if aead {
+            if offers_integ {
+                continue;
+            }
             let Some(&prf_id) = PRF_CANDIDATES.iter().find(|&&p| has(proposal, transform_type::PRF, p, None)) else {
                 continue;
             };
@@ -238,15 +322,13 @@ fn select_from_proposal(proposal: &Proposal) -> Option<ChosenSuite> {
     None
 }
 
+/// Whether `proposal` offers transform `tid` of type `ttype` with the Key
+/// Length `key_bits` -- `None` for a transform without one: a fixed-length
+/// cipher, PRF, INTEG or D-H group. On those RFC 7296 §3.3.5 says "The Key
+/// Length attribute MUST NOT be used", so one that carries it anyway is not a
+/// transform we understand, and §3.3.6 makes it unacceptable.
 fn has(proposal: &Proposal, ttype: u8, tid: u16, key_bits: Option<u16>) -> bool {
-    proposal.transforms.iter().any(|t| {
-        t.transform_type == ttype
-            && t.transform_id == tid
-            && match key_bits {
-                Some(bits) => t.key_length == Some(bits),
-                None => true,
-            }
-    })
+    proposal.transforms.iter().any(|t| t.transform_type == ttype && t.transform_id == tid && t.key_length == key_bits)
 }
 
 /// The ESP/AH CHILD SA cipher named by an `SAr2`/`SAi2` payload: the
@@ -276,8 +358,9 @@ impl ChosenEspSuite {
         crate::ikev2::sk::SkCipher::from_encr_integ(self.encr_id, self.encr_key_bits, self.integ_id)
     }
 
-    /// Whether every transform this suite names was actually present in
-    /// `offer`'s ESP/AH proposal. Mirrors [`ChosenSuite::matches_offer`] for
+    /// Whether every transform this suite names was actually present in one
+    /// of `offer`'s ESP proposals -- any of them: the answer's proposal
+    /// number says which ([`accepted_proposal`] holds it to that). Mirrors [`ChosenSuite::matches_offer`] for
     /// the CHILD SA: RFC 7296 §2.7 requires the peer's SAr2/SAi2 answer to be
     /// built from the ESP proposal *we* sent, not merely a combination
     /// `select_esp`/`sk::SkCipher` knows how to decode. Without this check, a
@@ -287,9 +370,10 @@ impl ChosenEspSuite {
     /// `ESN_NONE` (this crate's 32-bit ESP sequence counters would then
     /// disagree with what the peer believes it negotiated).
     pub fn matches_offer(&self, offer: &SecurityAssociation) -> bool {
-        let Some(proposal) = offer.proposals.iter().find(|p| p.protocol_id == protocol_id::ESP) else {
-            return false;
-        };
+        offer.proposals.iter().filter(|p| p.protocol_id == protocol_id::ESP).any(|p| self.matches_proposal(p))
+    }
+
+    fn matches_proposal(&self, proposal: &Proposal) -> bool {
         let encr_key_bits = if fixed_key_bits(self.encr_id).is_some() { None } else { Some(self.encr_key_bits) };
         if !has(proposal, transform_type::ENCR, self.encr_id, encr_key_bits) {
             return false;
@@ -609,6 +693,245 @@ mod tests {
         ]);
         let chosen = select_esp(&answer).unwrap();
         assert!(!chosen.matches_offer(&offer));
+    }
+
+    #[test]
+    fn a_fixed_key_cipher_is_echoed_without_a_key_length() {
+        // RFC 7296 §3.3.5: "The Key Length attribute MUST NOT be used with
+        // transforms that use a fixed-length key", and §3.3.6: attributes are
+        // "returned unmodified" -- the offer carried none.
+        for (encr, integ) in [(transform_id::CHACHA20_POLY1305, None), (transform_id::TRIPLE_DES, Some(transform_id::AUTH_HMAC_SHA1_96))] {
+            let mut transforms = vec![tf(transform_type::ENCR, encr, None), tf(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, None)];
+            transforms.extend(integ.map(|id| tf(transform_type::INTEG, id, None)));
+            transforms.push(tf(transform_type::DH, transform_id::X25519, None));
+            let chosen = select(&proposal(1, transforms)).unwrap();
+            let echo = chosen.to_proposal();
+            let echoed = echo.transforms.iter().find(|t| t.transform_type == transform_type::ENCR).unwrap();
+            assert_eq!(echoed.key_length, None, "ENCR {encr}");
+            assert!(chosen.matches_offer(&SecurityAssociation { proposals: vec![echo.clone()] }));
+        }
+        // A variable-length cipher keeps its Key Length.
+        let chosen = select(&proposal(1, vec![
+            tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(128)),
+            tf(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, None),
+            tf(transform_type::DH, transform_id::X25519, None),
+        ]))
+        .unwrap();
+        assert_eq!(chosen.to_proposal().transforms[0].key_length, Some(128));
+    }
+
+    #[test]
+    fn a_key_length_on_a_fixed_length_transform_makes_it_unacceptable() {
+        // §3.3.5 forbids the attribute there, and §3.3.6: "a transform ...
+        // that contains a Transform Attribute it does not understand" is
+        // unacceptable -- whatever a Key Length on ChaCha20 or a PRF means,
+        // it isn't what we'd run.
+        let base = || {
+            vec![
+                tf(transform_type::ENCR, transform_id::CHACHA20_POLY1305, None),
+                tf(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, None),
+                tf(transform_type::DH, transform_id::X25519, None),
+            ]
+        };
+        assert!(select(&proposal(1, base())).is_some());
+        for at in 0..3 {
+            let mut transforms = base();
+            transforms[at].key_length = Some(128);
+            assert_eq!(select(&proposal(1, transforms)), None, "Key Length on transform {at}");
+        }
+        // Another transform of the same type without it is still taken.
+        let mut transforms = base();
+        transforms[0].key_length = Some(128);
+        transforms.push(tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)));
+        assert_eq!(select(&proposal(1, transforms)).unwrap().encr_id, transform_id::AES_GCM_16);
+    }
+
+    #[test]
+    fn an_aead_cipher_is_not_picked_from_a_proposal_that_carries_integrity() {
+        // §2.7: the accepted suite "MUST contain exactly one transform of each
+        // type included in the proposal" -- a proposal with INTEG transforms
+        // needs one answered, which a combined-mode cipher cannot take (§3.3:
+        // it offers "no integrity algorithm or a single integrity algorithm of
+        // NONE").
+        let mixed = proposal(1, vec![
+            tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)),
+            tf(transform_type::ENCR, transform_id::AES_CBC, Some(256)),
+            tf(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, None),
+            tf(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, None),
+            tf(transform_type::DH, transform_id::X25519, None),
+        ]);
+        let chosen = select(&mixed).unwrap();
+        assert_eq!((chosen.encr_id, chosen.integ_id), (transform_id::AES_CBC, Some(transform_id::AUTH_HMAC_SHA2_256_128)));
+
+        let aead_with_integ = proposal(1, vec![
+            tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)),
+            tf(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, None),
+            tf(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, None),
+            tf(transform_type::DH, transform_id::X25519, None),
+        ]);
+        assert_eq!(select(&aead_with_integ), None);
+    }
+
+    #[test]
+    fn a_proposal_with_a_transform_type_we_do_not_know_is_skipped() {
+        // §3.3.6: "a proposal that contains a Transform Type it does not
+        // understand ... MUST [be considered] unacceptable; however, other
+        // proposals in the same SA payload are processed as usual" -- e.g.
+        // RFC 9370's ADDKE types (6-12) without IKE_INTERMEDIATE.
+        let suite = |num: u8, extra: Option<Transform>| {
+            let mut transforms = vec![
+                tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)),
+                tf(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, None),
+                tf(transform_type::DH, transform_id::X25519, None),
+            ];
+            transforms.extend(extra);
+            Proposal { num, protocol_id: protocol_id::IKE, spi: Vec::new(), transforms }
+        };
+        let addke = tf(6, transform_id::ECP256, None);
+        let sa = SecurityAssociation { proposals: vec![suite(1, Some(addke.clone())), suite(2, None)] };
+        assert_eq!(select(&sa).unwrap().proposal_num, 2);
+        let only = SecurityAssociation { proposals: vec![suite(1, Some(addke))] };
+        assert_eq!(select(&only), None);
+    }
+
+    #[test]
+    fn an_esp_answer_picking_the_second_proposal_matches_the_offer() {
+        let offer = SecurityAssociation {
+            proposals: vec![
+                Proposal {
+                    num: 1,
+                    protocol_id: protocol_id::ESP,
+                    spi: vec![1, 2, 3, 4],
+                    transforms: vec![tf(transform_type::ENCR, transform_id::CHACHA20_POLY1305, None), tf(transform_type::ESN, transform_id::ESN_NONE, None)],
+                },
+                Proposal {
+                    num: 2,
+                    protocol_id: protocol_id::ESP,
+                    spi: vec![1, 2, 3, 4],
+                    transforms: vec![tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)), tf(transform_type::ESN, transform_id::ESN_NONE, None)],
+                },
+            ],
+        };
+        let answer = SecurityAssociation { proposals: vec![Proposal { spi: vec![9, 9, 9, 9], ..offer.proposals[1].clone() }] };
+        let chosen = select_esp(&answer).unwrap();
+        assert!(chosen.matches_offer(&offer));
+        assert_eq!(accepted_proposal(&answer, &offer), Ok(&answer.proposals[0]));
+    }
+
+    #[test]
+    fn an_answer_must_be_one_proposal_of_ours_with_one_transform_of_each_type() {
+        let offer = SecurityAssociation {
+            proposals: vec![
+                Proposal {
+                    num: 1,
+                    protocol_id: protocol_id::IKE,
+                    spi: Vec::new(),
+                    transforms: vec![
+                        tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)),
+                        tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(128)),
+                        tf(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, None),
+                        tf(transform_type::DH, transform_id::X25519, None),
+                        tf(transform_type::DH, transform_id::ECP256, None),
+                    ],
+                },
+                Proposal {
+                    num: 2,
+                    protocol_id: protocol_id::IKE,
+                    spi: Vec::new(),
+                    transforms: vec![
+                        tf(transform_type::ENCR, transform_id::AES_CBC, Some(256)),
+                        tf(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, None),
+                        tf(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, None),
+                        tf(transform_type::DH, transform_id::X25519, None),
+                    ],
+                },
+            ],
+        };
+        let answer = |num: u8, transforms: Vec<Transform>| SecurityAssociation {
+            proposals: vec![Proposal { num, protocol_id: protocol_id::IKE, spi: Vec::new(), transforms }],
+        };
+        let gcm = || {
+            vec![
+                tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(128)),
+                tf(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, None),
+                tf(transform_type::DH, transform_id::ECP256, None),
+            ]
+        };
+        let cbc = || {
+            vec![
+                tf(transform_type::ENCR, transform_id::AES_CBC, Some(256)),
+                tf(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, None),
+                tf(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, None),
+                tf(transform_type::DH, transform_id::X25519, None),
+            ]
+        };
+        assert!(accepted_proposal(&answer(1, gcm()), &offer).is_ok());
+        assert!(accepted_proposal(&answer(2, cbc()), &offer).is_ok());
+
+        let mut bad: Vec<(&str, SecurityAssociation)> = vec![
+            ("the number of another proposal", answer(2, gcm())),
+            ("a number we never sent", answer(3, gcm())),
+            ("another protocol", SecurityAssociation { proposals: vec![Proposal { protocol_id: protocol_id::ESP, ..answer(1, gcm()).proposals[0].clone() }] }),
+            ("no proposal", SecurityAssociation { proposals: Vec::new() }),
+        ];
+        let mut two = answer(1, gcm());
+        two.proposals.push(answer(2, cbc()).proposals.remove(0));
+        bad.push(("two proposals", two));
+        let mut both_dh = gcm();
+        both_dh.push(tf(transform_type::DH, transform_id::X25519, None));
+        bad.push(("two transforms of a type", answer(1, both_dh)));
+        let mut no_dh = gcm();
+        no_dh.pop();
+        bad.push(("a type of the proposal left out", answer(1, no_dh)));
+        let mut integ = gcm();
+        integ.push(tf(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, None));
+        bad.push(("a type the proposal doesn't have", answer(1, integ)));
+        let mut resized = gcm();
+        resized[0].key_length = Some(192);
+        bad.push(("an attribute changed", answer(1, resized)));
+        let mut other = gcm();
+        other[1] = tf(transform_type::PRF, transform_id::PRF_HMAC_SHA2_512, None);
+        bad.push(("a transform we never offered", answer(1, other)));
+        for (what, sa) in bad {
+            assert_eq!(accepted_proposal(&sa, &offer), Err(IkeError::NoProposalChosen), "{what}");
+        }
+    }
+
+    #[test]
+    fn an_esp_answer_may_leave_out_an_esn_none_it_was_offered() {
+        // The one leniency, the convention `select_esp` already follows.
+        let offer = esp_proposal(vec![
+            tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)),
+            tf(transform_type::ESN, transform_id::ESN_NONE, None),
+        ]);
+        let answer = esp_proposal(vec![tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256))]);
+        assert!(accepted_proposal(&answer, &offer).is_ok());
+        let esn_only = esp_proposal(vec![
+            tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)),
+            tf(transform_type::ESN, transform_id::ESN_ENABLED, None),
+        ]);
+        assert_eq!(accepted_proposal(&answer, &esn_only), Err(IkeError::NoProposalChosen));
+    }
+
+    #[test]
+    fn an_esp_answer_may_add_dh_none_to_an_offer_without_pfs() {
+        // "No PFS" spelled out, as asked -- but only NONE, only once, only in
+        // ESP and only when we offered no DH at all.
+        let gcm = || tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256));
+        let none = || tf(transform_type::DH, 0, None);
+        let modp2048 = || tf(transform_type::DH, transform_id::MODP_2048, None);
+        let no_pfs = esp_proposal(vec![gcm()]);
+        assert!(accepted_proposal(&esp_proposal(vec![gcm(), none()]), &no_pfs).is_ok());
+
+        let refused = [
+            ("a group we never asked for", esp_proposal(vec![gcm(), modp2048()]), no_pfs.clone()),
+            ("NONE twice", esp_proposal(vec![gcm(), none(), none()]), no_pfs.clone()),
+            ("NONE for a PFS offer", esp_proposal(vec![gcm(), none()]), esp_proposal(vec![gcm(), modp2048()])),
+            ("NONE in an IKE proposal", proposal(1, vec![gcm(), none()]), proposal(1, vec![gcm()])),
+        ];
+        for (what, answer, offer) in refused {
+            assert_eq!(accepted_proposal(&answer, &offer), Err(IkeError::NoProposalChosen), "{what}");
+        }
     }
 
     #[test]

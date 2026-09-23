@@ -80,13 +80,9 @@ pub fn build_ike_rekey_request(
     iv: &[u8; 8],
 ) -> Result<Vec<u8>, IkeError> {
     let group = DhGroup::from_transform_id(old_sa.suite.dh_id).ok_or(IkeError::NoProposalChosen)?;
-    let mut prop = old_sa.suite.to_proposal();
-    prop.num = 1; // a single-proposal offer: numbered from 1 whatever number the first handshake's pick had
-    prop.protocol_id = protocol_id::IKE;
-    prop.spi = new_spi_i.to_be_bytes().to_vec();
     let ke = KeyExchange { dh_group: old_sa.suite.dh_id, data: group.public(dh_private) };
     let inner = vec![
-        (PayloadType::SecurityAssociation, SecurityAssociation { proposals: vec![prop] }.to_bytes()),
+        (PayloadType::SecurityAssociation, ike_rekey_offer(old_sa, new_spi_i).to_bytes()),
         (PayloadType::Nonce, ni.to_vec()),
         (PayloadType::KeyExchange, ke.to_bytes()),
     ];
@@ -104,6 +100,16 @@ pub fn build_ike_rekey_request(
     let first = first_payload_type(&inner);
     let bytes = encode_payload_chain(&inner);
     build_encrypted(old_sa.suite.sk_cipher(), header, first, &bytes, our_sk_e(old_sa), our_sk_a(old_sa), iv)
+}
+
+/// The SA payload [`build_ike_rekey_request`] sends: a single proposal, the
+/// suite `old_sa` runs, carrying `new_spi_i`.
+fn ike_rekey_offer(old_sa: &CompletedSaInit, new_spi_i: u64) -> SecurityAssociation {
+    let mut prop = old_sa.suite.to_proposal();
+    prop.num = 1; // a single-proposal offer: numbered from 1 whatever number the first handshake's pick had
+    prop.protocol_id = protocol_id::IKE;
+    prop.spi = new_spi_i.to_be_bytes().to_vec();
+    SecurityAssociation { proposals: vec![prop] }
 }
 
 /// Initiator: finish the rekey from the peer's `response`, deriving the new IKE
@@ -142,7 +148,9 @@ pub fn initiator_complete_ike_rekey(
     let nr = nr.ok_or(IkeError::MissingPayload("Nonce"))?;
     let ke = KeyExchange::parse(&ke_bytes.ok_or(IkeError::MissingPayload("KE"))?)?;
 
-    let proposal = sa.proposals.first().ok_or(IkeError::NoProposalChosen)?;
+    // Our one proposal, by its number, with one transform of each of its types
+    // (RFC 7296 §2.7, §3.3.1, §3.3.6); its SPI is the peer's, not ours.
+    let proposal = negotiate::accepted_proposal(&sa, &ike_rekey_offer(old_sa, new_spi_i))?;
     if proposal.spi.len() != 8 {
         return Err(IkeError::Crypto("expected an 8-byte IKE SPI"));
     }
@@ -219,13 +227,14 @@ pub fn responder_process_ike_rekey(
     let ke = KeyExchange::parse(&ke_bytes.ok_or(IkeError::MissingPayload("KE"))?)?;
 
     let sa = SecurityAssociation::parse(&sa_bytes)?;
-    let proposal = sa.proposals.first().ok_or(IkeError::NoProposalChosen)?;
+    // The new SA's SPIi is the one in the proposal we chose (RFC 7296 §3.3.1),
+    // not in whichever came first.
+    let (proposal, suite) = negotiate::select_with_proposal(&sa).ok_or(IkeError::NoProposalChosen)?;
     if proposal.spi.len() != 8 {
         return Err(IkeError::Crypto("expected an 8-byte IKE SPI"));
     }
     let spi_i = u64::from_be_bytes(proposal.spi[..8].try_into().unwrap());
 
-    let suite = negotiate::select(&sa).ok_or(IkeError::NoProposalChosen)?;
     // RFC 7296 §3.9 and §2.10, as for Nr in `initiator_complete_ike_rekey`.
     Nonce::parse_for_prf(&ni, suite.prf_algorithm())?;
     let group = DhGroup::from_transform_id(suite.dh_id).ok_or(IkeError::NoProposalChosen)?;
@@ -293,6 +302,7 @@ pub fn responder_process_ike_rekey(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ikev2::payload::Proposal;
     use crate::ikev2::exchange::{
         default_offer, initiator_complete, initiator_request, responder_respond, LocalSecret,
     };
@@ -503,8 +513,13 @@ mod tests {
         prop.spi = 7u64.to_be_bytes().to_vec();
         prop.transforms.retain(|t| t.transform_type != transform_type::DH);
         prop.transforms.extend(dh.iter().map(|&id| Transform { transform_type: transform_type::DH, transform_id: id, key_length: None }));
+        ike_rekey_message_with(from, response, vec![prop], ke)
+    }
+
+    /// [`ike_rekey_message`] with the SA payload's `proposals` given as they are.
+    fn ike_rekey_message_with(from: &CompletedSaInit, response: bool, proposals: Vec<Proposal>, ke: Option<KeyExchange>) -> Vec<u8> {
         let mut inner = vec![
-            (PayloadType::SecurityAssociation, SecurityAssociation { proposals: vec![prop] }.to_bytes()),
+            (PayloadType::SecurityAssociation, SecurityAssociation { proposals }.to_bytes()),
             (PayloadType::Nonce, vec![0x66u8; 32]),
         ];
         inner.extend(ke.map(|ke| (PayloadType::KeyExchange, ke.to_bytes())));
@@ -586,6 +601,71 @@ mod tests {
         for (what, request, expected) in cases {
             assert_eq!(answer(&request), Err(expected), "{what}");
         }
+    }
+
+    /// RFC 7296 §2.7, §3.3.1, §3.3.6: the answer to our rekey is our one
+    /// proposal -- by its number, with one transform of each of its types and
+    /// nothing else -- whatever SPI it carries. Each forged answer below names
+    /// the very suite we offered (so `select` and the suite comparison pass)
+    /// and must still be refused; the well-formed one completes.
+    #[test]
+    fn an_ike_rekey_answer_must_be_our_one_proposal() {
+        use crate::ikev2::payload::transform_type;
+
+        let (init_sa, resp_sa) = sa_pair();
+        let (ni, dh, new_spi_i) = ([0x55u8; 32], [3u8; 32], 0xAABB_CCDD_1122_3344);
+        let group = DhGroup::from_transform_id(init_sa.suite.dh_id).unwrap();
+        let ke = || Some(KeyExchange { dh_group: group.transform_id(), data: group.public(&[9u8; 32]) });
+        let complete = |resp: &[u8]| initiator_complete_ike_rekey(&init_sa, &ni, new_spi_i, &dh, resp).map(|_| ());
+
+        let mut ours = resp_sa.suite.to_proposal();
+        ours.num = 1;
+        ours.protocol_id = protocol_id::IKE;
+        ours.spi = 7u64.to_be_bytes().to_vec();
+        assert_eq!(complete(&ike_rekey_message_with(&resp_sa, true, vec![ours.clone()], ke())), Ok(()), "control");
+
+        let dup_dh = {
+            let mut p = ours.clone();
+            let t = p.transforms.iter().find(|t| t.transform_type == transform_type::DH).unwrap().clone();
+            p.transforms.push(t);
+            p
+        };
+        let cases = [
+            ("two proposals", vec![ours.clone(), ours.clone()]),
+            ("two DH transforms", vec![dup_dh]),
+            ("a proposal number we never sent", vec![Proposal { num: 2, ..ours.clone() }]),
+        ];
+        for (what, proposals) in cases {
+            assert_eq!(complete(&ike_rekey_message_with(&resp_sa, true, proposals, ke())), Err(IkeError::NoProposalChosen), "{what}");
+        }
+    }
+
+    /// RFC 7296 §3.3.1: each proposal of an IKE SA rekey carries the SPI the
+    /// initiator wants for the new SA *if that proposal is the one chosen*, so
+    /// the responder keys the new SA on the SPI of the proposal it picked -- not
+    /// on the first one, which it may well have turned down.
+    #[test]
+    fn an_ike_rekey_responder_keys_the_new_sa_on_the_chosen_proposals_spi() {
+        use crate::ikev2::payload::{transform_type, Transform};
+
+        let (init_sa, resp_sa) = sa_pair();
+        let group = DhGroup::from_transform_id(init_sa.suite.dh_id).unwrap();
+        let ke = Some(KeyExchange { dh_group: group.transform_id(), data: group.public(&[3u8; 32]) });
+
+        let mut good = init_sa.suite.to_proposal();
+        good.num = 2;
+        good.protocol_id = protocol_id::IKE;
+        good.spi = 0x2222_2222_2222_2222u64.to_be_bytes().to_vec();
+        let mut refused = good.clone();
+        refused.num = 1;
+        refused.spi = 0x1111_1111_1111_1111u64.to_be_bytes().to_vec();
+        for t in refused.transforms.iter_mut().filter(|t: &&mut Transform| t.transform_type == transform_type::ENCR) {
+            t.transform_id = 0x7777; // no cipher we speak: this proposal is turned down
+        }
+        let request = ike_rekey_message_with(&init_sa, false, vec![refused, good], ke);
+        let (_, new_sa) = responder_process_ike_rekey(&resp_sa, &request, 7, &[9u8; 32], &[0x66u8; 32], &[2u8; 8]).unwrap();
+        assert_eq!(new_sa.suite.proposal_num, 2);
+        assert_eq!(new_sa.spi_i, 0x2222_2222_2222_2222);
     }
 
     /// [`sa_pair`] on an offer whose PRF is `prf`.

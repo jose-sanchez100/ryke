@@ -7728,7 +7728,8 @@ mod tests {
         let (first, inner) = open_encrypted(sa.suite.sk_cipher(), &buf[..n], &sa.keys.sk_ei, &sa.keys.sk_ai).unwrap();
         let payload = |ty| payloads(first, &inner).map(|p| p.unwrap()).find(|p| p.payload_type == ty).map(|p| p.data.to_vec());
         let asked = payload(PayloadType::TrafficSelectorInitiator).map(|ts| TrafficSelectors::parse(&ts).unwrap());
-        let client_spi = crate::ikev2::ike_auth::esp_spi_from_sa(&payload(PayloadType::SecurityAssociation).unwrap()).unwrap();
+        let offer = crate::ikev2::payload::SecurityAssociation::parse(&payload(PayloadType::SecurityAssociation).unwrap()).unwrap();
+        let client_spi = crate::ikev2::ike_auth::esp_spi(&offer.proposals[0]).unwrap();
         let (resp, _) =
             rekey::responder_process_rekey_with_pfs(sa, &buf[..n], 0xFEED_FACE, &[0x77u8; 32], SkCipher::Aes256Gcm, None, &[8u8; 8], Some(assigned))
                 .unwrap();

@@ -249,6 +249,16 @@ pub fn build_rekey_request_with_pfs(
     build_child_request(sa, message_id, Some(rekeyed_spi), new_spi, ni, cipher, pfs, &ts, iv)
 }
 
+/// The SA payload [`build_child_request`] sends: `esp_offer_for_cipher`'s one
+/// proposal, plus the DH group `pfs` when PFS is asked for.
+fn child_offer(new_spi: u32, cipher: SkCipher, pfs: Option<DhGroup>) -> SecurityAssociation {
+    let mut offer = esp_offer_for_cipher(new_spi, cipher);
+    if let Some(group) = pfs {
+        offer.proposals[0].transforms.push(Transform { transform_type: transform_type::DH, transform_id: group.transform_id(), key_length: None });
+    }
+    offer
+}
+
 /// The `CREATE_CHILD_SA` request behind both a CHILD SA rekey and the
 /// creation of an *additional* CHILD SA next to the one `IKE_AUTH` made
 /// (RFC 7296 §1.3.1): `rekeyed_spi` is `Some(our inbound SPI of the SA being
@@ -270,10 +280,7 @@ pub fn build_child_request(
     ts: &TrafficSelectors,
     iv: &[u8; 8],
 ) -> Result<Vec<u8>, IkeError> {
-    let mut offer = esp_offer_for_cipher(new_spi, cipher);
-    if let Some((group, _)) = pfs {
-        offer.proposals[0].transforms.push(Transform { transform_type: transform_type::DH, transform_id: group.transform_id(), key_length: None });
-    }
+    let offer = child_offer(new_spi, cipher, pfs.map(|(group, _)| group));
     let mut inner = Vec::new();
     if let Some(rekeyed_spi) = rekeyed_spi {
         let rekey_notify = Notify {
@@ -487,6 +494,10 @@ pub fn responder_process_rekey_with_pfs(
     Ok((response, child))
 }
 
+/// The transform types an ESP proposal may carry (RFC 7296 §3.3.3): any other
+/// makes it unacceptable (§3.3.6).
+const ESP_TRANSFORM_TYPES: &[u8] = &[transform_type::ENCR, transform_type::INTEG, transform_type::DH, transform_type::ESN];
+
 /// Pick the proposal to answer a CHILD SA rekey the peer started with (RFC 7296
 /// §2.7): the first one that offers the algorithms of the SA being rekeyed --
 /// a rekey keeps the running `cipher` -- and, when the request carries a KE
@@ -510,7 +521,7 @@ pub fn responder_process_rekey_with_pfs(
 /// Returns the proposal to send back (the
 /// chosen one's number, our `new_spi`, one transform per type), the peer's
 /// SPI from it, and the DH group PFS runs on, if any.
-fn choose_child_proposal(
+pub(crate) fn choose_child_proposal(
     peer_sa: &SecurityAssociation,
     cipher: SkCipher,
     new_spi: u32,
@@ -527,6 +538,12 @@ fn choose_child_proposal(
     let mut wanted_group = None;
     for p in &peer_sa.proposals {
         if p.protocol_id != protocol_id::ESP || p.spi.len() != 4 {
+            continue;
+        }
+        // RFC 7296 §3.3.6: a transform type we don't know makes the whole
+        // proposal unacceptable (RFC 9370's ADDKE types included, without
+        // IKE_INTERMEDIATE); the others are weighed as usual.
+        if !p.transforms.iter().all(|t| ESP_TRANSFORM_TYPES.contains(&t.transform_type)) {
             continue;
         }
         let of_type = |ty: u8| p.transforms.iter().filter(move |t| t.transform_type == ty);
@@ -559,16 +576,29 @@ fn choose_child_proposal(
                 continue;
             }
         };
+        // §2.7: "exactly one transform of each type included in the proposal"
+        // -- so no ESN where it left ESN out, and the NONE it spelled out for
+        // an integrity algorithm next to an AEAD cipher, or for DH without PFS.
         let mut reply = ours.clone();
         reply.num = p.num;
-        if let Some(group) = group {
-            reply.transforms.push(Transform { transform_type: transform_type::DH, transform_id: group.transform_id(), key_length: None });
+        if of_type(transform_type::ESN).next().is_none() {
+            reply.transforms.retain(|t| t.transform_type != transform_type::ESN);
+        }
+        if !ours.transforms.iter().any(|t| t.transform_type == transform_type::INTEG) && of_type(transform_type::INTEG).next().is_some() {
+            reply.transforms.push(Transform { transform_type: transform_type::INTEG, transform_id: 0, key_length: None });
+        }
+        match group {
+            Some(group) => {
+                reply.transforms.push(Transform { transform_type: transform_type::DH, transform_id: group.transform_id(), key_length: None })
+            }
+            None if !dh_offered.is_empty() => reply.transforms.push(Transform { transform_type: transform_type::DH, transform_id: 0, key_length: None }),
+            None => {}
         }
         let peer_spi = u32::from_be_bytes(p.spi[..4].try_into().unwrap());
         return Ok((reply, peer_spi, group));
     }
     ike_debug!(
-        "CREATE_CHILD_SA: none of the peer's ESP proposals fits the running cipher {cipher:?} (KE group {ke_group:?}, our PFS policy {pfs:?}, group we'd take {wanted_group:?}); offered: {:?}",
+        "CHILD SA: none of the peer's ESP proposals fits the cipher {cipher:?} (KE group {ke_group:?}, our PFS policy {pfs:?}, group we'd take {wanted_group:?}); offered: {:?}",
         peer_sa.proposals
     );
     Err(wanted_group.map_or(IkeError::NoProposalChosen, |g| IkeError::InvalidKeGroup(g.transform_id())))
@@ -713,8 +743,12 @@ pub fn initiator_complete_child(
         }
     }
     let (sa_bytes, nr) = find_sa_and_nonce(sa, first, &inner)?;
-    let peer_spi = esp_spi_from_sa(&sa_bytes)?;
     let peer_sa = SecurityAssociation::parse(&sa_bytes)?;
+    // Our one proposal, by its number, with one transform of each of its
+    // types (RFC 7296 §2.7, §3.3.1, §3.3.6) -- the offer `build_child_request`
+    // sent, whose SPI (ours) the answer replaces with the peer's.
+    negotiate::accepted_proposal(&peer_sa, &child_offer(new_spi, cipher, pfs.map(|(group, _)| group)))?;
+    let peer_spi = esp_spi_from_sa(&sa_bytes)?;
 
     // RFC 7296 §2.7: the response's ESP proposal must be built from the offer
     // we actually sent (`esp_offer_for_cipher(_, cipher)` -- `build_child_request`/
@@ -1186,11 +1220,59 @@ mod tests {
         assert!(!ke, "the chosen proposal has no DH, so no KE in the answer");
         assert!(proposal.transforms.iter().all(|t| t.transform_type != transform_type::DH));
 
-        let (mut peer_child, _) =
-            initiator_complete_child(&peer_sa, &[0x33u8; 32], 0x2222_2222, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), &resp)
-                .unwrap();
+        // The peer's side, derived by hand: `initiator_complete_child` only
+        // takes answers to its own one-proposal offer, not to these five.
+        let our_spi = u32::from_be_bytes(proposal.spi[..4].try_into().unwrap());
+        let prf = peer_sa.suite.prf_algorithm();
+        let mut peer_child =
+            ChildSa::derive_with_cipher(prf, SkCipher::Aes256Gcm, &peer_sa.keys.sk_d, &[0x33u8; 32], &[0x44u8; 32], Role::Initiator, 0x2222_2222, our_spi);
         let pkt = peer_child.outbound.seal(b"peer -> us", next_header::IPV4).unwrap();
         assert_eq!(our_child.inbound.open(&pkt).unwrap().0, b"peer -> us");
+    }
+
+    /// RFC 7296 §3.3.6: a proposal with a transform type we don't know (an
+    /// RFC 9370 ADDKE one, say, which peers not running `IKE_INTERMEDIATE`
+    /// MUST treat as unknown) is unacceptable -- and the next one is weighed
+    /// as usual.
+    #[test]
+    fn a_peer_started_rekey_skips_a_proposal_with_a_transform_type_we_do_not_know() {
+        let (our_sa, peer_sa) = sa_pair();
+        let gcm = (transform_id::AES_GCM_16, Some(256));
+        let mut addke = esp_proposal(1, 0x2222_2222, gcm, None, &[]);
+        addke.transforms.push(Transform { transform_type: 6, transform_id: transform_id::MODP_2048, key_length: None });
+        let offers = vec![addke, esp_proposal(2, 0x3333_3333, gcm, None, &[])];
+        let req = peer_rekey_request(&peer_sa, offers, None, &TrafficSelectors::ipv4_full_tunnel());
+        let (resp, _) =
+            responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &PfsPolicy::none(), &[6u8; 32], &[2u8; 8])
+                .unwrap();
+        let (proposal, _, _, _) = read_rekey_response(&resp, &peer_sa);
+        assert_eq!(proposal.num, 2);
+    }
+
+    /// RFC 7296 §2.7: the accepted suite "MUST contain exactly one transform
+    /// of each type included in the proposal" -- no more, no fewer. A proposal
+    /// spelling out INTEG NONE and DH NONE, and leaving ESN out, is answered
+    /// with GCM, INTEG NONE and DH NONE, and no ESN.
+    #[test]
+    fn a_peer_started_rekey_is_answered_with_one_transform_of_each_offered_type() {
+        let (our_sa, peer_sa) = sa_pair();
+        let t = |transform_type, transform_id, key_length| Transform { transform_type, transform_id, key_length };
+        let gcm = t(transform_type::ENCR, transform_id::AES_GCM_16, Some(256));
+        let (integ_none, dh_none) = (t(transform_type::INTEG, 0, None), t(transform_type::DH, 0, None));
+        let offer = Proposal {
+            num: 1,
+            protocol_id: protocol_id::ESP,
+            spi: 0x2222_2222u32.to_be_bytes().to_vec(),
+            transforms: vec![gcm.clone(), integ_none.clone(), dh_none.clone()],
+        };
+        let req = peer_rekey_request(&peer_sa, vec![offer], None, &TrafficSelectors::ipv4_full_tunnel());
+        let (resp, _) =
+            responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &PfsPolicy::none(), &[6u8; 32], &[2u8; 8])
+                .unwrap();
+        let (proposal, _, _, _) = read_rekey_response(&resp, &peer_sa);
+        let mut got = proposal.transforms;
+        got.sort_by_key(|t| t.transform_type);
+        assert_eq!(got, vec![gcm, integ_none, dh_none]);
     }
 
     /// A rekey of a tunnel running AES-CBC/SHA-256 keeps that pair, even when the
@@ -1365,6 +1447,11 @@ mod tests {
     fn hand_built_answer(resp_sa: &CompletedSaInit, dh: &[u16], ke: Option<KeyExchange>) -> Vec<u8> {
         let mut sa = esp_offer_for_cipher(0x2222_2222, SkCipher::Aes256Gcm);
         sa.proposals[0].transforms.extend(dh.iter().map(|&id| Transform { transform_type: transform_type::DH, transform_id: id, key_length: None }));
+        hand_built_answer_with(resp_sa, sa, ke)
+    }
+
+    /// [`hand_built_answer`] with the SA payload `sa` as it is.
+    fn hand_built_answer_with(resp_sa: &CompletedSaInit, sa: SecurityAssociation, ke: Option<KeyExchange>) -> Vec<u8> {
         let ts = TrafficSelectors::ipv4_full_tunnel();
         let mut inner = vec![(PayloadType::SecurityAssociation, sa.to_bytes()), (PayloadType::Nonce, vec![0x44; 32])];
         inner.extend(ke.map(|ke| (PayloadType::KeyExchange, ke.to_bytes())));
@@ -1451,6 +1538,36 @@ mod tests {
         assert_eq!(complete(&hand_built_answer(&resp_sa, &[0], None)), Ok(()));
         assert_eq!(complete(&hand_built_answer(&resp_sa, &[transform_id::MODP_2048], Some(ke.clone()))), Err(IkeError::NoProposalChosen));
         assert!(matches!(complete(&hand_built_answer(&resp_sa, &[], Some(ke))), Err(IkeError::Crypto(_))));
+    }
+
+    /// RFC 7296 §2.7, §3.3.1, §3.3.6: the answer to our CHILD SA request is
+    /// our one proposal, by its number, with one transform of each of its
+    /// types. Each forged answer below carries only transforms we offered --
+    /// the ESP suite it names matches our offer -- and must still be refused.
+    #[test]
+    fn a_child_sa_answer_must_be_our_one_proposal() {
+        let (init_sa, resp_sa) = sa_pair();
+        let complete = |resp: &[u8]| {
+            initiator_complete_child(&init_sa, &[0x33u8; 32], 0x1111_1111, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), resp)
+                .map(|_| ())
+        };
+        let ours = esp_offer_for_cipher(0x2222_2222, SkCipher::Aes256Gcm).proposals.remove(0);
+        assert_eq!(complete(&hand_built_answer_with(&resp_sa, SecurityAssociation { proposals: vec![ours.clone()] }, None)), Ok(()), "control");
+
+        let dup_encr = {
+            let mut p = ours.clone();
+            p.transforms.push(p.transforms[0].clone());
+            p
+        };
+        let cases = [
+            ("two proposals", vec![ours.clone(), ours.clone()]),
+            ("two ENCR transforms", vec![dup_encr]),
+            ("a proposal number we never sent", vec![Proposal { num: 2, ..ours.clone() }]),
+        ];
+        for (what, proposals) in cases {
+            let answer = hand_built_answer_with(&resp_sa, SecurityAssociation { proposals }, None);
+            assert_eq!(complete(&answer), Err(IkeError::NoProposalChosen), "{what}");
+        }
     }
 
     /// A peer's rekey request with `proposals` and a KE payload `ke` as is --

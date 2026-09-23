@@ -580,12 +580,14 @@ pub fn initiator_complete(local: &LocalSecret, request: &[u8], response: &[u8]) 
     let header = IkeHeader::parse(response)?;
     let payloads = parse_sa_init(&header, &response[IkeHeader::LEN..])?;
 
-    // Interpret the responder's chosen proposal; it must be a suite we support.
-    let suite = negotiate::select(&payloads.sa).ok_or(IkeError::NoProposalChosen)?;
-    // ...and one we actually offered, not merely one we'd support from some
-    // other peer (RFC 7296 §2.7) -- see `ChosenSuite::matches_offer`'s doc.
+    // The answer must be one of our proposals, by its number, with exactly one
+    // transform of each type it had (RFC 7296 §2.7, §3.3.1, §3.3.6)...
     let our_offer_header = IkeHeader::parse(request)?;
     let our_offer = parse_sa_init(&our_offer_header, &request[IkeHeader::LEN..])?;
+    negotiate::accepted_proposal(&payloads.sa, &our_offer.sa)?;
+    // ...naming a suite we support, and one we actually offered, not merely one
+    // we'd support from some other peer -- see `ChosenSuite::matches_offer`'s doc.
+    let suite = negotiate::select(&payloads.sa).ok_or(IkeError::NoProposalChosen)?;
     if !suite.matches_offer(&our_offer.sa) {
         return Err(IkeError::NoProposalChosen);
     }
@@ -1015,6 +1017,43 @@ mod tests {
 
         let err = initiator_complete(&init, &request, &response).unwrap_err();
         assert_eq!(err, IkeError::NoProposalChosen);
+    }
+
+    #[test]
+    fn initiator_accepts_only_one_of_its_proposals_with_one_transform_of_each_type() {
+        // RFC 7296 §2.7 / §3.3.6: the answer is a single proposal of ours, with
+        // exactly one transform of each type we offered and nothing else, and
+        // (§3.3.1) the number of the proposal it accepted. Each forged answer
+        // below carries only transforms we offered -- so the suite it names is
+        // one `matches_offer` recognises -- and must still be refused.
+        let init = init_secret();
+        let resp = resp_secret();
+        let request = initiator_request(&init, &default_offer());
+        let ours = default_offer().proposals[0].clone();
+        let dup_dh = {
+            let mut p = ours.clone();
+            p.transforms.push(p.transforms[2].clone());
+            p
+        };
+        let renumbered = Proposal { num: 2, ..ours.clone() };
+        let bad: [(&str, Vec<Proposal>); 3] = [
+            ("two proposals", vec![ours.clone(), ours.clone()]),
+            ("two DH transforms", vec![dup_dh]),
+            ("a proposal number we never sent", vec![renumbered]),
+        ];
+        let group = DhGroup::X25519;
+        let public = group.public(&resp.dh_private);
+        let header = base_header(init.spi, resp.spi, Flags { initiator: false, version: false, response: true });
+        for (what, proposals) in bad {
+            let answer = SecurityAssociation { proposals };
+            let response = build_sa_init(header, &answer, group.transform_id(), &public, &resp.nonce, &[]);
+            assert_eq!(initiator_complete(&init, &request, &response).unwrap_err(), IkeError::NoProposalChosen, "{what}");
+        }
+
+        // Positive control: the same responder answering our proposal as offered.
+        let answer = SecurityAssociation { proposals: vec![ours] };
+        let response = build_sa_init(header, &answer, group.transform_id(), &public, &resp.nonce, &[]);
+        initiator_complete(&init, &request, &response).expect("our own proposal, echoed back, completes");
     }
 
     #[test]

@@ -24,7 +24,10 @@
 //! MSCHAPv2 has begun (RFC 3748 §2.1, §5.2, §5.3.1), answers a duplicate
 //! Request with its first Response (§4.1), checks the authenticator response
 //! before it acknowledges it (RFC 2759 §8.8), and takes EAP-Success only after
-//! that (RFC 3748 §4.2) and the final message only after its own AUTH. The
+//! that (RFC 3748 §4.2) and the final message only after its own AUTH. It takes
+//! EAP-Failure only in the shape and phase §4.2 gives it -- no data, the
+//! Identifier of its last Response -- and discards one that comes after both
+//! sides' success indications, going on to the AUTH exchange. The
 //! responder takes each Response only for the Request it has outstanding, by
 //! EAP Identifier (RFC 3748 §4.1) and step, and the initiator's AUTH only
 //! after it sent EAP-Success.
@@ -608,7 +611,7 @@ impl EapInitiator {
 
         let eap = eap::EapPacket::parse(eap_bytes)?;
         if eap.code == eap::code::FAILURE {
-            return Ok(EapEvent::Failed(None));
+            return self.take_failure(&eap, next_id, entropy);
         }
         if eap.code == eap::code::SUCCESS {
             // RFC 3748 §4.2: EAP-Success counts only once the method has
@@ -627,15 +630,7 @@ impl EapInitiator {
             if !answers_ours || !eap.data.is_empty() {
                 return Ok(EapEvent::Failed(None));
             }
-            // EAP done: send AUTH keyed by the MSK.
-            let msk = mschapv2::derive_msk(&self.password, &self.nt_response);
-            let idi = self.id.to_bytes();
-            let algo = self.sa.suite.prf_algorithm();
-            let octets = initiator_signed_octets(algo, &self.sa.init_message, &self.sa.nr, &self.sa.keys.sk_pi, &idi);
-            let auth = Authentication { method: auth_method::SHARED_KEY, data: psk_auth(algo, &msk, &octets) };
-            let msg = build_sk(&self.sa, next_id, false, &[(PayloadType::Authentication, auth.to_bytes())], &iv(entropy))?;
-            self.step = PeerStep::AuthSent;
-            return Ok(EapEvent::Reply(msg));
+            return self.send_auth(next_id, entropy);
         }
         if eap.code != eap::code::REQUEST {
             return Ok(EapEvent::Failed(None));
@@ -662,6 +657,54 @@ impl EapInitiator {
         let msg = build_sk(&self.sa, next_id, false, &[(PayloadType::Eap, resp.to_bytes())], &iv(entropy))?;
         self.last_request = Some((eap, resp));
         Ok(EapEvent::Reply(msg))
+    }
+
+    /// EAP is done (RFC 7296 §2.16): our AUTH, keyed by the MSK, goes out
+    /// and the final message is next.
+    fn send_auth(&mut self, next_id: u32, entropy: &mut impl Entropy) -> Result<EapEvent, IkeError> {
+        let msk = mschapv2::derive_msk(&self.password, &self.nt_response);
+        let idi = self.id.to_bytes();
+        let algo = self.sa.suite.prf_algorithm();
+        let octets = initiator_signed_octets(algo, &self.sa.init_message, &self.sa.nr, &self.sa.keys.sk_pi, &idi);
+        let auth = Authentication { method: auth_method::SHARED_KEY, data: psk_auth(algo, &msk, &octets) };
+        let msg = build_sk(&self.sa, next_id, false, &[(PayloadType::Authentication, auth.to_bytes())], &iv(entropy))?;
+        self.step = PeerStep::AuthSent;
+        Ok(EapEvent::Reply(msg))
+    }
+
+    /// An EAP-Failure packet (RFC 3748 §4.2).
+    ///
+    /// Once the success result indications have been exchanged by both sides
+    /// -- the server proved it knows the password and we acknowledged it --
+    /// a Failure "MUST be silently discarded" and the peer "MAY ... conclude
+    /// that the EAP Success packet was lost and that authentication
+    /// concluded successfully". Its shape does not matter then. Nothing
+    /// else comes in place of it, so discarding it means going on to the
+    /// AUTH exchange, which is what authenticates in IKEv2 (§2.16): the
+    /// final message must still carry an AUTH that verifies under the MSK.
+    ///
+    /// In the steps before that, where the method lets the server finish
+    /// (after our Identity Response, after our MSCHAPv2 Response --
+    /// draft-kamath-pppext-eap-mschapv2-02 §2.5, §2.8 --, and, by RFC 7296
+    /// §2.16, "at any time"), it ends the exchange if it is one: no data,
+    /// Length 4 ("Success and Failure packets MUST NOT contain additional
+    /// data"), and the Identifier of the Response it answers. One that is not
+    /// is no EAP-Failure but a malformed message (an error, not a rejection
+    /// of the credentials), and changes nothing. With no Response of ours
+    /// yet there is no Identifier to match.
+    fn take_failure(&mut self, eap: &eap::EapPacket, next_id: u32, entropy: &mut impl Entropy) -> Result<EapEvent, IkeError> {
+        if self.step == PeerStep::ServerProven {
+            return self.send_auth(next_id, entropy);
+        }
+        if !eap.data.is_empty() {
+            return Err(IkeError::MalformedPayload("EAP-Failure with data (RFC 3748 §4.2)"));
+        }
+        if let Some((_, response)) = &self.last_request {
+            if response.identifier != eap.identifier {
+                return Err(IkeError::MalformedPayload("EAP-Failure does not answer our last Response (RFC 3748 §4.2)"));
+            }
+        }
+        Ok(EapEvent::Failed(None))
     }
 
     /// The Type-Data of our Response to a new EAP Request, or `Err` to end
@@ -2025,6 +2068,166 @@ mod tests {
         padded.extend_from_slice(&[0xAA, 0xBB]);
         let padded = build_sk(&responder.sa, 9, true, &[(PayloadType::Eap, padded)], &[6u8; 8]).unwrap();
         assert_eq!(finish(initiator, responder, &padded), Outcome::Established);
+    }
+
+    /// An EAP-Failure as the responder's side would send it.
+    fn failure_with(responder: &EapResponder, identifier: u8, data: Vec<u8>) -> Vec<u8> {
+        responder_eap(responder, &eap::EapPacket { code: eap::code::FAILURE, identifier, data })
+    }
+
+    #[test]
+    fn eap_takes_eap_failure_as_the_end_only_when_it_answers_its_last_response() {
+        // RFC 3748 §4.2: Failure carries the Identifier of the Response it
+        // answers and no data -- its Length is 4. Where the method's own
+        // specification lets it finish, an EAP-Failure ends the exchange:
+        // after our Identity Response (no method has begun), and after our
+        // MSCHAPv2 Response (draft-kamath-pppext-eap-mschapv2-02 §2.5, §2.8:
+        // the authenticator "MAY terminate the authentication ... such as
+        // by sending an EAP Failure").
+        for stop in [Step::Challenge, Step::SuccessRequest] {
+            let (mut initiator, responder, _, last) = run_until(stop);
+            let ours = eap_from_initiator(&responder, &last).unwrap().identifier;
+            let got = initiator.handle(&failure_with(&responder, ours, vec![]), &mut SeedEntropy::new(1));
+            assert!(matches!(got, Ok(EapEvent::Failed(None))), "legitimate Failure at {stop:?}: {got:?}");
+
+            // Octets past its Length are padding, and MUST be ignored (§4).
+            let (mut initiator, responder, _, last) = run_until(stop);
+            let ours = eap_from_initiator(&responder, &last).unwrap().identifier;
+            let mut padded = eap::EapPacket { code: eap::code::FAILURE, identifier: ours, data: vec![] }.to_bytes();
+            padded.extend_from_slice(&[0xAA, 0xBB]);
+            let padded = build_sk(&responder.sa, 9, true, &[(PayloadType::Eap, padded)], &[6u8; 8]).unwrap();
+            let got = initiator.handle(&padded, &mut SeedEntropy::new(1));
+            assert!(matches!(got, Ok(EapEvent::Failed(None))), "padded Failure at {stop:?}: {got:?}");
+        }
+
+        // One that does not answer our Response, or has data within its
+        // Length, is no EAP-Failure: it is refused as a malformed message and
+        // changes nothing, so the exchange still goes on with the real next
+        // message.
+        type Forgery = (&'static str, fn(u8) -> u8, Vec<u8>);
+        let bad: [Forgery; 4] = [
+            ("Identifier + 1", |id| id.wrapping_add(1), vec![]),
+            ("Identifier ^ 0x80", |id| id ^ 0x80, vec![]),
+            ("one octet of data within its Length", |id| id, vec![0]),
+            ("data within its Length", |id| id, vec![0, 0, 0, 0]),
+        ];
+        for stop in [Step::Challenge, Step::SuccessRequest] {
+            for (what, identifier, data) in &bad {
+                let (mut initiator, responder, msg, last) = run_until(stop);
+                let identifier = identifier(eap_from_initiator(&responder, &last).unwrap().identifier);
+                let got = initiator.handle(&failure_with(&responder, identifier, data.clone()), &mut SeedEntropy::new(1));
+                assert!(matches!(got, Err(IkeError::MalformedPayload(_))), "{what} at {stop:?}: {got:?}");
+                assert_eq!(finish(initiator, responder, &msg), Outcome::Established, "{what} at {stop:?}: the exchange went on");
+            }
+        }
+    }
+
+    #[test]
+    fn eap_takes_a_failure_before_any_response_of_its_own_as_the_end() {
+        // RFC 7296 §2.16: the responder "MAY at any time terminate the IKE
+        // exchange by sending an EAP payload containing the Failure message",
+        // its first response included. There is no Response of ours yet for
+        // its Identifier to answer, so only the format is checked.
+        for (identifier, data, ends) in [(0u8, vec![], true), (0x55, vec![], true), (0, vec![1], false)] {
+            let (mut initiator, responder, msg, _) = run_until(Step::Identity);
+            let (msg_id, mut ps) = decrypt(&initiator.sa, &msg).unwrap();
+            for (t, body) in &mut ps {
+                if *t == PayloadType::Eap {
+                    *body = eap::EapPacket { code: eap::code::FAILURE, identifier, data: data.clone() }.to_bytes();
+                }
+            }
+            let first = build_sk(&responder.sa, msg_id, true, &ps, &[3u8; 8]).unwrap();
+            let got = initiator.handle(&first, &mut SeedEntropy::new(1));
+            if ends {
+                assert!(matches!(got, Ok(EapEvent::Failed(None))), "Identifier {identifier}: {got:?}");
+            } else {
+                assert!(matches!(got, Err(IkeError::MalformedPayload(_))), "data {data:?}: {got:?}");
+            }
+        }
+    }
+
+    /// The responder's final message with its AUTH payload changed by `edit`.
+    fn final_message_with_auth_edited(initiator: &EapInitiator, responder: &EapResponder, edit: fn(&mut Authentication)) -> Vec<u8> {
+        let (msg_id, mut ps) = decrypt(&initiator.sa, &final_message_now(initiator, responder)).unwrap();
+        for (t, body) in &mut ps {
+            if *t == PayloadType::Authentication {
+                let mut auth = Authentication::parse(body).unwrap();
+                edit(&mut auth);
+                *body = auth.to_bytes();
+            }
+        }
+        build_sk(&responder.sa, msg_id, true, &ps, &[3u8; 8]).unwrap()
+    }
+
+    #[test]
+    fn eap_discards_a_failure_once_the_success_indications_are_exchanged() {
+        // RFC 3748 §4.2: "after success result indications have been
+        // exchanged by both sides, a Failure packet MUST be silently
+        // discarded", and the peer "MAY, in the event that an EAP Success is
+        // not received, conclude that the EAP Success packet was lost and
+        // that authentication concluded successfully". Here the server
+        // proved it knows the password (RFC 2759 §8.8) and we acknowledged
+        // it, so no Failure -- of any shape -- ends the exchange; it goes on
+        // to the MSK-keyed AUTH exchange, which is what authenticates in
+        // IKEv2 (RFC 7296 §2.16).
+        type Shape = (&'static str, fn(u8) -> u8, Vec<u8>);
+        let shapes: [Shape; 3] = [
+            ("answering our Response", |id| id, vec![]),
+            ("under another Identifier", |id| id ^ 0x80, vec![]),
+            ("with data", |id| id, vec![0, 0]),
+        ];
+        for (what, identifier, data) in shapes {
+            let (mut initiator, mut responder, _eap_success, last) = run_until(Step::EapSuccess);
+            let identifier = identifier(eap_from_initiator(&responder, &last).unwrap().identifier);
+            let auth = match initiator.handle(&failure_with(&responder, identifier, data), &mut SeedEntropy::new(1)) {
+                Ok(EapEvent::Reply(auth)) => auth,
+                other => panic!("Failure {what}: {other:?}"),
+            };
+            // What went out is our MSK-keyed AUTH, which the responder takes...
+            let final_msg = match responder.handle(&auth, &mut SeedEntropy::new(2)) {
+                Ok(EapEvent::Established(Some(f))) => f,
+                other => panic!("Failure {what}: the responder did not take the AUTH: {other:?}"),
+            };
+            // ...and the exchange completes as it always does.
+            assert!(matches!(initiator.handle(&final_msg, &mut SeedEntropy::new(1)), Ok(EapEvent::Established(None))), "Failure {what}");
+        }
+
+        // The final AUTH is checked all the same: a gateway that does not
+        // prove it derived the same MSK does not establish anything, Failure
+        // discarded or not -- whether its data is off or it names another
+        // method (RFC 7296 §3.8) over the right data.
+        type Edit = (&'static str, fn(&mut Authentication));
+        let edits: [Edit; 2] = [
+            ("data off by one bit", |auth| auth.data[3] ^= 1),
+            ("right data, another method", |auth| auth.method = auth_method::DIGITAL_SIGNATURE),
+        ];
+        for (what, edit) in edits {
+            let (mut initiator, responder, _, last) = run_until(Step::EapSuccess);
+            let ours = eap_from_initiator(&responder, &last).unwrap().identifier;
+            assert!(matches!(initiator.handle(&failure_with(&responder, ours, vec![]), &mut SeedEntropy::new(1)), Ok(EapEvent::Reply(_))));
+            let forged = final_message_with_auth_edited(&initiator, &responder, edit);
+            let got = initiator.handle(&forged, &mut SeedEntropy::new(1));
+            assert!(matches!(got, Ok(EapEvent::Failed(None))), "{what}: {got:?}");
+        }
+        // ...and a final message without an AUTH is no final message.
+        let (mut initiator, responder, _, last) = run_until(Step::EapSuccess);
+        let ours = eap_from_initiator(&responder, &last).unwrap().identifier;
+        assert!(matches!(initiator.handle(&failure_with(&responder, ours, vec![]), &mut SeedEntropy::new(1)), Ok(EapEvent::Reply(_))));
+        let no_auth = build_sk(&responder.sa, 9, true, &[(PayloadType::IdResponder, responder.id.to_bytes())], &[3u8; 8]).unwrap();
+        assert!(matches!(initiator.handle(&no_auth, &mut SeedEntropy::new(1)), Ok(EapEvent::Failed(None))));
+    }
+
+    #[test]
+    fn eap_keeps_ending_the_exchange_on_a_failure_where_the_final_message_belongs() {
+        // Our AUTH is out (RFC 7296 §2.16): the response to it is the final
+        // message. An IKE response is not sent again in another form, so
+        // nothing can come after a message that is not that one, and the
+        // exchange ends there -- Failure or not.
+        let (mut initiator, responder, eap_success, last) = run_until(Step::EapSuccess);
+        let ours = eap_from_initiator(&responder, &last).unwrap().identifier;
+        assert!(matches!(initiator.handle(&eap_success, &mut SeedEntropy::new(1)), Ok(EapEvent::Reply(_))));
+        let got = initiator.handle(&failure_with(&responder, ours, vec![]), &mut SeedEntropy::new(1));
+        assert!(matches!(got, Ok(EapEvent::Failed(None))), "{got:?}");
     }
 
     /// A named change to an EAP packet.

@@ -17,6 +17,21 @@
 //! The responder authenticates with a PSK; both final AUTH payloads key off the
 //! EAP-derived MSK. This whole sequence is interop-validated against an
 //! independent IKEv2 responder.
+//!
+//! Each side keeps to that order. The initiator answers nothing before the
+//! server's AUTH has verified (unless told not to check it), answers
+//! Identity and Notification Requests and Naks a method it doesn't run until
+//! MSCHAPv2 has begun (RFC 3748 §2.1, §5.2, §5.3.1), answers a duplicate
+//! Request with its first Response (§4.1), checks the authenticator response
+//! before it acknowledges it (RFC 2759 §8.8), and takes EAP-Success only after
+//! that (RFC 3748 §4.2) and the final message only after its own AUTH. The
+//! responder takes each Response only for the Request it has outstanding, by
+//! EAP Identifier (RFC 3748 §4.1) and step, and the initiator's AUTH only
+//! after it sent EAP-Success.
+//!
+//! In `IKE_AUTH` each EAP message rides in an IKE message the other side
+//! answers, so where RFC 3748 has a message "silently discarded" nothing else
+//! would come: either side ends the exchange then ([`EapEvent::Failed`]).
 
 use std::collections::HashMap;
 
@@ -40,7 +55,7 @@ use crate::ikev2::payload::{
 };
 use crate::role::Role;
 use crate::ikev2::sign::SigningKey;
-use crate::ikev2::sk::{build_encrypted, open_encrypted};
+use crate::ikev2::sk::{build_encrypted, ct_eq, open_encrypted};
 
 /// How the server (responder) authenticates *itself* in the EAP exchange
 /// (RFC 7296 §2.16 — its own AUTH, separate from the EAP/MSK exchange).
@@ -66,9 +81,10 @@ pub enum ServerVerify {
     /// Require the server's leaf certificate to (a) build a valid X.509 path to
     /// one of these trusted CA certificates (DER) — checking each hop's
     /// signature, validity window, and CA status — (b) carry `expected_dns` in
-    /// its SubjectAltName when given, and (c) produce a valid RFC 7427
-    /// signature. Revocation (CRL/OCSP) and EKU are still the consumer's to
-    /// add.
+    /// its SubjectAltName when given, and (c) produce a valid AUTH signature:
+    /// RFC 7427's (method 14), RSA's (method 1) or ECDSA-P256-SHA256's
+    /// (method 9, RFC 4754). Revocation (CRL/OCSP) and EKU are still the
+    /// consumer's to add.
     TrustedCas {
         cas: Vec<Vec<u8>>,
         /// The dNSName the client intends to reach, if it wants that bound
@@ -193,6 +209,22 @@ fn iv(entropy: &mut impl Entropy) -> [u8; 8] {
     iv
 }
 
+/// Where an [`EapInitiator`]'s EAP conversation stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerStep {
+    /// No method has begun: Identity and Notification Requests are answered,
+    /// and a Request for a method we don't run gets a Nak.
+    Selecting,
+    /// We answered the MSCHAPv2 Challenge: the Success Request is next.
+    Answered { auth_challenge: [u8; 16], peer_challenge: [u8; 16] },
+    /// The authenticator response verified and we acknowledged it:
+    /// EAP-Success is next.
+    ServerProven,
+    /// EAP-Success came and our MSK-keyed AUTH went out: the final message
+    /// is next.
+    AuthSent,
+}
+
 /// EAP-MSCHAPv2 **initiator** (client) — the phone's role.
 pub struct EapInitiator {
     sa: CompletedSaInit,
@@ -204,6 +236,10 @@ pub struct EapInitiator {
     nt_response: [u8; 24],
     verify: ServerVerify,
     server_verified: bool,
+    step: PeerStep,
+    /// The last EAP Request we answered and our Response to it, to answer a
+    /// duplicate the same way.
+    last_request: Option<(eap::EapPacket, eap::EapPacket)>,
     /// The responder's IDr as its first IKE_AUTH response carried it (payload
     /// body, no generic header), or empty until then. RFC 7296 §2.16 has the
     /// responder send IDr only once: the final message holds just AUTH (+ SA/
@@ -277,6 +313,8 @@ impl EapInitiator {
             nt_response: [0u8; 24],
             verify,
             server_verified: false,
+            step: PeerStep::Selecting,
+            last_request: None,
             server_idr: Vec::new(),
             send_certreq: false,
             peer_child_spi: None,
@@ -386,8 +424,9 @@ impl EapInitiator {
 
     /// Authenticate the server from its first response (`SK{ IDr, [CERT,] AUTH,
     /// EAP }`): the leaf must chain to a trusted CA, vouch for the expected
-    /// dNSName, and produce a valid RFC 7427 signature over the responder's
-    /// signed octets. Returns `false` on any failure so the caller can abort.
+    /// dNSName, and sign the responder's signed octets with one of the
+    /// methods [`ServerVerify::TrustedCas`] names. Returns `false` on any
+    /// failure so the caller can abort.
     fn verify_server(&self, ps: &Payloads) -> bool {
         let (Some(idr), Some(auth_bytes)) =
             (find(ps, PayloadType::IdResponder), find(ps, PayloadType::Authentication))
@@ -419,13 +458,14 @@ impl EapInitiator {
             Ok(a) => a,
             Err(_) => return false,
         };
-        if auth.method != auth_method::DIGITAL_SIGNATURE && auth.method != auth_method::RSA_SIG {
-            return false;
-        }
         let octets = responder_signed_octets(self.sa.suite.prf_algorithm(), &self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, idr);
         // Path validation (chain + dates + CA) + SAN binding + signature.
-        // `auth.method` selects RFC 7427 method 14 or classic method 1 (a
-        // real FortiGate "Certificates + EAP" sends method 1, not 14).
+        // `auth.method` selects RFC 7427 method 14, classic RSA method 1 (a
+        // real FortiGate "Certificates + EAP" sends method 1, not 14) or
+        // ECDSA method 9 (what an EC-keyed server, ours included, sends a
+        // client that offered no SIGNATURE_HASH_ALGORITHMS) -- the same
+        // three direct certificate authentication takes; `verify_cert_auth`
+        // refuses any other.
         crate::ikev2::sign::verify_cert_auth(leaf, &certs[1..], cas, expected_dns.as_deref(), now, auth.method, &auth.data, &octets).is_ok()
     }
 
@@ -494,9 +534,14 @@ impl EapInitiator {
         }
 
         let Some(eap_bytes) = find(&ps, PayloadType::Eap) else {
-            // No EAP → the responder's final message. Key-confirm its MSK-keyed
-            // AUTH (mirroring what the responder does to us); presence alone is
-            // not enough — it must prove it derived the same EAP MSK.
+            // No EAP → the responder's final message, which answers our
+            // MSK-keyed AUTH: before that went out there is no MSK to check
+            // it with. Key-confirm its MSK-keyed AUTH (mirroring what the
+            // responder does to us); presence alone is not enough — it must
+            // prove it derived the same EAP MSK.
+            if self.step != PeerStep::AuthSent {
+                return Ok(EapEvent::Failed(None));
+            }
             let Some(auth_bytes) = find(&ps, PayloadType::Authentication) else {
                 return Ok(EapEvent::Failed(None));
             };
@@ -505,13 +550,14 @@ impl EapInitiator {
             let expect =
                 psk_auth(algo, &msk, &responder_signed_octets(algo, &self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, &self.server_idr));
             let got = Authentication::parse(auth_bytes)?;
+            let verified = got.method == auth_method::SHARED_KEY && ct_eq(&got.data, &expect);
             let Some(sar2) = find(&ps, PayloadType::SecurityAssociation) else {
                 // RFC 7296 §1.2: a CHILD SA that fails inside IKE_AUTH leaves the
                 // IKE SA established, so this final message is a valid AUTH plus
                 // an error notify and no SA/TS. Once the MSK-keyed AUTH has
                 // verified, that is a rejection with a stated reason -- not the
                 // failed authentication it used to be reported as.
-                if got.method == auth_method::SHARED_KEY && got.data == expect {
+                if verified {
                     let rejected = ps
                         .iter()
                         .filter(|(t, _)| *t == PayloadType::Notify)
@@ -522,7 +568,7 @@ impl EapInitiator {
                 }
                 return Ok(EapEvent::Failed(None));
             };
-            if got.method == auth_method::SHARED_KEY && got.data == expect {
+            if verified {
                 let esp_suite = SecurityAssociation::parse(sar2).ok().and_then(|sa| negotiate::select_esp(&sa));
                 // RFC 7296 §2.7: the responder's SAr2 must be built from the
                 // ESP proposal we actually offered, not merely one
@@ -545,18 +591,23 @@ impl EapInitiator {
                     self.granted_ts = Some(ts);
                 }
             }
-            return Ok(if got.method == auth_method::SHARED_KEY && got.data == expect {
-                EapEvent::Established(None)
-            } else {
-                EapEvent::Failed(None)
-            });
+            return Ok(if verified { EapEvent::Established(None) } else { EapEvent::Failed(None) });
         };
+        if self.step == PeerStep::AuthSent {
+            return Ok(EapEvent::Failed(None));
+        }
 
         let eap = eap::EapPacket::parse(eap_bytes)?;
         if eap.code == eap::code::FAILURE {
             return Ok(EapEvent::Failed(None));
         }
         if eap.code == eap::code::SUCCESS {
+            // RFC 3748 §4.2: EAP-Success counts only once the method has
+            // finished -- here, once the server proved it knows the
+            // password. A "canned" one before that is no success.
+            if self.step != PeerStep::ServerProven {
+                return Ok(EapEvent::Failed(None));
+            }
             // EAP done: send AUTH keyed by the MSK.
             let msk = mschapv2::derive_msk(&self.password, &self.nt_response);
             let idi = self.id.to_bytes();
@@ -564,46 +615,122 @@ impl EapInitiator {
             let octets = initiator_signed_octets(algo, &self.sa.init_message, &self.sa.nr, &self.sa.keys.sk_pi, &idi);
             let auth = Authentication { method: auth_method::SHARED_KEY, data: psk_auth(algo, &msk, &octets) };
             let msg = build_sk(&self.sa, next_id, false, &[(PayloadType::Authentication, auth.to_bytes())], &iv(entropy))?;
+            self.step = PeerStep::AuthSent;
             return Ok(EapEvent::Reply(msg));
         }
+        if eap.code != eap::code::REQUEST {
+            return Ok(EapEvent::Failed(None));
+        }
 
-        // EAP Request → respond by method.
-        let resp = match eap.eap_type() {
-            Some(t) if t == eap::eap_type::IDENTITY => {
+        // RFC 3748 §4.1: a duplicate of the Request we last answered gets
+        // the same Response, and is not processed again. Another Request
+        // under its Identifier is no duplicate.
+        if let Some((request, response)) = &self.last_request {
+            if eap.identifier == request.identifier {
+                if eap != *request {
+                    return Ok(EapEvent::Failed(None));
+                }
+                let msg = build_sk(&self.sa, next_id, false, &[(PayloadType::Eap, response.to_bytes())], &iv(entropy))?;
+                return Ok(EapEvent::Reply(msg));
+            }
+        }
+
+        let data = match self.answer(&eap, entropy)? {
+            Ok(data) => data,
+            Err(reason) => return Ok(EapEvent::Failed(reason)),
+        };
+        let resp = eap::EapPacket { code: eap::code::RESPONSE, identifier: eap.identifier, data };
+        let msg = build_sk(&self.sa, next_id, false, &[(PayloadType::Eap, resp.to_bytes())], &iv(entropy))?;
+        self.last_request = Some((eap, resp));
+        Ok(EapEvent::Reply(msg))
+    }
+
+    /// The Type-Data of our Response to a new EAP Request, or `Err` to end
+    /// the exchange -- with the server's reason when it gave one. Each
+    /// Request is taken only in the step it belongs to.
+    fn answer(&mut self, eap: &eap::EapPacket, entropy: &mut impl Entropy) -> Result<Result<Vec<u8>, Option<EapFailureReason>>, IkeError> {
+        let op = eap.data.get(1).copied();
+        Ok(Ok(match (self.step, eap.eap_type()) {
+            (PeerStep::Selecting, Some(eap::eap_type::IDENTITY)) => {
                 let mut d = vec![eap::eap_type::IDENTITY];
                 d.extend_from_slice(&self.user);
-                eap::EapPacket { code: eap::code::RESPONSE, identifier: eap.identifier, data: d }
+                d
             }
-            Some(t) if t == eap::eap_type::MSCHAPV2 && eap.data.get(1) == Some(&eap::op::CHALLENGE) => {
+            // RFC 3748 §5.2: a Notification Request gets a Notification
+            // Response (no Type-Data), whatever else is going on, and
+            // changes nothing.
+            (PeerStep::Selecting | PeerStep::Answered { .. } | PeerStep::ServerProven, Some(eap::eap_type::NOTIFICATION)) => {
+                vec![eap::eap_type::NOTIFICATION]
+            }
+            (PeerStep::Selecting, Some(eap::eap_type::MSCHAPV2)) if op == Some(eap::op::CHALLENGE) => {
                 let (mschap_id, auth_challenge, _name) = eap::parse_challenge(&eap.data)?;
                 let mut peer_challenge = [0u8; 16];
                 entropy.fill(&mut peer_challenge);
                 self.nt_response = mschapv2::generate_nt_response(&auth_challenge, &peer_challenge, &self.user, &self.password);
-                let data = eap::build_response(mschap_id, &auth_challenge, &peer_challenge, &self.user, &self.password);
-                eap::EapPacket { code: eap::code::RESPONSE, identifier: eap.identifier, data }
+                self.step = PeerStep::Answered { auth_challenge, peer_challenge };
+                eap::build_response(mschap_id, &auth_challenge, &peer_challenge, &self.user, &self.password)
             }
-            Some(t) if t == eap::eap_type::MSCHAPV2 && eap.data.get(1) == Some(&eap::op::SUCCESS) => {
-                eap::EapPacket { code: eap::code::RESPONSE, identifier: eap.identifier, data: vec![eap::eap_type::MSCHAPV2, eap::op::SUCCESS] }
+            (PeerStep::Answered { auth_challenge, peer_challenge }, Some(eap::eap_type::MSCHAPV2)) if op == Some(eap::op::SUCCESS) => {
+                // RFC 2759 §8.8, draft-kamath-pppext-eap-mschapv2 §2.3: the
+                // server proves it knows the password with the authenticator
+                // response; if that is missing or wrong the session ends
+                // without an answer -- and so without the MSK-keyed AUTH.
+                let expected = mschapv2::authenticator_response(&self.password, &self.nt_response, &peer_challenge, &auth_challenge, &self.user);
+                match eap::parse_success(&eap.data) {
+                    Ok(got) if ct_eq(&got, &expected) => {}
+                    _ => return Ok(Err(None)),
+                }
+                self.step = PeerStep::ServerProven;
+                vec![eap::eap_type::MSCHAPV2, eap::op::SUCCESS]
             }
-            Some(t) if t == eap::eap_type::MSCHAPV2 && eap.data.get(1) == Some(&eap::op::FAILURE) => {
+            (_, Some(eap::eap_type::MSCHAPV2)) if op == Some(eap::op::FAILURE) => {
                 // The server's own stated reason, e.g. "E=691 R=1 C=<chal> V=3"
                 // (RFC 2759 -- E=691 is ERROR_AUTHENTICATION_FAILURE, a
                 // rejected username/password, not a protocol problem). Bytes
                 // 5.. are the ASCII message, mirroring `eap::build_success`'s
                 // layout for the Success case.
                 let reason = eap.data.get(5..).map(String::from_utf8_lossy).unwrap_or_default();
-                let reason = EapFailureReason::parse(reason);
-                return Ok(EapEvent::Failed(Some(reason)));
+                return Ok(Err(Some(EapFailureReason::parse(reason))));
             }
-            _ => return Ok(EapEvent::Failed(None)),
-        };
-        let msg = build_sk(&self.sa, next_id, false, &[(PayloadType::Eap, resp.to_bytes())], &iv(entropy))?;
-        Ok(EapEvent::Reply(msg))
+            // RFC 3748 §5.3.1, §5.3.2: until a method has begun, a Request
+            // for one we don't run (Expanded Types included -- we support
+            // none) gets a Legacy Nak naming MSCHAPv2. Types 1-3 are no
+            // methods, and once MSCHAPv2 has begun no other runs (§2.1).
+            (PeerStep::Selecting, Some(t)) if t > eap::eap_type::NAK && t != eap::eap_type::MSCHAPV2 => {
+                vec![eap::eap_type::NAK, eap::eap_type::MSCHAPV2]
+            }
+            _ => return Ok(Err(None)),
+        }))
     }
 }
 
+/// Where an [`EapResponder`]'s exchange stands: what it takes next and, while
+/// EAP runs, the Identifier of the Request it has outstanding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthStep {
+    /// The initiator's first `IKE_AUTH` request: no AUTH, no EAP.
+    Start,
+    /// The Identity Response.
+    Identity { id: u8 },
+    /// The MSCHAPv2 Response to our Challenge.
+    Challenge { id: u8 },
+    /// The MSCHAPv2 Success Response acknowledging our Success Request.
+    Success { id: u8 },
+    /// We sent EAP-Success: the initiator's MSK-keyed AUTH.
+    Succeeded,
+    /// Established or failed: nothing more is taken.
+    Done,
+}
+
+/// The MS-CHAPv2-ID of our Challenge and Success Requests.
+const MSCHAP_ID: u8 = 1;
+
 /// EAP-MSCHAPv2 **responder** (server): authenticates itself ([`ServerAuth`]),
 /// verifies the client's EAP password, then exchanges the MSK-keyed AUTHs.
+///
+/// It takes each initiator request once, in order; a retransmitted request
+/// is the caller's to answer with the response it already gave (see the
+/// crate docs), not one to hand back in.
 pub struct EapResponder {
     sa: CompletedSaInit,
     id: Identification,
@@ -614,7 +741,7 @@ pub struct EapResponder {
     /// identity selects one at the Identity step; an unknown identity is rejected.
     users: HashMap<Vec<u8>, String>,
     child_spi: u32,
-    eap_id: u8,
+    step: AuthStep,
     auth_challenge: [u8; 16],
     nt_response: [u8; 24],
     peer_idi: Vec<u8>,
@@ -660,7 +787,7 @@ impl EapResponder {
             password: String::new(),
             users,
             child_spi,
-            eap_id: 1,
+            step: AuthStep::Start,
             auth_challenge: [0u8; 16],
             nt_response: [0u8; 24],
             peer_idi: Vec::new(),
@@ -710,17 +837,29 @@ impl EapResponder {
     pub fn handle(&mut self, message: &[u8], entropy: &mut impl Entropy) -> Result<EapEvent, IkeError> {
         let (msg_id, ps) = decrypt(&self.sa, message)?;
         self.peer_mobike |= crate::ikev2::mobike::peer_supports_mobike(&ps);
+        let event = self.advance(msg_id, &ps, entropy)?;
+        if !matches!(event, EapEvent::Reply(_)) {
+            // Established or failed: this exchange takes nothing more.
+            self.step = AuthStep::Done;
+        }
+        Ok(event)
+    }
 
+    /// Take the next initiator message, in the step it belongs to.
+    fn advance(&mut self, msg_id: u32, ps: &Payloads, entropy: &mut impl Entropy) -> Result<EapEvent, IkeError> {
         // msg-1: IDi + SA + TS, no AUTH, no EAP → authenticate ourselves and
         // start EAP with an Identity request: SK{ IDr, [CERT,] AUTH, EAP }.
-        if find(&ps, PayloadType::Eap).is_none() && find(&ps, PayloadType::Authentication).is_none() {
-            let Some(sai2) = find(&ps, PayloadType::SecurityAssociation) else {
+        if find(ps, PayloadType::Eap).is_none() && find(ps, PayloadType::Authentication).is_none() {
+            if self.step != AuthStep::Start {
+                return Ok(EapEvent::Failed(None));
+            }
+            let Some(sai2) = find(ps, PayloadType::SecurityAssociation) else {
                 return Ok(EapEvent::Failed(None));
             };
             // Capture the initiator's ESP SPI (for the CHILD SA) and its IDi
             // verbatim (its final AUTH signs over it).
             self.peer_child_spi = esp_spi_from_sa(sai2);
-            self.peer_idi = find(&ps, PayloadType::IdInitiator).unwrap_or(&[]).to_vec();
+            self.peer_idi = find(ps, PayloadType::IdInitiator).unwrap_or(&[]).to_vec();
             let idr = self.id.to_bytes();
             let algo = self.sa.suite.prf_algorithm();
             let octets = responder_signed_octets(algo, &self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, &idr);
@@ -748,21 +887,29 @@ impl EapResponder {
                     inner.push((PayloadType::Authentication, auth.to_bytes()));
                 }
             }
-            let eap = eap::EapPacket { code: eap::code::REQUEST, identifier: self.eap_id, data: vec![eap::eap_type::IDENTITY] };
+            let id = 1;
+            let eap = eap::EapPacket { code: eap::code::REQUEST, identifier: id, data: vec![eap::eap_type::IDENTITY] };
             inner.push((PayloadType::Eap, eap.to_bytes()));
             let msg = build_sk(&self.sa, msg_id, true, &inner, &iv(entropy))?;
+            self.step = AuthStep::Identity { id };
             return Ok(EapEvent::Reply(msg));
         }
 
-        // Final: the initiator's MSK-keyed AUTH (no EAP, has AUTH).
-        if let Some(auth_bytes) = find(&ps, PayloadType::Authentication) {
-            if find(&ps, PayloadType::Eap).is_none() {
+        // Final: the initiator's MSK-keyed AUTH (no EAP, has AUTH) -- only
+        // once EAP has succeeded: before that there is no MSK, and the one
+        // computed from nothing is anyone's to compute (RFC 7296 §2.16).
+        if let Some(auth_bytes) = find(ps, PayloadType::Authentication) {
+            if find(ps, PayloadType::Eap).is_none() {
+                if self.step != AuthStep::Succeeded {
+                    return Ok(EapEvent::Failed(None));
+                }
                 let msk = mschapv2::derive_msk(&self.password, &self.nt_response);
                 let algo = self.sa.suite.prf_algorithm();
                 let expect =
                     psk_auth(algo, &msk, &initiator_signed_octets(algo, &self.sa.init_message, &self.sa.nr, &self.sa.keys.sk_pi, &self.peer_idi));
                 let got = crate::ikev2::payload::Authentication::parse(auth_bytes)?;
-                if got.data != expect {
+                // RFC 7296 §2.16: the EAP AUTH is the Shared Key MIC keyed by the MSK.
+                if got.method != auth_method::SHARED_KEY || !ct_eq(&got.data, &expect) {
                     return Ok(EapEvent::Failed(None));
                 }
                 // Send our final AUTH(MSK) + SAr2 + TSi + TSr.
@@ -808,13 +955,26 @@ impl EapResponder {
             }
         }
 
-        // Otherwise an EAP response drives the next step.
-        let eap_bytes = find(&ps, PayloadType::Eap).ok_or(IkeError::MissingPayload("EAP"))?;
+        // Otherwise an EAP response drives the next step. It must answer
+        // the Request we have outstanding, by Identifier (RFC 3748 §4.1) and
+        // by step; an initiator's AUTH has no place in it.
+        let eap_bytes = find(ps, PayloadType::Eap).ok_or(IkeError::MissingPayload("EAP"))?;
+        let id = match self.step {
+            AuthStep::Identity { id } | AuthStep::Challenge { id } | AuthStep::Success { id } => id,
+            _ => return Ok(EapEvent::Failed(None)),
+        };
+        if find(ps, PayloadType::Authentication).is_some() {
+            return Ok(EapEvent::Failed(None));
+        }
         let eap = eap::EapPacket::parse(eap_bytes)?;
-        self.eap_id = self.eap_id.wrapping_add(1);
+        if eap.code != eap::code::RESPONSE || eap.identifier != id {
+            return Ok(EapEvent::Failed(None));
+        }
+        let next = id.wrapping_add(1);
+        let op = eap.data.get(1).copied();
 
-        let out = match eap.eap_type() {
-            Some(t) if t == eap::eap_type::IDENTITY => {
+        let (out, step) = match (self.step, eap.eap_type()) {
+            (AuthStep::Identity { .. }, Some(eap::eap_type::IDENTITY)) => {
                 // The claimed identity selects this client's credentials; an
                 // unknown username is rejected here, before any challenge.
                 let claimed = eap.data.get(1..).unwrap_or(&[]).to_vec();
@@ -827,19 +987,26 @@ impl EapResponder {
                 }
                 // Got the identity → send an MSCHAPv2 Challenge.
                 entropy.fill(&mut self.auth_challenge);
-                eap::build_challenge(1, &self.auth_challenge, b"ryke")
+                (eap::build_challenge(MSCHAP_ID, &self.auth_challenge, b"ryke"), AuthStep::Challenge { id: next })
             }
-            Some(t) if t == eap::eap_type::MSCHAPV2 && eap.data.get(1) == Some(&eap::op::RESPONSE) => {
+            (AuthStep::Challenge { .. }, Some(eap::eap_type::MSCHAPV2)) if op == Some(eap::op::RESPONSE) => {
                 let resp = eap::parse_response(&eap.data)?;
+                // The Response copies its Challenge's identifier (RFC 1994
+                // §4.1, which MS-CHAPv2 keeps -- RFC 2759 §4).
+                if resp.mschap_id != MSCHAP_ID {
+                    return Ok(EapEvent::Failed(None));
+                }
                 self.nt_response = mschapv2::generate_nt_response(&self.auth_challenge, &resp.peer_challenge, &self.user, &self.password);
-                if self.nt_response != resp.nt_response {
+                if !ct_eq(&self.nt_response, &resp.nt_response) {
                     return Ok(EapEvent::Failed(None));
                 }
                 let auth_resp = mschapv2::generate_authenticator_response(&self.password, &self.nt_response, &resp.peer_challenge, &self.auth_challenge, &self.user);
-                eap::build_success(1, &auth_resp)
+                (eap::build_success(MSCHAP_ID, &auth_resp), AuthStep::Success { id: next })
             }
-            Some(t) if t == eap::eap_type::MSCHAPV2 && eap.data.get(1) == Some(&eap::op::SUCCESS) => {
-                // Client acked → send EAP-Success.
+            (AuthStep::Success { .. }, Some(eap::eap_type::MSCHAPV2)) if op == Some(eap::op::SUCCESS) => {
+                // Client acked → send EAP-Success, with the Identifier of
+                // the Response it answers (RFC 3748 §4.2).
+                self.step = AuthStep::Succeeded;
                 return Ok(EapEvent::Reply(build_sk(&self.sa, msg_id, true, &[(
                     PayloadType::Eap,
                     eap::EapPacket { code: eap::code::SUCCESS, identifier: eap.identifier, data: vec![] }.to_bytes(),
@@ -847,7 +1014,8 @@ impl EapResponder {
             }
             _ => return Ok(EapEvent::Failed(None)),
         };
-        let req = eap::EapPacket { code: eap::code::REQUEST, identifier: self.eap_id, data: out };
+        self.step = step;
+        let req = eap::EapPacket { code: eap::code::REQUEST, identifier: next, data: out };
         Ok(EapEvent::Reply(build_sk(&self.sa, msg_id, true, &[(PayloadType::Eap, req.to_bytes())], &iv(entropy))?))
     }
 }
@@ -1307,5 +1475,566 @@ mod tests {
             }
             other => panic!("expected EapEvent::Failed(Some(_)), got {other:?}"),
         }
+    }
+
+    /// Where the real exchange stands, by the message the responder sends next.
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    enum Step {
+        Identity,
+        Challenge,
+        SuccessRequest,
+        EapSuccess,
+        Final,
+    }
+
+    fn step_of(initiator: &EapInitiator, msg: &[u8]) -> Step {
+        match eap_from_responder(initiator, msg) {
+            None => Step::Final,
+            Some(p) if p.code == eap::code::SUCCESS => Step::EapSuccess,
+            Some(p) => match (p.data.first().copied(), p.data.get(1).copied()) {
+                (Some(eap::eap_type::IDENTITY), _) => Step::Identity,
+                (Some(eap::eap_type::MSCHAPV2), Some(eap::op::CHALLENGE)) => Step::Challenge,
+                (Some(eap::eap_type::MSCHAPV2), Some(eap::op::SUCCESS)) => Step::SuccessRequest,
+                other => panic!("unexpected request {other:?}"),
+            },
+        }
+    }
+
+    /// The EAP packet in a message the responder sent, if any.
+    fn eap_from_responder(initiator: &EapInitiator, msg: &[u8]) -> Option<eap::EapPacket> {
+        let (_, ps) = decrypt(&initiator.sa, msg).unwrap();
+        find(&ps, PayloadType::Eap).map(|b| eap::EapPacket::parse(b).unwrap())
+    }
+
+    /// The EAP packet in a message the initiator sent, if any.
+    fn eap_from_initiator(responder: &EapResponder, msg: &[u8]) -> Option<eap::EapPacket> {
+        let (_, ps) = decrypt(&responder.sa, msg).unwrap();
+        find(&ps, PayloadType::Eap).map(|b| eap::EapPacket::parse(b).unwrap())
+    }
+
+    /// A message from the responder's side carrying only `eap`.
+    fn responder_eap(responder: &EapResponder, eap: &eap::EapPacket) -> Vec<u8> {
+        build_sk(&responder.sa, 9, true, &[(PayloadType::Eap, eap.to_bytes())], &[6u8; 8]).unwrap()
+    }
+
+    /// A message from the initiator's side carrying `inner`.
+    fn initiator_msg(initiator: &EapInitiator, inner: &[(PayloadType, Vec<u8>)]) -> Vec<u8> {
+        build_sk(&initiator.sa, 9, false, inner, &[7u8; 8]).unwrap()
+    }
+
+    fn psk_pair() -> (EapInitiator, EapResponder) {
+        let (init_sa, resp_sa) = sa_pair();
+        let psk = b"group-psk".to_vec();
+        let initiator =
+            EapInitiator::new(init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111, ServerVerify::Psk(psk.clone()));
+        let responder = EapResponder::new(resp_sa, Identification::fqdn("gw"), ServerAuth::Psk(psk), b"alice".to_vec(), "s3cret".into(), 0x2222);
+        (initiator, responder)
+    }
+
+    /// Run the real exchange until the responder's next message is at `stop`,
+    /// and hand that message back undelivered, with the initiator's last one.
+    fn run_until(stop: Step) -> (EapInitiator, EapResponder, Vec<u8>, Vec<u8>) {
+        let (mut initiator, mut responder) = psk_pair();
+        let mut ie = SeedEntropy::new(1);
+        let mut re = SeedEntropy::new(2);
+        let mut in_flight = initiator.start(&mut ie).unwrap();
+        loop {
+            let m = match responder.handle(&in_flight, &mut re).unwrap() {
+                EapEvent::Reply(m) | EapEvent::Established(Some(m)) => m,
+                other => panic!("unexpected responder event: {other:?}"),
+            };
+            if step_of(&initiator, &m) == stop {
+                return (initiator, responder, m, in_flight);
+            }
+            match initiator.handle(&m, &mut ie).unwrap() {
+                EapEvent::Reply(m2) => in_flight = m2,
+                other => panic!("the initiator ended early: {other:?}"),
+            }
+        }
+    }
+
+    /// Hand `msg` to the initiator, then play the rest of the exchange out
+    /// with the real responder.
+    fn finish(mut initiator: EapInitiator, mut responder: EapResponder, msg: &[u8]) -> Outcome {
+        let mut ie = SeedEntropy::new(11);
+        let mut re = SeedEntropy::new(12);
+        let mut in_flight = match initiator.handle(msg, &mut ie).unwrap() {
+            EapEvent::Reply(m) => m,
+            other => panic!("the initiator ended early: {other:?}"),
+        };
+        loop {
+            match responder.handle(&in_flight, &mut re).unwrap() {
+                EapEvent::Reply(m) => match initiator.handle(&m, &mut ie).unwrap() {
+                    EapEvent::Reply(m2) => in_flight = m2,
+                    EapEvent::Established(_) => return Outcome::Established,
+                    EapEvent::Failed(_) => return Outcome::Failed,
+                },
+                EapEvent::Established(Some(f)) => {
+                    return match initiator.handle(&f, &mut ie).unwrap() {
+                        EapEvent::Established(None) => Outcome::Established,
+                        _ => Outcome::Failed,
+                    }
+                }
+                _ => return Outcome::Failed,
+            }
+        }
+    }
+
+    /// The Success-Request `msg` carries, with its message replaced by `text`.
+    fn with_success_message(initiator: &EapInitiator, responder: &EapResponder, msg: &[u8], text: &[u8]) -> Vec<u8> {
+        let mut p = eap_from_responder(initiator, msg).unwrap();
+        p.data.truncate(5);
+        p.data.extend_from_slice(text);
+        let ms_len = (p.data.len() - 1) as u16;
+        p.data[3..5].copy_from_slice(&ms_len.to_be_bytes());
+        responder_eap(responder, &p)
+    }
+
+    /// The responder's final message as a gateway that knows the password
+    /// would build it from the initiator's current NT-Response.
+    fn final_message_now(initiator: &EapInitiator, responder: &EapResponder) -> Vec<u8> {
+        let algo = responder.sa.suite.prf_algorithm();
+        let msk = mschapv2::derive_msk("s3cret", &initiator.nt_response);
+        let idr = responder.id.to_bytes();
+        let octets = responder_signed_octets(algo, &responder.sa.resp_message, &responder.sa.ni, &responder.sa.keys.sk_pr, &idr);
+        let auth = Authentication { method: auth_method::SHARED_KEY, data: psk_auth(algo, &msk, &octets) };
+        let inner = [
+            (PayloadType::IdResponder, idr),
+            (PayloadType::Authentication, auth.to_bytes()),
+            (PayloadType::SecurityAssociation, esp_offer(0x2222).to_bytes()),
+            (PayloadType::TrafficSelectorInitiator, full_tunnel_ts()),
+            (PayloadType::TrafficSelectorResponder, full_tunnel_ts()),
+        ];
+        build_sk(&responder.sa, 9, true, &inner, &[8u8; 8]).unwrap()
+    }
+
+    #[test]
+    fn eap_takes_a_classic_ecdsa_server_auth_method_9() {
+        // A client that offers no SIGNATURE_HASH_ALGORITHMS (a native iOS
+        // one) gets RFC 4754's ECDSA-P256-SHA256 AUTH, method 9, from an EC
+        // key -- which direct certificate authentication already verifies.
+        let (mut init_sa, mut resp_sa) = sa_pair();
+        init_sa.peer_signature_hashes.clear();
+        resp_sa.peer_signature_hashes.clear();
+        let initiator =
+            EapInitiator::new(init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111, trust(vec![CA_CERT_DER.to_vec()]));
+        let mut responder =
+            EapResponder::new(resp_sa, Identification::fqdn("vpn.example.com"), cert_server(), b"alice".to_vec(), "s3cret".into(), 0x2222);
+        let first = match responder.handle(&initiator.start(&mut SeedEntropy::new(1)).unwrap(), &mut SeedEntropy::new(2)).unwrap() {
+            EapEvent::Reply(m) => m,
+            other => panic!("unexpected responder event: {other:?}"),
+        };
+        let (_, ps) = decrypt(&initiator.sa, &first).unwrap();
+        let auth = Authentication::parse(find(&ps, PayloadType::Authentication).unwrap()).unwrap();
+        assert_eq!(auth.method, auth_method::ECDSA_SHA256_P256);
+
+        let (mut init_sa, mut resp_sa) = sa_pair();
+        init_sa.peer_signature_hashes.clear();
+        resp_sa.peer_signature_hashes.clear();
+        let initiator =
+            EapInitiator::new(init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111, trust(vec![CA_CERT_DER.to_vec()]));
+        let responder =
+            EapResponder::new(resp_sa, Identification::fqdn("vpn.example.com"), cert_server(), b"alice".to_vec(), "s3cret".into(), 0x2222);
+        assert_eq!(drive(initiator, responder), Outcome::Established);
+    }
+
+    #[test]
+    fn eap_rejects_a_method_9_signature_that_does_not_verify() {
+        let (mut init_sa, mut resp_sa) = sa_pair();
+        init_sa.peer_signature_hashes.clear();
+        resp_sa.peer_signature_hashes.clear();
+        let mut initiator =
+            EapInitiator::new(init_sa, Identification::fqdn("alice"), b"alice".to_vec(), "s3cret".into(), 0x1111, trust(vec![CA_CERT_DER.to_vec()]));
+        let mut responder =
+            EapResponder::new(resp_sa, Identification::fqdn("vpn.example.com"), cert_server(), b"alice".to_vec(), "s3cret".into(), 0x2222);
+        let first = match responder.handle(&initiator.start(&mut SeedEntropy::new(1)).unwrap(), &mut SeedEntropy::new(2)).unwrap() {
+            EapEvent::Reply(m) => m,
+            other => panic!("unexpected responder event: {other:?}"),
+        };
+        let (msg_id, mut ps) = decrypt(&initiator.sa, &first).unwrap();
+        for (t, body) in &mut ps {
+            if *t == PayloadType::Authentication {
+                let mut auth = Authentication::parse(body).unwrap();
+                assert_eq!(auth.method, auth_method::ECDSA_SHA256_P256);
+                auth.data[10] ^= 1;
+                *body = auth.to_bytes();
+            }
+        }
+        let forged = build_sk(&responder.sa, msg_id, true, &ps, &[3u8; 8]).unwrap();
+        assert!(matches!(initiator.handle(&forged, &mut SeedEntropy::new(1)), Ok(EapEvent::Failed(None))));
+    }
+
+    #[test]
+    fn eap_ends_on_a_wrong_or_missing_authenticator_response() {
+        // RFC 2759 §8.8 and the EAP-MSCHAPv2 draft §2.3: the peer MUST check
+        // the authenticator response, and when it is missing or wrong end
+        // the session without answering.
+        let wrong: [&[u8]; 5] =
+            [b"S=0000000000000000000000000000000000000000", b"", b"M=welcome", b"S=0000", b"S=ZZ00000000000000000000000000000000000000"];
+        for text in wrong {
+            let (mut initiator, responder, msg, _) = run_until(Step::SuccessRequest);
+            let forged = with_success_message(&initiator, &responder, &msg, text);
+            let got = initiator.handle(&forged, &mut SeedEntropy::new(1));
+            assert!(matches!(got, Ok(EapEvent::Failed(None))), "{:?}: {got:?}", String::from_utf8_lossy(text));
+        }
+        // The authenticator response stays wrong with its last digit changed.
+        let (mut initiator, responder, msg, _) = run_until(Step::SuccessRequest);
+        let p = eap_from_responder(&initiator, &msg).unwrap();
+        let mut text = p.data[5..].to_vec();
+        let last = 41;
+        text[last] = if text[last] == b'0' { b'1' } else { b'0' };
+        let forged = with_success_message(&initiator, &responder, &msg, &text);
+        assert!(matches!(initiator.handle(&forged, &mut SeedEntropy::new(1)), Ok(EapEvent::Failed(None))));
+    }
+
+    #[test]
+    fn eap_takes_the_authenticator_response_in_either_case_and_with_a_message() {
+        // RFC 2759 §8.7 writes the digits in upper case, but they are a
+        // number: lower case names the same one. The message may follow.
+        for (lower, message) in [(false, &b""[..]), (true, &b""[..]), (false, &b" M=Welcome"[..]), (true, &b" M=Welcome"[..])] {
+            let (initiator, responder, msg, _) = run_until(Step::SuccessRequest);
+            let p = eap_from_responder(&initiator, &msg).unwrap();
+            let mut text = p.data[5..47].to_vec();
+            if lower {
+                text.make_ascii_lowercase();
+                text[0] = b'S';
+            }
+            text.extend_from_slice(message);
+            let msg = with_success_message(&initiator, &responder, &msg, &text);
+            assert_eq!(finish(initiator, responder, &msg), Outcome::Established, "lower={lower} message={message:?}");
+        }
+    }
+
+    #[test]
+    fn eap_discards_a_canned_success() {
+        // RFC 3748 §4.2: by default a peer MUST discard an EAP-Success
+        // that comes before its method has finished.
+        for stop in [Step::Challenge, Step::SuccessRequest] {
+            let (mut initiator, responder, msg, _) = run_until(stop);
+            let id = eap_from_responder(&initiator, &msg).unwrap().identifier;
+            let canned = responder_eap(&responder, &eap::EapPacket { code: eap::code::SUCCESS, identifier: id, data: vec![] });
+            let got = initiator.handle(&canned, &mut SeedEntropy::new(1));
+            assert!(matches!(got, Ok(EapEvent::Failed(None))), "at {stop:?}: {got:?}");
+        }
+        // Nor an MSCHAPv2 Success Request before any Challenge: there is no
+        // NT-Response yet for it to prove anything about.
+        let (mut initiator, responder, msg, _) = run_until(Step::Challenge);
+        let id = eap_from_responder(&initiator, &msg).unwrap().identifier;
+        let data = eap::build_success(1, "S=0000000000000000000000000000000000000000");
+        let early = responder_eap(&responder, &eap::EapPacket { code: eap::code::REQUEST, identifier: id, data });
+        let got = initiator.handle(&early, &mut SeedEntropy::new(1));
+        assert!(matches!(got, Ok(EapEvent::Failed(None))), "Success Request before the Challenge: {got:?}");
+    }
+
+    #[test]
+    fn eap_takes_no_more_eap_once_its_auth_went_out() {
+        // After EAP-Success the method is over and our MSK-keyed AUTH is
+        // out: only the final message answers it (RFC 7296 §2.16) -- not
+        // EAP-Success again, nor a duplicate of the Request we answered
+        // last, nor a new Request.
+        for case in 0..3 {
+            let (mut initiator, mut responder, success_request, _) = run_until(Step::SuccessRequest);
+            let EapEvent::Reply(ack) = initiator.handle(&success_request, &mut SeedEntropy::new(1)).unwrap() else { panic!() };
+            let EapEvent::Reply(eap_success) = responder.handle(&ack, &mut SeedEntropy::new(2)).unwrap() else { panic!() };
+            assert!(matches!(initiator.handle(&eap_success, &mut SeedEntropy::new(1)), Ok(EapEvent::Reply(_))));
+            let late = match case {
+                0 => eap_success,
+                1 => success_request,
+                _ => {
+                    let id = eap_from_responder(&initiator, &eap_success).unwrap().identifier.wrapping_add(1);
+                    responder_eap(&responder, &eap::EapPacket { code: eap::code::REQUEST, identifier: id, data: vec![eap::eap_type::IDENTITY] })
+                }
+            };
+            let got = initiator.handle(&late, &mut SeedEntropy::new(1));
+            assert!(matches!(got, Ok(EapEvent::Failed(None))), "case {case}: {got:?}");
+        }
+    }
+
+    #[test]
+    fn eap_takes_the_final_message_only_after_eap_success() {
+        // The final AUTH is keyed by the MSK the finished method gives
+        // (RFC 7296 §2.16); before EAP-Success came, nothing has.
+        for stop in [Step::Challenge, Step::SuccessRequest, Step::EapSuccess] {
+            let (mut initiator, responder, _, _) = run_until(stop);
+            let early = final_message_now(&initiator, &responder);
+            let got = initiator.handle(&early, &mut SeedEntropy::new(1));
+            assert!(matches!(got, Ok(EapEvent::Failed(None))), "at {stop:?}: {got:?}");
+        }
+        // Positive control: the same message after our AUTH went out.
+        let (initiator, responder, msg, _) = run_until(Step::EapSuccess);
+        assert_eq!(finish(initiator, responder, &msg), Outcome::Established);
+    }
+
+    #[test]
+    fn eap_refuses_another_request_once_the_method_began() {
+        // RFC 3748 §2.1: once the peer answered the method, a Request of
+        // another Type is invalid; so is a second Challenge.
+        let requests = [
+            vec![eap::eap_type::IDENTITY],
+            vec![4, 16, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55],
+            eap::build_challenge(7, &[0x33; 16], b"again"),
+        ];
+        for data in requests {
+            let (mut initiator, responder, msg, _) = run_until(Step::SuccessRequest);
+            let id = eap_from_responder(&initiator, &msg).unwrap().identifier;
+            let other = responder_eap(&responder, &eap::EapPacket { code: eap::code::REQUEST, identifier: id, data: data.clone() });
+            let got = initiator.handle(&other, &mut SeedEntropy::new(1));
+            assert!(matches!(got, Ok(EapEvent::Failed(None))), "{data:?}: {got:?}");
+        }
+    }
+
+    #[test]
+    fn eap_naks_a_method_it_does_not_run_and_goes_on() {
+        // RFC 3748 §5.3.1: a Request for a Type the peer won't run gets a
+        // Legacy Nak naming the one it does, and the authenticator may try
+        // that one next.
+        for method in [4u8, 13, 254] {
+            let (mut initiator, responder, challenge, _) = run_until(Step::Challenge);
+            let other = responder_eap(&responder, &eap::EapPacket { code: eap::code::REQUEST, identifier: 0x42, data: vec![method, 1, 2, 3] });
+            let nak = match initiator.handle(&other, &mut SeedEntropy::new(1)).unwrap() {
+                EapEvent::Reply(m) => eap_from_initiator(&responder, &m).unwrap(),
+                other => panic!("type {method}: {other:?}"),
+            };
+            assert_eq!(nak, eap::EapPacket { code: eap::code::RESPONSE, identifier: 0x42, data: vec![eap::eap_type::NAK, eap::eap_type::MSCHAPV2] });
+            assert_eq!(finish(initiator, responder, &challenge), Outcome::Established, "type {method}");
+        }
+    }
+
+    #[test]
+    fn eap_answers_a_notification_and_goes_on() {
+        // RFC 3748 §5.2: the peer MUST answer a Notification with an empty
+        // Notification Response; it changes nothing else.
+        for stop in [Step::Challenge, Step::SuccessRequest] {
+            let (mut initiator, responder, next, _) = run_until(stop);
+            let note = responder_eap(
+                &responder,
+                &eap::EapPacket { code: eap::code::REQUEST, identifier: 0x51, data: [&[2u8][..], b"maintenance at 22:00"].concat() },
+            );
+            let answer = match initiator.handle(&note, &mut SeedEntropy::new(1)).unwrap() {
+                EapEvent::Reply(m) => eap_from_initiator(&responder, &m).unwrap(),
+                other => panic!("at {stop:?}: {other:?}"),
+            };
+            assert_eq!(answer, eap::EapPacket { code: eap::code::RESPONSE, identifier: 0x51, data: vec![2] });
+            assert_eq!(finish(initiator, responder, &next), Outcome::Established, "at {stop:?}");
+        }
+    }
+
+    #[test]
+    fn eap_answers_a_duplicate_request_with_its_first_response() {
+        // RFC 3748 §4.1: a duplicate Request gets the original Response,
+        // and is not processed again -- a second peer challenge would make
+        // the first NT-Response, the one the server holds, a stranger.
+        let (mut initiator, responder, challenge, _) = run_until(Step::Challenge);
+        let first = match initiator.handle(&challenge, &mut SeedEntropy::new(1)).unwrap() {
+            EapEvent::Reply(m) => eap_from_initiator(&responder, &m).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        let nt = initiator.nt_response;
+        let again = match initiator.handle(&challenge, &mut SeedEntropy::new(99)).unwrap() {
+            EapEvent::Reply(m) => eap_from_initiator(&responder, &m).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(again, first);
+        assert_eq!(initiator.nt_response, nt);
+
+        // The same Identifier on a Request that isn't the same is no
+        // duplicate: it is invalid.
+        let (mut initiator, responder, challenge, _) = run_until(Step::Challenge);
+        let p = eap_from_responder(&initiator, &challenge).unwrap();
+        assert!(matches!(initiator.handle(&challenge, &mut SeedEntropy::new(1)), Ok(EapEvent::Reply(_))));
+        let other = responder_eap(&responder, &eap::EapPacket { data: eap::build_challenge(1, &[0x77; 16], b"ryke"), ..p });
+        assert!(matches!(initiator.handle(&other, &mut SeedEntropy::new(1)), Ok(EapEvent::Failed(None))));
+    }
+
+    #[test]
+    fn eap_refuses_eap_packets_a_peer_never_receives() {
+        for code in [eap::code::RESPONSE, 5] {
+            let (mut initiator, responder, msg, _) = run_until(Step::Challenge);
+            let p = eap_from_responder(&initiator, &msg).unwrap();
+            let odd = responder_eap(&responder, &eap::EapPacket { code, ..p });
+            let got = initiator.handle(&odd, &mut SeedEntropy::new(1));
+            assert!(matches!(got, Ok(EapEvent::Failed(None))), "code {code}: {got:?}");
+        }
+    }
+
+    /// An AUTH over the initiator's signed octets keyed by the MSK that an
+    /// empty password and an all-zero NT-Response give -- which anyone can
+    /// compute.
+    fn auth_anyone_can_compute(initiator: &EapInitiator, idi: &[u8]) -> Authentication {
+        let algo = initiator.sa.suite.prf_algorithm();
+        let msk = mschapv2::derive_msk("", &[0u8; 24]);
+        let octets = initiator_signed_octets(algo, &initiator.sa.init_message, &initiator.sa.nr, &initiator.sa.keys.sk_pi, idi);
+        Authentication { method: auth_method::SHARED_KEY, data: psk_auth(algo, &msk, &octets) }
+    }
+
+    #[test]
+    fn eap_responder_takes_no_final_auth_before_eap_succeeded() {
+        // Straight after the Identity request.
+        let (initiator, mut responder) = psk_pair();
+        let msg1 = initiator.start(&mut SeedEntropy::new(1)).unwrap();
+        assert!(matches!(responder.handle(&msg1, &mut SeedEntropy::new(2)), Ok(EapEvent::Reply(_))));
+        let auth = auth_anyone_can_compute(&initiator, &initiator.id.to_bytes());
+        let got = responder.handle(&initiator_msg(&initiator, &[(PayloadType::Authentication, auth.to_bytes())]), &mut SeedEntropy::new(2));
+        assert!(matches!(got, Ok(EapEvent::Failed(None))), "{got:?}");
+
+        // In the first message, over an empty IDi.
+        let (initiator, mut responder) = psk_pair();
+        let auth = auth_anyone_can_compute(&initiator, &[]);
+        let msg1 = initiator_msg(
+            &initiator,
+            &[
+                (PayloadType::IdInitiator, initiator.id.to_bytes()),
+                (PayloadType::Authentication, auth.to_bytes()),
+                (PayloadType::SecurityAssociation, esp_offer(0x1111).to_bytes()),
+                (PayloadType::TrafficSelectorInitiator, full_tunnel_ts()),
+                (PayloadType::TrafficSelectorResponder, full_tunnel_ts()),
+            ],
+        );
+        let got = responder.handle(&msg1, &mut SeedEntropy::new(2));
+        assert!(matches!(got, Ok(EapEvent::Failed(None))), "{got:?}");
+
+        // After the Challenge, with the MSCHAPv2 answer skipped.
+        let (initiator, mut responder, _, _) = run_until(Step::Challenge);
+        let auth = auth_anyone_can_compute(&initiator, &initiator.id.to_bytes());
+        let got = responder.handle(&initiator_msg(&initiator, &[(PayloadType::Authentication, auth.to_bytes())]), &mut SeedEntropy::new(2));
+        assert!(matches!(got, Ok(EapEvent::Failed(None))), "{got:?}");
+    }
+
+    #[test]
+    fn eap_responder_needs_the_identity_before_the_challenge_answer() {
+        // An MSCHAPv2 Response in place of the Identity one would be checked
+        // against no user's password and a challenge never sent.
+        let (initiator, mut responder) = psk_pair();
+        let msg1 = initiator.start(&mut SeedEntropy::new(1)).unwrap();
+        assert!(matches!(responder.handle(&msg1, &mut SeedEntropy::new(2)), Ok(EapEvent::Reply(_))));
+        let data = eap::build_response(1, &[0u8; 16], &[0x44; 16], b"", "");
+        let resp = eap::EapPacket { code: eap::code::RESPONSE, identifier: 1, data };
+        let got = responder.handle(&initiator_msg(&initiator, &[(PayloadType::Eap, resp.to_bytes())]), &mut SeedEntropy::new(2));
+        assert!(matches!(got, Ok(EapEvent::Failed(None))), "{got:?}");
+    }
+
+    /// `msg` from the initiator with its EAP packet changed by `f`.
+    fn with_initiator_eap(initiator: &EapInitiator, responder: &EapResponder, msg: &[u8], f: impl FnOnce(&mut eap::EapPacket)) -> Vec<u8> {
+        let mut p = eap_from_initiator(responder, msg).unwrap();
+        f(&mut p);
+        initiator_msg(initiator, &[(PayloadType::Eap, p.to_bytes())])
+    }
+
+    #[test]
+    fn eap_responder_discards_answers_to_requests_it_did_not_send() {
+        // RFC 3748 §4.1: a Response whose Identifier is not the outstanding
+        // Request's MUST be discarded.
+        let (mut initiator, mut responder) = psk_pair();
+        let msg1 = initiator.start(&mut SeedEntropy::new(1)).unwrap();
+        let EapEvent::Reply(identity) = responder.handle(&msg1, &mut SeedEntropy::new(2)).unwrap() else { panic!() };
+        let EapEvent::Reply(answer) = initiator.handle(&identity, &mut SeedEntropy::new(1)).unwrap() else { panic!() };
+        let wrong = with_initiator_eap(&initiator, &responder, &answer, |p| p.identifier ^= 0x80);
+        let got = responder.handle(&wrong, &mut SeedEntropy::new(2));
+        assert!(matches!(got, Ok(EapEvent::Failed(None))), "EAP Identifier: {got:?}");
+        // That ended the exchange: the right answer finds nothing to go on.
+        let got = responder.handle(&answer, &mut SeedEntropy::new(2));
+        assert!(matches!(got, Ok(EapEvent::Failed(None))), "after a failure: {got:?}");
+
+        // Only a Response answers a Request.
+        let (mut initiator, mut responder) = psk_pair();
+        let msg1 = initiator.start(&mut SeedEntropy::new(1)).unwrap();
+        let EapEvent::Reply(identity) = responder.handle(&msg1, &mut SeedEntropy::new(2)).unwrap() else { panic!() };
+        let EapEvent::Reply(answer) = initiator.handle(&identity, &mut SeedEntropy::new(1)).unwrap() else { panic!() };
+        let wrong = with_initiator_eap(&initiator, &responder, &answer, |p| p.code = eap::code::REQUEST);
+        let got = responder.handle(&wrong, &mut SeedEntropy::new(2));
+        assert!(matches!(got, Ok(EapEvent::Failed(None))), "EAP Request: {got:?}");
+
+        // The MSCHAPv2 Response must answer our Challenge's MS-CHAPv2-ID.
+        let (mut initiator, mut responder, challenge, _) = run_until(Step::Challenge);
+        let EapEvent::Reply(answer) = initiator.handle(&challenge, &mut SeedEntropy::new(1)).unwrap() else { panic!() };
+        let wrong = with_initiator_eap(&initiator, &responder, &answer, |p| p.data[2] ^= 0x80);
+        let got = responder.handle(&wrong, &mut SeedEntropy::new(2));
+        assert!(matches!(got, Ok(EapEvent::Failed(None))), "MS-CHAPv2-ID: {got:?}");
+
+        // A Success-Response while our Challenge is outstanding.
+        let (initiator, mut responder, challenge, _) = run_until(Step::Challenge);
+        let id = eap_from_responder(&initiator, &challenge).unwrap().identifier;
+        let early = eap::EapPacket { code: eap::code::RESPONSE, identifier: id, data: vec![eap::eap_type::MSCHAPV2, eap::op::SUCCESS] };
+        let got = responder.handle(&initiator_msg(&initiator, &[(PayloadType::Eap, early.to_bytes())]), &mut SeedEntropy::new(2));
+        assert!(matches!(got, Ok(EapEvent::Failed(None))), "early Success-Response: {got:?}");
+
+        // An Identity Response while our Challenge is outstanding.
+        let (initiator, mut responder, challenge, _) = run_until(Step::Challenge);
+        let id = eap_from_responder(&initiator, &challenge).unwrap().identifier;
+        let late = eap::EapPacket { code: eap::code::RESPONSE, identifier: id, data: [&[eap::eap_type::IDENTITY][..], b"alice"].concat() };
+        let got = responder.handle(&initiator_msg(&initiator, &[(PayloadType::Eap, late.to_bytes())]), &mut SeedEntropy::new(2));
+        assert!(matches!(got, Ok(EapEvent::Failed(None))), "late Identity: {got:?}");
+    }
+
+    #[test]
+    fn eap_responder_takes_each_step_once_and_alone() {
+        // The first request once: a second would swap the IDi the final
+        // AUTH is checked over, and the CHILD SA's SPI, mid-exchange.
+        let (initiator, mut responder) = psk_pair();
+        let msg1 = initiator.start(&mut SeedEntropy::new(1)).unwrap();
+        assert!(matches!(responder.handle(&msg1, &mut SeedEntropy::new(2)), Ok(EapEvent::Reply(_))));
+        let got = responder.handle(&msg1, &mut SeedEntropy::new(2));
+        assert!(matches!(got, Ok(EapEvent::Failed(None))), "a second first request: {got:?}");
+
+        // No AUTH rides with an EAP answer: while EAP runs there is no MSK.
+        let (mut initiator, mut responder) = psk_pair();
+        let msg1 = initiator.start(&mut SeedEntropy::new(1)).unwrap();
+        let EapEvent::Reply(identity) = responder.handle(&msg1, &mut SeedEntropy::new(2)).unwrap() else { panic!() };
+        let EapEvent::Reply(answer) = initiator.handle(&identity, &mut SeedEntropy::new(1)).unwrap() else { panic!() };
+        let p = eap_from_initiator(&responder, &answer).unwrap();
+        let auth = auth_anyone_can_compute(&initiator, &initiator.id.to_bytes());
+        let both = initiator_msg(&initiator, &[(PayloadType::Authentication, auth.to_bytes()), (PayloadType::Eap, p.to_bytes())]);
+        let got = responder.handle(&both, &mut SeedEntropy::new(2));
+        assert!(matches!(got, Ok(EapEvent::Failed(None))), "AUTH with the Identity answer: {got:?}");
+    }
+
+    #[test]
+    fn eap_responder_wants_the_final_auth_as_a_shared_key_mic() {
+        // RFC 7296 §2.16: the MSK-keyed AUTH is a Shared Key Message
+        // Integrity Code, method 2.
+        let (mut initiator, mut responder, eap_success, _) = run_until(Step::EapSuccess);
+        let EapEvent::Reply(auth_msg) = initiator.handle(&eap_success, &mut SeedEntropy::new(1)).unwrap() else { panic!() };
+        let (_, ps) = decrypt(&responder.sa, &auth_msg).unwrap();
+        let mut auth = Authentication::parse(find(&ps, PayloadType::Authentication).unwrap()).unwrap();
+        auth.method = auth_method::RSA_SIG;
+        let got = responder.handle(&initiator_msg(&initiator, &[(PayloadType::Authentication, auth.to_bytes())]), &mut SeedEntropy::new(2));
+        assert!(matches!(got, Ok(EapEvent::Failed(None))), "{got:?}");
+    }
+
+    #[test]
+    fn eap_responder_answers_the_real_exchange_step_by_step() {
+        // Positive control: the requests the responder sends, in order, with
+        // the EAP Identifiers moving on and the Success carrying the last
+        // Response's.
+        let (mut initiator, mut responder) = psk_pair();
+        let mut ie = SeedEntropy::new(1);
+        let mut re = SeedEntropy::new(2);
+        let mut in_flight = initiator.start(&mut ie).unwrap();
+        let mut seen = Vec::new();
+        loop {
+            match responder.handle(&in_flight, &mut re).unwrap() {
+                EapEvent::Reply(m) => {
+                    let answered = eap_from_initiator(&responder, &in_flight).map(|p| p.identifier);
+                    let p = eap_from_responder(&initiator, &m);
+                    seen.push((step_of(&initiator, &m), p.map(|p| p.identifier), answered));
+                    let EapEvent::Reply(next) = initiator.handle(&m, &mut ie).unwrap() else { panic!() };
+                    in_flight = next;
+                }
+                EapEvent::Established(Some(f)) => {
+                    assert!(matches!(initiator.handle(&f, &mut ie).unwrap(), EapEvent::Established(None)));
+                    break;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (Step::Identity, Some(1), None),
+                (Step::Challenge, Some(2), Some(1)),
+                (Step::SuccessRequest, Some(3), Some(2)),
+                (Step::EapSuccess, Some(3), Some(3)),
+            ]
+        );
     }
 }

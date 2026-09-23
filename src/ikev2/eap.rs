@@ -16,6 +16,7 @@ pub mod code {
 /// EAP method Types.
 pub mod eap_type {
     pub const IDENTITY: u8 = 1;
+    pub const NOTIFICATION: u8 = 2;
     pub const NAK: u8 = 3;
     pub const MSCHAPV2: u8 = 26;
 }
@@ -150,6 +151,32 @@ pub fn build_success(mschap_id: u8, auth_response: &str) -> Vec<u8> {
     d
 }
 
+/// Parse an EAP-MSCHAPv2 **Success** Request (server → peer), returning the
+/// authenticator response its message opens with: `"S="` and the 20 octets
+/// as 40 hex digits (RFC 2759 §8.7, draft-kamath-pppext-eap-mschapv2 §2.3).
+/// The digits are read in either case -- they are a number. What follows
+/// them, normally `" M=<message>"`, is not read.
+pub fn parse_success(data: &[u8]) -> Result<[u8; 20], IkeError> {
+    const BAD: IkeError = IkeError::Crypto("not an EAP-MSCHAPv2 Success with an authenticator response");
+    fn nibble(digit: u8) -> Result<u8, IkeError> {
+        match digit {
+            b'0'..=b'9' => Ok(digit - b'0'),
+            b'A'..=b'F' => Ok(digit - b'A' + 10),
+            b'a'..=b'f' => Ok(digit - b'a' + 10),
+            _ => Err(BAD),
+        }
+    }
+    if data.len() < 5 || data[0] != eap_type::MSCHAPV2 || data[1] != op::SUCCESS {
+        return Err(BAD);
+    }
+    let digits = data[5..].strip_prefix(b"S=").and_then(|m| m.get(..40)).ok_or(BAD)?;
+    let mut out = [0u8; 20];
+    for (byte, pair) in out.iter_mut().zip(digits.chunks(2)) {
+        *byte = nibble(pair[0])? << 4 | nibble(pair[1])?;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +219,30 @@ mod tests {
 
         // Wrong password is rejected.
         assert_eq!(verify_response(&auth_challenge, &resp, "wrong").unwrap_err(), IkeError::AuthFailed);
+    }
+
+    #[test]
+    fn parse_success_reads_the_authenticator_response_and_nothing_else() {
+        // RFC 2759 §9.2's authenticator response.
+        let want = [0x40, 0x7A, 0x55, 0x89, 0x11, 0x5F, 0xD0, 0xD6, 0x20, 0x9F, 0x51, 0x0F, 0xE9, 0xC0, 0x45, 0x66, 0x93, 0x2C, 0xDA, 0x56];
+        for text in ["S=407A5589115FD0D6209F510FE9C04566932CDA56", "S=407a5589115fd0d6209f510fe9c04566932cda56 M=Welcome"] {
+            assert_eq!(parse_success(&build_success(1, text)).unwrap(), want, "{text}");
+        }
+        for text in [
+            "",
+            "M=Welcome",
+            "S=407A5589115FD0D6209F510FE9C04566932CDA5",
+            "s=407A5589115FD0D6209F510FE9C04566932CDA56",
+            "S=G07A5589115FD0D6209F510FE9C04566932CDA56",
+            "S=+07A5589115FD0D6209F510FE9C04566932CDA56",
+            " S=407A5589115FD0D6209F510FE9C04566932CDA56",
+        ] {
+            assert!(parse_success(&build_success(1, text)).is_err(), "{text:?}");
+        }
+        // Only an MSCHAPv2 Success carries one.
+        let mut data = build_success(1, "S=407A5589115FD0D6209F510FE9C04566932CDA56");
+        data[1] = op::FAILURE;
+        assert!(parse_success(&data).is_err());
+        assert!(parse_success(&[eap_type::MSCHAPV2, op::SUCCESS, 1, 0]).is_err());
     }
 }

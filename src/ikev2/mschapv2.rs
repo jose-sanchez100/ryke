@@ -100,6 +100,24 @@ pub fn generate_authenticator_response(
     authenticator_challenge: &[u8; 16],
     user_name: &[u8],
 ) -> String {
+    let digest = authenticator_response(password, nt_response, peer_challenge, authenticator_challenge, user_name);
+    let mut s = String::with_capacity(2 + 40);
+    s.push_str("S=");
+    for b in digest {
+        s.push_str(&format!("{b:02X}"));
+    }
+    s
+}
+
+/// The 20 octets of RFC 2759 §8.7's authenticator response, the number
+/// [`generate_authenticator_response`] writes out in hex.
+pub fn authenticator_response(
+    password: &str,
+    nt_response: &[u8; 24],
+    peer_challenge: &[u8; 16],
+    authenticator_challenge: &[u8; 16],
+    user_name: &[u8],
+) -> [u8; 20] {
     let password_hash = nt_password_hash(password);
     let password_hash_hash = hash_nt_password_hash(&password_hash);
 
@@ -114,14 +132,7 @@ pub fn generate_authenticator_response(
     h2.update(digest);
     h2.update(challenge);
     h2.update(MAGIC2);
-    let digest2 = h2.finalize();
-
-    let mut s = String::with_capacity(2 + 40);
-    s.push_str("S=");
-    for b in digest2 {
-        s.push_str(&format!("{b:02X}"));
-    }
-    s
+    h2.finalize().into()
 }
 
 // --- EAP-MSCHAPv2 key derivation (RFC 3079 + draft-kamath-pppext-eap-mschapv2) ---

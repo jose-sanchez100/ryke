@@ -174,7 +174,11 @@ fn parse_sa_init(header: &IkeHeader, body: &[u8]) -> Result<SaInitPayloads, IkeE
                     // `PeerRejected` -- the caller needs to be able to tell
                     // "retry with this" apart from "stop, the peer refused".
                     if n.notify_type == notify_type::COOKIE {
-                        cookie = Some(n.data);
+                        // "MUST be between 1 and 64 octets" (§2.6); anything
+                        // else is no cookie to echo.
+                        if (1..=64).contains(&n.data.len()) {
+                            cookie = Some(n.data);
+                        }
                     } else if n.notify_type == notify_type::INVALID_KE_PAYLOAD {
                         invalid_ke_group = (n.data.len() == 2).then(|| u16::from_be_bytes([n.data[0], n.data[1]]));
                     } else if n.is_error() {
@@ -267,8 +271,27 @@ fn base_header(spi_i: u64, spi_r: u64, flags: Flags) -> IkeHeader {
 }
 
 fn build_sa_init(header: IkeHeader, sa: &SecurityAssociation, dh_group: u16, dh_public: &[u8], nonce: &[u8], extra_notifies: &[Notify]) -> Vec<u8> {
+    build_sa_init_with_cookie(header, None, sa, dh_group, dh_public, nonce, extra_notifies)
+}
+
+/// [`build_sa_init`], led by a COOKIE notify when `cookie` is `Some`: a retry
+/// after a COOKIE challenge carries it "as the first payload, and all other
+/// payloads unchanged" (RFC 7296 §2.6).
+fn build_sa_init_with_cookie(
+    header: IkeHeader,
+    cookie: Option<&[u8]>,
+    sa: &SecurityAssociation,
+    dh_group: u16,
+    dh_public: &[u8],
+    nonce: &[u8],
+    extra_notifies: &[Notify],
+) -> Vec<u8> {
     let ke = KeyExchange { dh_group, data: dh_public.to_vec() };
-    let mut b = MessageBuilder::new(header)
+    let mut b = MessageBuilder::new(header);
+    if let Some(cookie) = cookie {
+        b = b.push(PayloadType::Notify, Notify::status(notify_type::COOKIE, cookie.to_vec()).to_bytes());
+    }
+    let mut b = b
         .push(PayloadType::SecurityAssociation, sa.to_bytes())
         .push(PayloadType::KeyExchange, ke.to_bytes())
         .push(PayloadType::Nonce, Nonce { data: nonce.to_vec() }.to_bytes())
@@ -384,14 +407,64 @@ pub fn initiator_request_natt_retry(
     // `responder_respond_inner`, which hashes with its own real spi_r once it
     // has one -- symmetric only once we re-hash with the real spi_r to check
     // *its* response, done in `initiator_complete_natt`).
-    let mut extra_notifies = vec![
+    let extra_notifies = [
         natt::source_ip_notify(local.spi, 0, claimed.ip(), claimed.port()),
         natt::destination_ip_notify(local.spi, 0, peer_addr.ip(), peer_addr.port()),
     ];
-    if let Some(cookie) = cookie {
-        extra_notifies.push(Notify::status(notify_type::COOKIE, cookie.to_vec()));
+    build_sa_init_with_cookie(header, cookie, offer, group.transform_id(), &public, &local.nonce, &extra_notifies)
+}
+
+/// What an `IKE_SA_INIT` initiator carries into its next attempt after the
+/// responder answered with a stateless challenge instead of an SA (RFC 7296
+/// §2.6, §2.6.1, §1.2): the latest COOKIE to echo, and the DH group the
+/// responder named in INVALID_KE_PAYLOAD. Everything else -- SPIi, SAi1, Ni
+/// -- is resent unchanged.
+#[derive(Debug, Default)]
+pub struct SaInitRetry {
+    /// The cookie to echo as the first payload of the next attempt.
+    pub cookie: Option<Vec<u8>>,
+    /// The group to send the KE in instead of the offer's first one.
+    pub group: Option<DhGroup>,
+    cookies: u32,
+}
+
+impl SaInitRetry {
+    /// COOKIE challenges answered before giving up (§2.6: "The initiator
+    /// should limit the number of cookie exchanges it tries"). Three covers
+    /// §2.6.1's longer exchange -- a cookie, then a fresh one after the KE was
+    /// corrected -- plus one more from a responder that rotated its secret.
+    pub const MAX_COOKIES: u32 = 3;
+
+    /// Take in the challenge `err` from the last attempt: `Ok(())` to retry
+    /// with [`Self::cookie`] / [`Self::group`], or the error to give up with.
+    /// An INVALID_KE_PAYLOAD is honoured once, and only when it names a group
+    /// `offer` proposes other than the one already sent: the KE's group MUST
+    /// be one the same message's SA proposes (§3.4), and resending the same
+    /// KE could only draw the same answer.
+    pub fn absorb(&mut self, err: IkeError, offer: &SecurityAssociation) -> Result<(), IkeError> {
+        match err {
+            IkeError::CookieRequired { cookie } if self.cookies < Self::MAX_COOKIES => {
+                self.cookies += 1;
+                self.cookie = Some(cookie);
+                Ok(())
+            }
+            IkeError::InvalidKeGroup(id) if self.group.is_none() => {
+                let offered = offer
+                    .proposals
+                    .iter()
+                    .flat_map(|p| &p.transforms)
+                    .any(|t| t.transform_type == transform_type::DH && t.transform_id == id);
+                match DhGroup::from_transform_id(id) {
+                    Some(group) if offered && group != offer_dh_group(offer) => {
+                        self.group = Some(group);
+                        Ok(())
+                    }
+                    _ => Err(IkeError::InvalidKeGroup(id)),
+                }
+            }
+            err => Err(err),
+        }
     }
-    build_sa_init(header, offer, group.transform_id(), &public, &local.nonce, &extra_notifies)
 }
 
 /// A COOKIE challenge policy (RFC 7296 §2.6) — return-routability against
@@ -1107,6 +1180,107 @@ mod tests {
 
         let err = initiator_complete(&init, &request, &response).unwrap_err();
         assert_eq!(err, IkeError::InvalidKeGroup(transform_id::MODP_2048));
+    }
+
+    /// RFC 7296 §2.6: the retry carries the COOKIE "as the first payload, and
+    /// all other payloads unchanged" -- byte for byte the first attempt after it.
+    #[test]
+    fn a_cookie_retry_leads_with_the_cookie_and_resends_the_rest_unchanged() {
+        let init = init_secret();
+        let (ours, peer) = ("192.0.2.1:500".parse().unwrap(), "198.51.100.1:500".parse().unwrap());
+        let first = initiator_request_natt_retry(&init, &default_offer(), ours, peer, false, None, None);
+        let retry = initiator_request_natt_retry(&init, &default_offer(), ours, peer, false, Some(&[0xAB; 20]), None);
+
+        let header = IkeHeader::parse(&retry).unwrap();
+        assert_eq!(header.next_payload, PayloadType::Notify);
+        let lead = payloads(header.next_payload, &retry[IkeHeader::LEN..]).next().unwrap().unwrap();
+        let cookie = Notify::parse(lead.data).unwrap();
+        assert_eq!((cookie.notify_type, cookie.data), (notify_type::COOKIE, vec![0xAB; 20]));
+        // Generic payload header (4) + Notify header (4) + the cookie.
+        let lead_len = 4 + 4 + 20;
+        assert_eq!(retry[IkeHeader::LEN], first[16], "the cookie is followed by what the first attempt led with");
+        assert_eq!(&retry[IkeHeader::LEN + lead_len..], &first[IkeHeader::LEN..]);
+        assert_eq!((header.message_id, header.initiator_spi, header.responder_spi), (0, init.spi, 0));
+    }
+
+    /// RFC 7296 §2.6: COOKIE data "MUST be between 1 and 64 octets in length
+    /// (inclusive)". A bare notify outside that range is no challenge to echo.
+    #[test]
+    fn a_cookie_outside_1_to_64_octets_is_not_echoed() {
+        let init = init_secret();
+        let request = initiator_request(&init, &default_offer());
+        let answer = |len: usize| {
+            let header = base_header(init.spi, 0, Flags { initiator: false, version: false, response: true });
+            let notify = Notify::status(notify_type::COOKIE, vec![0xAA; len]);
+            let response = MessageBuilder::new(header).push(PayloadType::Notify, notify.to_bytes()).build();
+            initiator_complete(&init, &request, &response).unwrap_err()
+        };
+        for len in [1, 64] {
+            assert_eq!(answer(len), IkeError::CookieRequired { cookie: vec![0xAA; len] }, "{len} octets");
+        }
+        for len in [0, 65, 200] {
+            assert_eq!(answer(len), IkeError::MissingPayload("SA"), "{len} octets");
+        }
+    }
+
+    /// `default_offer` (X25519) also proposing MODP-2048 and ECP-256.
+    fn offer_with_three_groups() -> SecurityAssociation {
+        let mut offer = default_offer();
+        for id in [transform_id::MODP_2048, transform_id::ECP256] {
+            offer.proposals[0].transforms.push(Transform { transform_type: transform_type::DH, transform_id: id, key_length: None });
+        }
+        offer
+    }
+
+    /// §2.6.1: the longer exchange (cookie, INVALID_KE, fresh cookie) is
+    /// followed, the latest cookie is the one echoed, and cookies are bounded.
+    #[test]
+    fn an_sa_init_retry_follows_cookies_and_one_group_correction() {
+        let offer = offer_with_three_groups();
+        let mut retry = SaInitRetry::default();
+        retry.absorb(IkeError::CookieRequired { cookie: vec![1] }, &offer).unwrap();
+        retry.absorb(IkeError::InvalidKeGroup(transform_id::MODP_2048), &offer).unwrap();
+        retry.absorb(IkeError::CookieRequired { cookie: vec![2] }, &offer).unwrap();
+        assert_eq!((retry.cookie.as_deref(), retry.group), (Some(&[2u8][..]), Some(DhGroup::Modp2048)));
+        let request = initiator_request_natt_retry(
+            &init_secret(), &offer, "192.0.2.1:500".parse().unwrap(), "198.51.100.1:500".parse().unwrap(),
+            false, retry.cookie.as_deref(), retry.group,
+        );
+        let header = IkeHeader::parse(&request).unwrap();
+        let ke = payloads(header.next_payload, &request[IkeHeader::LEN..])
+            .map(Result::unwrap)
+            .find(|p| p.payload_type == PayloadType::KeyExchange)
+            .map(|p| KeyExchange::parse(p.data).unwrap())
+            .unwrap();
+        assert_eq!(ke.dh_group, transform_id::MODP_2048);
+
+        retry.absorb(IkeError::CookieRequired { cookie: vec![3] }, &offer).unwrap();
+        assert_eq!(
+            retry.absorb(IkeError::CookieRequired { cookie: vec![4] }, &offer),
+            Err(IkeError::CookieRequired { cookie: vec![4] }),
+            "at most {} cookie exchanges",
+            SaInitRetry::MAX_COOKIES
+        );
+    }
+
+    /// §3.4 / §1.2: INVALID_KE_PAYLOAD is honoured once, for a group we
+    /// offered and did not already send. Anything else is given up on.
+    #[test]
+    fn an_sa_init_retry_refuses_a_group_correction_it_cannot_honour() {
+        let offer = offer_with_three_groups();
+        for named in [transform_id::MODP_3072, transform_id::X25519, 0xFFF0] {
+            let mut retry = SaInitRetry::default();
+            assert_eq!(retry.absorb(IkeError::InvalidKeGroup(named), &offer), Err(IkeError::InvalidKeGroup(named)), "group {named}");
+            assert_eq!(retry.group, None);
+        }
+        let mut retry = SaInitRetry::default();
+        retry.absorb(IkeError::InvalidKeGroup(transform_id::ECP256), &offer).unwrap();
+        assert_eq!(
+            retry.absorb(IkeError::InvalidKeGroup(transform_id::MODP_2048), &offer),
+            Err(IkeError::InvalidKeGroup(transform_id::MODP_2048)),
+            "a second correction"
+        );
+        assert_eq!(retry.absorb(IkeError::NoProposalChosen, &offer), Err(IkeError::NoProposalChosen));
     }
 
     /// `default_offer` with its PRF swapped for `prf`.

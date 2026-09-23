@@ -25,7 +25,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crate::crypto::{derive_child_keys, DhGroup, IntegAlgorithm};
+use crate::crypto::{derive_child_keys, IntegAlgorithm};
 use crate::debug::ike_debug;
 use crate::entropy::{Entropy, OsEntropy};
 use crate::error::IkeError;
@@ -33,7 +33,7 @@ use crate::esp::ChildSa;
 use crate::ikev2::eap_auth::{EapEvent, EapInitiator, ServerVerify};
 use crate::ikev2::exchange::{
     default_offer, initiator_complete_natt, initiator_request_natt_retry, CompletedSaInit, LocalSecret,
-    NatStatus,
+    NatStatus, SaInitRetry,
 };
 use crate::ikev2::fragment::{self, Accepted, MessageKey, Reassembly};
 use crate::ikev2::ike_auth::{self, AuthConfig, ChildTsOffer};
@@ -2517,16 +2517,12 @@ impl<E: Entropy> Ikev2Session<E> {
     /// was -- plus the address that socket's traffic actually carries as its
     /// source from now on.
     /// Run `IKE_SA_INIT` to completion over `sock`, transparently retrying
-    /// through a `COOKIE` challenge and/or an `INVALID_KE_PAYLOAD` correction
-    /// (RFC 7296 §2.6, §1.2/§2.7): a responder under load, or one that just
-    /// doesn't support our guessed DH group, answers with a bare Notify and
-    /// keeps no state at all -- the previous behavior surfaced that as a
-    /// generic parse failure (`MissingPayload("SA")` or `PeerRejected`),
-    /// which is indistinguishable from an outright refusal, so this crate
-    /// gave up against a perfectly healthy gateway. Bounded to
-    /// `MAX_SA_INIT_CHALLENGES` extra round trips -- enough for either
-    /// challenge alone or a COOKIE-then-INVALID_KE chain -- so a responder
-    /// that keeps challenging forever (buggy or hostile) can't hang this.
+    /// through `COOKIE` challenges and an `INVALID_KE_PAYLOAD` correction
+    /// (RFC 7296 §2.6, §2.6.1, §1.2/§2.7): a responder under load, or one that
+    /// just doesn't support our guessed DH group, answers with a bare Notify
+    /// and keeps no state at all. What a retry may carry, and how many are
+    /// made before giving up, is [`SaInitRetry`]'s: a responder that keeps
+    /// challenging forever (buggy or hostile) can't hang this.
     fn sa_init_round_trip(
         &mut self,
         local: &LocalSecret,
@@ -2535,30 +2531,22 @@ impl<E: Entropy> Ikev2Session<E> {
         peer: SocketAddr,
         sock: &UdpSocket,
     ) -> Result<(CompletedSaInit, NatStatus), DriverError> {
-        const MAX_SA_INIT_CHALLENGES: u32 = 2;
-        let mut cookie: Option<Vec<u8>> = None;
-        let mut ke_group: Option<DhGroup> = None;
-        let mut challenges = 0u32;
+        let mut retry = SaInitRetry::default();
         loop {
-            let req = initiator_request_natt_retry(local, offer, our_addr, peer, self.force_natt, cookie.as_deref(), ke_group);
+            let req = initiator_request_natt_retry(local, offer, our_addr, peer, self.force_natt, retry.cookie.as_deref(), retry.group);
             ike_debug!("IKE_SA_INIT: sending to {peer} (spi_i={:016x})", local.spi);
             let resp = send_and_retry(sock, peer, &req)?;
             match initiator_complete_natt(local, &req, &resp, our_addr, peer) {
                 Ok(outcome) => return Ok(outcome),
-                Err(IkeError::CookieRequired { cookie: c }) if challenges < MAX_SA_INIT_CHALLENGES => {
-                    ike_debug!("IKE_SA_INIT: responder requires a return-routability cookie (RFC 7296 §2.6) -- retrying with it echoed back");
-                    cookie = Some(c);
-                    challenges += 1;
-                }
-                Err(IkeError::InvalidKeGroup(group)) if challenges < MAX_SA_INIT_CHALLENGES => {
-                    let Some(group) = DhGroup::from_transform_id(group) else {
-                        return Err(IkeError::InvalidKeGroup(group).into());
+                Err(e) => {
+                    let challenge = match &e {
+                        IkeError::CookieRequired { .. } => "requires a return-routability cookie (RFC 7296 §2.6)",
+                        IkeError::InvalidKeGroup(_) => "wants a different DH group (RFC 7296 §2.7, INVALID_KE_PAYLOAD)",
+                        _ => return Err(e.into()),
                     };
-                    ike_debug!("IKE_SA_INIT: responder wants a different DH group (RFC 7296 §2.7, INVALID_KE_PAYLOAD) -- retrying");
-                    ke_group = Some(group);
-                    challenges += 1;
+                    retry.absorb(e, offer)?;
+                    ike_debug!("IKE_SA_INIT: responder {challenge} -- retrying");
                 }
-                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -3225,6 +3213,7 @@ pub fn default_esp_offer() -> SecurityAssociation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::DhGroup;
     use crate::entropy::OsEntropy;
     use crate::ikev2::eap_auth::{EapResponder, ServerAuth};
     use crate::ikev2::exchange::{
@@ -5231,6 +5220,115 @@ mod tests {
         let local_port = next_addr().port();
         let (_sock, _our_addr, _sa, _nat) = session.sa_init_on_port(bind, &default_ike_offer(), local_port).unwrap();
         responder.join().unwrap();
+    }
+
+    /// A bare `IKE_SA_INIT` response to `request` carrying only one Notify --
+    /// the COOKIE or INVALID_KE_PAYLOAD challenge of RFC 7296 §2.6 / §1.2.
+    fn bare_sa_init_answer(request: &[u8], notify: u16, data: Vec<u8>) -> Vec<u8> {
+        use crate::ikev2::message::MessageBuilder;
+        use crate::ikev2::payload::Notify;
+        let mut header = IkeHeader::parse(request).unwrap();
+        header.flags = Flags { initiator: false, version: false, response: true };
+        header.next_payload = PayloadType::NoNext;
+        header.length = 0;
+        MessageBuilder::new(header).push(PayloadType::Notify, Notify::status(notify, data).to_bytes()).build()
+    }
+
+    /// `request`'s payloads, in order, as (type, body) pairs.
+    fn sa_init_payloads(request: &[u8]) -> Vec<(PayloadType, Vec<u8>)> {
+        let header = IkeHeader::parse(request).unwrap();
+        crate::ikev2::message::payloads(header.next_payload, &request[IkeHeader::LEN..])
+            .map(|p| p.map(|p| (p.payload_type, p.data.to_vec())).unwrap())
+            .collect()
+    }
+
+    /// RFC 7296 §2.6.1: an initiator MUST NOT fail when the responder does not
+    /// take the shorter exchange -- here it binds its cookie to the KE, so the
+    /// corrected request draws a fresh COOKIE before it is answered. Every
+    /// retry carries the latest cookie as its FIRST payload (§2.6 MUST) with
+    /// SAi1 and Ni exactly as first sent.
+    #[test]
+    fn sa_init_follows_cookie_then_invalid_ke_then_a_fresh_cookie() {
+        use crate::ikev2::payload::{transform_id, Notify};
+        let bind = next_addr();
+        let responder = thread::spawn(move || {
+            let sock = UdpSocket::bind(bind).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let resp_secret = LocalSecret::generate(&mut OsEntropy::new().unwrap(), 32);
+            let mut buf = [0u8; 2048];
+            let mut first: Option<Vec<(PayloadType, Vec<u8>)>> = None;
+            for step in 0..4 {
+                let (n, from) = sock.recv_from(&mut buf).unwrap();
+                let req = buf[..n].to_vec();
+                let got = sa_init_payloads(&req);
+                let expected_cookie = match step {
+                    0 => None,
+                    1 | 2 => Some(vec![0xC1u8; 16]),
+                    _ => Some(vec![0xC2u8; 40]),
+                };
+                let body = match &expected_cookie {
+                    None => got.clone(),
+                    Some(c) => {
+                        assert_eq!(got[0].0, PayloadType::Notify, "step {step}: the COOKIE must be the first payload");
+                        let n = Notify::parse(&got[0].1).unwrap();
+                        assert_eq!((n.notify_type, &n.data), (notify_type::COOKIE, c), "step {step}");
+                        got[1..].to_vec()
+                    }
+                };
+                let first = first.get_or_insert_with(|| body.clone());
+                let pick = |v: &[(PayloadType, Vec<u8>)], t| v.iter().find(|(pt, _)| *pt == t).unwrap().1.clone();
+                assert_eq!(pick(&body, PayloadType::SecurityAssociation), pick(first, PayloadType::SecurityAssociation), "step {step}: SAi1 unchanged");
+                assert_eq!(pick(&body, PayloadType::Nonce), pick(first, PayloadType::Nonce), "step {step}: Ni unchanged");
+                let answer = match step {
+                    0 => bare_sa_init_answer(&req, notify_type::COOKIE, vec![0xC1; 16]),
+                    1 => bare_sa_init_answer(&req, notify_type::INVALID_KE_PAYLOAD, transform_id::X25519.to_be_bytes().to_vec()),
+                    2 => bare_sa_init_answer(&req, notify_type::COOKIE, vec![0xC2; 40]),
+                    _ => match responder_respond_natt(&req, &resp_secret, bind, from, None).unwrap() {
+                        SaInitResult::Established { response, .. } => response,
+                        _ => panic!("the corrected request must be answered"),
+                    },
+                };
+                sock.send_to(&answer, from).unwrap();
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+        let local_port = next_addr().port();
+        let result = session.sa_init_on_port(bind, &offer_with_a_dh_guess_the_responder_wont_pick(), local_port);
+        responder.join().unwrap();
+        assert_eq!(result.unwrap().2.suite.dh_id, transform_id::X25519);
+    }
+
+    /// RFC 7296 §3.4: the KE's group MUST be one proposed in the same
+    /// message's SA. An INVALID_KE_PAYLOAD naming a group we never offered (or
+    /// the very group we already sent) cannot be corrected by a retry: the
+    /// initiator gives up after the one request instead of resending.
+    #[test]
+    fn sa_init_does_not_retry_an_invalid_ke_it_cannot_honour() {
+        use crate::ikev2::payload::transform_id;
+        for named in [transform_id::MODP_3072, transform_id::X25519, 0xFFF0] {
+            let bind = next_addr();
+            let responder = thread::spawn(move || {
+                let sock = UdpSocket::bind(bind).unwrap();
+                sock.set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+                let mut buf = [0u8; 2048];
+                let mut requests = 0;
+                while let Ok((n, from)) = sock.recv_from(&mut buf) {
+                    requests += 1;
+                    sock.send_to(&bare_sa_init_answer(&buf[..n], notify_type::INVALID_KE_PAYLOAD, named.to_be_bytes().to_vec()), from).unwrap();
+                }
+                requests
+            });
+            thread::sleep(Duration::from_millis(50));
+
+            let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+            let local_port = next_addr().port();
+            // default_ike_offer proposes X25519 only.
+            let err = session.sa_init_on_port(bind, &default_ike_offer(), local_port).unwrap_err();
+            assert!(matches!(err, DriverError::Ike(IkeError::InvalidKeGroup(g)) if g == named), "group {named}: {err:?}");
+            assert_eq!(responder.join().unwrap(), 1, "group {named}: no retry may follow");
+        }
     }
 
     /// `with_forced_natt` over a path with **no** NAT: the responder tells

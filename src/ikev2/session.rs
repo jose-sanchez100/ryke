@@ -3858,6 +3858,25 @@ mod tests {
         assert_eq!(liveness.child6.map(|c| (c.local, c.peer)), Some((0x6666, 0x7777)));
     }
 
+    /// RFC 7296 §3.9: the peer's rekey of the primary CHILD SA with an Ni
+    /// that is not 16 to 256 octets -- here none at all, 15 and 257 -- is
+    /// refused, answered `INVALID_SYNTAX` ("some type, length, or value was
+    /// out of range", §3.10.1), and the CHILD SA in place is kept.
+    #[test]
+    fn a_peer_rekey_whose_nonce_is_out_of_range_is_refused() {
+        for ni in [Vec::new(), vec![0x33; 15], vec![0x33; 257]] {
+            let len = ni.len();
+            let request = move |resp_sa: &CompletedSaInit| {
+                let ts = TrafficSelectors::ipv4_full_tunnel();
+                rekey::build_child_request(resp_sa, 0, Some(0xAAAA), PEER_NEW_SPI, &ni, SkCipher::Aes256Gcm, None, &ts, &[7u8; 8]).unwrap()
+            };
+            let (response, resp_sa, mut liveness) = peer_child_request_answered_with(PfsPolicy::none(), None, request);
+            assert_eq!(refusal_reason(&resp_sa, &response), notify_type::INVALID_SYNTAX, "Ni of {len} octets");
+            assert!(liveness.take_peer_rekeys().is_empty(), "Ni of {len} octets");
+            assert_eq!((liveness.child_local_spi, liveness.child_peer_spi), (0xBBBB, 0xAAAA), "Ni of {len} octets");
+        }
+    }
+
     /// Likewise the IPv6 CHILD SA, told apart from the primary by its SPI.
     #[test]
     fn a_peer_rekey_of_the_ipv6_child_sa_replaces_only_that_one() {

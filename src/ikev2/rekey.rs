@@ -31,7 +31,7 @@ use crate::ikev2::ike_auth::{assigned_ipv4_policy, check_granted_ts, esp_offer_f
 use crate::ikev2::message::{encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType};
 use crate::ikev2::negotiate;
 use crate::ikev2::payload::{
-    notify_type, protocol_id, transform_type, KeyExchange, Notify, Proposal, SecurityAssociation, TrafficSelector, TrafficSelectors, Transform,
+    notify_type, protocol_id, transform_type, KeyExchange, Nonce, Notify, Proposal, SecurityAssociation, TrafficSelector, TrafficSelectors, Transform,
 };
 use crate::ikev2::sk::{build_encrypted, open_encrypted, SkCipher};
 use crate::role::Role;
@@ -90,15 +90,18 @@ fn esp_spi_from_sa(sa_bytes: &[u8]) -> Result<u32, IkeError> {
     Ok(u32::from_be_bytes(proposal.spi[..4].try_into().unwrap()))
 }
 
-/// Extract the (SA bytes, Nonce bytes) from a decrypted CREATE_CHILD_SA message.
-fn find_sa_and_nonce(first: PayloadType, inner: &[u8]) -> Result<(Vec<u8>, Vec<u8>), IkeError> {
+/// Extract the (SA bytes, Nonce bytes) from a decrypted CREATE_CHILD_SA message
+/// of the peer's on `sa`. The nonce must be one RFC 7296 allows under `sa`'s
+/// PRF, which derives the new SA's keys from it ([`Nonce::parse_for_prf`]).
+fn find_sa_and_nonce(sa: &CompletedSaInit, first: PayloadType, inner: &[u8]) -> Result<(Vec<u8>, Vec<u8>), IkeError> {
+    let prf = sa.suite.prf_algorithm();
     let mut sa = None;
     let mut nonce = None;
     for payload in payloads(first, inner) {
         let payload = payload?;
         match payload.payload_type {
             PayloadType::SecurityAssociation => sa = Some(payload.data.to_vec()),
-            PayloadType::Nonce => nonce = Some(payload.data.to_vec()),
+            PayloadType::Nonce => nonce = Some(Nonce::parse_for_prf(payload.data, prf)?.data),
             _ => {}
         }
     }
@@ -353,7 +356,7 @@ pub fn peer_child_nonce(sa: &CompletedSaInit, msg: &[u8]) -> Option<Vec<u8>> {
 /// creates (its SA payload's), if the answer has one.
 pub(crate) fn peer_child_spi(sa: &CompletedSaInit, msg: &[u8]) -> Option<u32> {
     let (first, inner) = open_encrypted(sa.suite.sk_cipher(), msg, peer_sk_e(sa), peer_sk_a(sa)).ok()?;
-    let (sa_bytes, _) = find_sa_and_nonce(first, &inner).ok()?;
+    let (sa_bytes, _) = find_sa_and_nonce(sa, first, &inner).ok()?;
     esp_spi_from_sa(&sa_bytes).ok()
 }
 
@@ -426,7 +429,7 @@ pub fn responder_process_rekey_with_pfs(
 ) -> Result<(Vec<u8>, ChildSa), IkeError> {
     let message_id = IkeHeader::parse(request)?.message_id;
     let (first, inner) = open_encrypted(sa.suite.sk_cipher(), request, peer_sk_e(sa), peer_sk_a(sa))?;
-    let (sa_bytes, ni) = find_sa_and_nonce(first, &inner)?;
+    let (sa_bytes, ni) = find_sa_and_nonce(sa, first, &inner)?;
     let peer_spi = esp_spi_from_sa(&sa_bytes)?;
     let peer_sa = SecurityAssociation::parse(&sa_bytes)?;
     let peer_ke = find_ke(first, &inner)?;
@@ -600,7 +603,7 @@ pub fn responder_answer_child_rekey(
 ) -> Result<(Vec<u8>, ChildSa), IkeError> {
     let message_id = IkeHeader::parse(request)?.message_id;
     let (first, inner) = open_encrypted(sa.suite.sk_cipher(), request, peer_sk_e(sa), peer_sk_a(sa))?;
-    let (sa_bytes, ni) = find_sa_and_nonce(first, &inner)?;
+    let (sa_bytes, ni) = find_sa_and_nonce(sa, first, &inner)?;
     let peer_sa = SecurityAssociation::parse(&sa_bytes)?;
     let peer_ke = find_ke(first, &inner)?;
     let (tsi, tsr) = requested_ts(first, &inner)?;
@@ -709,7 +712,7 @@ pub fn initiator_complete_child(
             _ => {}
         }
     }
-    let (sa_bytes, nr) = find_sa_and_nonce(first, &inner)?;
+    let (sa_bytes, nr) = find_sa_and_nonce(sa, first, &inner)?;
     let peer_spi = esp_spi_from_sa(&sa_bytes)?;
     let peer_sa = SecurityAssociation::parse(&sa_bytes)?;
 
@@ -1685,5 +1688,67 @@ mod tests {
             wide_tsi,
             "with no assignment the responder echoes the initiator's TSi"
         );
+    }
+
+    /// [`sa_pair`] on an offer whose PRF is `prf`.
+    fn sa_pair_with_prf(prf: u16) -> (CompletedSaInit, CompletedSaInit) {
+        let mut offer = default_offer();
+        let t = offer.proposals[0].transforms.iter_mut().find(|t| t.transform_type == crate::ikev2::payload::transform_type::PRF).unwrap();
+        t.transform_id = prf;
+        let init = LocalSecret { dh_private: [7u8; 32], nonce: vec![0x11; 32], spi: 0xA1 };
+        let resp = LocalSecret { dh_private: [9u8; 32], nonce: vec![0x22; 32], spi: 0xB2 };
+        let request = initiator_request(&init, &offer);
+        let (response, resp_done) = responder_respond(&request, &resp).unwrap();
+        (initiator_complete(&init, &request, &response).unwrap(), resp_done)
+    }
+
+    /// The three ways the responder answers a peer's `CREATE_CHILD_SA` and the
+    /// initiator's completion, each refusing the peer's nonce when it is
+    /// `bad`, with `error`, and taking it on at `good` (ours is always 32 octets).
+    fn check_child_nonces(init_sa: &CompletedSaInit, resp_sa: &CompletedSaInit, bad: &[u8], good: &[u8], error: IkeError) {
+        let ours = [0x44u8; 32];
+        let answer = |ni: &[u8]| {
+            let req = build_rekey_request(init_sa, 2, 0xDEAD_BEEF, 0x1111_1111, ni, &[1u8; 8]).unwrap();
+            let processed = responder_process_rekey(resp_sa, &req, 0x2222_2222, &ours, &[2u8; 8], None).map(|_| ());
+            let answered = responder_answer_child_rekey(resp_sa, &req, 0x2222_2222, &ours, SkCipher::Aes256Gcm, &PfsPolicy::none(), &[6u8; 32], &[2u8; 8])
+                .map(|_| ());
+            (processed, answered)
+        };
+        let complete = |nr: &[u8]| {
+            let req = build_rekey_request(init_sa, 2, 0xDEAD_BEEF, 0x1111_1111, &ours, &[1u8; 8]).unwrap();
+            let (resp, _) = responder_process_rekey(resp_sa, &req, 0x2222_2222, nr, &[2u8; 8], None).unwrap();
+            initiator_complete_rekey(init_sa, &ours, 0x1111_1111, &resp).map(|_| ())
+        };
+        assert_eq!(answer(bad), (Err(error.clone()), Err(error.clone())), "Ni of {} octets", bad.len());
+        assert_eq!(complete(bad), Err(error), "Nr of {} octets", bad.len());
+        assert_eq!(answer(good), (Ok(()), Ok(())), "Ni of {} octets", good.len());
+        assert_eq!(complete(good), Ok(()), "Nr of {} octets", good.len());
+    }
+
+    /// RFC 7296 §3.9: "The size of the Nonce Data MUST be between 16 and 256
+    /// octets, inclusive" -- a `CREATE_CHILD_SA`'s Ni and Nr as much as
+    /// `IKE_SA_INIT`'s. An empty, 15- or 257-octet nonce is refused whichever
+    /// side receives it; 16 and 256 octets are taken on.
+    #[test]
+    fn a_child_sa_nonce_out_of_range_is_refused_on_both_sides() {
+        let (init_sa, resp_sa) = sa_pair();
+        let range = IkeError::Crypto("nonce length out of range (16-256 bytes)");
+        check_child_nonces(&init_sa, &resp_sa, &[], &[0x33; 16], range.clone());
+        check_child_nonces(&init_sa, &resp_sa, &[0x33; 15], &[0x33; 16], range.clone());
+        check_child_nonces(&init_sa, &resp_sa, &[0x33; 257], &[0x33; 256], range);
+    }
+
+    /// RFC 7296 §2.10: the nonces of a `CREATE_CHILD_SA` feed the IKE SA's
+    /// PRF (KEYMAT = prf+(SK_d, Ni | Nr), §2.17), so each MUST be at least
+    /// half its key -- 32 octets under PRF_HMAC_SHA2_512, 24 under
+    /// PRF_HMAC_SHA2_384.
+    #[test]
+    fn a_child_sa_nonce_shorter_than_half_the_prf_key_is_refused() {
+        use crate::ikev2::payload::transform_id::{PRF_HMAC_SHA2_384, PRF_HMAC_SHA2_512};
+        let short = IkeError::Crypto("nonce shorter than half the negotiated PRF's key");
+        for (prf, half) in [(PRF_HMAC_SHA2_512, 32), (PRF_HMAC_SHA2_384, 24)] {
+            let (init_sa, resp_sa) = sa_pair_with_prf(prf);
+            check_child_nonces(&init_sa, &resp_sa, &vec![0x33; half - 1], &vec![0x33; half], short.clone());
+        }
     }
 }

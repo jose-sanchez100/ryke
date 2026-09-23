@@ -25,7 +25,7 @@ use crate::ikev2::message::{
     encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType,
 };
 use crate::ikev2::negotiate;
-use crate::ikev2::payload::{notify_type_name, protocol_id, KeyExchange, Notify, SecurityAssociation};
+use crate::ikev2::payload::{notify_type_name, protocol_id, KeyExchange, Nonce, Notify, SecurityAssociation};
 use crate::ikev2::sk::{build_encrypted, open_encrypted};
 use crate::role::Role;
 
@@ -154,6 +154,9 @@ pub fn initiator_complete_ike_rekey(
     {
         return Err(IkeError::NoProposalChosen);
     }
+    // RFC 7296 §3.9 and §2.10: Nr is 16 to 256 octets and at least half the key
+    // of the PRF that makes the new SKEYSEED from it.
+    Nonce::parse_for_prf(&nr, suite.prf_algorithm())?;
     let group = DhGroup::from_transform_id(suite.dh_id).ok_or(IkeError::NoProposalChosen)?;
     if ke.dh_group != group.transform_id() {
         return Err(IkeError::DhGroupMismatch { expected: group.transform_id(), got: ke.dh_group });
@@ -223,6 +226,8 @@ pub fn responder_process_ike_rekey(
     let spi_i = u64::from_be_bytes(proposal.spi[..8].try_into().unwrap());
 
     let suite = negotiate::select(&sa).ok_or(IkeError::NoProposalChosen)?;
+    // RFC 7296 §3.9 and §2.10, as for Nr in `initiator_complete_ike_rekey`.
+    Nonce::parse_for_prf(&ni, suite.prf_algorithm())?;
     let group = DhGroup::from_transform_id(suite.dh_id).ok_or(IkeError::NoProposalChosen)?;
     if ke.dh_group != group.transform_id() {
         return Err(IkeError::DhGroupMismatch { expected: group.transform_id(), got: ke.dh_group });
@@ -580,6 +585,63 @@ mod tests {
         ];
         for (what, request, expected) in cases {
             assert_eq!(answer(&request), Err(expected), "{what}");
+        }
+    }
+
+    /// [`sa_pair`] on an offer whose PRF is `prf`.
+    fn sa_pair_with_prf(prf: u16) -> (CompletedSaInit, CompletedSaInit) {
+        let mut offer = default_offer();
+        let t = offer.proposals[0].transforms.iter_mut().find(|t| t.transform_type == crate::ikev2::payload::transform_type::PRF).unwrap();
+        t.transform_id = prf;
+        let init = LocalSecret { dh_private: [7u8; 32], nonce: vec![0x11; 32], spi: 0xA1 };
+        let resp = LocalSecret { dh_private: [9u8; 32], nonce: vec![0x22; 32], spi: 0xB2 };
+        let request = initiator_request(&init, &offer);
+        let (response, resp_done) = responder_respond(&request, &resp).unwrap();
+        (initiator_complete(&init, &request, &response).unwrap(), resp_done)
+    }
+
+    /// An IKE SA rekey's responder refuses the peer's Ni, and its initiator
+    /// the peer's Nr, when `bad`, with `error`; both take them on at `good`
+    /// (ours is always 32 octets).
+    fn check_ike_rekey_nonces(init_sa: &CompletedSaInit, resp_sa: &CompletedSaInit, bad: &[u8], good: &[u8], error: IkeError) {
+        let (ours, dh, new_spi_i, new_spi_r) = ([0x55u8; 32], [3u8; 32], 0xAABB_CCDD_1122_3344u64, 0x9988_7766_5544_3322u64);
+        let answer = |ni: &[u8]| {
+            let request = build_ike_rekey_request(init_sa, 5, new_spi_i, ni, &dh, &[1u8; 8]).unwrap();
+            responder_process_ike_rekey(resp_sa, &request, new_spi_r, &[9u8; 32], &ours, &[2u8; 8]).map(|_| ())
+        };
+        let complete = |nr: &[u8]| {
+            let request = build_ike_rekey_request(init_sa, 5, new_spi_i, &ours, &dh, &[1u8; 8]).unwrap();
+            let (response, _) = responder_process_ike_rekey(resp_sa, &request, new_spi_r, &[9u8; 32], nr, &[2u8; 8]).unwrap();
+            initiator_complete_ike_rekey(init_sa, &ours, new_spi_i, &dh, &response).map(|_| ())
+        };
+        assert_eq!(answer(bad), Err(error.clone()), "Ni of {} octets", bad.len());
+        assert_eq!(complete(bad), Err(error), "Nr of {} octets", bad.len());
+        assert_eq!(answer(good), Ok(()), "Ni of {} octets", good.len());
+        assert_eq!(complete(good), Ok(()), "Nr of {} octets", good.len());
+    }
+
+    /// RFC 7296 §3.9: an IKE SA rekey's Ni and Nr MUST be 16 to 256 octets,
+    /// like every nonce; an empty, 15- or 257-octet one is refused whichever
+    /// side receives it.
+    #[test]
+    fn an_ike_rekey_nonce_out_of_range_is_refused_on_both_sides() {
+        let (init_sa, resp_sa) = sa_pair();
+        let range = IkeError::Crypto("nonce length out of range (16-256 bytes)");
+        check_ike_rekey_nonces(&init_sa, &resp_sa, &[], &[0x33; 16], range.clone());
+        check_ike_rekey_nonces(&init_sa, &resp_sa, &[0x33; 15], &[0x33; 16], range.clone());
+        check_ike_rekey_nonces(&init_sa, &resp_sa, &[0x33; 257], &[0x33; 256], range);
+    }
+
+    /// RFC 7296 §2.10: the new IKE SA's SKEYSEED is its PRF keyed with the
+    /// old SK_d over Ni | Nr (§2.18), and each nonce MUST be at least half
+    /// that PRF's key.
+    #[test]
+    fn an_ike_rekey_nonce_shorter_than_half_the_prf_key_is_refused() {
+        use crate::ikev2::payload::transform_id::{PRF_HMAC_SHA2_384, PRF_HMAC_SHA2_512};
+        let short = IkeError::Crypto("nonce shorter than half the negotiated PRF's key");
+        for (prf, half) in [(PRF_HMAC_SHA2_512, 32), (PRF_HMAC_SHA2_384, 24)] {
+            let (init_sa, resp_sa) = sa_pair_with_prf(prf);
+            check_ike_rekey_nonces(&init_sa, &resp_sa, &vec![0x33; half - 1], &vec![0x33; half], short.clone());
         }
     }
 }

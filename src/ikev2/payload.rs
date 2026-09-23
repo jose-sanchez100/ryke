@@ -271,6 +271,18 @@ impl Nonce {
         }
         Ok(Nonce { data: body.to_vec() })
     }
+    /// [`Nonce::parse`], for a nonce the peer sent once `prf` is negotiated:
+    /// RFC 7296 §2.10 also asks that it be "at least half the key size of
+    /// the negotiated pseudorandom function" -- an HMAC PRF's key is its
+    /// output (§2.13), so 24 octets for PRF_HMAC_SHA2_384 and 32 for
+    /// PRF_HMAC_SHA2_512.
+    pub fn parse_for_prf(body: &[u8], prf: crate::crypto::PrfAlgorithm) -> Result<Nonce, IkeError> {
+        let nonce = Nonce::parse(body)?;
+        if nonce.data.len() < prf.output_len().div_ceil(2) {
+            return Err(IkeError::Crypto("nonce shorter than half the negotiated PRF's key"));
+        }
+        Ok(nonce)
+    }
     pub fn to_bytes(&self) -> Vec<u8> {
         self.data.clone()
     }

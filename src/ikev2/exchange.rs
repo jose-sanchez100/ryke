@@ -506,6 +506,7 @@ fn responder_respond_inner(
     }
 
     let suite = negotiate::select(&payloads.sa).ok_or(IkeError::NoProposalChosen)?;
+    Nonce::parse_for_prf(&payloads.nonce.data, suite.prf_algorithm())?;
     let group = DhGroup::from_transform_id(suite.dh_id).ok_or(IkeError::NoProposalChosen)?;
 
     // The initiator sends a KE payload for its best-guess group; if we selected a
@@ -588,6 +589,7 @@ pub fn initiator_complete(local: &LocalSecret, request: &[u8], response: &[u8]) 
     if !suite.matches_offer(&our_offer.sa) {
         return Err(IkeError::NoProposalChosen);
     }
+    Nonce::parse_for_prf(&payloads.nonce.data, suite.prf_algorithm())?;
     let group = DhGroup::from_transform_id(suite.dh_id).ok_or(IkeError::NoProposalChosen)?;
     let peer_public = dh_peer(&payloads.ke, group)?;
     let shared = group.shared(&local.dh_private, peer_public)?;
@@ -1066,5 +1068,56 @@ mod tests {
 
         let err = initiator_complete(&init, &request, &response).unwrap_err();
         assert_eq!(err, IkeError::InvalidKeGroup(transform_id::MODP_2048));
+    }
+
+    /// `default_offer` with its PRF swapped for `prf`.
+    fn offer_with_prf(prf: u16) -> SecurityAssociation {
+        let mut offer = default_offer();
+        let t = offer.proposals[0].transforms.iter_mut().find(|t| t.transform_type == transform_type::PRF).unwrap();
+        t.transform_id = prf;
+        offer
+    }
+
+    /// RFC 7296 §2.10: a nonce MUST be at least half the key size of the
+    /// negotiated PRF -- an HMAC PRF's key is its output (§2.13), so 24
+    /// octets for PRF_HMAC_SHA2_384 and 32 for PRF_HMAC_SHA2_512, beyond the
+    /// 16 §3.9 asks of every nonce. Each side checks the other's once it
+    /// knows the PRF: the responder the initiator's Ni, the initiator the
+    /// responder's Nr.
+    #[test]
+    fn an_sa_init_nonce_shorter_than_half_the_negotiated_prf_key_is_refused() {
+        let short = Some(IkeError::Crypto("nonce shorter than half the negotiated PRF's key"));
+        for (prf, half) in [(transform_id::PRF_HMAC_SHA2_512, 32), (transform_id::PRF_HMAC_SHA2_384, 24)] {
+            let offer = offer_with_prf(prf);
+
+            let init = LocalSecret { nonce: vec![0x11; half - 1], ..init_secret() };
+            let request = initiator_request(&init, &offer);
+            assert_eq!(responder_respond(&request, &resp_secret()).err(), short, "Ni for PRF {prf}");
+
+            let request = initiator_request(&init_secret(), &offer);
+            let resp = LocalSecret { nonce: vec![0x22; half - 1], ..resp_secret() };
+            let (response, _) = responder_respond(&request, &resp).unwrap();
+            assert_eq!(initiator_complete(&init_secret(), &request, &response).err(), short, "Nr for PRF {prf}");
+
+            // Exactly half the key is enough, both ways.
+            let init = LocalSecret { nonce: vec![0x11; half], ..init_secret() };
+            let resp = LocalSecret { nonce: vec![0x22; half], ..resp_secret() };
+            let request = initiator_request(&init, &offer);
+            let (response, resp_done) = responder_respond(&request, &resp).unwrap();
+            let init_done = initiator_complete(&init, &request, &response).unwrap();
+            assert_eq!(init_done.keys.sk_d, resp_done.keys.sk_d, "PRF {prf}");
+        }
+    }
+
+    /// The positive control: with PRF_HMAC_SHA2_256 (a 32-octet key) §3.9's
+    /// 16-octet floor is also §2.10's, so 16-octet nonces run both ways.
+    #[test]
+    fn sixteen_octet_nonces_are_enough_for_a_sha2_256_prf() {
+        let init = LocalSecret { nonce: vec![0x11; 16], ..init_secret() };
+        let resp = LocalSecret { nonce: vec![0x22; 16], ..resp_secret() };
+        let request = initiator_request(&init, &offer_with_prf(transform_id::PRF_HMAC_SHA2_256));
+        let (response, resp_done) = responder_respond(&request, &resp).unwrap();
+        let init_done = initiator_complete(&init, &request, &response).unwrap();
+        assert_eq!(init_done.keys.sk_d, resp_done.keys.sk_d);
     }
 }

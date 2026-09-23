@@ -215,8 +215,9 @@ enum PeerStep {
     /// No method has begun: Identity and Notification Requests are answered,
     /// and a Request for a method we don't run gets a Nak.
     Selecting,
-    /// We answered the MSCHAPv2 Challenge: the Success Request is next.
-    Answered { auth_challenge: [u8; 16], peer_challenge: [u8; 16] },
+    /// We answered the MSCHAPv2 Challenge, under its MS-CHAPv2-ID: the
+    /// Success Request is next.
+    Answered { mschap_id: u8, auth_challenge: [u8; 16], peer_challenge: [u8; 16] },
     /// The authenticator response verified and we acknowledged it:
     /// EAP-Success is next.
     ServerProven,
@@ -608,6 +609,16 @@ impl EapInitiator {
             if self.step != PeerStep::ServerProven {
                 return Ok(EapEvent::Failed(None));
             }
+            // It is the reply to the Response we sent last, so it carries
+            // that one's Identifier, and no data: its Length is 4 (§4.2).
+            // Octets past that Length are padding, which `parse` already
+            // left out (§4). An IKE_AUTH response is not sent again in
+            // another form, so a Success that does not answer ours ends
+            // the exchange rather than being waited past.
+            let answers_ours = self.last_request.as_ref().is_some_and(|(_, response)| response.identifier == eap.identifier);
+            if !answers_ours || !eap.data.is_empty() {
+                return Ok(EapEvent::Failed(None));
+            }
             // EAP done: send AUTH keyed by the MSK.
             let msk = mschapv2::derive_msk(&self.password, &self.nt_response);
             let idi = self.id.to_bytes();
@@ -667,17 +678,20 @@ impl EapInitiator {
                 let mut peer_challenge = [0u8; 16];
                 entropy.fill(&mut peer_challenge);
                 self.nt_response = mschapv2::generate_nt_response(&auth_challenge, &peer_challenge, &self.user, &self.password);
-                self.step = PeerStep::Answered { auth_challenge, peer_challenge };
+                self.step = PeerStep::Answered { mschap_id, auth_challenge, peer_challenge };
                 eap::build_response(mschap_id, &auth_challenge, &peer_challenge, &self.user, &self.password)
             }
-            (PeerStep::Answered { auth_challenge, peer_challenge }, Some(eap::eap_type::MSCHAPV2)) if op == Some(eap::op::SUCCESS) => {
+            (PeerStep::Answered { mschap_id, auth_challenge, peer_challenge }, Some(eap::eap_type::MSCHAPV2)) if op == Some(eap::op::SUCCESS) => {
                 // RFC 2759 §8.8, draft-kamath-pppext-eap-mschapv2 §2.3: the
                 // server proves it knows the password with the authenticator
                 // response; if that is missing or wrong the session ends
                 // without an answer -- and so without the MSK-keyed AUTH.
+                // It answers our Response, so it carries that one's
+                // MS-CHAPv2-ID (RFC 2759 §5 keeps the CHAP Success format,
+                // RFC 1994 §4.2).
                 let expected = mschapv2::authenticator_response(&self.password, &self.nt_response, &peer_challenge, &auth_challenge, &self.user);
                 match eap::parse_success(&eap.data) {
-                    Ok(got) if ct_eq(&got, &expected) => {}
+                    Ok(got) if eap.data[2] == mschap_id && ct_eq(&got, &expected) => {}
                     _ => return Ok(Err(None)),
                 }
                 self.step = PeerStep::ServerProven;
@@ -1753,6 +1767,118 @@ mod tests {
         let early = responder_eap(&responder, &eap::EapPacket { code: eap::code::REQUEST, identifier: id, data });
         let got = initiator.handle(&early, &mut SeedEntropy::new(1));
         assert!(matches!(got, Ok(EapEvent::Failed(None))), "Success Request before the Challenge: {got:?}");
+    }
+
+    #[test]
+    fn eap_takes_eap_success_only_as_a_bare_reply_to_its_last_response() {
+        // RFC 3748 §4.2: EAP-Success carries the Identifier of the Response
+        // it answers, and no data -- its Length is 4.
+        let (initiator, responder, msg, last) = run_until(Step::EapSuccess);
+        let ours = eap_from_initiator(&responder, &last).unwrap().identifier;
+        assert_eq!(eap_from_responder(&initiator, &msg).unwrap().identifier, ours);
+        assert_eq!(finish(initiator, responder, &msg), Outcome::Established);
+
+        type Forgery = (&'static str, fn(u8) -> u8, Vec<u8>);
+        let bad: [Forgery; 3] = [
+            ("Identifier + 1", |id| id.wrapping_add(1), vec![]),
+            ("Identifier ^ 0x80", |id| id ^ 0x80, vec![]),
+            ("data within its Length", |id| id, vec![0, 0, 0, 0]),
+        ];
+        for (what, identifier, data) in bad {
+            let (mut initiator, responder, _, last) = run_until(Step::EapSuccess);
+            let identifier = identifier(eap_from_initiator(&responder, &last).unwrap().identifier);
+            let forged = responder_eap(&responder, &eap::EapPacket { code: eap::code::SUCCESS, identifier, data });
+            let got = initiator.handle(&forged, &mut SeedEntropy::new(1));
+            assert!(matches!(got, Ok(EapEvent::Failed(None))), "{what}: {got:?}");
+        }
+
+        // Octets past its Length are padding, and MUST be ignored (§4).
+        let (initiator, responder, msg, _) = run_until(Step::EapSuccess);
+        let mut padded = eap_from_responder(&initiator, &msg).unwrap().to_bytes();
+        padded.extend_from_slice(&[0xAA, 0xBB]);
+        let padded = build_sk(&responder.sa, 9, true, &[(PayloadType::Eap, padded)], &[6u8; 8]).unwrap();
+        assert_eq!(finish(initiator, responder, &padded), Outcome::Established);
+    }
+
+    /// A named change to an EAP packet.
+    type EapEdit = (&'static str, fn(&mut eap::EapPacket));
+
+    /// `msg`'s EAP packet as the responder's side would send it after `f`.
+    fn with_responder_eap(initiator: &EapInitiator, responder: &EapResponder, msg: &[u8], f: impl FnOnce(&mut eap::EapPacket)) -> Vec<u8> {
+        let mut p = eap_from_responder(initiator, msg).unwrap();
+        f(&mut p);
+        responder_eap(responder, &p)
+    }
+
+    #[test]
+    fn eap_takes_mschapv2_requests_only_with_a_consistent_header() {
+        // draft-kamath-pppext-eap-mschapv2-02 §2.1: MS-Length is the EAP
+        // Length minus 5 and a Challenge's Value-Size is 16.
+        let bad_challenges: [EapEdit; 4] = [
+            ("Value-Size 0", |p| p.data[5] = 0),
+            ("Value-Size 17", |p| p.data[5] = 17),
+            ("MS-Length 4", |p| p.data[3..5].copy_from_slice(&4u16.to_be_bytes())),
+            ("MS-Length 65535", |p| p.data[3..5].copy_from_slice(&u16::MAX.to_be_bytes())),
+        ];
+        for (what, f) in bad_challenges {
+            let (mut initiator, responder, msg, _) = run_until(Step::Challenge);
+            let forged = with_responder_eap(&initiator, &responder, &msg, f);
+            let got = initiator.handle(&forged, &mut SeedEntropy::new(1));
+            assert!(!matches!(got, Ok(EapEvent::Reply(_))), "Challenge {what}: {got:?}");
+        }
+
+        // The Success Request: MS-Length as above, and the MS-CHAPv2-ID of
+        // the Response it answers (RFC 2759 §5 keeps the CHAP Success
+        // format, whose Identifier is copied from that Response -- RFC
+        // 1994 §4.2).
+        let bad_successes: [EapEdit; 4] = [
+            ("MS-CHAPv2-ID ^ 0x80", |p| p.data[2] ^= 0x80),
+            ("MS-CHAPv2-ID + 1", |p| p.data[2] = p.data[2].wrapping_add(1)),
+            ("MS-Length 4", |p| p.data[3..5].copy_from_slice(&4u16.to_be_bytes())),
+            ("MS-Length 65535", |p| p.data[3..5].copy_from_slice(&u16::MAX.to_be_bytes())),
+        ];
+        for (what, f) in bad_successes {
+            let (mut initiator, responder, msg, _) = run_until(Step::SuccessRequest);
+            let forged = with_responder_eap(&initiator, &responder, &msg, f);
+            let got = initiator.handle(&forged, &mut SeedEntropy::new(1));
+            assert!(matches!(got, Ok(EapEvent::Failed(None))), "Success Request {what}: {got:?}");
+        }
+
+        // The untouched ones go through.
+        let (initiator, responder, msg, _) = run_until(Step::Challenge);
+        let same = with_responder_eap(&initiator, &responder, &msg, |_| {});
+        assert_eq!(finish(initiator, responder, &same), Outcome::Established);
+        let (initiator, responder, msg, _) = run_until(Step::SuccessRequest);
+        let same = with_responder_eap(&initiator, &responder, &msg, |_| {});
+        assert_eq!(finish(initiator, responder, &same), Outcome::Established);
+    }
+
+    #[test]
+    fn eap_responder_takes_the_mschapv2_response_only_with_a_consistent_header() {
+        // draft-kamath-pppext-eap-mschapv2-02 §2.2: MS-Length is the EAP
+        // Length minus 5 and a Response's Value-Size is 49.
+        let bad: [EapEdit; 5] = [
+            ("Value-Size 0", |p| p.data[5] = 0),
+            ("Value-Size 48", |p| p.data[5] = 48),
+            ("Value-Size 50", |p| p.data[5] = 50),
+            ("MS-Length 4", |p| p.data[3..5].copy_from_slice(&4u16.to_be_bytes())),
+            ("MS-Length + 1", |p| {
+                let ms_len = u16::from_be_bytes([p.data[3], p.data[4]]) + 1;
+                p.data[3..5].copy_from_slice(&ms_len.to_be_bytes());
+            }),
+        ];
+        for (what, f) in bad {
+            let (mut initiator, mut responder, challenge, _) = run_until(Step::Challenge);
+            let EapEvent::Reply(answer) = initiator.handle(&challenge, &mut SeedEntropy::new(1)).unwrap() else { panic!() };
+            let forged = with_initiator_eap(&initiator, &responder, &answer, f);
+            let got = responder.handle(&forged, &mut SeedEntropy::new(2));
+            assert!(!matches!(got, Ok(EapEvent::Reply(_))), "Response {what}: {got:?}");
+        }
+        // The untouched one goes through.
+        let (mut initiator, mut responder, challenge, _) = run_until(Step::Challenge);
+        let EapEvent::Reply(answer) = initiator.handle(&challenge, &mut SeedEntropy::new(1)).unwrap() else { panic!() };
+        let same = with_initiator_eap(&initiator, &responder, &answer, |_| {});
+        assert!(matches!(responder.handle(&same, &mut SeedEntropy::new(2)), Ok(EapEvent::Reply(_))));
     }
 
     #[test]

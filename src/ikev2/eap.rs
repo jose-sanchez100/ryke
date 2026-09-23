@@ -78,9 +78,19 @@ pub fn build_challenge(mschap_id: u8, challenge: &[u8; 16], name: &[u8]) -> Vec<
     d
 }
 
+/// Whether `data` -- a Request's or Response's Type-Data, from its Type on
+/// -- is an EAP-MSCHAPv2 `opcode` packet whose MS-Length is the EAP Length
+/// minus 5 (draft-kamath-pppext-eap-mschapv2-02 §2), which here is
+/// `data.len() - 1`.
+fn is_mschapv2(data: &[u8], opcode: u8) -> bool {
+    data.len() >= 5 && data[0] == eap_type::MSCHAPV2 && data[1] == opcode && usize::from(u16::from_be_bytes([data[3], data[4]])) == data.len() - 1
+}
+
 /// Parse an EAP-MSCHAPv2 Challenge, returning (mschap_id, challenge, name).
+/// Its Value-Size is 16, the Challenge's size (draft-kamath-pppext-eap-mschapv2-02
+/// §2.1); the Name may be empty (RFC 2759 §3).
 pub fn parse_challenge(data: &[u8]) -> Result<(u8, [u8; 16], Vec<u8>), IkeError> {
-    if data.len() < 22 || data[0] != eap_type::MSCHAPV2 || data[1] != op::CHALLENGE {
+    if !is_mschapv2(data, op::CHALLENGE) || data.len() < 22 || data[5] != 16 {
         return Err(IkeError::Crypto("not an EAP-MSCHAPv2 Challenge"));
     }
     let challenge: [u8; 16] = data[6..22].try_into().unwrap();
@@ -117,8 +127,10 @@ pub struct Response {
     pub name: Vec<u8>,
 }
 
+/// Parse an EAP-MSCHAPv2 Response, whose Value-Size is 49, the Response's
+/// size (draft-kamath-pppext-eap-mschapv2-02 §2.2).
 pub fn parse_response(data: &[u8]) -> Result<Response, IkeError> {
-    if data.len() < 55 || data[0] != eap_type::MSCHAPV2 || data[1] != op::RESPONSE {
+    if !is_mschapv2(data, op::RESPONSE) || data.len() < 55 || data[5] != 49 {
         return Err(IkeError::Crypto("not an EAP-MSCHAPv2 Response"));
     }
     Ok(Response {
@@ -166,7 +178,7 @@ pub fn parse_success(data: &[u8]) -> Result<[u8; 20], IkeError> {
             _ => Err(BAD),
         }
     }
-    if data.len() < 5 || data[0] != eap_type::MSCHAPV2 || data[1] != op::SUCCESS {
+    if !is_mschapv2(data, op::SUCCESS) {
         return Err(BAD);
     }
     let digits = data[5..].strip_prefix(b"S=").and_then(|m| m.get(..40)).ok_or(BAD)?;
@@ -244,5 +256,57 @@ mod tests {
         data[1] = op::FAILURE;
         assert!(parse_success(&data).is_err());
         assert!(parse_success(&[eap_type::MSCHAPV2, op::SUCCESS, 1, 0]).is_err());
+    }
+
+    /// `data` with its MS-Length set to `ms_len`.
+    fn with_ms_length(mut data: Vec<u8>, ms_len: u16) -> Vec<u8> {
+        data[3..5].copy_from_slice(&ms_len.to_be_bytes());
+        data
+    }
+
+    #[test]
+    fn mschapv2_headers_must_agree_with_their_packet() {
+        // draft-kamath-pppext-eap-mschapv2-02 §2-§2.3: MS-Length is the EAP
+        // Length minus 5 -- here, the Type-Data's length minus 1 -- and
+        // Value-Size is 16 in a Challenge, 49 in a Response.
+        let challenge = build_challenge(1, &[7; 16], b"server");
+        let response = build_response(1, &[7; 16], &[9; 16], b"User", "clientPass");
+        let success = build_success(1, "S=407A5589115FD0D6209F510FE9C04566932CDA56 M=Welcome");
+        for data in [&challenge, &response, &success] {
+            assert_eq!(usize::from(u16::from_be_bytes([data[3], data[4]])), data.len() - 1);
+        }
+        assert!(parse_challenge(&challenge).is_ok());
+        assert!(parse_response(&response).is_ok());
+        assert!(parse_success(&success).is_ok());
+        // A Challenge whose Name is empty (RFC 2759 §3: Microsoft
+        // authenticators send none) is still one.
+        assert!(parse_challenge(&build_challenge(1, &[7; 16], b"")).is_ok());
+
+        let wrong_lengths = |data: &Vec<u8>| {
+            let right = (data.len() - 1) as u16;
+            [0, 4, right - 1, right + 1, u16::MAX].map(|ms_len| with_ms_length(data.clone(), ms_len))
+        };
+        for bad in wrong_lengths(&challenge) {
+            assert!(parse_challenge(&bad).is_err(), "Challenge MS-Length {:?}", &bad[3..5]);
+        }
+        for bad in wrong_lengths(&response) {
+            assert!(parse_response(&bad).is_err(), "Response MS-Length {:?}", &bad[3..5]);
+        }
+        for bad in wrong_lengths(&success) {
+            assert!(parse_success(&bad).is_err(), "Success MS-Length {:?}", &bad[3..5]);
+        }
+
+        for value_size in [0, 15, 17, 49] {
+            let mut bad = challenge.clone();
+            bad[5] = value_size;
+            assert!(parse_challenge(&bad).is_err(), "Challenge Value-Size {value_size}");
+        }
+        for value_size in [0, 16, 48, 50] {
+            let mut bad = response.clone();
+            bad[5] = value_size;
+            assert!(parse_response(&bad).is_err(), "Response Value-Size {value_size}");
+            assert!(verify_response(&[7; 16], &bad, "clientPass").is_err(), "Response Value-Size {value_size}");
+        }
+        assert!(verify_response(&[7; 16], &response, "clientPass").is_ok());
     }
 }

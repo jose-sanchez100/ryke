@@ -416,6 +416,26 @@ impl ChildScopes {
     }
 }
 
+/// The error notify, and its data, that refuses a `CREATE_CHILD_SA` request
+/// of the peer's -- an IKE or a CHILD SA rekey -- that can't be taken on for
+/// `error` (RFC 7296 §3.10.1). What the peer can retry differently is told
+/// how: no proposal we can run is `NO_PROPOSAL_CHOSEN` (§2.7), selectors we
+/// can't answer `TS_UNACCEPTABLE` (§2.9), a KE of another group than the
+/// one we take `INVALID_KE_PAYLOAD` naming that one (§1.3). Anything else is
+/// a payload that parsed but holds no value the RFC allows -- a nonce out of
+/// range, a missing payload, a DH value that isn't one -- and is
+/// `INVALID_SYNTAX`, which ends the IKE SA (§2.21.3).
+fn child_request_refusal(error: &IkeError) -> (u16, Vec<u8>) {
+    match *error {
+        IkeError::NoProposalChosen => (notify_type::NO_PROPOSAL_CHOSEN, Vec::new()),
+        IkeError::TsUnacceptable => (notify_type::TS_UNACCEPTABLE, Vec::new()),
+        IkeError::InvalidKeGroup(group) | IkeError::DhGroupMismatch { expected: group, .. } => {
+            (notify_type::INVALID_KE_PAYLOAD, group.to_be_bytes().to_vec())
+        }
+        _ => (notify_type::INVALID_SYNTAX, Vec::new()),
+    }
+}
+
 /// What our side of a CHILD SA from `CREATE_CHILD_SA` or `IKE_AUTH` holds,
 /// read from the gateway's answer `msg` to a request of ours: TSi is ours.
 fn granted_child_ts(sa: &CompletedSaInit, msg: &[u8]) -> Option<ChildTs> {
@@ -1400,7 +1420,9 @@ impl LivenessSession {
             (ExchangeType::Informational, _) => self.answer_peer_informational(on, header, msg, deletes, &iv),
             (_, OnIkeSa::Current) => {
                 self.answer_peer_create_child_sa(header, msg, &inner, &iv)?;
-                Ok(false)
+                // Answered INVALID_SYNTAX: fatal (§2.21.3), see
+                // `refuse_peer_child_request_with`.
+                Ok(self.peer_requests.gone)
             }
             (_, OnIkeSa::Retired) => {
                 self.refuse_peer_child_request(on, header, msg, &iv, notify_type::NO_ADDITIONAL_SAS, "on the IKE SA a rekey replaced")?;
@@ -1639,8 +1661,9 @@ impl LivenessSession {
         let (response, new_sa) = match ike_rekey::responder_process_ike_rekey(&self.sa, msg, new_spi_r, &dh_private, &nr, iv) {
             Ok(answered) => answered,
             Err(e) => {
+                let (reason, data) = child_request_refusal(&e);
                 let why = format!("the IKE SA rekey cannot be taken on: {e}");
-                return self.refuse_peer_child_request(OnIkeSa::Current, header, msg, iv, notify_type::NO_ADDITIONAL_SAS, &why);
+                return self.refuse_peer_child_request_with(OnIkeSa::Current, header, msg, iv, reason, data, &why);
             }
         };
         // Recorded in the window of the IKE SA it came on before this session
@@ -1777,14 +1800,7 @@ impl LivenessSession {
                 Ok(())
             }
             Err(e) => {
-                // RFC 7296 §1.3: INVALID_KE_PAYLOAD names the group we'd take, for
-                // the peer to retry its rekey with a KE of it.
-                let (reason, data) = match e {
-                    IkeError::NoProposalChosen => (notify_type::NO_PROPOSAL_CHOSEN, Vec::new()),
-                    IkeError::TsUnacceptable => (notify_type::TS_UNACCEPTABLE, Vec::new()),
-                    IkeError::InvalidKeGroup(group) => (notify_type::INVALID_KE_PAYLOAD, group.to_be_bytes().to_vec()),
-                    _ => (notify_type::INVALID_SYNTAX, Vec::new()),
-                };
+                let (reason, data) = child_request_refusal(&e);
                 self.refuse_peer_child_request_with(current, header, msg, iv, reason, data, &format!("cannot take it on: {e}"))
             }
         }
@@ -1805,6 +1821,9 @@ impl LivenessSession {
     /// Refuse the peer's `CREATE_CHILD_SA` request `msg` on the IKE SA `on`
     /// with the error notify `reason` carrying `data` -- an answer like any
     /// other, resent as it is if the request is retransmitted (RFC 7296 §2.1).
+    /// `INVALID_SYNTAX` is "fatal in both peers" (§2.21.3): that IKE SA is
+    /// gone, as in [`Self::answer_malformed_request`] -- on the current one,
+    /// the tunnel ends.
     #[allow(clippy::too_many_arguments)]
     fn refuse_peer_child_request_with(
         &mut self,
@@ -1817,8 +1836,17 @@ impl LivenessSession {
         why: &str,
     ) -> Result<(), DriverError> {
         let refusal = rekey::build_child_error_with_data(self.ike_sa(on), header.message_id, reason, data, iv)?;
-        ike_debug!("CREATE_CHILD_SA request from the peer (message id {}) -- refusing with {}: {why}", header.message_id, notify_type_name(reason));
-        self.respond(on, header, msg, wrap(&refusal, self.float), false);
+        let fatal = reason == notify_type::INVALID_SYNTAX;
+        ike_debug!(
+            "CREATE_CHILD_SA request from the peer (message id {}) -- refusing with {}{}: {why}",
+            header.message_id,
+            notify_type_name(reason),
+            if fatal { ", which deletes the IKE SA" } else { "" }
+        );
+        if fatal {
+            self.peer_requests_on(on).gone = true;
+        }
+        self.respond(on, header, msg, wrap(&refusal, self.float), fatal && on == OnIkeSa::Current);
         Ok(())
     }
 
@@ -3858,25 +3886,6 @@ mod tests {
         assert_eq!(liveness.child6.map(|c| (c.local, c.peer)), Some((0x6666, 0x7777)));
     }
 
-    /// RFC 7296 §3.9: the peer's rekey of the primary CHILD SA with an Ni
-    /// that is not 16 to 256 octets -- here none at all, 15 and 257 -- is
-    /// refused, answered `INVALID_SYNTAX` ("some type, length, or value was
-    /// out of range", §3.10.1), and the CHILD SA in place is kept.
-    #[test]
-    fn a_peer_rekey_whose_nonce_is_out_of_range_is_refused() {
-        for ni in [Vec::new(), vec![0x33; 15], vec![0x33; 257]] {
-            let len = ni.len();
-            let request = move |resp_sa: &CompletedSaInit| {
-                let ts = TrafficSelectors::ipv4_full_tunnel();
-                rekey::build_child_request(resp_sa, 0, Some(0xAAAA), PEER_NEW_SPI, &ni, SkCipher::Aes256Gcm, None, &ts, &[7u8; 8]).unwrap()
-            };
-            let (response, resp_sa, mut liveness) = peer_child_request_answered_with(PfsPolicy::none(), None, request);
-            assert_eq!(refusal_reason(&resp_sa, &response), notify_type::INVALID_SYNTAX, "Ni of {len} octets");
-            assert!(liveness.take_peer_rekeys().is_empty(), "Ni of {len} octets");
-            assert_eq!((liveness.child_local_spi, liveness.child_peer_spi), (0xBBBB, 0xAAAA), "Ni of {len} octets");
-        }
-    }
-
     /// Likewise the IPv6 CHILD SA, told apart from the primary by its SPI.
     #[test]
     fn a_peer_rekey_of_the_ipv6_child_sa_replaces_only_that_one() {
@@ -4526,6 +4535,100 @@ mod tests {
             deliver(&mut liveness, &gateway, &build_informational(&resp_sa, 1, false, &[], &[1u8; 8]).unwrap());
             assert_eq!(sent_to(&gateway), None, "{exchange:?}: the IKE SA is gone, nothing new is answered on it");
         }
+    }
+
+    /// The gateway's rekey of the IKE SA on `sa`, message id `mid`: its
+    /// proposal runs `sa`'s suite with the DH groups `dh`, its KE is one of
+    /// `ke`, and its Ni is `ni`.
+    fn gateway_ike_rekey_offering(sa: &CompletedSaInit, mid: u32, dh: &[u16], ke: crate::crypto::DhGroup, ni: &[u8]) -> Vec<u8> {
+        use crate::ikev2::message::{encode_payload_chain, first_payload_type};
+        use crate::ikev2::payload::{transform_type, KeyExchange, Transform};
+
+        let mut proposal = sa.suite.to_proposal();
+        proposal.num = 1;
+        proposal.protocol_id = protocol_id::IKE;
+        proposal.spi = 0x5555_6666_7777_8888u64.to_be_bytes().to_vec();
+        proposal.transforms.retain(|t| t.transform_type != transform_type::DH);
+        proposal.transforms.extend(dh.iter().map(|&id| Transform { transform_type: transform_type::DH, transform_id: id, key_length: None }));
+        let inner = vec![
+            (PayloadType::SecurityAssociation, SecurityAssociation { proposals: vec![proposal] }.to_bytes()),
+            (PayloadType::Nonce, ni.to_vec()),
+            (PayloadType::KeyExchange, KeyExchange { dh_group: ke.transform_id(), data: ke.public(&PEER_DH) }.to_bytes()),
+        ];
+        let header = gateway_header(sa, mid, ExchangeType::CreateChildSa, false);
+        from_gateway_raw(sa, header, first_payload_type(&inner), &encode_payload_chain(&inner))
+    }
+
+    /// RFC 7296 §2.21.3 for a `CREATE_CHILD_SA` of the gateway's whose
+    /// payloads parse but don't hold a value the RFC allows -- here a rekey
+    /// of the primary CHILD SA, and one of the IKE SA, with an empty nonce
+    /// (§3.9): answered `INVALID_SYNTAX` ("some type, length, or value was
+    /// out of range", §3.10.1), which is "fatal in both peers", so the IKE SA
+    /// is gone, as for a malformed payload chain. Nothing in it is taken on.
+    /// The CHILD SA rekey used to be answered `INVALID_SYNTAX` with the IKE
+    /// SA going on regardless, and the IKE SA rekey `NO_ADDITIONAL_SAS`.
+    #[test]
+    fn a_badly_formatted_rekey_of_the_gateway_s_is_answered_invalid_syntax_and_ends_the_ike_sa() {
+        for what in ["CHILD SA rekey", "IKE SA rekey"] {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let spis = (init_sa.spi_i, init_sa.spi_r);
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut liveness = session_facing(&gateway, init_sa, None);
+            let request = if what == "IKE SA rekey" {
+                gateway_ike_rekey(&resp_sa, 0, &[])
+            } else {
+                let ts = TrafficSelectors::ipv4_full_tunnel();
+                rekey::build_child_request(&resp_sa, 0, Some(0xAAAA), PEER_NEW_SPI, &[], SkCipher::Aes256Gcm, None, &ts, &[7u8; 8]).unwrap()
+            };
+
+            assert_eq!(deliver(&mut liveness, &gateway, &request), Liveness::PeerTornDown, "{what}");
+            let answer = sent_to(&gateway).expect("answered");
+            let refusal = error_answer(&resp_sa, &answer, ExchangeType::CreateChildSa, 0);
+            assert_eq!(refusal, (notify_type::INVALID_SYNTAX, Vec::new()), "{what}");
+            assert!(liveness.take_peer_rekeys().is_empty(), "{what}: nothing taken on");
+            assert_eq!((liveness.child_local_spi, liveness.child_peer_spi), (0xBBBB, 0xAAAA), "{what}");
+            assert_eq!((liveness.sa.spi_i, liveness.sa.spi_r), spis, "{what}: still the IKE SA it came on");
+            assert_eq!(deliver(&mut liveness, &gateway, &request), Liveness::PeerTornDown, "{what}");
+            assert_eq!(sent_to(&gateway), Some(answer), "{what}: a retransmission gets the same answer");
+            deliver(&mut liveness, &gateway, &build_informational(&resp_sa, 1, false, &[], &[1u8; 8]).unwrap());
+            assert_eq!(sent_to(&gateway), None, "{what}: the IKE SA is gone, nothing new is answered on it");
+        }
+    }
+
+    /// ...while an IKE SA rekey that is well formed but can't be taken on is
+    /// refused with the notify that says why, for the gateway to retry, and
+    /// the IKE SA goes on: no proposal we can run is `NO_PROPOSAL_CHOSEN`
+    /// (RFC 7296 §2.7, §3.10.1), and a KE of another group than the one we
+    /// take out of the proposal `INVALID_KE_PAYLOAD` naming that one (§1.3,
+    /// §3.10.1). Both used to be `NO_ADDITIONAL_SAS`.
+    #[test]
+    fn an_ike_sa_rekey_of_the_gateway_s_we_cannot_take_on_is_refused_with_why_and_the_ike_sa_goes_on() {
+        use crate::crypto::DhGroup;
+        use crate::ikev2::payload::transform_id::MODP_768;
+
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let ours = resp_sa.suite.dh_id;
+        let cases = [
+            (
+                "no DH group IKEv2 may run",
+                gateway_ike_rekey_offering(&resp_sa, 0, &[MODP_768], DhGroup::Modp768, &PEER_NI),
+                (notify_type::NO_PROPOSAL_CHOSEN, Vec::new()),
+            ),
+            (
+                "a KE of another group",
+                gateway_ike_rekey_offering(&resp_sa, 1, &[ours], DhGroup::Modp2048, &PEER_NI),
+                (notify_type::INVALID_KE_PAYLOAD, ours.to_be_bytes().to_vec()),
+            ),
+        ];
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        for (mid, (what, request, refusal)) in (0u32..).zip(cases) {
+            assert_eq!(deliver(&mut liveness, &gateway, &request), Liveness::Alive, "{what}");
+            let answer = sent_to(&gateway).expect("answered");
+            assert_eq!(error_answer(&resp_sa, &answer, ExchangeType::CreateChildSa, mid), refusal, "{what}");
+        }
+        assert_eq!(deliver(&mut liveness, &gateway, &build_informational(&resp_sa, 2, false, &[], &[1u8; 8]).unwrap()), Liveness::Alive);
+        assert!(open_informational(&resp_sa, &sent_to(&gateway).expect("the IKE SA still answers")).unwrap().is_empty());
     }
 
     /// ...and an unauthenticated one is still dropped, answered with nothing

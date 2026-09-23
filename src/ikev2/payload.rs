@@ -77,8 +77,9 @@ fn push_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
-/// One Transform substructure. We model the single attribute that IKEv2 ever
-/// negotiates in practice — Key Length; other attributes are ignored on parse.
+/// One Transform substructure. We model the single attribute that IKEv2
+/// defines -- Key Length. A received transform carrying anything else is not
+/// understood and is left out on parse (RFC 7296 §3.3.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transform {
     pub transform_type: u8,
@@ -89,8 +90,10 @@ pub struct Transform {
 
 impl Transform {
     /// Parse one transform from the front of `buf`; returns it and the number of
-    /// bytes consumed (its declared Transform Length).
-    fn parse(buf: &[u8]) -> Result<(Transform, usize), IkeError> {
+    /// bytes consumed (its declared Transform Length). The transform is `None`
+    /// when it carries an attribute we do not understand: RFC 7296 §3.3.6 makes
+    /// it unacceptable, while other transforms of its type still count.
+    fn parse(buf: &[u8]) -> Result<(Option<Transform>, usize), IkeError> {
         if buf.len() < 8 {
             return Err(IkeError::Truncated { need: 8, have: buf.len() });
         }
@@ -103,31 +106,45 @@ impl Transform {
         }
         let transform_type = buf[4];
         let transform_id = u16be(buf, 6);
-        let key_length = Self::find_key_length(&buf[8..length])?;
-        Ok((Transform { transform_type, transform_id, key_length }, length))
+        let transform = Self::read_attributes(&buf[8..length])?
+            .map(|key_length| Transform { transform_type, transform_id, key_length });
+        Ok((transform, length))
     }
 
-    fn find_key_length(mut attrs: &[u8]) -> Result<Option<u16>, IkeError> {
+    /// The Key Length in a transform's attribute area (RFC 7296 §3.3.5):
+    /// `Some(key_length)` when every attribute there is understood, `None` when
+    /// one is not -- an unknown type, a Key Length in the variable-length
+    /// encoding (a fixed-length attribute "MUST NOT" use it), or a second Key
+    /// Length. Bytes that do not form whole attributes are malformed.
+    fn read_attributes(mut attrs: &[u8]) -> Result<Option<Option<u16>>, IkeError> {
         let mut key_length = None;
-        while attrs.len() >= 4 {
+        let mut understood = true;
+        while !attrs.is_empty() {
+            if attrs.len() < 4 {
+                return Err(IkeError::Truncated { need: 4, have: attrs.len() });
+            }
             let header = u16be(attrs, 0);
             let attr_type = header & 0x7fff;
-            if header & ATTR_FORMAT_TV != 0 {
+            let size = if header & ATTR_FORMAT_TV != 0 {
                 // TV: 2-byte value inline.
-                if attr_type == ATTR_KEY_LENGTH {
+                if attr_type == ATTR_KEY_LENGTH && key_length.is_none() {
                     key_length = Some(u16be(attrs, 2));
+                } else {
+                    understood = false;
                 }
-                attrs = &attrs[4..];
+                4
             } else {
                 // TLV: 2-byte length then value.
                 let len = u16be(attrs, 2) as usize;
                 if 4 + len > attrs.len() {
                     return Err(IkeError::BadLength { declared: 4 + len, available: attrs.len() });
                 }
-                attrs = &attrs[4 + len..];
-            }
+                understood = false;
+                4 + len
+            };
+            attrs = &attrs[size..];
         }
-        Ok(key_length)
+        Ok(understood.then_some(key_length))
     }
 
     fn write(&self, out: &mut Vec<u8>, is_last: bool) {
@@ -182,8 +199,13 @@ impl Proposal {
         let mut transforms = Vec::with_capacity(transform_count);
         for _ in 0..transform_count {
             let (transform, consumed) = Transform::parse(&buf[off..length])?;
-            transforms.push(transform);
+            // One we do not understand is not on offer (RFC 7296 §3.3.6).
+            transforms.extend(transform);
             off += consumed;
+        }
+        // The transforms fill the proposal: its Length has no room for more.
+        if off != length {
+            return Err(IkeError::BadLength { declared: length, available: off });
         }
         Ok((Proposal { num, protocol_id, spi, transforms }, length))
     }
@@ -1768,5 +1790,90 @@ mod tests {
     fn truncated_inputs_are_rejected_not_panicked() {
         assert!(matches!(KeyExchange::parse(&[0, 31, 0]), Err(IkeError::Truncated { .. })));
         assert!(SecurityAssociation::parse(&[0, 0, 0, 4]).is_err());
+    }
+
+    /// One raw transform with `attrs` as its attribute area.
+    fn raw_transform(transform_type: u8, transform_id: u16, attrs: &[u8], is_last: bool) -> Vec<u8> {
+        let mut out = vec![if is_last { 0 } else { 3 }, 0];
+        push_u16(&mut out, (8 + attrs.len()) as u16);
+        out.extend_from_slice(&[transform_type, 0]);
+        push_u16(&mut out, transform_id);
+        out.extend_from_slice(attrs);
+        out
+    }
+
+    /// One raw IKE proposal (a single-proposal SA body) holding `transforms`,
+    /// followed by `tail` inside the proposal's own Length.
+    fn raw_sa(transforms: &[Vec<u8>], tail: &[u8]) -> Vec<u8> {
+        let body: Vec<u8> = transforms.concat();
+        let mut out = vec![0, 0];
+        push_u16(&mut out, (8 + body.len() + tail.len()) as u16);
+        out.extend_from_slice(&[1, protocol_id::IKE, 0, transforms.len() as u8]);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(tail);
+        out
+    }
+
+    const KL_256_TV: [u8; 4] = [0x80, 14, 0x01, 0x00];
+
+    #[test]
+    fn a_transform_with_an_attribute_we_do_not_understand_is_unacceptable() {
+        // RFC 7296 §3.3.6: such a transform MUST be considered unacceptable;
+        // other transforms of the same type are processed as usual.
+        let cases: [(&str, Vec<u8>); 5] = [
+            ("unknown TV attribute", [&KL_256_TV[..], &[0x80, 99, 0, 1]].concat()),
+            ("unknown TLV attribute", [&KL_256_TV[..], &[0x00, 99, 0, 2, 0xAB, 0xCD]].concat()),
+            // §3.3.5: a fixed-length attribute MUST NOT use the TLV encoding.
+            ("Key Length as TLV", vec![0x00, 14, 0, 2, 0x01, 0x00]),
+            ("Key Length twice", [&KL_256_TV[..], &[0x80, 14, 0x00, 0x80]].concat()),
+            ("Key Length twice, same value", [KL_256_TV, KL_256_TV].concat()),
+        ];
+        for (what, attrs) in cases {
+            let sa = raw_sa(
+                &[
+                    raw_transform(transform_type::ENCR, transform_id::AES_GCM_16, &attrs, false),
+                    raw_transform(transform_type::ENCR, transform_id::AES_GCM_16, &[0x80, 14, 0x00, 0x80], false),
+                    raw_transform(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, &[], true),
+                ],
+                &[],
+            );
+            let parsed = SecurityAssociation::parse(&sa).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            assert_eq!(
+                parsed.proposals[0].transforms,
+                vec![
+                    Transform { transform_type: transform_type::ENCR, transform_id: transform_id::AES_GCM_16, key_length: Some(128) },
+                    Transform { transform_type: transform_type::PRF, transform_id: transform_id::PRF_HMAC_SHA2_256, key_length: None },
+                ],
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_tv_key_length_is_understood() {
+        let sa = raw_sa(&[raw_transform(transform_type::ENCR, transform_id::AES_CBC, &KL_256_TV, true)], &[]);
+        let parsed = SecurityAssociation::parse(&sa).unwrap();
+        assert_eq!(
+            parsed.proposals[0].transforms,
+            vec![Transform { transform_type: transform_type::ENCR, transform_id: transform_id::AES_CBC, key_length: Some(256) }]
+        );
+    }
+
+    #[test]
+    fn attribute_bytes_that_do_not_form_an_attribute_are_malformed() {
+        for tail in [&[0x80][..], &[0x80, 14], &[0x80, 14, 0x01]] {
+            let attrs = [&KL_256_TV[..], tail].concat();
+            let sa = raw_sa(&[raw_transform(transform_type::ENCR, transform_id::AES_CBC, &attrs, true)], &[]);
+            assert!(SecurityAssociation::parse(&sa).is_err(), "{} stray attribute byte(s) accepted", tail.len());
+        }
+    }
+
+    #[test]
+    fn bytes_after_a_proposals_transforms_are_malformed() {
+        let transforms = [raw_transform(transform_type::ENCR, transform_id::AES_CBC, &KL_256_TV, true)];
+        assert!(SecurityAssociation::parse(&raw_sa(&transforms, &[])).is_ok());
+        for tail in [&[0u8][..], &[0, 0, 0, 0], &[0; 8]] {
+            assert!(SecurityAssociation::parse(&raw_sa(&transforms, tail)).is_err(), "{} trailing byte(s) accepted", tail.len());
+        }
     }
 }

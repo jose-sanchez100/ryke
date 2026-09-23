@@ -2108,33 +2108,76 @@ fn natt_local_port(local_port: u16) -> u16 {
 const RETRY_BACKOFFS: &[Duration] =
     &[Duration::from_secs(2), Duration::from_secs(4), Duration::from_secs(8), Duration::from_secs(8), Duration::from_secs(8)];
 
-/// Send `wire` to `dest` and wait for any datagram in reply, retransmitting
-/// the same `wire` bytes (same Message ID -- RFC 7296 §2.1 requires a
-/// retransmission to be bit-for-bit identical, never a freshly built
-/// request) once per entry in [`RETRY_BACKOFFS`] until one arrives. Returns
-/// the last attempt's timeout error if every attempt goes unanswered.
-fn send_and_retry(sock: &UdpSocket, dest: SocketAddr, wire: &[u8]) -> Result<Vec<u8>, DriverError> {
+/// Send the `IKE_SA_INIT` request `wire` to `dest` and hand `judge` its
+/// answer, retransmitting the same `wire` bytes (same Message ID -- RFC 7296
+/// §2.1 requires a retransmission to be bit-for-bit identical, never a
+/// freshly built request) once per entry in [`RETRY_BACKOFFS`] until an
+/// answer is judged good.
+///
+/// - Only a datagram answering this request reaches `judge`: the response
+///   on our SPIi, `IKE_SA_INIT` and the request's Message ID, from the
+///   responder (§2.1, §3.1). The responder's SPI is not known yet, so it is
+///   not compared. Anything else, IKE or not, is passed over.
+/// - Nothing in `IKE_SA_INIT` is authenticated, and "the recipient should
+///   continue trying for some time before giving up" (§2.21.1): an answer
+///   `judge` refuses does not end the exchange at once. The wait for a
+///   better one goes on until the current attempt times out, and only then
+///   is the refusal returned, with no further retransmission -- so a genuine
+///   refusal costs at most that one wait.
+///
+/// Returns a timeout error if every attempt goes unanswered.
+fn send_and_retry<T>(
+    sock: &UdpSocket,
+    dest: SocketAddr,
+    wire: &[u8],
+    mut judge: impl FnMut(&[u8]) -> Result<T, IkeError>,
+) -> Result<T, DriverError> {
+    let request = IkeHeader::parse(wire)?;
+    let answers = |header: &IkeHeader| {
+        header.initiator_spi == request.initiator_spi
+            && header.exchange_type == ExchangeType::IkeSaInit
+            && header.message_id == request.message_id
+            && header.flags.response
+            && !header.flags.initiator
+    };
     let mut buf = [0u8; 8192];
-    let mut last_err = None;
     for (attempt, timeout) in RETRY_BACKOFFS.iter().enumerate() {
         if attempt > 0 {
             ike_debug!("retransmitting request to {dest} (attempt {}/{})", attempt + 1, RETRY_BACKOFFS.len());
         }
         crate::debug::dump(">>>", dest, wire);
         sock.send_to(wire, dest)?;
-        sock.set_read_timeout(Some(*timeout))?;
-        match sock.recv(&mut buf) {
-            Ok(n) => {
-                crate::debug::dump("<<<", dest, &buf[..n]);
-                return Ok(buf[..n].to_vec());
+        let deadline = Instant::now() + *timeout;
+        let mut refused = None;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                last_err = Some(e);
+            sock.set_read_timeout(Some(remaining))?;
+            let n = match sock.recv(&mut buf) {
+                Ok(n) => n,
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => break,
+                Err(e) => return Err(e.into()),
+            };
+            crate::debug::dump("<<<", dest, &buf[..n]);
+            if !IkeHeader::parse(&buf[..n]).is_ok_and(|header| answers(&header)) {
+                ike_debug!("IKE_SA_INIT: a datagram that is not the answer to our request -- dropped");
+                continue;
             }
-            Err(e) => return Err(e.into()),
+            match judge(&buf[..n]) {
+                Ok(answer) => return Ok(answer),
+                Err(e) => {
+                    ike_debug!("IKE_SA_INIT: answer refused ({e}) -- still listening until this attempt times out");
+                    refused = Some(e);
+                }
+            }
+        }
+        if let Some(e) = refused {
+            return Err(e.into());
         }
     }
-    Err(last_err.expect("RETRY_BACKOFFS is non-empty").into())
+    Err(io::Error::new(io::ErrorKind::TimedOut, format!("no IKE_SA_INIT answer after {} attempts", RETRY_BACKOFFS.len())).into())
 }
 
 /// Like [`send_and_retry`], for the `IKE_AUTH` request `wire` (sealed under
@@ -2535,18 +2578,22 @@ impl<E: Entropy> Ikev2Session<E> {
         loop {
             let req = initiator_request_natt_retry(local, offer, our_addr, peer, self.force_natt, retry.cookie.as_deref(), retry.group);
             ike_debug!("IKE_SA_INIT: sending to {peer} (spi_i={:016x})", local.spi);
-            let resp = send_and_retry(sock, peer, &req)?;
-            match initiator_complete_natt(local, &req, &resp, our_addr, peer) {
-                Ok(outcome) => return Ok(outcome),
+            // `None`: a challenge taken up, to answer with a new request.
+            let outcome = send_and_retry(sock, peer, &req, |resp| match initiator_complete_natt(local, &req, resp, our_addr, peer) {
+                Ok(outcome) => Ok(Some(outcome)),
                 Err(e) => {
                     let challenge = match &e {
                         IkeError::CookieRequired { .. } => "requires a return-routability cookie (RFC 7296 §2.6)",
                         IkeError::InvalidKeGroup(_) => "wants a different DH group (RFC 7296 §2.7, INVALID_KE_PAYLOAD)",
-                        _ => return Err(e.into()),
+                        _ => return Err(e),
                     };
                     retry.absorb(e, offer)?;
                     ike_debug!("IKE_SA_INIT: responder {challenge} -- retrying");
+                    Ok(None)
                 }
+            })?;
+            if let Some(outcome) = outcome {
+                return Ok(outcome);
             }
         }
     }
@@ -3245,21 +3292,65 @@ mod tests {
         let server_addr = server_sock.local_addr().unwrap();
         let client_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
 
-        let responder = thread::spawn(move || {
-            let mut buf = [0u8; 64];
-            // First datagram: simulate packet loss by just reading and
-            // discarding it -- no reply.
-            let (n, _from) = server_sock.recv_from(&mut buf).unwrap();
-            assert_eq!(&buf[..n], b"ping");
-            // The retransmission (same bytes, RFC 7296 §2.1): reply this time.
-            let (n, from) = server_sock.recv_from(&mut buf).unwrap();
-            assert_eq!(&buf[..n], b"ping");
-            server_sock.send_to(b"pong", from).unwrap();
+        let request = initiator_request(&LocalSecret::generate(&mut OsEntropy::new().unwrap(), 32), &default_ike_offer());
+        let answer = bare_sa_init_answer(&request, notify_type::COOKIE, vec![0xC0; 8]);
+        let responder = thread::spawn({
+            let (request, answer) = (request.clone(), answer.clone());
+            move || {
+                let mut buf = [0u8; 2048];
+                // First datagram: simulate packet loss by just reading and
+                // discarding it -- no reply.
+                let (n, _from) = server_sock.recv_from(&mut buf).unwrap();
+                assert_eq!(&buf[..n], request);
+                // The retransmission (same bytes, RFC 7296 §2.1): reply this time.
+                let (n, from) = server_sock.recv_from(&mut buf).unwrap();
+                assert_eq!(&buf[..n], request);
+                server_sock.send_to(&answer, from).unwrap();
+            }
         });
 
-        let resp = send_and_retry(&client_sock, server_addr, b"ping").unwrap();
-        assert_eq!(resp, b"pong");
+        let resp = send_and_retry(&client_sock, server_addr, &request, |resp| Ok(resp.to_vec())).unwrap();
+        assert_eq!(resp, answer);
         responder.join().unwrap();
+    }
+
+    /// The filter on its own (RFC 7296 §2.1, §3.1): with a `judge` that takes
+    /// anything, only the answer to this very request may reach it.
+    #[test]
+    fn send_and_retry_hands_judge_only_the_answer_to_its_request() {
+        let request = initiator_request(&LocalSecret::generate(&mut OsEntropy::new().unwrap(), 32), &default_ike_offer());
+        let answer = bare_sa_init_answer(&request, notify_type::COOKIE, vec![0xC0; 8]);
+        let with = |f: &dyn Fn(&mut Vec<u8>)| {
+            let mut m = answer.clone();
+            f(&mut m);
+            m
+        };
+        let strays = [
+            b"not IKE at all".to_vec(),
+            with(&|m| m[0] ^= 0xFF),                                    // another SPIi
+            with(&|m| m[18] = 35),                                      // IKE_AUTH
+            with(&|m| m[20..24].copy_from_slice(&1u32.to_be_bytes())), // Message ID 1
+            with(&|m| m[19] = 0x08),                                    // a request (I, not R)
+            with(&|m| m[19] = 0x00),                                    // a responder's request
+            with(&|m| m[19] = 0x28),                                    // R and I both set
+        ];
+        for stray in strays {
+            let server_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let server_addr = server_sock.local_addr().unwrap();
+            let client_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let responder = thread::spawn({
+                let (stray, answer) = (stray.clone(), answer.clone());
+                move || {
+                    let mut buf = [0u8; 2048];
+                    let (_, from) = server_sock.recv_from(&mut buf).unwrap();
+                    server_sock.send_to(&stray, from).unwrap();
+                    server_sock.send_to(&answer, from).unwrap();
+                }
+            });
+            let got = send_and_retry(&client_sock, server_addr, &request, |resp| Ok(resp.to_vec())).unwrap();
+            responder.join().unwrap();
+            assert_eq!(got, answer, "a stray reached judge: {stray:02x?}");
+        }
     }
 
     #[test]
@@ -5298,6 +5389,82 @@ mod tests {
         let result = session.sa_init_on_port(bind, &offer_with_a_dh_guess_the_responder_wont_pick(), local_port);
         responder.join().unwrap();
         assert_eq!(result.unwrap().2.suite.dh_id, transform_id::X25519);
+    }
+
+    /// RFC 7296 §2.1/§3.1: the answer to our IKE_SA_INIT is the response on
+    /// our SPIi, IKE_SA_INIT, Message ID 0, from the responder. Datagrams that
+    /// are not that -- stray, stale, or someone else's -- are passed over, and
+    /// an unauthenticated refusal is not acted on at once (§2.21.1): the real
+    /// answer arriving just after it still completes the exchange.
+    #[test]
+    fn sa_init_passes_over_datagrams_that_are_not_its_answer() {
+        let bind = next_addr();
+        let responder = thread::spawn(move || {
+            let sock = UdpSocket::bind(bind).unwrap();
+            sock.set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+            let resp_secret = LocalSecret::generate(&mut OsEntropy::new().unwrap(), 32);
+            let mut buf = [0u8; 2048];
+            let mut requests = 0;
+            while let Ok((n, from)) = sock.recv_from(&mut buf) {
+                requests += 1;
+                let req = buf[..n].to_vec();
+                let SaInitResult::Established { response, .. } = responder_respond_natt(&req, &resp_secret, bind, from, None).unwrap() else {
+                    panic!("the request must be answered");
+                };
+                let mut wrong_spi = response.clone();
+                wrong_spi[0] ^= 0xFF;
+                let mut wrong_id = response.clone();
+                wrong_id[20..24].copy_from_slice(&1u32.to_be_bytes());
+                let mut wrong_exchange = response.clone();
+                wrong_exchange[18] = 35; // IKE_AUTH
+                let strays: [&[u8]; 6] = [
+                    b"not IKE at all",
+                    &wrong_spi,
+                    &req, // a request, not a response
+                    &wrong_id,
+                    &wrong_exchange,
+                    &bare_sa_init_answer(&req, notify_type::NO_PROPOSAL_CHOSEN, Vec::new()),
+                ];
+                for stray in strays {
+                    sock.send_to(stray, from).unwrap();
+                }
+                sock.send_to(&response, from).unwrap();
+            }
+            requests
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+        let result = session.sa_init_on_port(bind, &default_ike_offer(), next_addr().port());
+        assert_eq!(responder.join().unwrap(), 1, "answered on the first try: nothing to retransmit");
+        result.unwrap();
+    }
+
+    /// Control for the above: a refusal with nothing better behind it is
+    /// still reported as the peer's refusal, without a retransmission.
+    #[test]
+    fn sa_init_reports_a_refusal_nothing_better_follows() {
+        let bind = next_addr();
+        let responder = thread::spawn(move || {
+            let sock = UdpSocket::bind(bind).unwrap();
+            sock.set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+            let mut buf = [0u8; 2048];
+            let mut requests = 0;
+            while let Ok((n, from)) = sock.recv_from(&mut buf) {
+                requests += 1;
+                sock.send_to(&bare_sa_init_answer(&buf[..n], notify_type::NO_PROPOSAL_CHOSEN, Vec::new()), from).unwrap();
+            }
+            requests
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+        let err = session.sa_init_on_port(bind, &default_ike_offer(), next_addr().port()).unwrap_err();
+        assert!(
+            matches!(err, DriverError::Ike(IkeError::PeerRejected { notify_type: notify_type::NO_PROPOSAL_CHOSEN, .. })),
+            "{err:?}"
+        );
+        assert_eq!(responder.join().unwrap(), 1);
     }
 
     /// RFC 7296 §3.4: the KE's group MUST be one proposed in the same

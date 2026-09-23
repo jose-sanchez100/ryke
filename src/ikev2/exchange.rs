@@ -148,6 +148,13 @@ fn parse_signature_hashes(data: &[u8]) -> Vec<u16> {
 }
 
 fn parse_sa_init(header: &IkeHeader, body: &[u8]) -> Result<SaInitPayloads, IkeError> {
+    // The header's Length is the whole message's (RFC 7296 §3.1). Nothing
+    // protects an IKE_SA_INIT, and AUTH later signs its exact octets, so one
+    // that disagrees with the datagram carrying it is not taken as one.
+    let available = IkeHeader::LEN + body.len();
+    if header.length as usize != available {
+        return Err(IkeError::BadLength { declared: header.length as usize, available });
+    }
     let mut sa = None;
     let mut ke = None;
     let mut nonce = None;
@@ -1220,6 +1227,42 @@ mod tests {
         }
         for len in [0, 65, 200] {
             assert_eq!(answer(len), IkeError::MissingPayload("SA"), "{len} octets");
+        }
+    }
+
+    /// `message` with its header Length set to `declared` and `extra` bytes
+    /// appended after it.
+    fn relength(message: &[u8], declared: i64, extra: &[u8]) -> Vec<u8> {
+        let mut out = [message, extra].concat();
+        let length = (message.len() as i64 + declared) as u32;
+        out[24..28].copy_from_slice(&length.to_be_bytes());
+        out
+    }
+
+    /// RFC 7296 §3.1: the header's Length is the length of the whole message.
+    /// IKE_SA_INIT is unprotected -- and AUTH later signs these exact octets --
+    /// so a datagram that disagrees with its own header is not taken as one.
+    #[test]
+    fn an_sa_init_whose_length_is_not_the_datagram_length_is_malformed() {
+        let request = initiator_request(&init_secret(), &default_offer());
+        let (response, _) = responder_respond(&request, &resp_secret()).unwrap();
+        // Controls: both messages as built are consistent and accepted.
+        assert_eq!(IkeHeader::parse(&request).unwrap().length as usize, request.len());
+        assert!(initiator_complete(&init_secret(), &request, &response).is_ok());
+
+        let bad = [(-4, &[][..]), (4, &[][..]), (0, &[0u8; 4][..]), (-1, &[][..])];
+        for (declared, extra) in bad {
+            let what = format!("Length {declared:+}, {} byte(s) appended", extra.len());
+            let request_bad = relength(&request, declared, extra);
+            assert!(
+                matches!(responder_respond(&request_bad, &resp_secret()), Err(IkeError::BadLength { .. })),
+                "responder took a request with {what}"
+            );
+            let response_bad = relength(&response, declared, extra);
+            assert!(
+                matches!(initiator_complete(&init_secret(), &request, &response_bad), Err(IkeError::BadLength { .. })),
+                "initiator took a response with {what}"
+            );
         }
     }
 

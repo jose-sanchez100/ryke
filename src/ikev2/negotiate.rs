@@ -795,6 +795,38 @@ mod tests {
     }
 
     #[test]
+    fn a_transform_carrying_an_attribute_we_do_not_understand_is_never_selected() {
+        // §3.3.6: that transform is unacceptable; siblings of its type still
+        // count. Built from the wire so the parser's verdict is what's tested.
+        let wire = |encr_attrs: &[u8]| {
+            let t = |ty: u8, id: u16, attrs: &[u8], last: bool| {
+                let mut out = vec![if last { 0 } else { 3 }, 0];
+                out.extend_from_slice(&((8 + attrs.len()) as u16).to_be_bytes());
+                out.extend_from_slice(&[ty, 0]);
+                out.extend_from_slice(&id.to_be_bytes());
+                out.extend_from_slice(attrs);
+                out
+            };
+            let body = [
+                t(transform_type::ENCR, transform_id::AES_GCM_16, encr_attrs, false),
+                t(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, &[], false),
+                t(transform_type::DH, transform_id::X25519, &[], true),
+            ]
+            .concat();
+            let mut sa = vec![0, 0];
+            sa.extend_from_slice(&((8 + body.len()) as u16).to_be_bytes());
+            sa.extend_from_slice(&[1, protocol_id::IKE, 0, 3]);
+            sa.extend_from_slice(&body);
+            SecurityAssociation::parse(&sa).unwrap()
+        };
+        assert!(select(&wire(&[0x80, 14, 0x01, 0x00])).is_some(), "control: TV Key Length 256");
+        assert_eq!(select(&wire(&[0x80, 14, 0x01, 0x00, 0x80, 99, 0, 0])), None, "unknown TV attribute");
+        assert_eq!(select(&wire(&[0x00, 14, 0, 2, 0x01, 0x00])), None, "Key Length as TLV");
+        // §3.3.5: AES-GCM needs its Key Length; without one it is not picked.
+        assert_eq!(select(&wire(&[])), None, "AES-GCM with no Key Length");
+    }
+
+    #[test]
     fn an_esp_answer_picking_the_second_proposal_matches_the_offer() {
         let offer = SecurityAssociation {
             proposals: vec![

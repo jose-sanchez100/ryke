@@ -63,16 +63,27 @@
 //! gateway starts goes unanswered; and the ISAKMP SA is never rekeyed --
 //! once its lifetime is up, a new `connect` is the way on.
 //!
+//! IKEv2 fragmentation (RFC 7383), which every `IKE_SA_INIT` advertises:
+//! [`Ikev2Session`] and [`LivenessSession`] reassemble each fragmented
+//! message the peer sends -- the answers to their requests, in the
+//! handshake and after it, and the peer's own requests -- and every
+//! fragment is authenticated before it is kept. What they send, requests
+//! and answers alike, goes out whole: a large `IKE_AUTH` request (one
+//! carrying a certificate chain, say) is left to IP fragmentation, and
+//! there is no path MTU discovery.
+//!
 //! ### Bundled servers
 //!
 //! [`ikev2::server::Server`] and [`ikev1::server::Server`] are minimal
 //! responders for tests and examples, not gateways: a PSK or certificates
 //! (in IKEv1, Main Mode only), one CHILD SA at a time, no EAP or XAUTH, no
 //! NAT-T, and never an exchange of their own. Their module docs list what
-//! they do.
+//! they do. The IKEv2 one reassembles a request that comes in fragments and
+//! answers it in fragments no larger than the request's.
 //!
 //! [`ikev2::client::Client`] is the matching minimal IKEv2 initiator: the
-//! handshake, nothing after it.
+//! handshake, nothing after it. It reassembles a fragmented `IKE_AUTH`
+//! response, but sends each request once, with no retransmission.
 //!
 //! ### What the consumer supplies
 //!

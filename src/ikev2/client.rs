@@ -13,6 +13,13 @@
 //! dropped by the OS. See [`crate::ikev2::exchange::NatStatus`]'s own doc
 //! for the detection details; this module only owns the transport-switching
 //! side of it.
+//!
+//! RFC 7383 IKE fragmentation, which `IKE_SA_INIT` always advertises: an
+//! `IKE_AUTH` response in fragments is reassembled, each fragment
+//! authenticated before it is kept ([`crate::ikev2::fragment::Reassembly`]).
+//! The request itself always goes out whole, and it is sent once: this
+//! client does not retransmit, so a lost request or fragment of the
+//! response fails the handshake with the socket's read timeout.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
@@ -24,7 +31,9 @@ use crate::esp::ChildSa;
 use crate::ikev2::exchange::{
     default_offer, initiator_complete_natt, initiator_request_natt, CompletedSaInit, LocalSecret, NatStatus,
 };
+use crate::ikev2::fragment::{Accepted, MessageKey, Reassembly, MAX_FRAGMENTS};
 use crate::ikev2::ike_auth::{self, AuthConfig};
+use crate::ikev2::message::{IkeHeader, PayloadType};
 use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
 use crate::ikev2::payload::Identification;
 use crate::role::Role;
@@ -145,6 +154,31 @@ impl<E: Entropy> Client<E> {
         }
     }
 
+    /// The response to our `request` on `sa`: the first whole message that
+    /// comes, or the fragments of one (RFC 7383 §2.6) reassembled and sealed
+    /// again as one `SK` message under the responder's keys. A fragment of
+    /// another message, or one that does not authenticate, is dropped;
+    /// after `4 * MAX_FRAGMENTS` datagrams without a complete response, it
+    /// gives up.
+    fn recv_response(&mut self, sa: &CompletedSaInit, request: &[u8], floated: bool) -> Result<Vec<u8>, DriverError> {
+        let asked = IkeHeader::parse(request)?;
+        let mut answer = Reassembly::new(MessageKey { initiator: false, response: true, ..MessageKey::of(&asked) });
+        let cipher = sa.suite.sk_cipher();
+        for _ in 0..4 * usize::from(MAX_FRAGMENTS) {
+            let msg = self.recv_step(floated)?;
+            let Ok(header) = IkeHeader::parse(&msg) else { continue };
+            if header.next_payload != PayloadType::EncryptedFragment {
+                return Ok(msg);
+            }
+            if let Accepted::Complete(first, inner) = answer.accept(&msg, cipher, &sa.keys.sk_er, &sa.keys.sk_ar) {
+                let mut iv = [0u8; 8];
+                self.entropy.fill(&mut iv);
+                return Ok(crate::ikev2::sk::build_encrypted(cipher, header, first, &inner, &sa.keys.sk_er, &sa.keys.sk_ar, &iv)?);
+            }
+        }
+        Err(IkeError::Crypto("no complete IKE_AUTH response among the fragments received").into())
+    }
+
     /// Run `IKE_SA_INIT` against `server` and return our completed state
     /// plus what it found out about NAT on the path (RFC 7296 §2.23):
     /// sends our default offer carrying `NAT_DETECTION_*` notifies, waits
@@ -177,7 +211,7 @@ impl<E: Entropy> Client<E> {
         let esp_offer = ike_auth::esp_offer(0);
         let request = ike_auth::initiator_auth_request(sa, cfg, child_spi, &esp_offer, &iv)?;
         self.send_step(&request, server, floated)?;
-        let response = self.recv_step(floated)?;
+        let response = self.recv_response(sa, &request, floated)?;
         let (id, spi, _esp_suite, ip4, _tsr) = ike_auth::initiator_verify_auth(sa, &response, cfg, &esp_offer)?;
         Ok((id, spi, ip4))
     }
@@ -262,5 +296,49 @@ mod tests {
         let client = Client { transport: UdpTransport::bind("127.0.0.1:0").unwrap(), natt_transport: None, entropy: SeedEntropy::new(1) };
         assert!(client.enable_natt_encap(false).is_ok(), "not floated -- nothing to enable");
         assert!(client.enable_natt_encap(true).is_err(), "floated with no port-4500 socket must error, not silently no-op");
+    }
+
+    /// RFC 7383 §2.6: the client advertises IKE fragmentation in
+    /// `IKE_SA_INIT`, so an `IKE_AUTH` response in fragments must be
+    /// reassembled -- a forged fragment ahead of the real ones changing
+    /// nothing. It used to be handed whole to `initiator_verify_auth`,
+    /// which found no `SK` payload in it.
+    #[test]
+    fn connect_reassembles_a_fragmented_ike_auth_response() {
+        use crate::ikev2::exchange::{responder_respond_natt, SaInitResult};
+        use crate::ikev2::fragment::build_fragments;
+        use crate::ikev2::sk::open_encrypted;
+
+        let gateway = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        gateway.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let bind = gateway.local_addr().unwrap();
+        let responder = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let (n, from) = gateway.recv_from(&mut buf).unwrap();
+            let (response, sa) = match responder_respond_natt(&buf[..n], &resp_secret(), bind, from, None).unwrap() {
+                SaInitResult::Established { response, sa } => (response, sa),
+                _ => panic!("expected Established"),
+            };
+            gateway.send_to(&response, from).unwrap();
+            let (n, from) = gateway.recv_from(&mut buf).unwrap();
+            let rcfg = AuthConfig::psk(Identification::fqdn("gw.test"), b"psk".to_vec());
+            let (resp, ..) = ike_auth::responder_process_auth(&sa, &buf[..n], &rcfg, 0xC0FFEE, &[9u8; 8], None).unwrap();
+            let (cipher, sk_e, sk_a) = (sa.suite.sk_cipher(), &sa.keys.sk_er, &sa.keys.sk_ar);
+            let (first, inner) = open_encrypted(cipher, &resp, sk_e, sk_a).unwrap();
+            let header = IkeHeader::parse(&resp).unwrap();
+            let fragments = build_fragments(cipher, &header, first, &inner, sk_e, sk_a, 42, inner.len().div_ceil(3)).unwrap();
+            let mut forged = fragments[0].clone();
+            *forged.last_mut().unwrap() ^= 1;
+            for f in std::iter::once(&forged).chain(&fragments) {
+                gateway.send_to(f, from).unwrap();
+            }
+        });
+        let mut client = Client::bind("127.0.0.1:0", SeedEntropy::new(1)).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let cfg = AuthConfig::psk(Identification::fqdn("client.test"), b"psk".to_vec());
+        let (_sa, peer, child, _) = client.connect(bind, &cfg, 0x1234).unwrap();
+        responder.join().unwrap();
+        assert_eq!(peer, Identification::fqdn("gw.test"));
+        assert_eq!(child.outbound.spi(), 0xC0FFEE);
     }
 }

@@ -35,10 +35,10 @@ use crate::ikev2::exchange::{
     default_offer, initiator_complete_natt, initiator_request_natt_retry, CompletedSaInit, LocalSecret,
     NatStatus,
 };
-use crate::ikev2::fragment;
+use crate::ikev2::fragment::{self, Accepted, MessageKey, Reassembly};
 use crate::ikev2::ike_auth::{self, AuthConfig, ChildTsOffer};
 use crate::ikev2::ike_rekey;
-use crate::ikev2::informational::{build_informational, dpd_request, open_from_peer, payload_list};
+use crate::ikev2::informational::{build_informational, dpd_request, open_from_peer, payload_list, peer_sk_a, peer_sk_e};
 use crate::ikev2::message::{payloads, ExchangeType, IkeHeader, PayloadType};
 use crate::ikev1::quick::{ChildKeyMaterial, RekeyedChild};
 use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
@@ -232,6 +232,26 @@ struct PeerRequests {
     /// that it could be a replay of.
     next: Option<u64>,
     last: Option<AnsweredRequest>,
+    /// The fragments in hand of the next request, if it comes fragmented
+    /// (RFC 7383), and since when.
+    fragments: Option<(Reassembly, Instant)>,
+}
+
+/// How long the fragments of a request from the peer are kept waiting for
+/// the rest (RFC 7383 §2.6 recommends a responder wait as long as it would
+/// for an answer as an initiator: [`RETRY_BACKOFFS`], all of it).
+const FRAGMENT_REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What [`LivenessSession::take_fragment`] made of one fragment.
+enum Fragmented {
+    /// Nothing to act on yet (stored, or dropped).
+    Pending,
+    /// The last fragment of a message: the whole message, as one `SK`
+    /// message.
+    Whole(IkeHeader, Vec<u8>),
+    /// Fragment 1 of the last request answered: the answer went out again.
+    /// Whether that request ended the tunnel.
+    AnsweredAgain { tears_down: bool },
 }
 
 /// Where this session's IKE SA is in its life -- see [`LivenessSession::rekey_ike`].
@@ -522,13 +542,14 @@ impl LivenessSession {
     fn send_and_await(&mut self, wire: &[u8], expected_mid: u32, timeout: Duration) -> Result<Liveness, DriverError> {
         const ATTEMPTS: u32 = 3;
         let mut last = Liveness::NoReply;
+        let mut answer = Reassembly::new(self.answer_key(expected_mid, ExchangeType::Informational));
         for attempt in 0..ATTEMPTS {
             if attempt > 0 {
                 ike_debug!("INFORMATIONAL: retransmitting to {} (attempt {}/{ATTEMPTS})", self.dest, attempt + 1);
             }
             crate::debug::dump(">>>", self.dest, wire);
             self.sock.send_to(wire, self.dest)?;
-            last = self.recv_and_classify(timeout, Some(expected_mid))?;
+            last = self.recv_and_classify(timeout, Some(&mut answer))?;
             if last != Liveness::NoReply {
                 return Ok(last);
             }
@@ -1023,8 +1044,8 @@ impl LivenessSession {
     /// [`Self::answer_peer_request`], and the wait goes on unless it ended
     /// the tunnel ([`Liveness::PeerTornDown`]). A datagram that isn't an
     /// IKEv2 message at all is dropped: anyone can send one.
-    fn recv_and_classify(&mut self, timeout: Duration, expected_mid: Option<u32>) -> Result<Liveness, DriverError> {
-        let quiet = if expected_mid.is_some() { Liveness::NoReply } else { Liveness::Alive };
+    fn recv_and_classify(&mut self, timeout: Duration, mut awaited: Option<&mut Reassembly>) -> Result<Liveness, DriverError> {
+        let quiet = if awaited.is_some() { Liveness::NoReply } else { Liveness::Alive };
         let deadline = Instant::now() + timeout;
         let mut buf = [0u8; 8192];
         loop {
@@ -1043,14 +1064,108 @@ impl LivenessSession {
             crate::debug::dump("<<<", self.dest, &buf[..n]);
             let Ok(msg) = unwrap(&buf[..n], self.float) else { continue };
             let Ok(header) = IkeHeader::parse(&msg) else { continue };
+            let (header, msg) = if header.next_payload == PayloadType::EncryptedFragment {
+                match self.take_fragment(&header, &msg, awaited.as_deref_mut())? {
+                    Fragmented::Whole(header, msg) => (header, msg),
+                    Fragmented::Pending => continue,
+                    Fragmented::AnsweredAgain { tears_down: true } => return Ok(Liveness::PeerTornDown),
+                    Fragmented::AnsweredAgain { tears_down: false } => continue,
+                }
+            } else {
+                (header, msg)
+            };
             if header.flags.response {
-                if expected_mid.is_some_and(|mid| self.is_answer(&header, &msg, mid, ExchangeType::Informational)) {
+                let answer = awaited.as_deref().map(Reassembly::key);
+                if answer.is_some_and(|key| self.is_answer(&header, &msg, key.message_id, key.exchange_type)) {
                     return Ok(Liveness::Alive);
                 }
                 continue;
             }
             if self.answer_peer_request(&header, &msg)? {
                 return Ok(Liveness::PeerTornDown);
+            }
+        }
+    }
+
+    /// The [`MessageKey`] of the peer's answer to our request `mid` of
+    /// `exchange` on the current IKE SA.
+    fn answer_key(&self, mid: u32, exchange: ExchangeType) -> MessageKey {
+        MessageKey {
+            initiator_spi: self.sa.spi_i,
+            responder_spi: self.sa.spi_r,
+            exchange_type: exchange,
+            initiator: self.sa.role == Role::Responder,
+            response: true,
+            message_id: mid,
+        }
+    }
+
+    /// One fragment (RFC 7383) from the peer, `header` its IKE header.
+    ///
+    /// - A response counts only toward `awaited`, the answer to the request
+    ///   we wait on, and only if it belongs to it; otherwise it is dropped.
+    /// - A request is taken only where [`Self::answer_peer_request`] would
+    ///   take the whole of it: on one of this session's IKE SAs, and in its
+    ///   receive window. Fragment 1 of the last request answered, once it
+    ///   authenticates, gets the answer again; any other fragment of it is
+    ///   ignored (RFC 7383 §2.6.1). The fragments of the next request are
+    ///   kept for [`FRAGMENT_REASSEMBLY_TIMEOUT`], and a fragment of another
+    ///   request replaces them only if it is authentic.
+    ///
+    /// Each fragment goes through [`Reassembly::accept`]. A message it
+    /// completes is sealed again as one `SK` message under the peer's keys,
+    /// and then goes where an unfragmented one would, checks included.
+    fn take_fragment(&mut self, header: &IkeHeader, msg: &[u8], awaited: Option<&mut Reassembly>) -> Result<Fragmented, DriverError> {
+        let mid = header.message_id;
+        if header.flags.response {
+            let Some(answer) = awaited.filter(|answer| answer.key() == MessageKey::of(header)) else {
+                return Ok(Fragmented::Pending);
+            };
+            let sa = &self.sa;
+            return match answer.accept(msg, sa.suite.sk_cipher(), peer_sk_e(sa), peer_sk_a(sa)) {
+                Accepted::Complete(first, inner) => whole_from_peer(sa, *header, first, &inner),
+                Accepted::Stored => Ok(Fragmented::Pending),
+                Accepted::Discarded(why) => {
+                    ike_debug!("response {mid}: fragment dropped: {why}");
+                    Ok(Fragmented::Pending)
+                }
+            };
+        }
+        let Some(on) = self.ike_sa_of(header) else {
+            return Ok(Fragmented::Pending);
+        };
+        let sa = self.ike_sa(on).clone();
+        let (cipher, sk_e, sk_a) = (sa.suite.sk_cipher(), peer_sk_e(&sa), peer_sk_a(&sa));
+        if let Some(last) = self.peer_requests(on).last.as_ref().filter(|last| last.message_id == mid) {
+            if !fragment::verify_fragment(cipher, msg, sk_e, sk_a).is_ok_and(|(number, _)| number == 1) {
+                return Ok(Fragmented::Pending);
+            }
+            ike_debug!("request {mid} from the peer: retransmitted (fragment 1) -- resending our answer");
+            let _ = self.sock.send_to(&last.response, self.dest);
+            return Ok(Fragmented::AnsweredAgain { tears_down: last.tears_down });
+        }
+        if self.peer_requests(on).next.is_some_and(|next| next != u64::from(mid))
+            || (on == OnIkeSa::Retired && self.ike.retired.as_ref().is_some_and(|r| r.deleted))
+        {
+            return Ok(Fragmented::Pending);
+        }
+        let key = MessageKey::of(header);
+        let requests = self.peer_requests_on(on);
+        let kept = requests.fragments.take().filter(|(_, since)| since.elapsed() <= FRAGMENT_REASSEMBLY_TIMEOUT);
+        let (mut request, since, other) = match kept {
+            Some((request, since)) if request.key() == key => (request, since, None),
+            other => (Reassembly::new(key), Instant::now(), other),
+        };
+        match request.accept(msg, cipher, sk_e, sk_a) {
+            Accepted::Complete(first, inner) => whole_from_peer(&sa, *header, first, &inner),
+            Accepted::Stored => {
+                requests.fragments = Some((request, since));
+                Ok(Fragmented::Pending)
+            }
+            Accepted::Discarded(why) => {
+                ike_debug!("request {mid} from the peer: fragment dropped: {why}");
+                requests.fragments = if request.is_empty() { other } else { Some((request, since)) };
+                Ok(Fragmented::Pending)
             }
         }
     }
@@ -1705,6 +1820,7 @@ impl LivenessSession {
     fn request_response(&mut self, wire: &[u8], mid: u32, timeout: Duration) -> Result<Reply, DriverError> {
         const ATTEMPTS: u32 = 3;
         let exchange = IkeHeader::parse(&unwrap(wire, self.float)?)?.exchange_type;
+        let mut answer = Reassembly::new(self.answer_key(mid, exchange));
         for attempt in 0..ATTEMPTS {
             if attempt > 0 {
                 ike_debug!("request {mid}: retransmitting to {} (attempt {}/{ATTEMPTS})", self.dest, attempt + 1);
@@ -1727,6 +1843,16 @@ impl LivenessSession {
                 crate::debug::dump("<<<", self.dest, &buf[..n]);
                 let Ok(msg) = unwrap(&buf[..n], self.float) else { continue };
                 let Ok(header) = IkeHeader::parse(&msg) else { continue };
+                let (header, msg) = if header.next_payload == PayloadType::EncryptedFragment {
+                    match self.take_fragment(&header, &msg, Some(&mut answer))? {
+                        Fragmented::Whole(header, msg) => (header, msg),
+                        Fragmented::Pending => continue,
+                        Fragmented::AnsweredAgain { tears_down: true } => return Ok(Reply::PeerTornDown),
+                        Fragmented::AnsweredAgain { tears_down: false } => continue,
+                    }
+                } else {
+                    (header, msg)
+                };
                 if header.flags.response {
                     if self.is_answer(&header, &msg, mid, exchange) {
                         return Ok(Reply::Response(msg));
@@ -1815,82 +1941,26 @@ fn send_and_retry(sock: &UdpSocket, dest: SocketAddr, wire: &[u8]) -> Result<Vec
     Err(last_err.expect("RETRY_BACKOFFS is non-empty").into())
 }
 
-/// Timeout for each individual fragment read once the first fragment of a
-/// response has arrived (RFC 7383 doesn't specify one -- this mirrors
-/// [`RETRY_BACKOFFS`]'s steady-state 8s entries: a real gateway sends every
-/// fragment of one message back-to-back, so this only needs to be long
-/// enough to ride out ordinary jitter, not a full retransmit cycle).
-const FRAGMENT_READ_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// Overall deadline for finishing one reassembly, independent of
-/// [`FRAGMENT_READ_TIMEOUT`]'s per-datagram idle timeout -- without this, a
-/// peer that trickles in one fragment just under the idle timeout each time
-/// could keep `send_and_retry_reassembling` waiting far longer than any real
-/// exchange should take.
-const FRAGMENT_TOTAL_DEADLINE: Duration = Duration::from_secs(30);
-
-/// Cap on the RFC 7383 Total Fragments a single reassembly will accept.
-/// Bounds the memory a hostile/broken peer can make [`FragmentSet`] hold --
-/// far above anything a real gateway's fragmentation threshold would ever
-/// produce (even a large certificate chain splits into a few dozen pieces at
-/// typical MTUs), so this only fires on a bogus Total field.
-const MAX_FRAGMENTS: u16 = 256;
-
-/// Accumulates RFC 7383 fragments for one message as they arrive, in any
-/// order, deduplicating by Fragment Number. RFC 7383 §2.6 requires
-/// discarding duplicate fragments before reassembly; this crate previously
-/// just appended every arrival (including retransmitted/duplicated ones) to
-/// a `Vec`, so a single duplicate made `reassemble`'s exact-count check fail
-/// *permanently*, even once every legitimate fragment had already arrived.
-#[derive(Default)]
-struct FragmentSet {
-    total: Option<u16>,
-    by_num: std::collections::BTreeMap<u16, Vec<u8>>,
-}
-
-impl FragmentSet {
-    /// Record one arrival. Structurally bogus headers (a Number of `0` or
-    /// past `Total`, or a `Total` beyond [`MAX_FRAGMENTS`]) are dropped
-    /// outright -- not something a real peer sends, and accepting them would
-    /// let a hostile one grow the set without bound. A `Total` that
-    /// disagrees with whatever's already in hand resets the set: fragments
-    /// from two different splits of a message can never reassemble
-    /// together, so keeping the stale ones around would just block a
-    /// genuinely complete resend from ever completing.
-    fn accept(&mut self, msg: &[u8]) {
-        let Ok((frag_num, total)) = fragment::peek_fragment_header(msg) else { return };
-        if total == 0 || total > MAX_FRAGMENTS || frag_num == 0 || frag_num > total {
-            return;
-        }
-        if self.total != Some(total) {
-            self.by_num.clear();
-            self.total = Some(total);
-        }
-        self.by_num.entry(frag_num).or_insert_with(|| msg.to_vec());
-    }
-
-    /// `Some(fragments)`, in Fragment Number order, once every `1..=Total`
-    /// slot is filled -- `None` while any are still missing.
-    fn complete(&self) -> Option<Vec<Vec<u8>>> {
-        let total = self.total?;
-        (self.by_num.len() == total as usize).then(|| self.by_num.values().cloned().collect())
-    }
-}
-
-/// Like [`send_and_retry`], but transparently reassembles the reply if the
-/// peer fragmented it (RFC 7383): when the first datagram back carries an
-/// `SKF` payload instead of `SK`, this keeps reading further datagrams for
-/// the same Message ID until every fragment `1..=total` is in (deduplicating
-/// and bounding them via [`FragmentSet`]), verifies and decrypts them via
-/// [`fragment::reassemble`], then re-encrypts the result as a single
-/// ordinary `SK` message under the same peer key material. That keeps every
-/// existing `open_encrypted` call site (which only ever expects a plain
-/// `SK` payload) unchanged -- this is the one place that needs to know
-/// fragments exist at all.
+/// Like [`send_and_retry`], for the `IKE_AUTH` request `wire` (sealed under
+/// `cipher`; `sk_e`/`sk_a` are the *peer's* send keys, the ones the caller
+/// then opens the answer with): returns the peer's response to it, whole or
+/// reassembled from RFC 7383 fragments.
 ///
-/// `cipher`/`sk_e`/`sk_a` are the *peer's* send keys (the same ones the
-/// caller is about to pass to `open_encrypted`/`initiator_verify_auth`/etc.
-/// on the returned bytes).
+/// - Only a datagram answering this request is looked at: the response on
+///   the request's IKE SA, exchange and Message ID, from the other side
+///   ([`MessageKey`]). Anything else, IKE or not, is passed over.
+/// - A whole response must authenticate (RFC 7296 §2.21.3); one that does
+///   not is passed over, and the wait goes on.
+/// - A fragment goes to a [`Reassembly`], which authenticates it before it
+///   counts, drops replays and follows the Total Fragments rules of RFC 7383
+///   §2.6. Once complete, the message is sealed again as one ordinary `SK`
+///   message under the same peer keys, so the callers, which open `SK`
+///   messages, need not know fragments exist.
+/// - The request is retransmitted on the [`RETRY_BACKOFFS`] schedule until
+///   the whole response is in (RFC 7296 §2.1, RFC 7383 §2.6: a responder
+///   answers a retransmission with its whole response again). Fragments in
+///   hand are kept across retransmissions, since the peer resends the same
+///   ones, and dropped when the last attempt times out.
 fn send_and_retry_reassembling(
     sock: &UdpSocket,
     dest: SocketAddr,
@@ -1900,52 +1970,55 @@ fn send_and_retry_reassembling(
     sk_e: &[u8],
     sk_a: &[u8],
 ) -> Result<Vec<u8>, DriverError> {
-    let raw = send_and_retry(sock, dest, wire)?;
-    let first = unwrap(&raw, float)?;
-    let header = IkeHeader::parse(&first)?;
-    if header.next_payload != PayloadType::EncryptedFragment {
-        return Ok(first);
-    }
-    ike_debug!("IKE_AUTH: response is fragmented (RFC 7383) -- reassembling");
-
-    let mid = header.message_id;
-    let mut set = FragmentSet::default();
-    set.accept(&first);
-
-    let deadline = Instant::now() + FRAGMENT_TOTAL_DEADLINE;
+    let request = IkeHeader::parse(&unwrap(wire, float)?)?;
+    let key = MessageKey { initiator: !request.flags.initiator, response: true, ..MessageKey::of(&request) };
+    let mut reassembly = Reassembly::new(key);
     let mut buf = [0u8; MAX_DATAGRAM];
-    loop {
-        if let Some(fragments) = set.complete() {
-            if let Ok((first_inner, inner)) = fragment::reassemble(cipher, &fragments, sk_e, sk_a) {
-                ike_debug!("IKE_AUTH: reassembled {} fragment(s)", fragments.len());
-                let mut iv = [0u8; 8];
-                OsEntropy::new()?.fill(&mut iv);
-                let synthetic = sk::build_encrypted(cipher, header, first_inner, &inner, sk_e, sk_a, &iv)?;
-                return Ok(synthetic);
+    for (attempt, timeout) in RETRY_BACKOFFS.iter().enumerate() {
+        if attempt > 0 {
+            ike_debug!("retransmitting request to {dest} (attempt {}/{})", attempt + 1, RETRY_BACKOFFS.len());
+        }
+        crate::debug::dump(">>>", dest, wire);
+        sock.send_to(wire, dest)?;
+        let deadline = Instant::now() + *timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-            // A complete-looking set failed to authenticate as a whole --
-            // drop it and keep listening rather than spin on the same bad
-            // set forever; a genuinely complete, valid set can still arrive
-            // (e.g. the peer resends the whole message after a drop mangled
-            // one fragment in transit).
-            set = FragmentSet::default();
+            sock.set_read_timeout(Some(remaining))?;
+            let n = match sock.recv(&mut buf) {
+                Ok(n) => n,
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => break,
+                Err(e) => return Err(e.into()),
+            };
+            crate::debug::dump("<<<", dest, &buf[..n]);
+            let Ok(msg) = unwrap(&buf[..n], float) else { continue };
+            let Ok(header) = IkeHeader::parse(&msg) else { continue };
+            if MessageKey::of(&header) != key {
+                continue;
+            }
+            if header.next_payload != PayloadType::EncryptedFragment {
+                if sk::open_encrypted(cipher, &msg, sk_e, sk_a).is_ok() {
+                    return Ok(msg);
+                }
+                ike_debug!("response {}: does not authenticate -- dropped", key.message_id);
+                continue;
+            }
+            match reassembly.accept(&msg, cipher, sk_e, sk_a) {
+                Accepted::Complete(first_inner, inner) => {
+                    ike_debug!("response {}: reassembled from fragments (RFC 7383)", key.message_id);
+                    let mut iv = [0u8; 8];
+                    OsEntropy::new()?.fill(&mut iv);
+                    return Ok(sk::build_encrypted(cipher, header, first_inner, &inner, sk_e, sk_a, &iv)?);
+                }
+                Accepted::Stored => {}
+                Accepted::Discarded(why) => ike_debug!("response {}: fragment dropped: {why}", key.message_id),
+            }
         }
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(IkeError::Crypto("timed out waiting for the rest of a fragmented message").into());
-        }
-        sock.set_read_timeout(Some(remaining.min(FRAGMENT_READ_TIMEOUT)))?;
-        let n = sock.recv(&mut buf)?;
-        crate::debug::dump("<<<", dest, &buf[..n]);
-        let msg = unwrap(&buf[..n], float)?;
-        let h = IkeHeader::parse(&msg)?;
-        if h.message_id == mid && h.next_payload == PayloadType::EncryptedFragment {
-            set.accept(&msg);
-        }
-        // Anything else (a stray retransmit of an earlier message, ...) is
-        // just ignored -- keep waiting for the rest of this message.
     }
+    let what = if reassembly.is_empty() { "no response" } else { "the response came in part" };
+    Err(io::Error::new(io::ErrorKind::TimedOut, format!("{what} after {} attempts", RETRY_BACKOFFS.len())).into())
 }
 
 /// Whether `header` is that of a message from the peer on the IKE SA `sa`
@@ -1954,6 +2027,16 @@ fn send_and_retry_reassembling(
 /// rekey is whoever started the rekey (§2.18).
 fn from_peer_on(sa: &CompletedSaInit, header: &IkeHeader) -> bool {
     header.initiator_spi == sa.spi_i && header.responder_spi == sa.spi_r && header.flags.initiator == (sa.role == Role::Responder)
+}
+
+/// A message from the peer on `sa`, reassembled from fragments: `header`
+/// (that of its fragments), `first` and `inner` sealed as one `SK` message
+/// under the peer's keys, for the code that opens those.
+fn whole_from_peer(sa: &CompletedSaInit, header: IkeHeader, first: PayloadType, inner: &[u8]) -> Result<Fragmented, DriverError> {
+    let mut iv = [0u8; 8];
+    OsEntropy::new()?.fill(&mut iv);
+    let msg = sk::build_encrypted(sa.suite.sk_cipher(), header, first, inner, peer_sk_e(sa), peer_sk_a(sa), &iv)?;
+    Ok(Fragmented::Whole(IkeHeader::parse(&msg)?, msg))
 }
 
 fn wrap(msg: &[u8], float: bool) -> Vec<u8> {
@@ -4741,96 +4824,354 @@ mod tests {
         responder.join().unwrap();
     }
 
-    fn fragment_set_test_header() -> IkeHeader {
-        IkeHeader {
-            initiator_spi: 0x1111_2222_3333_4444,
-            responder_spi: 0x5555_6666_7777_8888,
-            next_payload: PayloadType::NoNext,
-            major_version: 2,
-            minor_version: 0,
-            exchange_type: ExchangeType::IkeAuth,
-            flags: Flags { initiator: false, version: false, response: true },
-            message_id: 7,
-            length: 0,
+    /// A responder that has run `IKE_SA_INIT` and built its `IKE_AUTH`
+    /// response, with that response in hand as three RFC 7383 fragments --
+    /// for the tests below to deliver as they choose.
+    struct FragmentingResponder {
+        sock: UdpSocket,
+        from: SocketAddr,
+        sa: CompletedSaInit,
+        /// The client's `IKE_AUTH` request, as it came in.
+        request: Vec<u8>,
+        header: IkeHeader,
+        first_inner: PayloadType,
+        inner: Vec<u8>,
+        fragments: Vec<Vec<u8>>,
+    }
+
+    impl FragmentingResponder {
+        fn start(bind: SocketAddr, psk: Vec<u8>) -> Self {
+            let sock = UdpSocket::bind(bind).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut buf = [0u8; 4096];
+            let (n, from) = sock.recv_from(&mut buf).unwrap();
+            let resp_secret = LocalSecret::generate(&mut OsEntropy::new().unwrap(), 32);
+            let (response, sa) = match responder_respond_natt(&buf[..n], &resp_secret, bind, from, None).unwrap() {
+                SaInitResult::Established { response, sa } => (response, sa),
+                _ => panic!("expected Established"),
+            };
+            sock.send_to(&response, from).unwrap();
+
+            let (n, from) = sock.recv_from(&mut buf).unwrap();
+            let request = buf[..n].to_vec();
+            let rcfg = AuthConfig::psk(Identification::fqdn("responder.test"), psk);
+            let (resp, _peer_id, _spi, _ic) = responder_process_auth(&sa, &request, &rcfg, 0xC0FFEE, &[9u8; 8], None).unwrap();
+            let (first_inner, inner) = open_encrypted(sa.suite.sk_cipher(), &resp, &sa.keys.sk_er, &sa.keys.sk_ar).unwrap();
+            let header = IkeHeader::parse(&resp).unwrap();
+            let mut responder = Self { sock, from, sa, request, header, first_inner, inner, fragments: Vec::new() };
+            responder.fragments = responder.split(3, 42);
+            assert_eq!(responder.fragments.len(), 3, "test setup: the response must split three ways");
+            responder
+        }
+
+        /// The response split into `pieces` fragments, with IVs from `iv_base`.
+        fn split(&self, pieces: usize, iv_base: u64) -> Vec<Vec<u8>> {
+            self.seal(self.header, &self.inner.clone(), pieces, iv_base)
+        }
+
+        /// `inner` under `header`, split into `pieces` fragments sealed with
+        /// the responder's real keys.
+        fn seal(&self, header: IkeHeader, inner: &[u8], pieces: usize, iv_base: u64) -> Vec<Vec<u8>> {
+            let per = inner.len().div_ceil(pieces).max(1);
+            let keys = &self.sa.keys;
+            fragment::build_fragments(self.sa.suite.sk_cipher(), &header, self.first_inner, inner, &keys.sk_er, &keys.sk_ar, iv_base, per).unwrap()
+        }
+
+        fn send(&self, msg: &[u8]) {
+            self.sock.send_to(msg, self.from).unwrap();
+        }
+
+        fn send_all(&self) {
+            for f in &self.fragments {
+                self.send(f);
+            }
+        }
+
+        fn recv(&self) -> Vec<u8> {
+            let mut buf = [0u8; 4096];
+            let (n, _) = self.sock.recv_from(&mut buf).unwrap();
+            buf[..n].to_vec()
         }
     }
 
-    #[test]
-    fn fragment_set_deduplicates_by_fragment_number() {
-        let sk_e = vec![9u8; 36];
-        let inner = vec![3u8; 90];
-        let frags = fragment::build_fragments(SkCipher::Aes256Gcm, &fragment_set_test_header(), PayloadType::IdInitiator, &inner, &sk_e, &[], 1, 30).unwrap();
-        assert_eq!(frags.len(), 3);
-
-        let mut set = FragmentSet::default();
-        set.accept(&frags[0]);
-        set.accept(&frags[0]); // duplicate -- must not count twice
-        assert!(set.complete().is_none());
-        set.accept(&frags[1]);
-        assert!(set.complete().is_none());
-        set.accept(&frags[2]);
-        let complete = set.complete().expect("all 3 distinct fragment numbers are in hand");
-        assert_eq!(complete.len(), 3);
+    /// Runs `script` as the responder and connects to it: `Ok` with the
+    /// CHILD SA's peer SPI, or the error the connect ended with.
+    fn connect_through_fragments(script: impl FnOnce(FragmentingResponder) + Send + 'static) -> Result<u32, DriverError> {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let responder = thread::spawn({
+            let psk = psk.clone();
+            move || script(FragmentingResponder::start(bind, psk))
+        });
+        thread::sleep(Duration::from_millis(50));
+        let mut session = Ikev2Session::new(OsEntropy::new().unwrap());
+        let cfg = AuthConfig::psk(Identification::fqdn("client.test"), psk);
+        let result = session
+            .connect_direct_on_port(bind, &default_ike_offer(), &cfg, false, &default_esp_offer(), next_addr().port())
+            .map(|tunnel| tunnel.peer_spi);
+        responder.join().unwrap();
+        result
     }
 
-    #[test]
-    fn fragment_set_ignores_a_total_beyond_the_cap() {
-        let sk_e = vec![9u8; 36];
-        let frags =
-            fragment::build_fragments(SkCipher::Aes256Gcm, &fragment_set_test_header(), PayloadType::IdInitiator, &[1, 2, 3], &sk_e, &[], 1, 30).unwrap();
-        assert_eq!(frags.len(), 1);
-        let mut forged = frags[0].clone();
-        // Total Fragments sits right after the 4-byte SKF generic header,
-        // which itself follows the 28-byte IKE header.
-        let total_off = IkeHeader::LEN + 6;
-        forged[total_off..total_off + 2].copy_from_slice(&(MAX_FRAGMENTS + 1).to_be_bytes());
-
-        let mut set = FragmentSet::default();
-        set.accept(&forged);
-        assert!(set.complete().is_none(), "a Total beyond MAX_FRAGMENTS must be dropped, not accepted");
-        assert!(set.total.is_none(), "the bogus Total must never even be recorded");
-        assert!(set.by_num.is_empty(), "the fragment carrying it must not be queued either");
+    fn flip_last_byte(mut msg: Vec<u8>) -> Vec<u8> {
+        *msg.last_mut().unwrap() ^= 1;
+        msg
     }
 
+    /// RFC 7383 §2.6: a fragment whose ICV does not verify is discarded.
+    /// It used to be stored first and checked only once the set was
+    /// complete, so a forged copy of fragment 1 sent ahead of the real set
+    /// held its place, the genuine fragment 1 was dropped as its duplicate,
+    /// and the connection failed.
     #[test]
-    fn fragment_set_resets_when_the_declared_total_changes() {
-        let sk_e = vec![9u8; 36];
-        let three_way = fragment::build_fragments(
-            SkCipher::Aes256Gcm,
-            &fragment_set_test_header(),
-            PayloadType::IdInitiator,
-            &[1u8; 90],
-            &sk_e,
-            &[],
-            1,
-            30,
-        )
-        .unwrap();
-        assert_eq!(three_way.len(), 3);
-        let two_way = fragment::build_fragments(
-            SkCipher::Aes256Gcm,
-            &fragment_set_test_header(),
-            PayloadType::IdInitiator,
-            &[2u8; 40],
-            &sk_e,
-            &[],
-            99,
-            30,
-        )
-        .unwrap();
-        assert_eq!(two_way.len(), 2);
+    fn a_forged_fragment_ahead_of_the_real_set_does_not_take_its_place() {
+        let got = connect_through_fragments(|r| {
+            r.send(&flip_last_byte(r.fragments[0].clone()));
+            r.send_all();
+        });
+        assert_eq!(got.unwrap(), 0xC0FFEE);
+    }
 
-        let mut set = FragmentSet::default();
-        set.accept(&three_way[0]);
-        set.accept(&three_way[1]);
-        assert!(set.complete().is_none());
-        // A fragment declaring a different Total arrives -- the stale
-        // 3-way partial set can never complete and must be dropped, not
-        // mixed with the new 2-way one.
-        set.accept(&two_way[0]);
-        set.accept(&two_way[1]);
-        let complete = set.complete().expect("the fresh 2-way set should complete on its own");
-        assert_eq!(complete.len(), 2);
+    /// RFC 7383 §2.6: only an authentic fragment with a larger Total
+    /// restarts the reassembly. A forged one used to throw away the
+    /// genuine fragments already in hand.
+    #[test]
+    fn a_forged_fragment_with_a_larger_total_does_not_restart_the_reassembly() {
+        let got = connect_through_fragments(|r| {
+            r.send(&r.fragments[0]);
+            r.send(&r.fragments[1]);
+            r.send(&flip_last_byte(r.split(4, 900)[0].clone()));
+            r.send(&r.fragments[2]);
+        });
+        assert_eq!(got.unwrap(), 0xC0FFEE);
+    }
+
+    /// RFC 7383 §2.6 (and §2.5.2: Total only grows as a sender retries with
+    /// smaller fragments): a fragment with a smaller Total than the ones in
+    /// hand is discarded, even an authentic one -- a late fragment of an
+    /// older split. It used to restart the reassembly, and the next genuine
+    /// fragment restarted it again.
+    #[test]
+    fn a_fragment_of_an_older_split_with_a_smaller_total_is_discarded() {
+        let got = connect_through_fragments(|r| {
+            r.send(&r.fragments[0]);
+            r.send(&r.fragments[1]);
+            r.send(&r.split(2, 500)[0]);
+            r.send(&r.fragments[2]);
+        });
+        assert_eq!(got.unwrap(), 0xC0FFEE);
+    }
+
+    /// ...while an authentic fragment with a larger Total does restart it:
+    /// the older, coarser split is dropped and the new one completes.
+    #[test]
+    fn a_split_with_a_larger_total_restarts_the_reassembly() {
+        let got = connect_through_fragments(|r| {
+            r.send(&r.split(2, 500)[0]);
+            r.send_all();
+        });
+        assert_eq!(got.unwrap(), 0xC0FFEE);
+    }
+
+    /// RFC 7383 §2.6.1 and RFC 7296 §2.2: fragments belong together by
+    /// their IKE SA, exchange, direction and Message ID. An authentic
+    /// fragment from the same peer with the right Message ID but another
+    /// exchange type, or sent as a request, used to be taken into the
+    /// `IKE_AUTH` response.
+    #[test]
+    fn an_authentic_fragment_of_another_message_is_not_mixed_in() {
+        let variants: [fn(&mut IkeHeader); 2] = [|h| h.exchange_type = ExchangeType::Informational, |h| h.flags.response = false];
+        for (i, variant) in variants.into_iter().enumerate() {
+            let got = connect_through_fragments(move |r| {
+                let mut other = r.header;
+                variant(&mut other);
+                r.send(&r.seal(other, &[0x5a; 90], 3, 700)[0]);
+                r.send_all();
+            });
+            assert_eq!(got.unwrap(), 0xC0FFEE, "variant {i}");
+        }
+    }
+
+    /// RFC 7383 §2.6 and RFC 7296 §2.1: when fragments of the response go
+    /// missing, the initiator retransmits its request and the responder
+    /// resends the response. The request used to go out no more once the
+    /// first fragment was in, so one lost fragment failed the connect.
+    #[test]
+    fn a_lost_fragment_is_recovered_by_retransmitting_the_request() {
+        let got = connect_through_fragments(|r| {
+            r.send(&r.fragments[0]);
+            r.send(&r.fragments[2]);
+            assert_eq!(r.recv(), r.request, "the retransmission is the same request");
+            r.send_all();
+        });
+        assert_eq!(got.unwrap(), 0xC0FFEE);
+    }
+
+    /// A datagram that is not an IKE message at all, arriving between
+    /// fragments, is passed over. It used to end the connect with a parse
+    /// error.
+    #[test]
+    fn a_datagram_that_is_not_ike_does_not_end_the_reassembly() {
+        let got = connect_through_fragments(|r| {
+            r.send(&r.fragments[0]);
+            r.send(b"xyz");
+            r.send(&r.fragments[1]);
+            r.send(&r.fragments[2]);
+        });
+        assert_eq!(got.unwrap(), 0xC0FFEE);
+    }
+
+    /// RFC 7296 §2.21.3 (and §3.14): a response that does not authenticate is
+    /// discarded. An unfragmented forgery with the right header, sent ahead
+    /// of the real fragments, used to be taken as the response.
+    #[test]
+    fn a_forged_whole_response_ahead_of_the_fragments_is_passed_over() {
+        let got = connect_through_fragments(|r| {
+            let cipher = r.sa.suite.sk_cipher();
+            let wrong_e = vec![0u8; r.sa.keys.sk_er.len()];
+            let wrong_a = vec![0u8; r.sa.keys.sk_ar.len()];
+            r.send(&sk::build_encrypted(cipher, r.header, r.first_inner, &r.inner, &wrong_e, &wrong_a, &[3u8; 8]).unwrap());
+            r.send_all();
+        });
+        assert_eq!(got.unwrap(), 0xC0FFEE);
+    }
+
+    /// `msg`, a message the gateway (the IKE SA's responder) built on `sa`,
+    /// as `pieces` RFC 7383 fragments with IVs from `iv_base`.
+    fn gateway_fragments(sa: &CompletedSaInit, msg: &[u8], pieces: usize, iv_base: u64) -> Vec<Vec<u8>> {
+        let cipher = sa.suite.sk_cipher();
+        let (first, inner) = open_encrypted(cipher, msg, &sa.keys.sk_er, &sa.keys.sk_ar).unwrap();
+        let header = IkeHeader::parse(msg).unwrap();
+        let per = inner.len().div_ceil(pieces).max(1);
+        let fragments = fragment::build_fragments(cipher, &header, first, &inner, &sa.keys.sk_er, &sa.keys.sk_ar, iv_base, per).unwrap();
+        assert_eq!(fragments.len(), pieces, "test setup: the message must split {pieces} ways");
+        fragments
+    }
+
+    /// The gateway's `fragments`, a forged copy of the first one ahead.
+    fn send_fragments_after_a_forgery(sock: &UdpSocket, to: SocketAddr, fragments: &[Vec<u8>]) {
+        sock.send_to(&flip_last_byte(fragments[0].clone()), to).unwrap();
+        for f in fragments {
+            sock.send_to(f, to).unwrap();
+        }
+    }
+
+    /// RFC 7383 §2.6: once IKE fragmentation is negotiated -- ryke always
+    /// advertises it -- any later exchange of the IKE SA may come
+    /// fragmented, not only `IKE_AUTH`. A DPD probe answered in fragments
+    /// used to go unrecognised, three times over, and read as a dead peer.
+    #[test]
+    fn a_dpd_probe_answered_in_fragments_finds_the_peer_alive() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, _) = responder_through_auth_spis(bind, psk);
+                let probe = recv_from_client(&sock);
+                let mid = IkeHeader::parse(&probe).unwrap().message_id;
+                let note = crate::ikev2::payload::Notify::status(40_000, vec![0x5a; 60]);
+                let answer = build_informational(&sa, mid, true, &[(PayloadType::Notify, note.to_bytes())], &[4u8; 8]).unwrap();
+                send_fragments_after_a_forgery(&sock, from, &gateway_fragments(&sa, &answer, 3, 100));
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let live = tunnel.liveness.probe(Duration::from_secs(1)).unwrap();
+        gateway.join().unwrap();
+        assert_eq!(live, Liveness::Alive);
+    }
+
+    /// RFC 7383 §2.6, for `CREATE_CHILD_SA`: a CHILD SA rekey answered in
+    /// fragments used to fail as unanswered.
+    #[test]
+    fn a_child_rekey_answered_in_fragments_completes() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, _) = responder_through_auth_spis(bind, psk);
+                let request = recv_from_client(&sock);
+                let (answer, _) = gateway_answers_rekey(&sa, &request, &[0x77; 32]);
+                send_fragments_after_a_forgery(&sock, from, &gateway_fragments(&sa, &answer, 4, 200));
+                // The Delete of the replaced SA that follows.
+                let delete = recv_from_client(&sock);
+                sock.send_to(&informational_answer(&sa, &delete, &[RESPONDER_CHILD_SPI]), from).unwrap();
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let rekeyed = tunnel.liveness.rekey_child(Duration::from_secs(1)).unwrap();
+        gateway.join().unwrap();
+        assert_eq!(rekeyed.peer_spi, PEER_L_SPI);
+    }
+
+    /// RFC 7383 §2.6 and §2.6.1, a request from the gateway in fragments:
+    /// it is answered once complete. Of a retransmission of it, fragment 1
+    /// gets the same answer again and any other fragment is ignored. It
+    /// used to be dropped unanswered.
+    #[test]
+    fn a_request_from_the_peer_in_fragments_is_answered_and_only_its_first_fragment_repeats_the_answer() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, _) = responder_through_auth_spis(bind, psk);
+                let note = crate::ikev2::payload::Notify::status(40_000, vec![0x5a; 60]);
+                let request = build_informational(&sa, 0, false, &[(PayloadType::Notify, note.to_bytes())], &[3u8; 8]).unwrap();
+                let fragments = gateway_fragments(&sa, &request, 3, 300);
+                send_fragments_after_a_forgery(&sock, from, &fragments);
+                sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let answer = recv_from_client(&sock);
+                let answered =
+                    open_informational(&sa, &answer).is_ok_and(|payloads| payloads.is_empty()) && IkeHeader::parse(&answer).unwrap().message_id == 0;
+                sock.send_to(&fragments[1], from).unwrap();
+                sock.send_to(&flip_last_byte(fragments[0].clone()), from).unwrap();
+                let quiet_on_others = client_stays_quiet(&sock);
+                sock.send_to(&fragments[0], from).unwrap();
+                sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let again = recv_from_client(&sock);
+                (answered, quiet_on_others, again == answer)
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let live = tunnel.liveness.peek(Duration::from_secs(4)).unwrap();
+        let (answered, quiet_on_others, answered_again) = gateway.join().unwrap();
+        assert_eq!(live, Liveness::Alive);
+        assert!(answered, "the reassembled request is answered, under its Message ID");
+        assert!(quiet_on_others, "a fragment other than 1 of a request answered, or a forged fragment 1, is ignored");
+        assert!(answered_again, "fragment 1 of a request answered gets the same answer again");
+    }
+
+    /// A Delete of the IKE SA that comes in fragments ends the tunnel, and
+    /// fragment 1 of its retransmission still reads as that teardown.
+    #[test]
+    fn a_delete_of_the_ike_sa_in_fragments_tears_the_tunnel_down() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, _) = responder_through_auth_spis(bind, psk);
+                let request = build_informational(&sa, 0, false, &[(PayloadType::Delete, Delete::ike_sa().to_bytes())], &[3u8; 8]).unwrap();
+                let fragments = gateway_fragments(&sa, &request, 3, 400);
+                send_fragments_after_a_forgery(&sock, from, &fragments);
+                sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let answer = recv_from_client(&sock);
+                let answered = IkeHeader::parse(&answer).unwrap().message_id == 0;
+                sock.send_to(&fragments[0], from).unwrap();
+                answered
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let first = tunnel.liveness.peek(Duration::from_secs(4)).unwrap();
+        let again = tunnel.liveness.peek(Duration::from_secs(4)).unwrap();
+        assert!(gateway.join().unwrap(), "the Delete is answered");
+        assert_eq!((first, again), (Liveness::PeerTornDown, Liveness::PeerTornDown));
     }
 
     #[test]

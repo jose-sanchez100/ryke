@@ -240,8 +240,14 @@ fn sighash_notify() -> Notify {
     Notify::status(notify_type::SIGNATURE_HASH_ALGORITHMS, data)
 }
 
-/// The `IKEV2_FRAGMENTATION_SUPPORTED` notify (RFC 7383 §2.4, empty payload):
-/// ryke can both send and reassemble SKF fragments, and always advertises so.
+/// The `IKEV2_FRAGMENTATION_SUPPORTED` notify (RFC 7383 §2.4, empty payload),
+/// which every `IKE_SA_INIT` built here carries. The routes that use it
+/// ([`crate::Ikev2Session`] and its [`crate::LivenessSession`],
+/// [`crate::ikev2::client::Client`], [`crate::ikev2::server::Server`])
+/// reassemble every fragmented message the peer sends them. Only the
+/// server sends fragments, answering a request that came in fragments; the
+/// initiators send their messages whole. A caller putting the building
+/// blocks together itself takes on the same: [`crate::ikev2::fragment`].
 fn fragmentation_supported_notify() -> Notify {
     Notify::status(notify_type::IKEV2_FRAGMENTATION_SUPPORTED, Vec::new())
 }

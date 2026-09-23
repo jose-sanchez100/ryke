@@ -16,8 +16,10 @@
 //!   the same "MAC covers everything up to itself" shape `SK{}`'s CBC framing
 //!   uses, just with FragNum/Total additionally covered.
 
+use std::collections::BTreeMap;
+
 use crate::error::IkeError;
-use crate::ikev2::message::{IkeHeader, PayloadType};
+use crate::ikev2::message::{ExchangeType, IkeHeader, PayloadType};
 use crate::ikev2::sk::{
     aead_nonce, aead_open_dispatch, aead_seal_dispatch, cbc_decrypt, cbc_encrypt, ct_eq, expand_iv, SkCipher,
 };
@@ -351,6 +353,183 @@ pub fn reassemble(cipher: SkCipher, messages: &[Vec<u8>], sk_e: &[u8], sk_a: &[u
     Ok((first_inner, inner))
 }
 
+/// The most fragments one message may declare (Total Fragments) for
+/// [`Reassembly`] to take it. Far above what any fragmentation threshold
+/// produces: even a long certificate chain at the smallest threshold
+/// RFC 7383 §2.5.1 recommends (576 bytes) is a few dozen.
+pub const MAX_FRAGMENTS: u16 = 256;
+
+/// The most content [`Reassembly`] holds for one message. An IKE message
+/// this large does not occur; this bounds what a peer holding the keys can
+/// make it keep.
+pub const MAX_REASSEMBLED_LEN: usize = 64 * 1024;
+
+/// Which message a fragment belongs to (RFC 7383 §2.6.1, RFC 7296 §2.2,
+/// §3.1): its IKE SA, exchange, direction and Message ID -- every field of
+/// the IKE header a fragment keeps from the message it was cut from, but
+/// the Length and Next Payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageKey {
+    pub initiator_spi: u64,
+    pub responder_spi: u64,
+    pub exchange_type: ExchangeType,
+    /// The header's Initiator flag.
+    pub initiator: bool,
+    /// The header's Response flag.
+    pub response: bool,
+    pub message_id: u32,
+}
+
+impl MessageKey {
+    pub fn of(header: &IkeHeader) -> Self {
+        Self {
+            initiator_spi: header.initiator_spi,
+            responder_spi: header.responder_spi,
+            exchange_type: header.exchange_type,
+            initiator: header.flags.initiator,
+            response: header.flags.response,
+            message_id: header.message_id,
+        }
+    }
+}
+
+/// What [`Reassembly::accept`] did with one fragment.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Accepted {
+    /// Stored; the others are still to come.
+    Stored,
+    /// It was the last one: the message's first inner payload type, and its
+    /// inner payloads.
+    Complete(PayloadType, Vec<u8>),
+    /// Discarded, for the reason given, and nothing else changed (RFC 7383
+    /// §2.6: "silently discarded").
+    Discarded(&'static str),
+}
+
+/// The fragments of one message as they come in, in any order (RFC 7383
+/// §2.6). A fragment is checked before it can change anything:
+///
+/// 1. it must belong to the message ([`MessageKey`]) and carry the SKF
+///    payload first;
+/// 2. its Fragment Number and Total Fragments must be non-zero, the number
+///    at most the total, and the total at most [`MAX_FRAGMENTS`] and not
+///    smaller than that of the fragments in hand;
+/// 3. a fragment with the number and total of one in hand is a replay;
+/// 4. it must authenticate (its ICV or AEAD tag).
+///
+/// Only then does it count: a larger Total than the fragments in hand drops
+/// them and starts over with this one (§2.5.2: a sender that refragments
+/// makes smaller fragments, so more of them), and it is stored. A forged
+/// fragment therefore never takes the place of a genuine one, and never
+/// throws genuine ones away. Content beyond [`MAX_REASSEMBLED_LEN`] drops
+/// the whole message.
+///
+/// How long to wait for the rest is the caller's: RFC 7383 §2.6 has it
+/// drop an incomplete message after a timeout, as the initiator or
+/// responder of the exchange would.
+pub struct Reassembly {
+    key: MessageKey,
+    total: u16,
+    /// By Fragment Number: the SKF payload's Next Payload, and the content.
+    fragments: BTreeMap<u16, (u8, Vec<u8>)>,
+    len: usize,
+}
+
+impl Reassembly {
+    pub fn new(key: MessageKey) -> Self {
+        Self { key, total: 0, fragments: BTreeMap::new(), len: 0 }
+    }
+
+    pub fn key(&self) -> MessageKey {
+        self.key
+    }
+
+    /// Whether no fragment is in hand.
+    pub fn is_empty(&self) -> bool {
+        self.fragments.is_empty()
+    }
+
+    /// Take one fragment, sealed under `cipher` with the sender's `sk_e`
+    /// (and, for a classic cipher, `sk_a`). On [`Accepted::Complete`] the
+    /// fragments in hand are released, so a late copy of one of them
+    /// starts a new message: telling a retransmission of a message already
+    /// processed apart (RFC 7383 §2.6.1) is the caller's.
+    pub fn accept(&mut self, message: &[u8], cipher: SkCipher, sk_e: &[u8], sk_a: &[u8]) -> Accepted {
+        let Ok(header) = IkeHeader::parse(message) else { return Accepted::Discarded("not an IKE message") };
+        if MessageKey::of(&header) != self.key {
+            return Accepted::Discarded("a fragment of another message");
+        }
+        let Ok((number, total)) = peek_fragment_header(message) else {
+            return Accepted::Discarded("no Encrypted Fragment payload");
+        };
+        if number == 0 || total == 0 || number > total || total > MAX_FRAGMENTS {
+            return Accepted::Discarded("invalid Fragment Number or Total Fragments");
+        }
+        if total < self.total {
+            return Accepted::Discarded("fewer Total Fragments than the fragments in hand");
+        }
+        if total == self.total && self.fragments.contains_key(&number) {
+            return Accepted::Discarded("a replay of a fragment in hand");
+        }
+        let Ok(fragment) = open_fragment(cipher, message, sk_e, sk_a) else {
+            return Accepted::Discarded("does not authenticate");
+        };
+        if total > self.total {
+            self.fragments.clear();
+            self.len = 0;
+            self.total = total;
+        }
+        self.len += fragment.content.len();
+        if self.len > MAX_REASSEMBLED_LEN {
+            self.fragments.clear();
+            self.len = 0;
+            self.total = 0;
+            return Accepted::Discarded("the message is too large");
+        }
+        self.fragments.insert(number, (fragment.next_payload, fragment.content));
+        if self.fragments.len() < usize::from(self.total) {
+            return Accepted::Stored;
+        }
+        let fragments = std::mem::take(&mut self.fragments);
+        self.len = 0;
+        self.total = 0;
+        let first_inner = PayloadType::from_u8(fragments[&1].0);
+        let inner = fragments.into_values().flat_map(|(_, content)| content).collect();
+        Accepted::Complete(first_inner, inner)
+    }
+}
+
+/// A fragment's Fragment Number and Total Fragments, once it has
+/// authenticated under `cipher` with the sender's keys. For a caller that
+/// must tell whether a fragment is genuine without reassembling it, such
+/// as one of a request already answered (RFC 7383 §2.6.1).
+pub fn verify_fragment(cipher: SkCipher, message: &[u8], sk_e: &[u8], sk_a: &[u8]) -> Result<(u16, u16), IkeError> {
+    let fragment = open_fragment(cipher, message, sk_e, sk_a)?;
+    Ok((fragment.frag_num, fragment.total))
+}
+
+/// `message`, an SK message we built with our own `sk_e`/`sk_a`, cut into
+/// fragments (RFC 7383 §2.5) of at most `max_len` bytes each, the IKE
+/// header included. `iv_base` seeds the fragments' IVs as in
+/// [`build_fragments`], and must be fresh under the key.
+pub fn fragment_message(cipher: SkCipher, message: &[u8], sk_e: &[u8], sk_a: &[u8], iv_base: u64, max_len: usize) -> Result<Vec<Vec<u8>>, IkeError> {
+    let header = IkeHeader::parse(message)?;
+    let (first_inner, inner) = crate::ikev2::sk::open_encrypted(cipher, message, sk_e, sk_a)?;
+    // What a fragment adds to its content: the IKE header, the SKF payload
+    // with its IV and ICV, and the Pad Length byte (plus, for CBC, padding
+    // up to a whole block).
+    let (iv_len, block) = if cipher.is_aead() { (IV_LEN, 1) } else { (cipher.block_len(), cipher.block_len()) };
+    let room = max_len.saturating_sub(IkeHeader::LEN + 4 + SKF_EXTRA + iv_len + cipher.icv_len());
+    let content_per_fragment = (room / block * block).saturating_sub(1);
+    if content_per_fragment == 0 {
+        return Err(IkeError::Crypto("fragments of that size cannot carry any content"));
+    }
+    if inner.len().div_ceil(content_per_fragment) > usize::from(MAX_FRAGMENTS) {
+        return Err(IkeError::Crypto("the message would need too many fragments"));
+    }
+    build_fragments(cipher, &header, first_inner, &inner, sk_e, sk_a, iv_base, content_per_fragment)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,5 +682,182 @@ mod tests {
         let cbc = SkCipher::Aes256Cbc(IntegAlgorithm::HmacSha2_512_256);
         let (sk_e_cbc, sk_a_cbc) = keys_for(cbc);
         assert!(reassemble(cbc, &frags, &sk_e_cbc, &sk_a_cbc).is_err());
+    }
+
+    fn all_ciphers() -> Vec<SkCipher> {
+        aead_ciphers().into_iter().chain(cbc_ciphers()).collect()
+    }
+
+    /// `inner` under [`header`] as fragments of `per` bytes of content.
+    fn split(cipher: SkCipher, inner: &[u8], per: usize, iv_base: u64) -> Vec<Vec<u8>> {
+        let (sk_e, sk_a) = keys_for(cipher);
+        build_fragments(cipher, &header(), PayloadType::IdInitiator, inner, &sk_e, &sk_a, iv_base, per).unwrap()
+    }
+
+    fn reassembly() -> Reassembly {
+        Reassembly::new(MessageKey::of(&header()))
+    }
+
+    fn forged(mut msg: Vec<u8>) -> Vec<u8> {
+        *msg.last_mut().unwrap() ^= 1;
+        msg
+    }
+
+    /// Where the SKF payload's Fragment Number and Total Fragments sit.
+    const NUMBER_AT: usize = IkeHeader::LEN + 4;
+    const TOTAL_AT: usize = IkeHeader::LEN + 6;
+
+    fn with_u16(mut msg: Vec<u8>, at: usize, value: u16) -> Vec<u8> {
+        msg[at..at + 2].copy_from_slice(&value.to_be_bytes());
+        msg
+    }
+
+    #[test]
+    fn reassembly_completes_in_any_order_and_a_replay_is_discarded() {
+        for cipher in all_ciphers() {
+            let (sk_e, sk_a) = keys_for(cipher);
+            let inner: Vec<u8> = (0..=200u8).collect();
+            let frags = split(cipher, &inner, 50, 10);
+            assert_eq!(frags.len(), 5);
+            let mut r = reassembly();
+            for f in frags[1..].iter().rev() {
+                assert_eq!(r.accept(f, cipher, &sk_e, &sk_a), Accepted::Stored, "{cipher:?}");
+            }
+            assert_eq!(r.accept(&frags[4], cipher, &sk_e, &sk_a), Accepted::Discarded("a replay of a fragment in hand"));
+            assert_eq!(r.accept(&frags[0], cipher, &sk_e, &sk_a), Accepted::Complete(PayloadType::IdInitiator, inner.clone()));
+            assert!(r.is_empty(), "a completed message is released");
+        }
+    }
+
+    /// RFC 7383 §2.6: the ICV is checked before a fragment can change
+    /// anything. A forged fragment 1 ahead of the real one does not hold
+    /// its place; a forged fragment with a larger Total does not throw away
+    /// the genuine ones in hand.
+    #[test]
+    fn a_forged_fragment_neither_takes_a_place_nor_restarts_the_reassembly() {
+        for cipher in all_ciphers() {
+            let (sk_e, sk_a) = keys_for(cipher);
+            let inner = vec![0x42u8; 150];
+            let frags = split(cipher, &inner, 50, 10);
+            let finer = split(cipher, &inner, 30, 90);
+            assert_eq!((frags.len(), finer.len()), (3, 5));
+            let mut r = reassembly();
+            assert_eq!(r.accept(&forged(frags[0].clone()), cipher, &sk_e, &sk_a), Accepted::Discarded("does not authenticate"));
+            assert!(r.is_empty(), "{cipher:?}");
+            assert_eq!(r.accept(&frags[0], cipher, &sk_e, &sk_a), Accepted::Stored);
+            assert_eq!(r.accept(&frags[1], cipher, &sk_e, &sk_a), Accepted::Stored);
+            assert_eq!(r.accept(&forged(finer[0].clone()), cipher, &sk_e, &sk_a), Accepted::Discarded("does not authenticate"));
+            assert_eq!(r.accept(&frags[2], cipher, &sk_e, &sk_a), Accepted::Complete(PayloadType::IdInitiator, inner.clone()));
+        }
+    }
+
+    /// RFC 7383 §2.6 (and §2.5.2: a sender that fragments again makes more,
+    /// smaller fragments): an authentic fragment with a larger Total drops
+    /// the fragments in hand and starts over; one with a smaller Total is
+    /// discarded.
+    #[test]
+    fn a_larger_total_restarts_the_reassembly_and_a_smaller_one_is_discarded() {
+        let cipher = SkCipher::Aes256Gcm;
+        let (sk_e, sk_a) = keys_for(cipher);
+        let inner = vec![0x42u8; 150];
+        let coarse = split(cipher, &inner, 75, 10);
+        let fine = split(cipher, &inner, 50, 90);
+        assert_eq!((coarse.len(), fine.len()), (2, 3));
+
+        let mut r = reassembly();
+        assert_eq!(r.accept(&coarse[0], cipher, &sk_e, &sk_a), Accepted::Stored);
+        assert_eq!(r.accept(&fine[0], cipher, &sk_e, &sk_a), Accepted::Stored);
+        assert_eq!(r.accept(&coarse[1], cipher, &sk_e, &sk_a), Accepted::Discarded("fewer Total Fragments than the fragments in hand"));
+        assert_eq!(r.accept(&fine[1], cipher, &sk_e, &sk_a), Accepted::Stored);
+        assert_eq!(r.accept(&fine[2], cipher, &sk_e, &sk_a), Accepted::Complete(PayloadType::IdInitiator, inner));
+    }
+
+    /// RFC 7383 §2.6.1, RFC 7296 §2.2: a fragment belongs to one message --
+    /// one IKE SA, exchange, direction and Message ID.
+    #[test]
+    fn an_authentic_fragment_of_another_message_is_discarded() {
+        let cipher = SkCipher::Aes256Gcm;
+        let (sk_e, sk_a) = keys_for(cipher);
+        let variants: [fn(&mut IkeHeader); 6] = [
+            |h| h.initiator_spi ^= 1,
+            |h| h.responder_spi ^= 1,
+            |h| h.exchange_type = ExchangeType::Informational,
+            |h| h.flags.initiator = false,
+            |h| h.flags.response = true,
+            |h| h.message_id += 1,
+        ];
+        for (i, variant) in variants.into_iter().enumerate() {
+            let mut other = header();
+            variant(&mut other);
+            let frag = build_fragments(cipher, &other, PayloadType::IdInitiator, &[7u8; 60], &sk_e, &sk_a, 5, 30).unwrap().remove(0);
+            let mut r = reassembly();
+            assert_eq!(r.accept(&frag, cipher, &sk_e, &sk_a), Accepted::Discarded("a fragment of another message"), "variant {i}");
+            assert!(r.is_empty());
+        }
+    }
+
+    /// RFC 7383 §2.6: Fragment Number and Total Fragments must be non-zero
+    /// and the number at most the total; a Total beyond [`MAX_FRAGMENTS`]
+    /// is not taken either. None of these is even authenticated.
+    #[test]
+    fn invalid_fragment_numbers_and_totals_are_discarded() {
+        let cipher = SkCipher::Aes256Gcm;
+        let (sk_e, sk_a) = keys_for(cipher);
+        let frag = split(cipher, &[7u8; 60], 30, 5).remove(0);
+        for bad in [
+            with_u16(frag.clone(), NUMBER_AT, 0),
+            with_u16(frag.clone(), TOTAL_AT, 0),
+            with_u16(frag.clone(), NUMBER_AT, 3),
+            with_u16(with_u16(frag.clone(), NUMBER_AT, MAX_FRAGMENTS + 1), TOTAL_AT, MAX_FRAGMENTS + 1),
+        ] {
+            let mut r = reassembly();
+            assert_eq!(r.accept(&bad, cipher, &sk_e, &sk_a), Accepted::Discarded("invalid Fragment Number or Total Fragments"));
+            assert!(r.is_empty());
+        }
+    }
+
+    /// A message whose fragments carry more than [`MAX_REASSEMBLED_LEN`]
+    /// is dropped whole, however authentic.
+    #[test]
+    fn a_message_beyond_the_size_cap_is_dropped_whole() {
+        let cipher = SkCipher::Aes256Gcm;
+        let (sk_e, sk_a) = keys_for(cipher);
+        let frags = split(cipher, &vec![1u8; MAX_REASSEMBLED_LEN + 1], 300, 5);
+        assert!(frags.len() <= usize::from(MAX_FRAGMENTS));
+        let mut r = reassembly();
+        let (last, rest) = frags.split_last().unwrap();
+        for f in rest {
+            assert_eq!(r.accept(f, cipher, &sk_e, &sk_a), Accepted::Stored);
+        }
+        assert_eq!(r.accept(last, cipher, &sk_e, &sk_a), Accepted::Discarded("the message is too large"));
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn verify_fragment_reads_number_and_total_only_from_an_authentic_fragment() {
+        for cipher in all_ciphers() {
+            let (sk_e, sk_a) = keys_for(cipher);
+            let frags = split(cipher, &[7u8; 90], 30, 5);
+            assert_eq!(verify_fragment(cipher, &frags[1], &sk_e, &sk_a).unwrap(), (2, 3));
+            assert!(verify_fragment(cipher, &forged(frags[1].clone()), &sk_e, &sk_a).is_err(), "{cipher:?}");
+        }
+    }
+
+    /// [`fragment_message`] cuts a whole `SK` message into fragments no
+    /// larger than asked, which reassemble to its payloads.
+    #[test]
+    fn fragment_message_keeps_every_fragment_within_the_size_asked() {
+        for cipher in all_ciphers() {
+            let (sk_e, sk_a) = keys_for(cipher);
+            let inner: Vec<u8> = (0..2000u32).map(|i| i as u8).collect();
+            let whole = crate::ikev2::sk::build_encrypted(cipher, header(), PayloadType::IdInitiator, &inner, &sk_e, &sk_a, &[1u8; 8]).unwrap();
+            for max_len in [200, 576, 1280] {
+                let frags = fragment_message(cipher, &whole, &sk_e, &sk_a, 7, max_len).unwrap();
+                assert!(frags.len() > 1, "{cipher:?} {max_len}");
+                assert!(frags.iter().all(|f| f.len() <= max_len), "{cipher:?} {max_len}");
+                assert_eq!(reassemble(cipher, &frags, &sk_e, &sk_a).unwrap(), (PayloadType::IdInitiator, inner.clone()));
+            }
+            assert!(fragment_message(cipher, &whole, &sk_e, &sk_a, 7, 60).is_err(), "no room for any content");
+        }
     }
 }

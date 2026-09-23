@@ -27,14 +27,14 @@ fn our_sk_a(sa: &CompletedSaInit) -> &[u8] {
     }
 }
 
-fn peer_sk_e(sa: &CompletedSaInit) -> &[u8] {
+pub(crate) fn peer_sk_e(sa: &CompletedSaInit) -> &[u8] {
     match sa.role {
         Role::Initiator => &sa.keys.sk_er,
         Role::Responder => &sa.keys.sk_ei,
     }
 }
 
-fn peer_sk_a(sa: &CompletedSaInit) -> &[u8] {
+pub(crate) fn peer_sk_a(sa: &CompletedSaInit) -> &[u8] {
     match sa.role {
         Role::Initiator => &sa.keys.sk_ar,
         Role::Responder => &sa.keys.sk_ai,

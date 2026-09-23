@@ -46,7 +46,7 @@ use crate::ikev1::quick::{ChildKeyMaterial, RekeyedChild};
 use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
 use crate::ikev2::negotiate::{self, ChosenEspSuite};
 use crate::ikev2::payload::{
-    notify_type, notify_type_name, protocol_id, Configuration, Delete, Identification, SecurityAssociation, TrafficSelectors,
+    notify_type, notify_type_name, protocol_id, Configuration, Delete, Identification, Notify, SecurityAssociation, TrafficSelectors,
 };
 use crate::ikev2::rekey::{self, PfsKeyExchange, PfsPolicy};
 use crate::ikev2::sk::{self, open_encrypted, SkCipher};
@@ -272,11 +272,18 @@ struct IkeSaState {
     /// We are deleting the current IKE SA and wait for the answer: a rekey of
     /// it from the peer now collides with that (RFC 7296 §2.25.2).
     closing: bool,
+    /// The peer answered a request of ours on the current IKE SA
+    /// `INVALID_SYNTAX`, which is "fatal in both peers": the IKE SA is over
+    /// without a Delete of either side (§2.21.3), and so is what hangs off it
+    /// (§1.4.1). Nothing is sent on it and nothing the peer sends on it is
+    /// answered. Belongs to the IKE SA it happened on: a rekey that puts
+    /// another in its place starts over (see [`LivenessSession::switch_ike_sa`]).
+    ended: bool,
 }
 
 impl IkeSaState {
     fn new() -> Self {
-        IkeSaState { since: Instant::now(), retired: None, answered_rekey: None, rekeying: None, closing: false }
+        IkeSaState { since: Instant::now(), retired: None, answered_rekey: None, rekeying: None, closing: false, ended: false }
     }
 }
 
@@ -575,7 +582,12 @@ pub enum Liveness {
     /// superseded, and does not end the tunnel. Also a request of the peer's
     /// on the IKE SA that authenticated but was badly formatted: answered
     /// `INVALID_SYNTAX`, which RFC 7296 §2.21.3 makes fatal to the IKE SA in
-    /// both peers (see [`LivenessSession::answer_malformed_request`]).
+    /// both peers (see [`LivenessSession::answer_malformed_request`]). And
+    /// the same in the other direction: an authentic `INVALID_SYNTAX` the peer
+    /// answered a request of ours with (see
+    /// [`LivenessSession::end_ike_sa_if_answered_invalid_syntax`]). After any
+    /// of those the IKE SA is over: nothing more goes out on it and the
+    /// peer's requests on it are not answered.
     PeerTornDown,
     /// No reply within the timeout. Could be transient packet loss rather
     /// than a dead peer -- callers should require a few consecutive misses
@@ -644,6 +656,9 @@ impl LivenessSession {
     /// retransmitting a few times (see [`Self::send_and_await`]) before
     /// concluding [`Liveness::NoReply`].
     pub fn probe(&mut self, timeout: Duration) -> Result<Liveness, DriverError> {
+        if self.ike.ended {
+            return Ok(Liveness::PeerTornDown);
+        }
         let mid = self.alloc_message_id()?;
 
         let mut iv = [0u8; 8];
@@ -665,6 +680,9 @@ impl LivenessSession {
     /// (nothing pending) is [`Liveness::Alive`], not [`Liveness::NoReply`]:
     /// silence is completely normal when nothing was just sent.
     pub fn peek(&mut self, timeout: Duration) -> Result<Liveness, DriverError> {
+        if self.ike.ended {
+            return Ok(Liveness::PeerTornDown);
+        }
         self.recv_and_classify(timeout, None)
     }
 
@@ -681,6 +699,11 @@ impl LivenessSession {
     /// [`Self::message_ids_exhausted`]); with none left at all it fails with
     /// [`IkeError::MessageIdsExhausted`], having sent nothing.
     pub fn close(&mut self) -> Result<(), DriverError> {
+        if self.ike.ended {
+            // RFC 7296 §2.21.3: an `INVALID_SYNTAX` answer deleted it already,
+            // "without needing an explicit Delete payload".
+            return Ok(());
+        }
         self.delete_ike_sa("graceful disconnect")
     }
 
@@ -861,6 +884,9 @@ impl LivenessSession {
         what: &str,
         timeout: Duration,
     ) -> Result<(RekeyedChild, Option<TrafficSelectors>, Option<ChildTs>), DriverError> {
+        if self.ike.ended {
+            return Err(IkeError::PeerTornDown.into());
+        }
         let op = replaces.map_or(ChildOp::Create, |(_, old)| ChildOp::Rekey(old));
         let keep = replaces.and_then(|(kind, _)| self.child_ts.get(kind).cloned());
         self.peer_child.in_flight = Some(OwnChildOp { op, crossed: None, old_deleted: false });
@@ -1142,6 +1168,9 @@ impl LivenessSession {
     /// [`Self::settle_rekey`] to explicitly retire the CHILD SA a rekey just
     /// replaced -- see that call site's doc for why this exists.
     fn delete_child_sa(&mut self, child: ChildSpis) -> Result<(), DriverError> {
+        if self.ike.ended {
+            return Err(IkeError::PeerTornDown.into());
+        }
         let mid = self.alloc_message_id()?;
         let mut iv = [0u8; 8];
         OsEntropy::new()?.fill(&mut iv);
@@ -1202,6 +1231,9 @@ impl LivenessSession {
             if header.flags.response {
                 let answer = awaited.as_deref().map(Reassembly::key);
                 if answer.is_some_and(|key| self.is_answer(&header, &msg, key.message_id, key.exchange_type)) {
+                    if self.end_ike_sa_if_answered_invalid_syntax(&msg) {
+                        return Ok(Liveness::PeerTornDown);
+                    }
                     return Ok(Liveness::Alive);
                 }
                 continue;
@@ -1307,6 +1339,31 @@ impl LivenessSession {
             && header.exchange_type == exchange
             && from_peer_on(&self.sa, header)
             && open_from_peer(&self.sa, msg).is_ok()
+    }
+
+    /// Take `answer`, one [`Self::is_answer`] took as the answer to a request
+    /// of ours, and see whether it is `INVALID_SYNTAX`: "fatal in both peers"
+    /// (RFC 7296 §2.21.3), the IKE SA is deleted without an INFORMATIONAL
+    /// exchange of its own, and no CHILD SA under it is left operating. It is
+    /// only ever asked of an answer that authenticated, on this IKE SA, to a
+    /// request of its exchange type and Message ID: §2.21.4 keeps unprotected
+    /// notifications, and the ones that answer nothing of ours, from changing
+    /// any state. `true` when it ended the IKE SA.
+    fn end_ike_sa_if_answered_invalid_syntax(&mut self, answer: &[u8]) -> bool {
+        let Ok((first, body)) = open_from_peer(&self.sa, answer) else { return false };
+        let refused = payload_list(first, &body).is_ok_and(|inner| {
+            inner.iter().any(|(kind, body)| {
+                *kind == PayloadType::Notify && Notify::parse(body).is_ok_and(|notify| notify.notify_type == notify_type::INVALID_SYNTAX)
+            })
+        });
+        if refused {
+            ike_debug!("the peer answered INVALID_SYNTAX -- the IKE SA is deleted (RFC 7296 §2.21.3)");
+            self.ike.ended = true;
+            self.peer_requests.gone = true;
+            self.peer_requests.last = None;
+            self.peer_requests.fragments = None;
+        }
+        refused
     }
 
     /// The IKE SA a message from the peer is on, by its header: the current
@@ -1881,6 +1938,7 @@ impl LivenessSession {
     fn switch_ike_sa(&mut self, new_sa: CompletedSaInit) -> RetiredIkeSa {
         self.next_message_id = 0;
         self.ike.since = Instant::now();
+        self.ike.ended = false;
         let old = std::mem::replace(&mut self.sa, new_sa);
         RetiredIkeSa::new(old, std::mem::take(&mut self.peer_requests))
     }
@@ -1923,6 +1981,9 @@ impl LivenessSession {
     /// way the tunnel carries on under the survivor, and this is
     /// [`Liveness::Alive`].
     pub fn rekey_ike(&mut self, timeout: Duration) -> Result<Liveness, DriverError> {
+        if self.ike.ended {
+            return Ok(Liveness::PeerTornDown);
+        }
         let mut entropy = OsEntropy::new()?;
         let mut ni = vec![0u8; NONCE_LEN];
         entropy.fill(&mut ni);
@@ -1943,7 +2004,17 @@ impl LivenessSession {
         let reply = self.request_response(&wrap(&req, self.float), mid, timeout);
         let own = self.ike.rekeying.take().unwrap_or_default();
         let ours = match reply {
-            Ok(Reply::PeerTornDown) => return Ok(Liveness::PeerTornDown),
+            // `INVALID_SYNTAX`, in either direction, ended the IKE SA this rekey
+            // was on, but the one the peer made meanwhile is its own, with keys
+            // of its own (RFC 7296 §2.8.2): the tunnel goes on under it.
+            Ok(Reply::PeerTornDown) => match own.crossed {
+                Some(crossed) if self.peer_requests.gone => {
+                    ike_debug!("CREATE_CHILD_SA (IKE SA rekey): the IKE SA ended on INVALID_SYNTAX, but the peer rekeyed it meanwhile -- moving to its SA");
+                    self.move_to_peers_ike_sa(crossed.sa);
+                    return Ok(Liveness::Alive);
+                }
+                _ => return Ok(Liveness::PeerTornDown),
+            },
             Ok(Reply::Response(response)) => Some(
                 ike_rekey::initiator_complete_ike_rekey(&self.sa, &ni, new_spi_i, &dh_private, &response)
                     .map(|new_sa| (new_sa, ni.min(rekey::peer_child_nonce(&self.sa, &response).unwrap_or_default())))
@@ -2051,6 +2122,9 @@ impl LivenessSession {
                 };
                 if header.flags.response {
                     if self.is_answer(&header, &msg, mid, exchange) {
+                        if self.end_ike_sa_if_answered_invalid_syntax(&msg) {
+                            return Ok(Reply::PeerTornDown);
+                        }
                         return Ok(Reply::Response(msg));
                     }
                     continue; // stale, unrelated or forged -- keep waiting
@@ -4726,6 +4800,171 @@ mod tests {
         assert!(sent_to(&gateway).is_some(), "Message ID 0 was not taken by the forgery");
     }
 
+    /// The gateway's answer -- authentic -- to our request `mid` of
+    /// `exchange` on `sa`, carrying the error notify `error` alone.
+    fn gateway_error_answer(sa: &CompletedSaInit, mid: u32, exchange: ExchangeType, error: u16) -> Vec<u8> {
+        let notify = crate::ikev2::payload::Notify::status(error, Vec::new());
+        from_gateway(sa, gateway_header(sa, mid, exchange, true), &[(PayloadType::Notify, notify.to_bytes())])
+    }
+
+    /// The current IKE SA is over (RFC 7296 §2.21.3): the session reports the
+    /// tunnel gone, and sends nothing more on it -- no probe, no CHILD SA
+    /// exchange, no Delete -- nor answers what the gateway sends on it.
+    fn assert_ike_sa_is_over(liveness: &mut LivenessSession, gateway: &UdpSocket, resp_sa: &CompletedSaInit, what: &str) {
+        let short = Duration::from_millis(100);
+        assert_eq!(liveness.probe(short).unwrap(), Liveness::PeerTornDown, "{what}: probe");
+        assert_eq!(sent_to(gateway), None, "{what}: no probe goes out on it");
+        assert_eq!(liveness.peek(short).unwrap(), Liveness::PeerTornDown, "{what}: peek");
+        let dpd = build_informational(resp_sa, 0, false, &[], &[1u8; 8]).unwrap();
+        assert_eq!(deliver(liveness, gateway, &dpd), Liveness::PeerTornDown, "{what}: the gateway's DPD probe");
+        assert_eq!(sent_to(gateway), None, "{what}: it is not answered");
+        assert!(matches!(liveness.rekey_child(short), Err(DriverError::Ike(IkeError::PeerTornDown))), "{what}: a CHILD SA rekey");
+        assert_eq!(sent_to(gateway), None, "{what}: no CHILD SA rekey goes out on it");
+        assert!(matches!(liveness.rekey_ike(short), Ok(Liveness::PeerTornDown)), "{what}: an IKE SA rekey");
+        assert_eq!(sent_to(gateway), None, "{what}: no IKE SA rekey goes out on it");
+        let delete = liveness.delete_child_sa(ChildSpis { local: 0xBBBB, peer: 0xAAAA });
+        assert!(matches!(delete, Err(DriverError::Ike(IkeError::PeerTornDown))), "{what}: a Delete of a CHILD SA");
+        assert_eq!(sent_to(gateway), None, "{what}: no Delete of a CHILD SA goes out on it");
+        liveness.close().unwrap();
+        assert_eq!(sent_to(gateway), None, "{what}: no Delete goes out for an IKE SA that is gone");
+    }
+
+    /// RFC 7296 §2.21.3: an `INVALID_SYNTAX` the peer answers a request of
+    /// ours with, on an authenticated IKE SA and once it has passed the MAC and
+    /// window checks, "is considered fatal in both peers, meaning that the IKE
+    /// SA is deleted without needing an explicit Delete payload". A CHILD SA
+    /// rekey answered so was a `PeerRejected`, and an IKE SA rekey too; the
+    /// session went on reporting the tunnel alive and answering the peer's
+    /// DPD probes, and a DPD probe of ours answered so was taken for a sign
+    /// of life.
+    #[test]
+    fn an_invalid_syntax_answer_to_a_request_of_ours_ends_the_ike_sa() {
+        for what in ["CHILD SA rekey", "IKE SA rekey", "DPD probe", "Delete of a CHILD SA"] {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut liveness = session_facing(&gateway, init_sa, None);
+            let exchange = if what.contains("rekey") { ExchangeType::CreateChildSa } else { ExchangeType::Informational };
+            // Waiting ahead of the request: the first one goes out under Message ID 2.
+            let answer = gateway_error_answer(&resp_sa, 2, exchange, notify_type::INVALID_SYNTAX);
+            gateway.send_to(&answer, liveness.sock.local_addr().unwrap()).unwrap();
+
+            let timeout = Duration::from_secs(2);
+            match what {
+                "CHILD SA rekey" => {
+                    assert!(matches!(liveness.rekey_child(timeout), Err(DriverError::Ike(IkeError::PeerTornDown))), "{what}");
+                }
+                "IKE SA rekey" => assert!(matches!(liveness.rekey_ike(timeout), Ok(Liveness::PeerTornDown)), "{what}"),
+                "DPD probe" => assert_eq!(liveness.probe(timeout).unwrap(), Liveness::PeerTornDown, "{what}"),
+                _ => {
+                    // Best-effort, like every Delete of ours: the answer ends the IKE SA all the same.
+                    let _ = liveness.delete_child_sa(ChildSpis { local: 0xBBBB, peer: 0xAAAA });
+                }
+            }
+            assert!(sent_to(&gateway).is_some(), "{what}: the request went out");
+            assert_ike_sa_is_over(&mut liveness, &gateway, &resp_sa, what);
+        }
+    }
+
+    /// ...but only when it is that answer: authentic, on this IKE SA's SPIs,
+    /// with the Message ID and the exchange of our request. What isn't --
+    /// forged, replayed, or another exchange's -- changes nothing (§2.21.4:
+    /// an unprotected notification must not change the state of any SA), and
+    /// the genuine answer that follows is taken as usual.
+    #[test]
+    fn an_invalid_syntax_that_is_not_the_answer_to_our_request_leaves_the_ike_sa_alone() {
+        use crate::ikev2::message::MessageBuilder;
+        use crate::ikev2::payload::Notify;
+
+        type Forge = fn(&CompletedSaInit) -> Vec<u8>;
+        let forgeries: [(&str, Forge); 5] = [
+            ("its integrity check broken", |sa| tampered(gateway_error_answer(sa, 2, ExchangeType::CreateChildSa, notify_type::INVALID_SYNTAX))),
+            ("not protected at all", |sa| {
+                MessageBuilder::new(gateway_header(sa, 2, ExchangeType::CreateChildSa, true))
+                    .push(PayloadType::Notify, Notify::status(notify_type::INVALID_SYNTAX, Vec::new()).to_bytes())
+                    .build()
+            }),
+            ("another Message ID", |sa| gateway_error_answer(sa, 7, ExchangeType::CreateChildSa, notify_type::INVALID_SYNTAX)),
+            ("another exchange", |sa| gateway_error_answer(sa, 2, ExchangeType::Informational, notify_type::INVALID_SYNTAX)),
+            ("another IKE SA", |sa| {
+                let mut header = gateway_header(sa, 2, ExchangeType::CreateChildSa, true);
+                header.initiator_spi ^= 1;
+                let notify = Notify::status(notify_type::INVALID_SYNTAX, Vec::new());
+                from_gateway(sa, header, &[(PayloadType::Notify, notify.to_bytes())])
+            }),
+        ];
+        for (what, forge) in forgeries {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut liveness = session_facing(&gateway, init_sa, None);
+            let to_session = liveness.sock.local_addr().unwrap();
+            gateway.send_to(&forge(&resp_sa), to_session).unwrap();
+            gateway.send_to(&rekey::build_child_refusal(&resp_sa, 2, &[5u8; 8]).unwrap(), to_session).unwrap();
+
+            match liveness.rekey_child(Duration::from_secs(2)) {
+                Err(DriverError::Ike(IkeError::PeerRejected { notify_type: t, .. })) => assert_eq!(t, notify_type::NO_ADDITIONAL_SAS, "{what}"),
+                other => panic!("{what}: expected the genuine refusal, got {other:?}"),
+            }
+            gateway.send_to(&build_informational(&resp_sa, 3, true, &[], &[2u8; 8]).unwrap(), to_session).unwrap();
+            assert_eq!(liveness.probe(Duration::from_secs(2)).unwrap(), Liveness::Alive, "{what}: the IKE SA goes on");
+            let dpd = build_informational(&resp_sa, 0, false, &[], &[1u8; 8]).unwrap();
+            assert_eq!(deliver(&mut liveness, &gateway, &dpd), Liveness::Alive, "{what}");
+            assert!(sent_to(&gateway).is_some(), "{what}: the gateway's DPD probe is still answered");
+        }
+    }
+
+    /// Every other error notify in an answer -- RFC 7296 makes only
+    /// `INVALID_SYNTAX` (and the authentication failures of `IKE_AUTH`) fatal
+    /// to the IKE SA -- is a refusal of that request alone: it is reported as
+    /// such, and the IKE SA and the tunnel go on.
+    #[test]
+    fn any_other_error_answer_to_a_request_of_ours_leaves_the_ike_sa_alone() {
+        for error in [
+            notify_type::NO_ADDITIONAL_SAS,
+            notify_type::TEMPORARY_FAILURE,
+            notify_type::NO_PROPOSAL_CHOSEN,
+            notify_type::TS_UNACCEPTABLE,
+            notify_type::INVALID_KE_PAYLOAD,
+            notify_type::UNSUPPORTED_CRITICAL_PAYLOAD,
+            notify_type::CHILD_SA_NOT_FOUND,
+        ] {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut liveness = session_facing(&gateway, init_sa, None);
+            let to_session = liveness.sock.local_addr().unwrap();
+            gateway.send_to(&gateway_error_answer(&resp_sa, 2, ExchangeType::CreateChildSa, error), to_session).unwrap();
+            match liveness.rekey_child(Duration::from_secs(2)) {
+                Err(DriverError::Ike(IkeError::PeerRejected { notify_type: t, .. })) => assert_eq!(t, error),
+                other => panic!("{}: expected it as PeerRejected, got {other:?}", notify_type_name(error)),
+            }
+            gateway.send_to(&gateway_error_answer(&resp_sa, 3, ExchangeType::CreateChildSa, error), to_session).unwrap();
+            assert!(matches!(liveness.rekey_ike(Duration::from_secs(2)), Err(DriverError::Ike(IkeError::PeerRejected { .. }))));
+            gateway.send_to(&build_informational(&resp_sa, 4, true, &[], &[2u8; 8]).unwrap(), to_session).unwrap();
+            assert_eq!(liveness.probe(Duration::from_secs(2)).unwrap(), Liveness::Alive, "{}", notify_type_name(error));
+        }
+    }
+
+    /// An `INVALID_SYNTAX` the peer *sends* -- a request of its own carrying
+    /// the notification, which RFC 7296 §2.21.3 asks it not to -- is not the
+    /// answer that makes the IKE SA fatal: it is an INFORMATIONAL request
+    /// like any other, answered, and the IKE SA goes on.
+    #[test]
+    fn an_invalid_syntax_in_a_request_of_the_peer_is_not_the_fatal_answer() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        let notify = crate::ikev2::payload::Notify::status(notify_type::INVALID_SYNTAX, Vec::new());
+        let request = build_informational(&resp_sa, 0, false, &[(PayloadType::Notify, notify.to_bytes())], &[1u8; 8]).unwrap();
+
+        assert_eq!(deliver(&mut liveness, &gateway, &request), Liveness::Alive);
+        let answer = sent_to(&gateway).expect("answered");
+        assert!(open_informational(&resp_sa, &answer).unwrap().is_empty(), "an empty INFORMATIONAL response");
+        let dpd = build_informational(&resp_sa, 1, false, &[], &[1u8; 8]).unwrap();
+        assert_eq!(deliver(&mut liveness, &gateway, &dpd), Liveness::Alive);
+        assert!(sent_to(&gateway).is_some(), "the IKE SA goes on");
+        gateway.send_to(&build_informational(&resp_sa, 2, true, &[], &[2u8; 8]).unwrap(), liveness.sock.local_addr().unwrap()).unwrap();
+        assert_eq!(liveness.probe(Duration::from_secs(2)).unwrap(), Liveness::Alive);
+    }
+
     /// RFC 7296 §2.5: a payload of a type we don't know with the critical
     /// flag set makes us reject the whole message, and the answer MUST carry
     /// `UNSUPPORTED_CRITICAL_PAYLOAD` with the payload's type. Nothing else
@@ -6873,6 +7112,42 @@ mod tests {
         assert_eq!(tunnel.liveness.child_peer_spi, PEER_P_SPI);
     }
 
+    /// RFC 7296 §2.21.3 in a crossed CHILD SA rekey (§2.8.1): the gateway
+    /// answered by ours `INVALID_SYNTAX` after its own rekey of the same SA
+    /// was answered. That IKE SA is deleted "without needing an explicit Delete
+    /// payload", and every CHILD SA is under it -- the one the gateway's rekey
+    /// made too, which is not handed to the caller. Nothing is sent on it
+    /// afterwards, no Delete of the SA that was replaced included.
+    #[test]
+    fn an_invalid_syntax_answer_to_a_crossed_child_sa_rekey_is_a_teardown() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, _client_spi) = responder_through_auth_spis(bind, psk);
+                let ours = recv_from_client(&sock);
+                let ni = [0x55u8; 32];
+                sock.send_to(&gateway_child_rekey(&sa, 0, RESPONDER_CHILD_SPI, PEER_P_SPI, &ni), from).unwrap();
+                let _answered = recv_from_client(&sock);
+                let mid = IkeHeader::parse(&ours).unwrap().message_id;
+                sock.send_to(&gateway_error_answer(&sa, mid, ExchangeType::CreateChildSa, notify_type::INVALID_SYNTAX), from).unwrap();
+                client_stays_quiet(&sock)
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let err = match tunnel.liveness.rekey_child(Duration::from_secs(5)) {
+            Err(DriverError::Ike(e)) => e,
+            other => panic!("expected an IKE error, got {:?}", other.map(|_| ())),
+        };
+        assert_eq!(err, IkeError::PeerTornDown);
+        assert_eq!(tunnel.liveness.probe(Duration::from_millis(100)).unwrap(), Liveness::PeerTornDown);
+        assert!(gateway.join().unwrap(), "nothing more goes out on the IKE SA that ended");
+        assert!(tunnel.liveness.take_peer_rekeys().is_empty(), "the gateway's SA is not handed over");
+    }
+
     /// RFC 7296 §2.8.1's second sequence: our rekey request only reaches the
     /// gateway after its own rekey of the same SA is complete -- the replaced
     /// SA deleted and all -- so it answers `CHILD_SA_NOT_FOUND`. Having
@@ -7453,6 +7728,150 @@ mod tests {
         assert_eq!(tunnel.liveness.probe(Duration::from_secs(2)).unwrap(), Liveness::Alive);
         assert_eq!(gateway.join().unwrap(), Some(notify_type::TEMPORARY_FAILURE));
         assert!(tunnel.liveness.take_peer_rekeys().is_empty(), "the refused CHILD SA rekey is nothing to install");
+    }
+
+    /// RFC 7296 §2.21.3 with §2.8.2: our rekey of the IKE SA crossed the
+    /// gateway's, which we answered, and ours is answered `INVALID_SYNTAX`.
+    /// That ends the IKE SA ours went out on, and that one alone: the IKE SA
+    /// the gateway's own rekey made is another, and stands -- the tunnel goes
+    /// on under it. Nothing more is answered on the one that ended.
+    #[test]
+    fn an_invalid_syntax_answer_to_our_ike_rekey_ends_the_old_ike_sa_but_not_the_one_the_gateway_rekeyed() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from) = responder_through_auth(bind, psk);
+                let ours = recv_from_client(&sock);
+                let ni = [0x55u8; 32];
+                sock.send_to(&gateway_ike_rekey(&sa, 0, &ni), from).unwrap();
+                let theirs = gateway_ike_rekey_done(&sa, &ni, &recv_from_client(&sock));
+                // A DPD probe on the old IKE SA, answered while it stands...
+                let old_probe = build_informational(&sa, 1, false, &[], &[1u8; 8]).unwrap();
+                sock.send_to(&old_probe, from).unwrap();
+                let answered_before = open_informational(&sa, &recv_response_from_client(&sock)).is_ok();
+                let mid = IkeHeader::parse(&ours).unwrap().message_id;
+                sock.send_to(&gateway_error_answer(&sa, mid, ExchangeType::CreateChildSa, notify_type::INVALID_SYNTAX), from).unwrap();
+
+                let probe = recv_on(&sock, &theirs);
+                sock.send_to(&informational_answer(&theirs, &probe, &[]), from).unwrap();
+                // ...but once that IKE SA ended, neither its retransmission nor
+                // the request after it is answered.
+                sock.set_read_timeout(Some(Duration::from_millis(700))).unwrap();
+                sock.send_to(&old_probe, from).unwrap();
+                let answered_again = sock.recv_from(&mut [0u8; 4096]).is_ok();
+                sock.send_to(&build_informational(&sa, 2, false, &[], &[2u8; 8]).unwrap(), from).unwrap();
+                let answered_next = sock.recv_from(&mut [0u8; 4096]).is_ok();
+                ((theirs.spi_i, theirs.spi_r), answered_before, answered_again, answered_next)
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        assert_eq!(tunnel.liveness.rekey_ike(Duration::from_secs(5)).unwrap(), Liveness::Alive);
+        assert_eq!(tunnel.liveness.probe(Duration::from_secs(2)).unwrap(), Liveness::Alive);
+        assert_eq!(tunnel.liveness.peek(Duration::from_secs(1)).unwrap(), Liveness::Alive);
+        let (theirs, answered_before, answered_again, answered_next) = gateway.join().unwrap();
+        assert_eq!((tunnel.liveness.sa.spi_i, tunnel.liveness.sa.spi_r), theirs, "the session is on the gateway's IKE SA");
+        assert!(answered_before, "the old IKE SA answered while it stood");
+        assert!(!answered_again, "the IKE SA that ended does not resend its last answer");
+        assert!(!answered_next, "the IKE SA that ended answers nothing new");
+    }
+
+    /// What an `INVALID_SYNTAX` answer leaves of the IKE SA's receive window:
+    /// nothing kept for the peer -- no answer to resend, no half-received
+    /// request -- and the window closed, so what the peer sends on it later
+    /// is dropped.
+    #[test]
+    fn an_invalid_syntax_answer_clears_what_the_ike_sa_kept_for_the_peer() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        let to_session = liveness.sock.local_addr().unwrap();
+
+        // The gateway's DPD probe is answered: the answer is kept for a retransmission.
+        let dpd = build_informational(&resp_sa, 0, false, &[], &[1u8; 8]).unwrap();
+        assert_eq!(deliver(&mut liveness, &gateway, &dpd), Liveness::Alive);
+        assert!(sent_to(&gateway).is_some());
+        assert!(liveness.peer_requests.last.is_some());
+        // And a request of the gateway's is half received.
+        let header = gateway_header(&resp_sa, 1, ExchangeType::Informational, false);
+        liveness.peer_requests.fragments = Some((Reassembly::new(MessageKey::of(&header)), Instant::now()));
+
+        gateway.send_to(&gateway_error_answer(&resp_sa, 2, ExchangeType::CreateChildSa, notify_type::INVALID_SYNTAX), to_session).unwrap();
+        assert!(matches!(liveness.rekey_child(Duration::from_secs(2)), Err(DriverError::Ike(IkeError::PeerTornDown))));
+
+        assert!(liveness.peer_requests.gone, "the window is closed");
+        assert!(liveness.peer_requests.last.is_none(), "no answer is kept to resend");
+        assert!(liveness.peer_requests.fragments.is_none(), "no half-received request is kept");
+    }
+
+    /// The same for the request that deletes the IKE SA our own rekey
+    /// replaced: answered `INVALID_SYNTAX`, that old IKE SA is over -- which it
+    /// was going to be -- and the new one, which is not the one that request
+    /// went out on, is left alone.
+    #[test]
+    fn an_invalid_syntax_answer_to_the_delete_of_the_ike_sa_our_rekey_replaced_leaves_the_new_ike_sa_alone() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from) = responder_through_auth(bind, psk);
+                let ours = recv_from_client(&sock);
+                let (response, new_sa) = gateway_answers_ike_rekey(&sa, &ours, &[0x80u8; 32]);
+                sock.send_to(&response, from).unwrap();
+                let client_delete = recv_from_client(&sock);
+                let mid = IkeHeader::parse(&client_delete).unwrap().message_id;
+                sock.send_to(&gateway_error_answer(&sa, mid, ExchangeType::Informational, notify_type::INVALID_SYNTAX), from).unwrap();
+
+                let probe = recv_on(&sock, &new_sa);
+                sock.send_to(&informational_answer(&new_sa, &probe, &[]), from).unwrap();
+                deletes_ike_sa(&sa, &client_delete)
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        assert_eq!(tunnel.liveness.rekey_ike(Duration::from_secs(5)).unwrap(), Liveness::Alive);
+        assert_eq!(tunnel.liveness.probe(Duration::from_secs(2)).unwrap(), Liveness::Alive);
+        assert!(gateway.join().unwrap(), "the old IKE SA was deleted, under its own keys");
+    }
+
+    /// The other way round: the gateway's request on the IKE SA our rekey is
+    /// in flight on is badly formatted, and we answer it `INVALID_SYNTAX` -- so
+    /// that IKE SA is over, "fatal in both peers", after the gateway's own
+    /// rekey of it was answered. The IKE SA that rekey made stands.
+    #[test]
+    fn answering_invalid_syntax_on_the_ike_sa_we_are_rekeying_keeps_the_ike_sa_the_gateway_rekeyed() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from) = responder_through_auth(bind, psk);
+                let _ours = recv_from_client(&sock);
+                let ni = [0x55u8; 32];
+                sock.send_to(&gateway_ike_rekey(&sa, 0, &ni), from).unwrap();
+                let theirs = gateway_ike_rekey_done(&sa, &ni, &recv_response_from_client(&sock));
+                let header = gateway_header(&sa, 1, ExchangeType::Informational, false);
+                sock.send_to(&from_gateway_raw(&sa, header, PayloadType::Delete, &MALFORMED_CHAIN), from).unwrap();
+                let refusal = open_informational(&sa, &recv_response_from_client(&sock)).map(|inner| inner.len());
+
+                let probe = recv_on(&sock, &theirs);
+                sock.send_to(&informational_answer(&theirs, &probe, &[]), from).unwrap();
+                ((theirs.spi_i, theirs.spi_r), refusal.is_ok())
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        assert_eq!(tunnel.liveness.rekey_ike(Duration::from_secs(5)).unwrap(), Liveness::Alive);
+        assert_eq!(tunnel.liveness.probe(Duration::from_secs(2)).unwrap(), Liveness::Alive);
+        let (theirs, refused) = gateway.join().unwrap();
+        assert!(refused, "the malformed request is answered on the IKE SA it came on");
+        assert_eq!((tunnel.liveness.sa.spi_i, tunnel.liveness.sa.spi_r), theirs, "the session is on the gateway's IKE SA");
     }
 
     /// RFC 7296 §2.25.2: a gateway deleting the IKE SA we are rekeying, with no

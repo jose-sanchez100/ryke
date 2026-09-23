@@ -131,7 +131,9 @@ pub enum IkeError {
     /// as "not the message we're waiting for", so the whole-tunnel teardown
     /// went unnoticed and the recreate just kept retrying forever. Kept
     /// distinct from a plain timeout/`Crypto` error so a caller can declare
-    /// the tunnel dead immediately instead of scheduling a retry.
+    /// the tunnel dead immediately instead of scheduling a retry. An IKEv2
+    /// peer answering the exchange `INVALID_SYNTAX` is the same: RFC 7296
+    /// §2.21.3 makes that fatal to the IKE SA, deleted without a Delete payload.
     #[error("the peer deleted the IKE SA while this exchange was in flight")]
     PeerTornDown,
 

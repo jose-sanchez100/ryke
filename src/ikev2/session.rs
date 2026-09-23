@@ -3029,6 +3029,10 @@ mod tests {
             let forged = build_informational(&other_resp, req_id, true, &[], &[9u8; 8]).unwrap();
             sock.send_to(&forged, from).unwrap();
             // No genuine reply ever follows -- the peer is actually silent.
+            // It stays bound, though, until the probe is done: the probe
+            // retransmits after each timeout, and on Windows a retransmission
+            // to a closed port comes back as WSAECONNRESET on its next recv.
+            sock
         });
         thread::sleep(Duration::from_millis(50));
 
@@ -3038,7 +3042,7 @@ mod tests {
         // Must NOT report Alive on the forged datagram -- with no genuine
         // reply arriving, the probe times out instead.
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::NoReply);
-        responder.join().unwrap();
+        let _silent_peer = responder.join().unwrap();
     }
 
     #[test]

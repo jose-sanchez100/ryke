@@ -1734,6 +1734,66 @@ mod tests {
         assert_eq!(answer(&req, &PfsPolicy::none()).err(), Some(IkeError::NoProposalChosen), "unknown group");
     }
 
+    /// A peer's rekey request whose SA payload body is `sa_body` as it went on
+    /// the wire -- proposals `SecurityAssociation` cannot express, with an
+    /// attribute we don't understand -- and `ke` as its KE payload, if any.
+    fn peer_rekey_request_wire(peer_sa: &CompletedSaInit, sa_body: &[u8], ke: Option<KeyExchange>) -> Vec<u8> {
+        let ts = TrafficSelectors::ipv4_full_tunnel();
+        let mut inner = vec![(PayloadType::SecurityAssociation, sa_body.to_vec()), (PayloadType::Nonce, vec![0x33; 32])];
+        inner.extend(ke.map(|ke| (PayloadType::KeyExchange, ke.to_bytes())));
+        inner.push((PayloadType::TrafficSelectorInitiator, ts.to_bytes()));
+        inner.push((PayloadType::TrafficSelectorResponder, ts.to_bytes()));
+        let first = first_payload_type(&inner);
+        build_encrypted(
+            peer_sa.suite.sk_cipher(),
+            create_child_header(peer_sa, 7, false),
+            first,
+            &encode_payload_chain(&inner),
+            our_sk_e(peer_sa),
+            our_sk_a(peer_sa),
+            &[1u8; 8],
+        )
+        .unwrap()
+    }
+
+    /// RFC 7296 §3.3.6: a transform with an attribute we do not understand is
+    /// unacceptable -- not absent. An ESP proposal whose ESN, integrity or DH
+    /// transform is one of those was not offered "without" it: the answer would
+    /// leave a type out that the proposal has (§2.7), or run without the PFS it
+    /// insists on. Its siblings and the peer's other proposals are processed
+    /// as usual.
+    #[test]
+    fn an_esp_proposal_with_a_transform_we_cannot_read_is_not_answered_as_without_it() {
+        use crate::ikev2::payload::test_wire::{proposal, sa, transform, KEY_LENGTH_256, UNKNOWN_ATTRIBUTE};
+        let (our_sa, peer_sa) = sa_pair();
+        let spi = 0x2222_2222u32.to_be_bytes();
+        let gcm = || transform(transform_type::ENCR, transform_id::AES_GCM_16, &KEY_LENGTH_256);
+        let esn_none = || transform(transform_type::ESN, transform_id::ESN_NONE, &[]);
+        let unreadable = |ty: u8, id: u16| transform(ty, id, &UNKNOWN_ATTRIBUTE);
+        let esp = |num: u8, transforms: &[Vec<u8>]| proposal(num, protocol_id::ESP, &spi, transforms);
+        let answer = |body: Vec<u8>| {
+            let req = peer_rekey_request_wire(&peer_sa, &body, None);
+            responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, &PfsPolicy::none(), &[6u8; 32], &[2u8; 8])
+                .map(|(resp, _)| read_rekey_response(&resp, &peer_sa).0)
+        };
+
+        assert_eq!(answer(sa(&[esp(1, &[gcm(), esn_none()])])).unwrap().num, 1, "control");
+        let refused = [
+            ("a DH we cannot read", esp(1, &[gcm(), esn_none(), unreadable(transform_type::DH, transform_id::MODP_2048)])),
+            ("an ESN we cannot read, in place of the ESN_NONE", esp(1, &[gcm(), unreadable(transform_type::ESN, transform_id::ESN_NONE)])),
+            ("an integrity algorithm we cannot read", esp(1, &[gcm(), unreadable(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128), esn_none()])),
+            ("a transform type nobody knows, unreadable", esp(1, &[gcm(), esn_none(), unreadable(99, 7)])),
+        ];
+        for (what, p) in refused {
+            assert_eq!(answer(sa(std::slice::from_ref(&p))).err(), Some(IkeError::NoProposalChosen), "{what}");
+            // ... and the next proposal, which is fine, is the one answered.
+            assert_eq!(answer(sa(&[p, esp(2, &[gcm(), esn_none()])])).unwrap().num, 2, "{what}, then a proposal we take");
+        }
+        // A sibling we cannot read leaves the transform we can: the ENCR here.
+        let sibling = esp(1, &[unreadable(transform_type::ENCR, transform_id::AES_GCM_16), gcm(), esn_none()]);
+        assert_eq!(answer(sa(&[sibling])).unwrap().num, 1, "an unreadable ENCR next to the one we run");
+    }
+
     fn extract_tsi(resp: &[u8], init_sa: &CompletedSaInit) -> Vec<u8> {
         let (first, dec) = open_encrypted_gcm(resp, peer_sk_e(init_sa)).unwrap();
         for p in payloads(first, &dec) {

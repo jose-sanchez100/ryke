@@ -56,6 +56,13 @@ pub mod transform_id {
     // ESN
     pub const ESN_NONE: u16 = 0;
     pub const ESN_ENABLED: u16 = 1;
+    /// What a received transform we cannot take stands for once parsed: one
+    /// carrying an attribute this crate does not understand (RFC 7296 §3.3.6,
+    /// "unacceptable"). It keeps its place and its Transform Type in the
+    /// proposal but names nothing we run -- a private-use ID no candidate list
+    /// holds -- so it is never selected, yet still counts as a transform of its
+    /// type that was offered (or answered). Never sent.
+    pub const UNUSABLE: u16 = 0xFFFF;
 }
 
 /// IKEv2 protocol IDs (RFC 7296 §3.3.1).
@@ -79,7 +86,11 @@ fn push_u16(out: &mut Vec<u8>, value: u16) {
 
 /// One Transform substructure. We model the single attribute that IKEv2
 /// defines -- Key Length. A received transform carrying anything else is not
-/// understood and is left out on parse (RFC 7296 §3.3.6).
+/// understood, and unacceptable (RFC 7296 §3.3.6): on parse it becomes a
+/// transform of its type that names [`transform_id::UNUSABLE`] -- never
+/// selected, but not gone either, because what the peer offered or answered
+/// is more than the transforms we could use (a type it insisted on, two
+/// transforms where one was to be answered).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transform {
     pub transform_type: u8,
@@ -90,10 +101,11 @@ pub struct Transform {
 
 impl Transform {
     /// Parse one transform from the front of `buf`; returns it and the number of
-    /// bytes consumed (its declared Transform Length). The transform is `None`
-    /// when it carries an attribute we do not understand: RFC 7296 §3.3.6 makes
-    /// it unacceptable, while other transforms of its type still count.
-    fn parse(buf: &[u8]) -> Result<(Option<Transform>, usize), IkeError> {
+    /// bytes consumed (its declared Transform Length). One that carries an
+    /// attribute we do not understand is RFC 7296 §3.3.6's unacceptable
+    /// transform: it comes back as [`transform_id::UNUSABLE`] of its type,
+    /// while other transforms of the type still count.
+    fn parse(buf: &[u8]) -> Result<(Transform, usize), IkeError> {
         if buf.len() < 8 {
             return Err(IkeError::Truncated { need: 8, have: buf.len() });
         }
@@ -106,8 +118,10 @@ impl Transform {
         }
         let transform_type = buf[4];
         let transform_id = u16be(buf, 6);
-        let transform = Self::read_attributes(&buf[8..length])?
-            .map(|key_length| Transform { transform_type, transform_id, key_length });
+        let transform = match Self::read_attributes(&buf[8..length])? {
+            Some(key_length) => Transform { transform_type, transform_id, key_length },
+            None => Transform { transform_type, transform_id: transform_id::UNUSABLE, key_length: None },
+        };
         Ok((transform, length))
     }
 
@@ -199,8 +213,7 @@ impl Proposal {
         let mut transforms = Vec::with_capacity(transform_count);
         for _ in 0..transform_count {
             let (transform, consumed) = Transform::parse(&buf[off..length])?;
-            // One we do not understand is not on offer (RFC 7296 §3.3.6).
-            transforms.extend(transform);
+            transforms.push(transform);
             off += consumed;
         }
         // The transforms fill the proposal: its Length has no room for more.
@@ -1214,6 +1227,59 @@ impl CertRequest {
     }
 }
 
+/// Proposals built byte by byte, for tests of what a peer can put on the wire
+/// that [`Transform`] cannot say: attributes this crate does not understand.
+#[cfg(test)]
+pub(crate) mod test_wire {
+    use super::push_u16;
+
+    pub const KEY_LENGTH_128: [u8; 4] = [0x80, 14, 0x00, 0x80];
+    pub const KEY_LENGTH_256: [u8; 4] = [0x80, 14, 0x01, 0x00];
+    /// A TV attribute of a type IKEv2 has not defined.
+    pub const UNKNOWN_ATTRIBUTE: [u8; 4] = [0x80, 99, 0, 1];
+
+    /// A transform with `attrs` as its attribute area, its "Last Substruc" set by [`proposal`].
+    pub fn transform(transform_type: u8, transform_id: u16, attrs: &[u8]) -> Vec<u8> {
+        let mut out = vec![3, 0];
+        push_u16(&mut out, (8 + attrs.len()) as u16);
+        out.extend_from_slice(&[transform_type, 0]);
+        push_u16(&mut out, transform_id);
+        out.extend_from_slice(attrs);
+        out
+    }
+
+    /// A proposal of `transforms`, its "Last Substruc" set by [`sa`].
+    pub fn proposal(num: u8, protocol_id: u8, spi: &[u8], transforms: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = transforms.concat();
+        let mut at = 0;
+        for (i, t) in transforms.iter().enumerate() {
+            if i + 1 == transforms.len() {
+                body[at] = 0;
+            }
+            at += t.len();
+        }
+        let mut out = vec![2, 0];
+        push_u16(&mut out, (8 + spi.len() + body.len()) as u16);
+        out.extend_from_slice(&[num, protocol_id, spi.len() as u8, transforms.len() as u8]);
+        out.extend_from_slice(spi);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// The SA payload body holding `proposals`.
+    pub fn sa(proposals: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = proposals.concat();
+        let mut at = 0;
+        for (i, p) in proposals.iter().enumerate() {
+            if i + 1 == proposals.len() {
+                out[at] = 0;
+            }
+            at += p.len();
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1838,15 +1904,67 @@ mod tests {
                 &[],
             );
             let parsed = SecurityAssociation::parse(&sa).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            // Left out it would leave the peer's offer looking like something
+            // else -- a type it insisted on gone, two answered transforms one --
+            // so it stays, as one that names nothing we could run.
             assert_eq!(
                 parsed.proposals[0].transforms,
                 vec![
+                    Transform { transform_type: transform_type::ENCR, transform_id: transform_id::UNUSABLE, key_length: None },
                     Transform { transform_type: transform_type::ENCR, transform_id: transform_id::AES_GCM_16, key_length: Some(128) },
                     Transform { transform_type: transform_type::PRF, transform_id: transform_id::PRF_HMAC_SHA2_256, key_length: None },
                 ],
                 "{what}"
             );
         }
+    }
+
+    #[test]
+    fn an_unusable_transform_keeps_its_type_whatever_the_type_is() {
+        // RFC 7296 §3.3.6: a Transform Type we do not know makes the whole
+        // proposal unacceptable -- also when its transform carries an attribute
+        // we do not know, which used to make it vanish without a trace.
+        use super::test_wire::{proposal, sa, transform, UNKNOWN_ATTRIBUTE};
+        let body = sa(&[proposal(
+            1,
+            protocol_id::IKE,
+            &[],
+            &[
+                transform(transform_type::ENCR, transform_id::AES_GCM_16, &super::test_wire::KEY_LENGTH_256),
+                transform(99, 7, &UNKNOWN_ATTRIBUTE),
+                transform(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, &UNKNOWN_ATTRIBUTE),
+                transform(transform_type::ESN, transform_id::ESN_NONE, &UNKNOWN_ATTRIBUTE),
+                transform(transform_type::DH, transform_id::X25519, &UNKNOWN_ATTRIBUTE),
+            ],
+        )]);
+        let parsed = SecurityAssociation::parse(&body).unwrap();
+        let unusable = |ty: u8| Transform { transform_type: ty, transform_id: transform_id::UNUSABLE, key_length: None };
+        assert_eq!(
+            parsed.proposals[0].transforms,
+            vec![
+                Transform { transform_type: transform_type::ENCR, transform_id: transform_id::AES_GCM_16, key_length: Some(256) },
+                unusable(99),
+                unusable(transform_type::INTEG),
+                unusable(transform_type::ESN),
+                unusable(transform_type::DH),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_transform_count_is_kept_whatever_the_transforms_are() {
+        use super::test_wire::{proposal, sa, transform, UNKNOWN_ATTRIBUTE};
+        let body = sa(&[proposal(
+            1,
+            protocol_id::ESP,
+            &[1, 2, 3, 4],
+            &[
+                transform(transform_type::ENCR, transform_id::AES_GCM_16, &UNKNOWN_ATTRIBUTE),
+                transform(transform_type::ENCR, transform_id::AES_GCM_16, &UNKNOWN_ATTRIBUTE),
+                transform(transform_type::ESN, transform_id::ESN_NONE, &[]),
+            ],
+        )]);
+        assert_eq!(SecurityAssociation::parse(&body).unwrap().proposals[0].transforms.len(), 3);
     }
 
     #[test]

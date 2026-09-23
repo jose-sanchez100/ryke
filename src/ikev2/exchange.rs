@@ -1136,6 +1136,75 @@ mod tests {
         initiator_complete(&init, &request, &response).expect("our own proposal, echoed back, completes");
     }
 
+    /// An `IKE_SA_INIT` whose SA payload body is `sa_body`, as it went on the
+    /// wire: for a proposal `SecurityAssociation` cannot express (an attribute we
+    /// do not understand). `response` has the responder's KE and header.
+    fn raw_sa_init(sa_body: &[u8], response: bool) -> Vec<u8> {
+        let (init, resp) = (init_secret(), resp_secret());
+        let group = DhGroup::X25519;
+        let (header, private, nonce) = if response {
+            (base_header(init.spi, resp.spi, Flags { initiator: false, version: false, response: true }), resp.dh_private, resp.nonce)
+        } else {
+            (base_header(init.spi, 0, Flags { initiator: true, version: false, response: false }), init.dh_private, init.nonce)
+        };
+        let ke = KeyExchange { dh_group: group.transform_id(), data: group.public(&private) };
+        MessageBuilder::new(header)
+            .push(PayloadType::SecurityAssociation, sa_body.to_vec())
+            .push(PayloadType::KeyExchange, ke.to_bytes())
+            .push(PayloadType::Nonce, Nonce { data: nonce }.to_bytes())
+            .build()
+    }
+
+    fn gcm256_prf_x25519() -> Vec<Vec<u8>> {
+        use crate::ikev2::payload::test_wire::{transform, KEY_LENGTH_256};
+        vec![
+            transform(transform_type::ENCR, transform_id::AES_GCM_16, &KEY_LENGTH_256),
+            transform(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, &[]),
+            transform(transform_type::DH, transform_id::X25519, &[]),
+        ]
+    }
+
+    #[test]
+    fn a_request_with_a_transform_type_we_do_not_know_is_refused_even_if_that_transform_is_unreadable() {
+        // RFC 7296 §3.3.6: a proposal with a Transform Type the responder does not
+        // understand is unacceptable. The transform naming it carries an attribute
+        // we do not understand, which used to make it disappear from the offer --
+        // and the proposal was answered as if it asked for nothing more.
+        use crate::ikev2::payload::test_wire::{proposal, sa, transform, UNKNOWN_ATTRIBUTE};
+        let offer = |extra: Option<Vec<u8>>| {
+            let mut transforms = gcm256_prf_x25519();
+            transforms.extend(extra);
+            raw_sa_init(&sa(&[proposal(1, protocol_id::IKE, &[], &transforms)]), false)
+        };
+        responder_respond(&offer(None), &resp_secret()).expect("control: the offer without it is answered");
+        for (what, extra) in [
+            ("a type we don't know, with an attribute we don't", transform(99, 7, &UNKNOWN_ATTRIBUTE)),
+            ("a type we don't know", transform(99, 7, &[])),
+        ] {
+            assert_eq!(responder_respond(&offer(Some(extra)), &resp_secret()).unwrap_err(), IkeError::NoProposalChosen, "{what}");
+        }
+    }
+
+    #[test]
+    fn initiator_takes_no_answer_with_two_encryption_transforms_one_of_which_it_cannot_read() {
+        // §2.7 / §3.3.6: "exactly one transform of each type" -- which the
+        // initiator MUST check. The unreadable one is still one, and its
+        // presence made the answer look like the single transform we offered.
+        use crate::ikev2::payload::test_wire::{proposal, sa, transform, KEY_LENGTH_256, UNKNOWN_ATTRIBUTE};
+        let init = init_secret();
+        let request = initiator_request(&init, &default_offer());
+        let answer = |extra: Option<Vec<u8>>| {
+            let mut transforms = gcm256_prf_x25519();
+            transforms.extend(extra);
+            raw_sa_init(&sa(&[proposal(1, protocol_id::IKE, &[], &transforms)]), true)
+        };
+        initiator_complete(&init, &request, &answer(None)).expect("control: our own proposal, echoed back");
+        let unreadable_encr = transform(transform_type::ENCR, transform_id::AES_GCM_16, &[&KEY_LENGTH_256[..], &UNKNOWN_ATTRIBUTE[..]].concat());
+        for (what, extra) in [("a second ENCR we cannot read", unreadable_encr), ("a type nobody knows, unreadable", transform(99, 7, &UNKNOWN_ATTRIBUTE))] {
+            assert_eq!(initiator_complete(&init, &request, &answer(Some(extra))).unwrap_err(), IkeError::NoProposalChosen, "{what}");
+        }
+    }
+
     #[test]
     fn responder_rejects_wrong_ke_group() {
         // SA offers X25519 (accepted) but the KE payload claims MODP-2048.

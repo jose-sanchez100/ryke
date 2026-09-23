@@ -972,4 +972,137 @@ mod tests {
         let offer = proposal(1, vec![tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256))]);
         assert!(!chosen.matches_offer(&offer));
     }
+
+    /// Proposals as they come off the wire, where a transform can carry an
+    /// attribute we don't understand -- what `Transform` cannot say.
+    mod wire {
+        use super::*;
+        use crate::ikev2::payload::test_wire::{proposal as raw_proposal, sa, transform, KEY_LENGTH_128, KEY_LENGTH_256, UNKNOWN_ATTRIBUTE};
+
+        pub fn gcm256() -> Vec<u8> {
+            transform(transform_type::ENCR, transform_id::AES_GCM_16, &KEY_LENGTH_256)
+        }
+        pub fn gcm128() -> Vec<u8> {
+            transform(transform_type::ENCR, transform_id::AES_GCM_16, &KEY_LENGTH_128)
+        }
+        pub fn prf() -> Vec<u8> {
+            transform(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, &[])
+        }
+        pub fn x25519() -> Vec<u8> {
+            transform(transform_type::DH, transform_id::X25519, &[])
+        }
+        /// A transform of that type and ID with an attribute IKEv2 has not defined.
+        pub fn with_unknown_attribute(ty: u8, id: u16) -> Vec<u8> {
+            transform(ty, id, &UNKNOWN_ATTRIBUTE)
+        }
+        pub fn ike(num: u8, transforms: &[Vec<u8>]) -> Vec<u8> {
+            raw_proposal(num, protocol_id::IKE, &[], transforms)
+        }
+        pub fn parse(proposals: &[Vec<u8>]) -> SecurityAssociation {
+            SecurityAssociation::parse(&sa(proposals)).unwrap()
+        }
+    }
+
+    #[test]
+    fn an_offer_with_a_requirement_we_cannot_read_is_not_taken_without_it() {
+        // RFC 7296 §3.3.6: a transform with an attribute we do not understand is
+        // unacceptable, and so is a proposal with a Transform Type we do not know
+        // -- whether that transform has such an attribute or not. Dropped on
+        // parse, the requirement was simply not there, and the proposal was
+        // answered as if it had never been made.
+        use wire::*;
+        let hidden = |what: &str, extra: Vec<u8>, expected: Option<u8>| {
+            let sa = parse(&[ike(1, &[gcm256(), prf(), x25519(), extra]), ike(2, &[gcm128(), prf(), x25519()])]);
+            assert_eq!(select(&sa).map(|s| s.proposal_num), expected, "{what}");
+        };
+        hidden("a transform type we don't know, with an attribute we don't", with_unknown_attribute(99, 7), Some(2));
+        hidden("a transform type we don't know", transform_of(99, 7), Some(2));
+        hidden("an ADDKE type (RFC 9370) with an unreadable attribute", with_unknown_attribute(6, transform_id::ECP256), Some(2));
+        // An integrity algorithm we cannot read next to a combined-mode cipher is
+        // still an integrity algorithm the answer would have to name (§2.7).
+        hidden("an integrity algorithm we cannot read, next to AEAD", with_unknown_attribute(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128), Some(2));
+    }
+
+    fn transform_of(ty: u8, id: u16) -> Vec<u8> {
+        crate::ikev2::payload::test_wire::transform(ty, id, &[])
+    }
+
+    #[test]
+    fn a_transform_we_cannot_read_leaves_the_others_of_its_type_selectable() {
+        // The other half of §3.3.6: "other transforms with the same Transform
+        // Type are processed as usual" -- the unreadable one is only skipped.
+        use wire::*;
+        let unreadable_gcm256 = with_unknown_attribute(transform_type::ENCR, transform_id::AES_GCM_16);
+        let chosen = select(&parse(&[ike(1, &[unreadable_gcm256, gcm128(), prf(), x25519()])])).unwrap();
+        assert_eq!((chosen.encr_id, chosen.encr_key_bits), (transform_id::AES_GCM_16, 128));
+
+        let unreadable_prf = with_unknown_attribute(transform_type::PRF, transform_id::PRF_HMAC_SHA2_512);
+        let chosen = select(&parse(&[ike(1, &[gcm256(), unreadable_prf, prf(), x25519()])])).unwrap();
+        assert_eq!(chosen.prf_id, transform_id::PRF_HMAC_SHA2_256);
+
+        // Nothing of a type we need but the unreadable one: nothing to choose.
+        for (what, ty, id) in [
+            ("ENCR", transform_type::ENCR, transform_id::AES_GCM_16),
+            ("PRF", transform_type::PRF, transform_id::PRF_HMAC_SHA2_256),
+            ("DH", transform_type::DH, transform_id::X25519),
+        ] {
+            let mut transforms = vec![gcm256(), prf(), x25519()];
+            transforms.retain(|t| t[4] != ty);
+            transforms.push(with_unknown_attribute(ty, id));
+            assert_eq!(select(&parse(&[ike(1, &transforms)])), None, "only an unreadable {what}");
+        }
+    }
+
+    #[test]
+    fn an_answer_is_not_one_transform_of_each_type_when_one_of_them_cannot_be_read() {
+        // §2.7/§3.3.6: the answer holds exactly one transform of each type and
+        // the initiator MUST check that. Two ENCR where one carries an attribute
+        // we do not understand are still two -- not one that we may pick.
+        use wire::*;
+        let offer = parse(&[ike(1, &[gcm256(), gcm128(), prf(), x25519()])]);
+        let answer = |transforms: &[Vec<u8>]| parse(&[ike(1, transforms)]);
+        let unreadable = |ty, id| with_unknown_attribute(ty, id);
+
+        assert!(accepted_proposal(&answer(&[gcm128(), prf(), x25519()]), &offer).is_ok(), "control: one of each");
+        let refused = [
+            ("two ENCR, one unreadable", answer(&[gcm128(), unreadable(transform_type::ENCR, transform_id::AES_GCM_16), prf(), x25519()])),
+            ("only an unreadable ENCR", answer(&[unreadable(transform_type::ENCR, transform_id::AES_GCM_16), prf(), x25519()])),
+            ("two PRF, one unreadable", answer(&[gcm128(), prf(), unreadable(transform_type::PRF, transform_id::PRF_HMAC_SHA2_512), x25519()])),
+            ("a type we never offered, unreadable", answer(&[gcm128(), prf(), x25519(), unreadable(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128)])),
+            ("a type nobody knows, unreadable", answer(&[gcm128(), prf(), x25519(), unreadable(99, 7)])),
+        ];
+        for (what, sa) in &refused {
+            assert_eq!(accepted_proposal(sa, &offer), Err(IkeError::NoProposalChosen), "{what}");
+        }
+    }
+
+    #[test]
+    fn an_esp_offer_with_an_esn_or_dh_we_cannot_read_is_not_taken_as_without_it() {
+        // The same in an ESP proposal (`choose_child_proposal`, `select_esp`): an
+        // ESN or DH transform we cannot read is one that was offered -- not
+        // "no ESN" or "no PFS".
+        use crate::ikev2::payload::test_wire::{proposal as raw_proposal, sa, transform, KEY_LENGTH_256, UNKNOWN_ATTRIBUTE};
+        let esp = |transforms: &[Vec<u8>]| SecurityAssociation::parse(&sa(&[raw_proposal(1, protocol_id::ESP, &[1, 2, 3, 4], transforms)])).unwrap();
+        let gcm = || transform(transform_type::ENCR, transform_id::AES_GCM_16, &KEY_LENGTH_256);
+        let esn_none = || transform(transform_type::ESN, transform_id::ESN_NONE, &[]);
+        let unreadable = |ty, id| transform(ty, id, &UNKNOWN_ATTRIBUTE);
+
+        let offer = SecurityAssociation {
+            proposals: vec![Proposal {
+                num: 1,
+                protocol_id: protocol_id::ESP,
+                spi: vec![9, 9, 9, 9],
+                transforms: vec![tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256)), tf(transform_type::ESN, transform_id::ESN_NONE, None)],
+            }],
+        };
+        assert!(accepted_proposal(&esp(&[gcm(), esn_none()]), &offer).is_ok(), "control");
+        let refused = [
+            ("an ESN we cannot read for the ESN_NONE offered", esp(&[gcm(), unreadable(transform_type::ESN, transform_id::ESN_NONE)])),
+            ("two ESN, one unreadable", esp(&[gcm(), esn_none(), unreadable(transform_type::ESN, transform_id::ESN_ENABLED)])),
+            ("a DH we cannot read", esp(&[gcm(), esn_none(), unreadable(transform_type::DH, transform_id::X25519)])),
+        ];
+        for (what, sa) in &refused {
+            assert_eq!(accepted_proposal(sa, &offer), Err(IkeError::NoProposalChosen), "{what}");
+        }
+    }
 }

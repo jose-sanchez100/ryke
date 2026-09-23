@@ -909,6 +909,10 @@ impl LivenessSession {
                 ike_debug!("CREATE_CHILD_SA: the peer deleted the tunnel's only CHILD SA while we rekeyed it -- tunnel torn down by the gateway");
                 IkeError::PeerTornDown.into()
             }
+            ChildKind::Ipv6 if !self.primary_child_alive => {
+                ike_debug!("CREATE_CHILD_SA: the peer deleted the tunnel's last CHILD SA while we rekeyed it -- tunnel torn down by the gateway");
+                IkeError::PeerTornDown.into()
+            }
             ChildKind::Ipv6 => {
                 ike_debug!("CREATE_CHILD_SA: the peer deleted the IPv6 CHILD SA while we rekeyed it -- primary CHILD SA and IKE SA are still up, renegotiating it");
                 self.child6 = None;
@@ -1359,16 +1363,18 @@ impl LivenessSession {
     /// A Delete of CHILD SAs is answered with our Delete for each pair
     /// (§1.4.1), naming our inbound SPI of it, but for one we are deleting
     /// ourselves, whose Delete is on its way (§2.25.1). It ends the tunnel
-    /// only when it leaves it no CHILD SA: the primary with no IPv6 one, or
-    /// both. One family's CHILD SA going on its own, the other still up, is
-    /// queued in `peer_child.deleted` for the caller to renegotiate (see
-    /// [`Self::take_peer_deleted_children`]); nothing in §1.4.1 makes
-    /// deleting a CHILD SA delete the IKE SA or any other. The CHILD SA a
-    /// rekey of the peer's replaced is the peer's routine cleanup -- confirmed
-    /// live against a FortiGate, which deletes the old SA right after every
-    /// rekey -- and one a CHILD SA exchange of ours is about is settled by
-    /// that exchange ([`Self::settle_rekey`]). SPIs this side doesn't know
-    /// are passed over.
+    /// only when it leaves it no CHILD SA, whatever order the Deletes came
+    /// in: the primary with no IPv6 one, the IPv6 one with the primary
+    /// already deleted, or both -- a policy of this library, not something
+    /// the RFC asks for. One family's CHILD SA going on its own, the other
+    /// still up, is queued in `peer_child.deleted` for the caller to
+    /// renegotiate (see [`Self::take_peer_deleted_children`]); nothing in
+    /// §1.4.1 makes deleting a CHILD SA delete the IKE SA or any other. The
+    /// CHILD SA a rekey of the peer's replaced is the peer's routine cleanup
+    /// -- confirmed live against a FortiGate, which deletes the old SA right
+    /// after every rekey -- and one a CHILD SA exchange of ours is about is
+    /// settled by that exchange ([`Self::settle_rekey`]). SPIs this side
+    /// doesn't know are passed over.
     fn answer_peer_informational(
         &mut self,
         on: OnIkeSa,
@@ -1438,7 +1444,12 @@ impl LivenessSession {
             }
             _ => {}
         }
-        let tears_down = primary && (self.child6.is_none() || child6.is_some());
+        // The tunnel ends when these Deletes leave it no CHILD SA, whatever
+        // order they came in: one deleted earlier and still to be
+        // renegotiated doesn't count.
+        let primary_left = self.primary_child_alive && !primary;
+        let child6_left = self.child6.is_some() && child6.is_none();
+        let tears_down = (primary || child6.is_some()) && !primary_left && !child6_left;
         if !tears_down {
             if primary {
                 ike_debug!(
@@ -3876,6 +3887,50 @@ mod tests {
         assert_eq!((liveness.child_local_spi, liveness.child_peer_spi), (0xBBBB, 0xAAAA), "untouched");
         assert!(liveness.primary_child_alive);
         responder.join().unwrap();
+    }
+
+    /// The tunnel ends when the gateway's Deletes leave it no CHILD SA, in
+    /// whichever order they come -- this library's contract, not an RFC
+    /// requirement (§1.4.1 lets an IKE SA outlive its CHILD SAs). Deleting
+    /// the primary and then the IPv6 CHILD SA used to leave a session with
+    /// no CHILD SA at all reporting `Alive`, while the other order ended it;
+    /// a CHILD SA deleted earlier and still waiting to be renegotiated
+    /// doesn't keep the tunnel up.
+    #[test]
+    fn the_tunnel_ends_when_its_last_child_sa_is_deleted_whatever_the_order() {
+        let (primary, ipv6) = ((0xAAAA, ChildKind::Primary), (0x7777, ChildKind::Ipv6));
+        for (first, second) in [(primary, ipv6), (ipv6, primary)] {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut liveness = session_facing(&gateway, init_sa, Some(ChildSpis { local: 0x6666, peer: 0x7777 }));
+            let delete =
+                |mid: u32, spi: u32| build_informational(&resp_sa, mid, false, &[delete_payload(Delete::esp(vec![spi]))], &[7u8; 8]).unwrap();
+
+            assert_eq!(deliver(&mut liveness, &gateway, &delete(0, first.0)), Liveness::Alive, "{first:?} first: the other still up");
+            assert!(sent_to(&gateway).is_some());
+            assert_eq!(liveness.take_peer_deleted_children(), vec![first.1]);
+            assert_eq!(deliver(&mut liveness, &gateway, &delete(1, second.0)), Liveness::PeerTornDown, "{first:?} first, then {second:?}: none left");
+            assert!(sent_to(&gateway).is_some(), "the Delete is still answered");
+        }
+    }
+
+    /// ...and likewise when the last one goes while our rekey of it is in
+    /// flight: the IPv6 CHILD SA lost with the primary already deleted ends
+    /// the tunnel, as the primary lost with no IPv6 CHILD SA does.
+    #[test]
+    fn losing_the_ipv6_child_sa_mid_rekey_with_the_primary_already_gone_ends_the_tunnel() {
+        let (init_sa, _) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let lost = || DriverError::Ike(IkeError::Crypto("the rekey came to nothing"));
+
+        let mut liveness = session_facing(&gateway, init_sa.clone(), Some(ChildSpis { local: 0x6666, peer: 0x7777 }));
+        liveness.primary_child_alive = false;
+        assert!(matches!(liveness.lost_child(ChildKind::Ipv6, lost()), DriverError::Ike(IkeError::PeerTornDown)));
+
+        // Control: with the primary up, it is renegotiated instead.
+        let mut liveness = session_facing(&gateway, init_sa, Some(ChildSpis { local: 0x6666, peer: 0x7777 }));
+        assert!(matches!(liveness.lost_child(ChildKind::Ipv6, lost()), DriverError::Ike(IkeError::Crypto(_))));
+        assert_eq!(liveness.take_peer_deleted_children(), vec![ChildKind::Ipv6]);
     }
 
     /// RFC 7296 §2.1: a retransmitted request must get the identical

@@ -31,7 +31,7 @@ use crate::ikev2::ike_auth::{assigned_ipv4_policy, check_granted_ts, esp_offer_f
 use crate::ikev2::message::{encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType};
 use crate::ikev2::negotiate;
 use crate::ikev2::payload::{
-    notify_type, protocol_id, transform_type, KeyExchange, Nonce, Notify, Proposal, SecurityAssociation, TrafficSelector, TrafficSelectors, Transform,
+    notify_type, protocol_id, transform_id, transform_type, KeyExchange, Nonce, Notify, Proposal, SecurityAssociation, TrafficSelector, TrafficSelectors, Transform,
 };
 use crate::ikev2::sk::{build_encrypted, open_encrypted, SkCipher};
 use crate::role::Role;
@@ -554,13 +554,20 @@ pub(crate) fn choose_child_proposal(
                 || of_type(t.transform_type).any(|o| o.transform_id == t.transform_id && o.key_length == t.key_length)
         });
         // An AEAD cipher takes no integrity algorithm: a proposal that insists on one is another algorithm.
+        // The NONE that lets it through is the plain one: integrity, DH and ESN transforms take no Key
+        // Length (RFC 7296 §3.3.5), so one that carries it is not a transform we understand -- unacceptable
+        // (§3.3.6), not a NONE to answer with the attribute dropped ("returned unmodified").
         let integ_forced = !ours.transforms.iter().any(|t| t.transform_type == transform_type::INTEG)
             && of_type(transform_type::INTEG).next().is_some()
-            && !of_type(transform_type::INTEG).any(|t| t.transform_id == 0);
+            && !of_type(transform_type::INTEG).any(|t| t.transform_id == 0 && t.key_length.is_none());
         if !offers_all || integ_forced {
             continue;
         }
-        let dh_offered: Vec<u16> = of_type(transform_type::DH).map(|t| t.transform_id).collect();
+        // Every DH transform it names, an unreadable one (or one with a Key Length) as `UNUSABLE`: the
+        // proposal does insist on a group, just not on one we can take.
+        let dh_offered: Vec<u16> = of_type(transform_type::DH)
+            .map(|t| if t.key_length.is_none() { t.transform_id } else { transform_id::UNUSABLE })
+            .collect();
         let group = match ke_group {
             Some(g) if dh_offered.contains(&g) && pfs.allows_group(g) => match negotiate::ikev2_dh_group(g) {
                 Some(group) => Some(group),
@@ -1792,6 +1799,104 @@ mod tests {
         // A sibling we cannot read leaves the transform we can: the ENCR here.
         let sibling = esp(1, &[unreadable(transform_type::ENCR, transform_id::AES_GCM_16), gcm(), esn_none()]);
         assert_eq!(answer(sa(&[sibling])).unwrap().num, 1, "an unreadable ENCR next to the one we run");
+    }
+
+    /// RFC 7296 §3.3.5, §3.3.6: a DH, integrity or ESN transform takes no Key
+    /// Length ("MUST NOT be used with transforms that use a fixed-length key"),
+    /// so one that carries it is a transform we do not understand --
+    /// unacceptable, and its siblings of the type are weighed as usual. It is
+    /// not a group, a NONE or an ESN to accept and answer with the attribute
+    /// stripped: the answer's transform must be the offered one, "attributes
+    /// ... returned unmodified".
+    #[test]
+    fn a_fixed_length_transform_with_a_key_length_is_not_one_we_take() {
+        let (our_sa, peer_sa) = sa_pair();
+        let peer_dh = [5u8; 32];
+        let tf = |transform_type: u8, transform_id: u16, key_length: Option<u16>| Transform { transform_type, transform_id, key_length };
+        let esp = |num: u8, middle: Vec<Transform>| {
+            let mut transforms = vec![tf(transform_type::ENCR, transform_id::AES_GCM_16, Some(256))];
+            transforms.extend(middle);
+            transforms.push(tf(transform_type::ESN, transform_id::ESN_NONE, None));
+            Proposal { num, protocol_id: protocol_id::ESP, spi: 0x2222_2222u32.to_be_bytes().to_vec(), transforms }
+        };
+        let dh = |id: u16, key_length: Option<u16>| tf(transform_type::DH, id, key_length);
+        let integ_none = |key_length: Option<u16>| tf(transform_type::INTEG, 0, key_length);
+        let (modp, ecp) = (transform_id::MODP_2048, transform_id::ECP256);
+        let required = |group: u16| PfsPolicy::from_offer(&SecurityAssociation { proposals: vec![esp(1, vec![dh(group, None)])] }).unwrap();
+
+        // The answer to `proposals` (with a KE of `ke`), which -- when there is
+        // one -- is checked against the offer too: the proposal number is the
+        // offered one's and every transform of it is one the peer sent, as sent.
+        let answer = |proposals: Vec<Proposal>, ke: Option<DhGroup>, pfs: &PfsPolicy| {
+            let req = peer_rekey_request(&peer_sa, proposals.clone(), ke.map(|g| (g, &peer_dh[..])), &TrafficSelectors::ipv4_full_tunnel());
+            responder_answer_child_rekey(&our_sa, &req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, pfs, &[6u8; 32], &[2u8; 8]).map(|(resp, _)| {
+                let (answered, ..) = read_rekey_response(&resp, &peer_sa);
+                let offered = proposals.iter().find(|p| p.num == answered.num).expect("the answer names a proposal we sent");
+                for t in &answered.transforms {
+                    assert!(offered.transforms.contains(t), "{t:?} is not a transform of proposal {}, as it was sent: {offered:?}", answered.num);
+                }
+                negotiate::accepted_proposal(&SecurityAssociation { proposals: vec![answered.clone()] }, &SecurityAssociation { proposals })
+                    .expect("the answer is consistent with the offer");
+                answered
+            })
+        };
+        let dh_of = |p: &Proposal| p.transforms.iter().filter(|t| t.transform_type == transform_type::DH).cloned().collect::<Vec<_>>();
+        let integ_of = |p: &Proposal| p.transforms.iter().filter(|t| t.transform_type == transform_type::INTEG).cloned().collect::<Vec<_>>();
+
+        // A group with a Key Length is no group we run; the plain one is.
+        let group = Some(DhGroup::Modp2048);
+        assert_eq!(dh_of(&answer(vec![esp(1, vec![dh(modp, None)])], group, &required(modp)).unwrap()), [dh(modp, None)], "control: the group as offered");
+        assert_eq!(answer(vec![esp(1, vec![dh(modp, Some(2048))])], group, &required(modp)), Err(IkeError::NoProposalChosen), "the group with a Key Length");
+        assert_eq!(
+            answer(vec![esp(1, vec![dh(modp, Some(2048))]), esp(2, vec![dh(modp, None)])], group, &required(modp)).unwrap().num,
+            2,
+            "the group with a Key Length, then a proposal with the plain one"
+        );
+        assert_eq!(
+            dh_of(&answer(vec![esp(1, vec![dh(modp, Some(2048)), dh(modp, None)])], group, &required(modp)).unwrap()),
+            [dh(modp, None)],
+            "the group with a Key Length next to the plain one, in one proposal"
+        );
+
+        // Two alternatives of the type: the one we can read is taken, on its own KE; a KE of the other is
+        // INVALID_KE_PAYLOAD for the one we can.
+        let alternatives = || vec![esp(1, vec![dh(modp, Some(2048)), dh(ecp, None)])];
+        assert_eq!(dh_of(&answer(alternatives(), Some(DhGroup::EcpP256), &PfsPolicy::none()).unwrap()), [dh(ecp, None)], "a KE of the group that is fine");
+        assert_eq!(
+            answer(alternatives(), group, &PfsPolicy::none()),
+            Err(IkeError::InvalidKeGroup(ecp)),
+            "a KE of the group with the Key Length: retry with the other"
+        );
+
+        // DH NONE with a Key Length is not "PFS left optional", and a proposal with only that is not one without DH.
+        let none_answer = |middle: Vec<Transform>| answer(vec![esp(1, middle)], None, &PfsPolicy::none());
+        assert_eq!(dh_of(&none_answer(vec![dh(0, None)]).unwrap()), [dh(0, None)], "control: DH NONE, no PFS");
+        assert_eq!(none_answer(vec![dh(0, Some(128))]), Err(IkeError::NoProposalChosen), "DH NONE with a Key Length");
+        assert_eq!(dh_of(&none_answer(vec![dh(0, Some(128)), dh(0, None)]).unwrap()), [dh(0, None)], "the DH NONE with a Key Length next to the plain one");
+
+        // An AEAD cipher with an integrity NONE that carries a Key Length is not the "single NONE" of §3.3: it wants an integrity algorithm.
+        assert_eq!(integ_of(&none_answer(vec![integ_none(None)]).unwrap()), [integ_none(None)], "control: INTEG NONE");
+        assert_eq!(none_answer(vec![integ_none(Some(128))]), Err(IkeError::NoProposalChosen), "INTEG NONE with a Key Length");
+        assert_eq!(
+            integ_of(&none_answer(vec![integ_none(Some(128)), integ_none(None)]).unwrap()),
+            [integ_none(None)],
+            "the INTEG NONE with a Key Length next to the plain one"
+        );
+        let sha256 = tf(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, None);
+        assert_eq!(none_answer(vec![sha256.clone(), integ_none(Some(128))]), Err(IkeError::NoProposalChosen), "an integrity algorithm we do not use, and a NONE with a Key Length");
+        assert_eq!(integ_of(&none_answer(vec![sha256, integ_none(None)]).unwrap()), [integ_none(None)], "an integrity algorithm we do not use next to the NONE");
+
+        // ESN with a Key Length is not ESN_NONE.
+        let esn = |key_length: Option<u16>| tf(transform_type::ESN, transform_id::ESN_NONE, key_length);
+        let with_esn = |esns: Vec<Transform>| {
+            let mut p = esp(1, vec![]);
+            p.transforms.retain(|t| t.transform_type != transform_type::ESN);
+            p.transforms.extend(esns);
+            answer(vec![p], None, &PfsPolicy::none())
+        };
+        assert_eq!(with_esn(vec![esn(None)]).unwrap().transforms.last(), Some(&esn(None)), "control: ESN_NONE");
+        assert_eq!(with_esn(vec![esn(Some(32))]), Err(IkeError::NoProposalChosen), "ESN_NONE with a Key Length");
+        assert_eq!(with_esn(vec![esn(Some(32)), esn(None)]).unwrap().transforms.last(), Some(&esn(None)), "the ESN_NONE with a Key Length next to the plain one");
     }
 
     fn extract_tsi(resp: &[u8], init_sa: &CompletedSaInit) -> Vec<u8> {

@@ -53,24 +53,53 @@ const OID_RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
 const OID_EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
 const OID_SHA256_WITH_RSA: &str = "1.2.840.113549.1.1.11";
 const OID_ECDSA_WITH_SHA256: &str = "1.2.840.10045.4.3.2";
+const OID_RSASSA_PSS: &str = "1.2.840.113549.1.1.10";
+const OID_MGF1: &str = "1.2.840.113549.1.1.8";
+const OID_SHA256: &str = "2.16.840.1.101.3.4.2.1";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scheme {
     RsaPkcs1Sha256,
-    RsaPssSha256,
+    /// RSASSA-PSS with SHA-256 and MGF1-SHA-256; the field is the saltLength.
+    RsaPssSha256(usize),
     EcdsaP256Sha256,
 }
 
 fn scheme_of(alg: &[u8]) -> Option<Scheme> {
     if alg == sig_alg::RSA_SHA256 {
         Some(Scheme::RsaPkcs1Sha256)
-    } else if alg == sig_alg::RSA_PSS_SHA256 {
-        Some(Scheme::RsaPssSha256)
     } else if alg == sig_alg::ECDSA_P256_SHA256 {
         Some(Scheme::EcdsaP256Sha256)
     } else {
-        None
+        use der::Decode;
+        let alg = x509_cert::spki::AlgorithmIdentifierOwned::from_der(alg).ok()?;
+        pss_sha256_salt_len(&alg).map(Scheme::RsaPssSha256)
     }
+}
+
+/// The saltLength of an `id-RSASSA-PSS` AlgorithmIdentifier that names the one
+/// parameter set this crate honours: SHA-256 with MGF1-SHA-256 (RFC 4055
+/// §3.1; the only hash we advertise in `SIGNATURE_HASH_ALGORITHMS`, and RFC
+/// 8247 §3.2 forbids the SHA-1 defaults). Every encoding RFC 4055 lets a
+/// validator meet is accepted: the SHA-256 identifiers with a NULL or with
+/// absent parameters (§2.1), and a trailerField that is absent or 1. Anything
+/// else -- absent or empty parameters, another hash, another mask hash, a
+/// trailerField other than 1 -- is `None`.
+fn pss_sha256_salt_len(alg: &x509_cert::spki::AlgorithmIdentifierOwned) -> Option<usize> {
+    use der::{Decode, Encode};
+    if alg.oid.to_string() != OID_RSASSA_PSS {
+        return None;
+    }
+    let params_der = alg.parameters.as_ref()?.to_der().ok()?;
+    let params = rsa::pkcs1::RsaPssParams::from_der(&params_der).ok()?;
+    let sha256 = |oid: &der::asn1::ObjectIdentifier, p: Option<der::asn1::AnyRef<'_>>| {
+        oid.to_string() == OID_SHA256 && p.is_none_or(|p| p.is_null())
+    };
+    let mask_hash = params.mask_gen.parameters.as_ref()?;
+    let ok = sha256(&params.hash.oid, params.hash.parameters)
+        && params.mask_gen.oid.to_string() == OID_MGF1
+        && sha256(&mask_hash.oid, mask_hash.parameters);
+    ok.then_some(usize::from(params.salt_len))
 }
 
 /// Wrap a DER AlgorithmIdentifier + raw signature into method-14 AUTH Data.
@@ -99,11 +128,51 @@ pub enum SigningKey {
     /// RSA, PKCS#1 v1.5 padding, SHA-256 (`sha256WithRSAEncryption`). Boxed
     /// because an `RsaPrivateKey` dwarfs the other variant.
     RsaSha256(Box<rsa::RsaPrivateKey>),
+    /// RSA, RSASSA-PSS with SHA-256, MGF1-SHA-256 and a 32-octet salt, for
+    /// method 14 only (`SigningKey::into_rsa_pss`). Method 1 and the IKEv1
+    /// SIG payload are PKCS#1 v1.5 by definition and are signed as such.
+    RsaPssSha256(Box<rsa::RsaPrivateKey>),
     /// ECDSA on P-256 with SHA-256 (deterministic, RFC 6979).
     EcdsaP256(p256::ecdsa::SigningKey),
 }
 
+/// The OS CSPRNG as the `rand_core` generator the `rsa` crate wants for PSS salts.
+struct OsRng;
+
+impl rsa::rand_core::RngCore for OsRng {
+    fn next_u32(&mut self) -> u32 {
+        let mut b = [0u8; 4];
+        self.fill_bytes(&mut b);
+        u32::from_le_bytes(b)
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut b = [0u8; 8];
+        self.fill_bytes(&mut b);
+        u64::from_le_bytes(b)
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        getrandom::getrandom(dest).expect("operating-system randomness must be available");
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
+        getrandom::getrandom(dest).map_err(rsa::rand_core::Error::new)
+    }
+}
+
+impl rsa::rand_core::CryptoRng for OsRng {}
+
 impl SigningKey {
+    /// Make an RSA key sign RFC 7427 method 14 with RSASSA-PSS/SHA-256 (RFC 8247
+    /// §3.2: "RSASSA-PSS MUST be supported and RSASSA-PKCS1-v1.5 MAY be")
+    /// instead of PKCS#1 v1.5. Opt-in because RFC 7427 §5 gives the peers no
+    /// way to say which signature algorithm they verify, so a peer that only
+    /// knows PKCS#1 v1.5 would refuse it. An EC key is an error.
+    pub fn into_rsa_pss(self) -> Result<Self, IkeError> {
+        match self {
+            SigningKey::RsaSha256(key) | SigningKey::RsaPssSha256(key) => Ok(SigningKey::RsaPssSha256(key)),
+            SigningKey::EcdsaP256(_) => Err(IkeError::Crypto("RSASSA-PSS needs an RSA key")),
+        }
+    }
+
     /// Load an ECDSA P-256 signing key from a PKCS#8 DER document — the form a
     /// server certificate's private key is generated in (`openssl pkcs8 …`).
     pub fn ecdsa_p256_from_pkcs8_der(der: &[u8]) -> Result<Self, IkeError> {
@@ -136,6 +205,7 @@ impl SigningKey {
     pub fn algorithm_id(&self) -> &'static [u8] {
         match self {
             SigningKey::RsaSha256(_) => sig_alg::RSA_SHA256,
+            SigningKey::RsaPssSha256(_) => sig_alg::RSA_PSS_SHA256,
             SigningKey::EcdsaP256(_) => sig_alg::ECDSA_P256_SHA256,
         }
     }
@@ -147,6 +217,9 @@ impl SigningKey {
         let sig = match self {
             SigningKey::RsaSha256(key) => key
                 .sign(rsa::Pkcs1v15Sign::new::<Sha256>(), &digest)
+                .map_err(|_| IkeError::Crypto("RSA signing failed"))?,
+            SigningKey::RsaPssSha256(key) => key
+                .sign_with_rng(&mut OsRng, rsa::Pss::new::<Sha256>(), &digest)
                 .map_err(|_| IkeError::Crypto("RSA signing failed"))?,
             SigningKey::EcdsaP256(key) => {
                 use p256::ecdsa::signature::hazmat::PrehashSigner;
@@ -178,7 +251,9 @@ impl SigningKey {
                     .map_err(|_| IkeError::Crypto("ECDSA signing failed"))?;
                 Ok(sig.to_bytes().to_vec())
             }
-            SigningKey::RsaSha256(_) => Err(IkeError::Crypto("method 9 needs an ECDSA P-256 key")),
+            SigningKey::RsaSha256(_) | SigningKey::RsaPssSha256(_) => {
+                Err(IkeError::Crypto("method 9 needs an ECDSA P-256 key"))
+            }
         }
     }
 
@@ -193,7 +268,7 @@ impl SigningKey {
     /// payload convention.
     pub fn sign_classic_rsa_auth_data(&self, signed_octets: &[u8]) -> Result<Vec<u8>, IkeError> {
         match self {
-            SigningKey::RsaSha256(key) => {
+            SigningKey::RsaSha256(key) | SigningKey::RsaPssSha256(key) => {
                 let digest = Sha256::digest(signed_octets);
                 key.sign(rsa::Pkcs1v15Sign::new::<Sha256>(), &digest)
                     .map_err(|_| IkeError::Crypto("RSA signing failed"))
@@ -215,7 +290,7 @@ impl SigningKey {
     /// hash bytes.
     pub fn sign_classic_rsa_raw(&self, data: &[u8]) -> Result<Vec<u8>, IkeError> {
         match self {
-            SigningKey::RsaSha256(key) => key
+            SigningKey::RsaSha256(key) | SigningKey::RsaPssSha256(key) => key
                 .sign(rsa::Pkcs1v15Sign::new_unprefixed(), data)
                 .map_err(|_| IkeError::Crypto("RSA signing failed")),
             SigningKey::EcdsaP256(_) => Err(IkeError::Crypto("IKEv1 SIG payload needs an RSA certificate key")),
@@ -321,8 +396,8 @@ impl VerifyingKey {
             (VerifyingKey::Rsa(pk), Scheme::RsaPkcs1Sha256) => pk
                 .verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &digest, sig)
                 .map_err(|_| IkeError::AuthFailed),
-            (VerifyingKey::Rsa(pk), Scheme::RsaPssSha256) => pk
-                .verify(rsa::Pss::new::<Sha256>(), &digest, sig)
+            (VerifyingKey::Rsa(pk), Scheme::RsaPssSha256(salt_len)) => pk
+                .verify(rsa::Pss::new_with_salt::<Sha256>(salt_len), &digest, sig)
                 .map_err(|_| IkeError::AuthFailed),
             (VerifyingKey::EcdsaP256(vk), Scheme::EcdsaP256Sha256) => {
                 use p256::ecdsa::signature::hazmat::PrehashVerifier;
@@ -352,6 +427,12 @@ pub fn verify_cert_signed_by(leaf_der: &[u8], issuer_der: &[u8]) -> Result<(), I
     let alg_oid = leaf.signature_algorithm.oid.to_string();
     let digest = Sha256::digest(&tbs);
     match (&issuer_key, alg_oid.as_str()) {
+        (VerifyingKey::Rsa(pk), OID_RSASSA_PSS) => {
+            let salt_len = pss_sha256_salt_len(&leaf.signature_algorithm)
+                .ok_or(IkeError::Crypto("unsupported certificate signature algorithm"))?;
+            pk.verify(rsa::Pss::new_with_salt::<Sha256>(salt_len), &digest, sig)
+                .map_err(|_| IkeError::AuthFailed)
+        }
         (VerifyingKey::Rsa(pk), OID_SHA256_WITH_RSA) => pk
             .verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &digest, sig)
             .map_err(|_| IkeError::AuthFailed),
@@ -1654,5 +1735,376 @@ mod tests {
         let leaf = forge::cert(2, LEAF, &leaf_key(), &subject(255), &key, vec![]);
         assert!(cert_auth(&leaf, &intermediates, &[root_with(Some(0), vec![])]).is_err());
         cert_auth(&leaf, &intermediates, &[root_with(None, vec![])]).unwrap();
+    }
+}
+
+/// RSASSA-PSS (RFC 7427 Appendix A.4, RFC 4055 §3.1, RFC 8017): verification
+/// of method-14 AUTH data and of certificate signatures under every encoding
+/// the RFCs allow, and signing. Signatures here are made with the `rsa` crate
+/// directly and AlgorithmIdentifiers are hand-encoded, so nothing depends on
+/// the code under test.
+#[cfg(test)]
+mod pss_tests {
+    use super::*;
+    use crate::test_certs::{forge, RSA_KEY_PK8};
+    use rsa::rand_core::{CryptoRng, RngCore};
+
+    /// A deterministic, test-only RNG (PSS salts need some source).
+    struct TestRng(u64);
+    impl RngCore for TestRng {
+        fn next_u32(&mut self) -> u32 {
+            self.next_u64() as u32
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 1
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for b in dest {
+                *b = (self.next_u64() >> 8) as u8;
+            }
+        }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+    impl CryptoRng for TestRng {}
+
+    const OID_PSS: &[u8] = &[0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a];
+    const OID_MGF1: &[u8] = &[0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08];
+    const OID_SHA1: &[u8] = &[0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a];
+    const OID_SHA256: &[u8] = &[0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+    const OID_SHA384: &[u8] = &[0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
+
+    fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        assert!(body.len() < 128);
+        [&[tag, body.len() as u8][..], body].concat()
+    }
+
+    /// `AlgorithmIdentifier { hash_oid, NULL }`, or without the NULL.
+    fn hash_id(oid: &[u8], null: bool) -> Vec<u8> {
+        tlv(0x30, &[oid, if null { &[0x05, 0x00][..] } else { &[][..] }].concat())
+    }
+
+    /// A DER AlgorithmIdentifier for id-RSASSA-PSS whose parameters carry
+    /// exactly the fields given (`None` = the field is absent).
+    fn pss_id(hash: Option<Vec<u8>>, mgf_hash: Option<Vec<u8>>, salt: Option<u8>, trailer: Option<u8>) -> Vec<u8> {
+        let mut params = Vec::new();
+        if let Some(h) = hash {
+            params.extend(tlv(0xa0, &h));
+        }
+        if let Some(h) = mgf_hash {
+            params.extend(tlv(0xa1, &tlv(0x30, &[OID_MGF1, &h].concat())));
+        }
+        if let Some(s) = salt {
+            params.extend(tlv(0xa2, &tlv(0x02, &[s])));
+        }
+        if let Some(t) = trailer {
+            params.extend(tlv(0xa3, &tlv(0x02, &[t])));
+        }
+        tlv(0x30, &[OID_PSS, &tlv(0x30, &params)].concat())
+    }
+
+    fn sha256_id() -> Vec<u8> {
+        hash_id(OID_SHA256, true)
+    }
+
+    /// RFC 7427 Appendix A.4.3, byte for byte (72 octets, trailerField present).
+    fn rfc7427_a43() -> Vec<u8> {
+        let hex = "3046 0609 2a86 4886 f70d 0101 0a30 39a0 0f30 0d06 0960 8648 0165 0304 0201 0500 \
+                   a11c 301a 0609 2a86 4886 f70d 0101 0830 0d06 0960 8648 0165 0304 0201 0500 a203 \
+                   0201 20a3 0302 0101";
+        let hex: String = hex.split_whitespace().collect();
+        (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+    }
+
+    fn private_key() -> rsa::RsaPrivateKey {
+        use rsa::pkcs8::DecodePrivateKey;
+        rsa::RsaPrivateKey::from_pkcs8_der(RSA_KEY_PK8).unwrap()
+    }
+
+    /// An RSASSA-PSS/SHA-256 signature over `data` with the given salt length.
+    fn pss_sign(key: &rsa::RsaPrivateKey, data: &[u8], salt: usize) -> Vec<u8> {
+        key.sign_with_rng(&mut TestRng(7), rsa::Pss::new_with_salt::<Sha256>(salt), &Sha256::digest(data)).unwrap()
+    }
+
+    fn auth_data(alg: &[u8], sig: &[u8]) -> Vec<u8> {
+        [&[alg.len() as u8][..], alg, sig].concat()
+    }
+
+    fn verifier() -> VerifyingKey {
+        VerifyingKey::Rsa(private_key().to_public_key())
+    }
+
+    const OCTETS: &[u8] = b"InitiatorSignedOctets under RSASSA-PSS";
+
+    #[test]
+    fn the_helpers_reproduce_the_rfc_7427_a43_vector_and_our_own_constant() {
+        assert_eq!(pss_id(Some(sha256_id()), Some(sha256_id()), Some(32), Some(1)), rfc7427_a43());
+        assert_eq!(pss_id(Some(sha256_id()), Some(sha256_id()), Some(32), None), sig_alg::RSA_PSS_SHA256);
+    }
+
+    #[test]
+    fn pss_verifies_the_rfc_7427_appendix_a43_encoding() {
+        // RFC 7427's own SHA-256 example carries the (default) trailerField
+        // explicitly; RFC 4055 §3.1: a validator MUST recognise a present
+        // trailerField of 1 as well as an absent one.
+        let auth = auth_data(&rfc7427_a43(), &pss_sign(&private_key(), OCTETS, 32));
+        verifier().verify_auth_data(&auth, OCTETS).unwrap();
+    }
+
+    #[test]
+    fn pss_verifies_the_encoding_this_crate_emits_for_pss() {
+        let auth = auth_data(sig_alg::RSA_PSS_SHA256, &pss_sign(&private_key(), OCTETS, 32));
+        verifier().verify_auth_data(&auth, OCTETS).unwrap();
+        assert!(verifier().verify_auth_data(&auth, b"tampered").is_err());
+    }
+
+    #[test]
+    fn pss_verifies_hash_identifiers_with_absent_parameters() {
+        // RFC 4055 §2.1: "All implementations MUST accept both NULL and absent
+        // parameters as legal and equivalent encodings" of the SHA-2 identifiers,
+        // in hashAlgorithm and inside MGF1's parameters alike.
+        let sig = pss_sign(&private_key(), OCTETS, 32);
+        for (hash_null, mgf_null) in [(false, true), (true, false), (false, false)] {
+            let alg = pss_id(Some(hash_id(OID_SHA256, hash_null)), Some(hash_id(OID_SHA256, mgf_null)), Some(32), None);
+            verifier().verify_auth_data(&auth_data(&alg, &sig), OCTETS).unwrap_or_else(|e| {
+                panic!("hash NULL={hash_null} mgf NULL={mgf_null}: {e:?}")
+            });
+        }
+    }
+
+    #[test]
+    fn pss_verifies_with_the_salt_length_the_identifier_declares() {
+        // RFC 4055 §3.1: saltLength "does not need to be fixed" -- the signer
+        // chooses it and states it in the AlgorithmIdentifier.
+        for salt in [0u8, 20, 32, 64] {
+            let alg = pss_id(Some(sha256_id()), Some(sha256_id()), Some(salt), None);
+            let auth = auth_data(&alg, &pss_sign(&private_key(), OCTETS, salt as usize));
+            verifier().verify_auth_data(&auth, OCTETS).unwrap_or_else(|e| panic!("salt {salt}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn pss_refuses_a_signature_whose_salt_differs_from_the_declared_one() {
+        let sig = pss_sign(&private_key(), OCTETS, 20);
+        for declared in [0u8, 32, 64] {
+            let alg = pss_id(Some(sha256_id()), Some(sha256_id()), Some(declared), None);
+            assert!(verifier().verify_auth_data(&auth_data(&alg, &sig), OCTETS).is_err(), "declared {declared}, signed with 20");
+        }
+    }
+
+    #[test]
+    fn pss_refuses_parameters_this_crate_does_not_honour() {
+        let sig = pss_sign(&private_key(), OCTETS, 32);
+        let sha1 = || hash_id(OID_SHA1, true);
+        let sha384 = || hash_id(OID_SHA384, true);
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            // RFC 8247 §3.2: SHA-1 (the "empty" and "default" parameters) is MUST NOT,
+            // and SHA-1 was never advertised in our SIGNATURE_HASH_ALGORITHMS.
+            ("empty parameters (RFC 7427 A.4.1)", [&[0x30, 0x0d][..], OID_PSS, &[0x30, 0x00]].concat()),
+            ("absent parameters", tlv(0x30, OID_PSS)),
+            ("default SHA-1 written out", pss_id(Some(sha1()), Some(sha1()), Some(20), Some(1))),
+            ("hash omitted (= SHA-1)", pss_id(None, Some(sha256_id()), Some(32), None)),
+            ("SHA-256 with MGF1-SHA-1 (mask omitted)", pss_id(Some(sha256_id()), None, Some(32), None)),
+            ("SHA-256 with MGF1-SHA-1", pss_id(Some(sha256_id()), Some(sha1()), Some(32), None)),
+            ("SHA-256 with MGF1-SHA-384", pss_id(Some(sha256_id()), Some(sha384()), Some(32), None)),
+            ("SHA-384 (not advertised)", pss_id(Some(sha384()), Some(sha384()), Some(48), None)),
+            ("trailerField 2", pss_id(Some(sha256_id()), Some(sha256_id()), Some(32), Some(2))),
+        ];
+        for (what, alg) in cases {
+            assert!(verifier().verify_auth_data(&auth_data(&alg, &sig), OCTETS).is_err(), "{what} must be refused");
+        }
+        // A mask generation function that is not MGF1 (the hash inside it is SHA-256).
+        let mut other_mask = sig_alg::RSA_PSS_SHA256.to_vec();
+        let at = other_mask.windows(OID_MGF1.len()).position(|w| w == OID_MGF1).unwrap() + OID_MGF1.len() - 1;
+        other_mask[at] = 0x09;
+        assert!(verifier().verify_auth_data(&auth_data(&other_mask, &sig), OCTETS).is_err(), "non-MGF1 mask must be refused");
+    }
+
+    #[test]
+    fn pss_refuses_a_malformed_algorithm_identifier() {
+        let sig = pss_sign(&private_key(), OCTETS, 32);
+        // Octets after the SEQUENCE but inside the declared ASN.1 length.
+        let mut padded = sig_alg::RSA_PSS_SHA256.to_vec();
+        padded.push(0);
+        assert!(verifier().verify_auth_data(&auth_data(&padded, &sig), OCTETS).is_err());
+        // A SEQUENCE whose length overruns the identifier.
+        let mut short = sig_alg::RSA_PSS_SHA256.to_vec();
+        short.truncate(40);
+        assert!(verifier().verify_auth_data(&auth_data(&short, &sig), OCTETS).is_err());
+        // PSS parameters under another signature OID (sha256WithRSAEncryption).
+        let mut other_oid = sig_alg::RSA_PSS_SHA256.to_vec();
+        other_oid[12] = 0x0b;
+        assert!(verifier().verify_auth_data(&auth_data(&other_oid, &sig), OCTETS).is_err());
+        // The right OID with the parameters as a NULL, not a SEQUENCE.
+        let null_params = tlv(0x30, &[OID_PSS, &[0x05, 0x00][..]].concat());
+        assert!(verifier().verify_auth_data(&auth_data(&null_params, &sig), OCTETS).is_err());
+    }
+
+    #[test]
+    fn pss_signature_under_the_wrong_key_type_or_wrong_key_is_refused() {
+        let auth = auth_data(sig_alg::RSA_PSS_SHA256, &pss_sign(&private_key(), OCTETS, 32));
+        let ec = VerifyingKey::from_cert_der(crate::test_certs::LEAF_CERT_DER).unwrap();
+        assert!(ec.verify_auth_data(&auth, OCTETS).is_err());
+        let other = rsa::RsaPrivateKey::new(&mut TestRng(99), 1024).unwrap();
+        assert!(VerifyingKey::Rsa(other.to_public_key()).verify_auth_data(&auth, OCTETS).is_err());
+    }
+
+    // -- signing with RSASSA-PSS ---------------------------------------------
+    // Verification support does not imply signing: RSA keys sign PKCS#1 v1.5
+    // unless the caller converts the key with `into_rsa_pss`.
+
+    fn pss_key() -> SigningKey {
+        SigningKey::rsa_from_pkcs8_der(RSA_KEY_PK8).unwrap().into_rsa_pss().unwrap()
+    }
+
+    #[test]
+    fn a_pss_signing_key_signs_method_14_with_pss_and_nothing_else() {
+        let key = pss_key();
+        assert_eq!(key.algorithm_id(), sig_alg::RSA_PSS_SHA256);
+        let a1 = key.sign_auth_data(OCTETS).unwrap();
+        let (alg, sig) = parse_auth_data(&a1).unwrap();
+        assert_eq!(alg, sig_alg::RSA_PSS_SHA256);
+        // Checked with the rsa crate, not with our verifier: PSS with salt 32
+        // verifies, PKCS#1 v1.5 over the same digest does not.
+        let public = private_key().to_public_key();
+        let digest = Sha256::digest(OCTETS);
+        public.verify(rsa::Pss::new_with_salt::<Sha256>(32), &digest, sig).unwrap();
+        assert!(public.verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &digest, sig).is_err());
+        // Our verifier agrees, and refuses other octets.
+        verifier().verify_auth_data(&a1, OCTETS).unwrap();
+        assert!(verifier().verify_auth_data(&a1, b"tampered").is_err());
+        // The salt is random: two signatures over the same octets differ, both verify.
+        let a2 = key.sign_auth_data(OCTETS).unwrap();
+        assert_ne!(a1, a2);
+        verifier().verify_auth_data(&a2, OCTETS).unwrap();
+    }
+
+    #[test]
+    fn an_rsa_key_still_signs_pkcs1_v15_by_default() {
+        let key = SigningKey::rsa_from_pkcs8_der(RSA_KEY_PK8).unwrap();
+        assert_eq!(key.algorithm_id(), sig_alg::RSA_SHA256);
+        let auth = key.sign_auth_data(OCTETS).unwrap();
+        let (alg, sig) = parse_auth_data(&auth).unwrap();
+        assert_eq!(alg, sig_alg::RSA_SHA256);
+        let public = private_key().to_public_key();
+        let digest = Sha256::digest(OCTETS);
+        public.verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &digest, sig).unwrap();
+        assert!(public.verify(rsa::Pss::new_with_salt::<Sha256>(32), &digest, sig).is_err());
+    }
+
+    #[test]
+    fn only_an_rsa_key_converts_to_pss() {
+        assert!(forge::ec_key(1).into_rsa_pss().is_err());
+        // Converting twice is harmless.
+        assert_eq!(pss_key().into_rsa_pss().unwrap().algorithm_id(), sig_alg::RSA_PSS_SHA256);
+        // A PSS key cannot make an ECDSA method-9 signature.
+        assert!(pss_key().sign_ecdsa_p256_raw(OCTETS).is_err());
+    }
+
+    #[test]
+    fn a_pss_key_still_makes_the_classic_pkcs1_signatures_of_methods_1_and_ikev1() {
+        // RFC 7296 §3.8 method 1 and the IKEv1 SIG payload are PKCS#1 v1.5 by
+        // definition; a key opted in to PSS for method 14 must keep them.
+        let key = pss_key();
+        let m1 = key.sign_classic_rsa_auth_data(OCTETS).unwrap();
+        verifier().verify_classic_rsa_auth_data(&m1, OCTETS).unwrap();
+        let hash = Sha256::digest(OCTETS);
+        let sig = key.sign_classic_rsa_raw(&hash).unwrap();
+        verifier().verify_classic_rsa_raw(&sig, &hash).unwrap();
+    }
+
+    #[test]
+    fn cert_auth_payload_signs_pss_only_under_method_14() {
+        use crate::ikev2::ike_auth::cert_auth_payload;
+        use crate::ikev2::payload::{auth_method, sighash};
+        let key = pss_key();
+        let a = cert_auth_payload(&key, &[sighash::SHA2_256], OCTETS).unwrap();
+        assert_eq!(a.method, auth_method::DIGITAL_SIGNATURE);
+        assert_eq!(parse_auth_data(&a.data).unwrap().0, sig_alg::RSA_PSS_SHA256);
+        verifier().verify_auth_data(&a.data, OCTETS).unwrap();
+        // No negotiated Digital Signature: method 1, a plain PKCS#1 v1.5 signature.
+        let a = cert_auth_payload(&key, &[], OCTETS).unwrap();
+        assert_eq!(a.method, auth_method::RSA_SIG);
+        verifier().verify_classic_rsa_auth_data(&a.data, OCTETS).unwrap();
+    }
+
+    #[test]
+    fn a_pss_key_issues_pss_signed_certificates() {
+        let ca_key = pss_key();
+        let ca = forge::cert(1, CA, &ca_key, CA, &ca_key, vec![forge::basic_constraints(true, None)]);
+        let leaf = forge::cert(2, LEAF, &forge::ec_key(2), CA, &ca_key, vec![]);
+        verify_cert_signed_by(&leaf, &ca).unwrap();
+        validate_chain(&leaf, &[], std::slice::from_ref(&ca), forge::NOW).unwrap();
+        use der::Decode;
+        let parsed = x509_cert::Certificate::from_der(&leaf).unwrap();
+        assert_eq!(parsed.signature_algorithm.oid.to_string(), OID_RSASSA_PSS);
+    }
+
+    // -- certificates signed with RSASSA-PSS (RFC 4055 §3.1) ---------------
+
+    const CA: &str = "CN=Pss CA,O=Ryke Test";
+    const LEAF: &str = "CN=vpn.example.com,O=Ryke Test";
+
+    fn ca_and_leaf() -> (Vec<u8>, Vec<u8>) {
+        let ca_key = forge::rsa_key();
+        let ca = forge::cert(1, CA, &ca_key, CA, &ca_key, vec![forge::basic_constraints(true, None)]);
+        let leaf = forge::cert(2, LEAF, &forge::ec_key(2), CA, &ca_key, vec![]);
+        (ca, leaf)
+    }
+
+    /// `cert` with its signature replaced by an RSASSA-PSS one under
+    /// `alg` (in both places RFC 5280 §4.1.1.2 requires) made with the RSA test key.
+    fn resigned_pss(cert: &[u8], alg: &[u8], salt: usize) -> Vec<u8> {
+        use der::{Decode, Encode};
+        use x509_cert::spki::AlgorithmIdentifierOwned;
+        let mut c = x509_cert::Certificate::from_der(cert).unwrap();
+        let alg = AlgorithmIdentifierOwned::from_der(alg).unwrap();
+        c.tbs_certificate.signature = alg.clone();
+        let tbs = c.tbs_certificate.to_der().unwrap();
+        c.signature_algorithm = alg;
+        c.signature = der::asn1::BitString::from_bytes(&pss_sign(&private_key(), &tbs, salt)).unwrap();
+        c.to_der().unwrap()
+    }
+
+    #[test]
+    fn a_certificate_signed_with_rsassa_pss_sha256_verifies_under_its_issuers_key() {
+        let (ca, leaf) = ca_and_leaf();
+        for alg in [sig_alg::RSA_PSS_SHA256.to_vec(), rfc7427_a43(), pss_id(Some(hash_id(OID_SHA256, false)), Some(hash_id(OID_SHA256, false)), Some(32), None)] {
+            let pss_leaf = resigned_pss(&leaf, &alg, 32);
+            verify_cert_signed_by(&pss_leaf, &ca).unwrap_or_else(|e| panic!("{alg:02x?}: {e:?}"));
+            // ... and the whole path validates (the leaf's key here is ECDSA).
+            validate_chain(&pss_leaf, &[], std::slice::from_ref(&ca), forge::NOW).unwrap();
+        }
+        // A declared salt other than 32 is honoured.
+        let alg = pss_id(Some(sha256_id()), Some(sha256_id()), Some(20), None);
+        verify_cert_signed_by(&resigned_pss(&leaf, &alg, 20), &ca).unwrap();
+    }
+
+    #[test]
+    fn a_pss_certificate_signature_is_refused_when_forged_or_unsupported() {
+        let (ca, leaf) = ca_and_leaf();
+        let pss_leaf = resigned_pss(&leaf, sig_alg::RSA_PSS_SHA256, 32);
+        // A different issuer key.
+        let other = forge::cert(9, CA, &forge::ec_key(4), CA, &forge::ec_key(4), vec![forge::basic_constraints(true, None)]);
+        assert!(verify_cert_signed_by(&pss_leaf, &other).is_err());
+        // Tampered TBS: the leaf's serial changes but the signature stays.
+        use der::{Decode, Encode};
+        let mut c = x509_cert::Certificate::from_der(&pss_leaf).unwrap();
+        c.tbs_certificate.serial_number = 777u32.into();
+        assert!(verify_cert_signed_by(&c.to_der().unwrap(), &ca).is_err());
+        // Declared salt does not match the signature's.
+        let wrong_salt = resigned_pss(&leaf, &pss_id(Some(sha256_id()), Some(sha256_id()), Some(20), None), 32);
+        assert!(verify_cert_signed_by(&wrong_salt, &ca).is_err());
+        // SHA-1 default parameters, an MGF hash different from the hash, absent parameters.
+        for (what, alg) in [
+            ("SHA-1", pss_id(Some(hash_id(OID_SHA1, true)), Some(hash_id(OID_SHA1, true)), Some(20), Some(1))),
+            ("mgf mismatch", pss_id(Some(sha256_id()), Some(hash_id(OID_SHA1, true)), Some(32), None)),
+            ("absent parameters", tlv(0x30, OID_PSS)),
+        ] {
+            assert!(verify_cert_signed_by(&resigned_pss(&leaf, &alg, 32), &ca).is_err(), "{what}");
+        }
     }
 }

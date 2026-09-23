@@ -720,7 +720,7 @@ pub(crate) mod forge {
                 use p256::pkcs8::EncodePublicKey;
                 k.verifying_key().to_public_key_der().unwrap()
             }
-            SigningKey::RsaSha256(k) => {
+            SigningKey::RsaSha256(k) | SigningKey::RsaPssSha256(k) => {
                 use rsa::pkcs8::EncodePublicKey;
                 k.to_public_key().to_public_key_der().unwrap()
             }
@@ -748,11 +748,19 @@ pub(crate) mod forge {
         use x509_cert::certificate::{Certificate, TbsCertificate, Version};
         use x509_cert::spki::AlgorithmIdentifierOwned;
         use x509_cert::time::{Time, Validity};
-        let (oid, parameters) = match issuer_key {
-            SigningKey::EcdsaP256(_) => ("1.2.840.10045.4.3.2", None),
-            SigningKey::RsaSha256(_) => ("1.2.840.113549.1.1.11", Some(der::asn1::Null.into())),
+        let algorithm = match issuer_key {
+            SigningKey::EcdsaP256(_) => {
+                AlgorithmIdentifierOwned { oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"), parameters: None }
+            }
+            SigningKey::RsaSha256(_) => AlgorithmIdentifierOwned {
+                oid: ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11"),
+                parameters: Some(der::asn1::Null.into()),
+            },
+            SigningKey::RsaPssSha256(_) => {
+                use der::Decode;
+                AlgorithmIdentifierOwned::from_der(crate::ikev2::sign::sig_alg::RSA_PSS_SHA256).unwrap()
+            }
         };
-        let algorithm = AlgorithmIdentifierOwned { oid: ObjectIdentifier::new_unwrap(oid), parameters };
         let time = |secs| Time::UtcTime(der::asn1::UtcTime::from_unix_duration(Duration::from_secs(secs)).unwrap());
         let tbs = TbsCertificate {
             version: Version::V3,
@@ -774,6 +782,10 @@ pub(crate) mod forge {
                 sig.to_der().as_bytes().to_vec()
             }
             SigningKey::RsaSha256(_) => issuer_key.sign_classic_rsa_auth_data(&tbs_der).unwrap(),
+            SigningKey::RsaPssSha256(_) => {
+                let auth = issuer_key.sign_auth_data(&tbs_der).unwrap();
+                crate::ikev2::sign::parse_auth_data(&auth).unwrap().1.to_vec()
+            }
         };
         let cert = Certificate { tbs_certificate: tbs, signature_algorithm: algorithm, signature: BitString::from_bytes(&signature).unwrap() };
         cert.to_der().unwrap()

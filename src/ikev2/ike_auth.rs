@@ -382,7 +382,7 @@ pub(crate) fn cert_auth_payload(
             method: auth_method::ECDSA_SHA256_P256,
             data: key.sign_ecdsa_p256_raw(octets)?,
         }),
-        SigningKey::RsaSha256(_) => Ok(Authentication {
+        SigningKey::RsaSha256(_) | SigningKey::RsaPssSha256(_) => Ok(Authentication {
             method: auth_method::RSA_SIG,
             data: key.sign_classic_rsa_auth_data(octets)?,
         }),
@@ -1574,6 +1574,44 @@ pub(crate) mod tests {
         use rsa::pkcs8::DecodePrivateKey;
         let pubk = VerifyingKey::Rsa(rsa::RsaPrivateKey::from_pkcs8_der(RSA_KEY_PK8).unwrap().to_public_key());
         pubk.verify_classic_rsa_auth_data(&rsa_auth.data, octets).unwrap();
+    }
+
+    /// `cert_config` with an RSA leaf whose key signs method 14 with
+    /// RSASSA-PSS (`SigningKey::into_rsa_pss`), under a root that itself
+    /// signs its certificates with RSASSA-PSS.
+    fn pss_cert_config() -> AuthConfig {
+        use crate::test_certs::forge;
+        const ROOT: &str = "CN=Pss Root";
+        let root_key = || forge::rsa_key().into_rsa_pss().unwrap();
+        let root = forge::cert(1, ROOT, &root_key(), ROOT, &root_key(), vec![forge::basic_constraints(true, None)]);
+        let leaf_key = || forge::rsa_key().into_rsa_pss().unwrap();
+        let san = vec![forge::subject_alt_name(&[forge::dns("vpn.example.com")])];
+        let leaf = forge::cert(2, "CN=vpn.example.com", &leaf_key(), ROOT, &root_key(), san);
+        AuthConfig {
+            id: Identification::fqdn("vpn.example.com"),
+            local: LocalAuth::Cert { key: leaf_key(), chain: vec![leaf] },
+            peer: PeerAuth::Cert { cas: vec![root], expected_dns: Some("vpn.example.com".into()), now_unix: forge::NOW },
+        }
+    }
+
+    #[test]
+    fn ike_auth_mutual_certificate_succeeds_with_rsassa_pss_signatures() {
+        let (init_sa, resp_sa) = run_sa_init();
+        let cfg = pss_cert_config;
+        let req = initiator_auth_request(&init_sa, &cfg(), 1, &esp_offer(0), &[1u8; 8]).unwrap();
+        let (resp, learned_i, ..) = responder_process_auth(&resp_sa, &req, &cfg(), 2, &[2u8; 8], None).unwrap();
+        assert_eq!(learned_i, Identification::fqdn("vpn.example.com"));
+        let (learned_r, ..) = initiator_verify_auth(&init_sa, &resp, &cfg(), &esp_offer(0), ChildTsOffer::Ipv4).unwrap();
+        assert_eq!(learned_r, Identification::fqdn("vpn.example.com"));
+    }
+
+    #[test]
+    fn ike_auth_rsassa_pss_falls_back_to_method_1_when_digital_signature_is_not_negotiated() {
+        let (mut init_sa, resp_sa) = run_sa_init();
+        init_sa.peer_signature_hashes.clear();
+        let cfg = pss_cert_config;
+        let req = initiator_auth_request(&init_sa, &cfg(), 1, &esp_offer(0), &[1u8; 8]).unwrap();
+        responder_process_auth(&resp_sa, &req, &cfg(), 2, &[2u8; 8], None).unwrap();
     }
 
     #[test]

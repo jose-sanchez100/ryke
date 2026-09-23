@@ -93,7 +93,12 @@ client (initiator) and server (responder)** roles.
   The server-auth path phones require. `sign.rs` implements Auth Method 14 — the
   AUTH Data `[len][DER AlgorithmIdentifier][signature]` over the §2.15 octets —
   with `sha256WithRSAEncryption` (RSA PKCS#1 v1.5) and `ecdsa-with-SHA256` on
-  P-256 for **sign + verify**, plus RSASSA-PSS/SHA-256 verify; X.509 leaf parsing
+  P-256 for **sign + verify**, plus RSASSA-PSS/SHA-256 (RFC 8247 §3.2): verified in
+  every encoding RFC 4055 §3.1 allows (NULL or absent hash parameters, trailerField
+  absent or 1, the declared saltLength honoured; SHA-1/other hashes refused), for
+  AUTH data and for certificate signatures, and signed only by an RSA key converted
+  with `SigningKey::into_rsa_pss` (the default RSA scheme stays PKCS#1 v1.5;
+  certificates whose own public key is `id-RSASSA-PSS` are not supported); X.509 leaf parsing
   (`VerifyingKey::from_cert_der`), single-hop chain signature checking
   (`verify_cert_signed_by`), and the CERTREQ trust-anchor `ca_key_hash`. `payload.rs`
   carries the `Certificate`/`CertRequest` bodies and the `SIGNATURE_HASH_ALGORITHMS`

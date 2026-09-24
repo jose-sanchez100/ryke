@@ -20,6 +20,9 @@ pub mod phase2;
 pub mod quick;
 #[cfg(test)]
 mod retransmit_tests;
+// Not used until the client and Quick Mode run their exchanges through it.
+#[allow(dead_code)]
+mod rtt;
 pub mod server;
 pub mod xauth;
 

@@ -90,9 +90,9 @@
 //! only; answering one would be a Quick Mode responder driven from the
 //! caller's loop, which nothing here does yet); the ISAKMP SA is never
 //! rekeyed -- once its lifetime is up, a new `connect` is the way on; and a
-//! lifetime in kilobytes, in Phase 1 or Phase 2, is accepted but neither
-//! held, counted nor applied (a volume limit is the gateway's to enforce),
-//! only the seconds are.
+//! lifetime in kilobytes is refused in Phase 1, and in Phase 2 handed to the
+//! caller ([`ikev1::quick::SaLifetime`], `Established::p2_lifetime_kilobytes`)
+//! to count -- this crate carries no data plane, so it counts none itself.
 //!
 //! IKEv2 fragmentation (RFC 7383), which every `IKE_SA_INIT` advertises:
 //! [`Ikev2Session`] and [`LivenessSession`] reassemble each fragmented
@@ -179,7 +179,7 @@ pub use crypto::{
     derive_child_keys, derive_session_keys, prf, prf_plus, ChildKeys, DhGroup, IntegAlgorithm,
     KeyLengths, SessionKeys,
 };
-pub use ikev1::quick::{ChildKeyMaterial, RekeyedChild};
+pub use ikev1::quick::{ChildKeyMaterial, RekeyedChild, SaLifetime};
 pub use ikev2::eap_auth::{EapEvent, EapFailureReason, EapInitiator, EapResponder, ServerAuth, ServerVerify};
 pub use entropy::{Entropy, SeedEntropy};
 pub use error::IkeError;

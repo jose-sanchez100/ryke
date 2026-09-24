@@ -39,9 +39,10 @@
 //! (only identical bytes count); measure the round-trip time the retransmission
 //! interval should follow (RFC 2408 §5.1 asks for it); answer a Quick Mode or a
 //! Phase 1 that the gateway starts (this is an initiator only); rekey the
-//! ISAKMP SA; or hold a Phase-2 lifetime in kilobytes (a volume limit is
-//! accepted and left to the gateway, see `quick`'s "SA lifetimes"; a Phase-1 one
-//! is refused). The look at port 500
+//! ISAKMP SA; or count what an SA protects (a Phase-2 lifetime in kilobytes the
+//! gateway states is handed over as [`Established::p2_lifetime_kilobytes`] for
+//! the caller, which runs the data plane, to count -- see `quick`'s "SA
+//! lifetimes"; a Phase-1 one is refused). The look at port 500
 //! after a floated Aggressive Mode third message is `connect`'s own, made only
 //! while it waits: once `connect` has returned nothing looks there. Quick
 //! Mode's third message, sent by `connect` or by a rekey, is
@@ -98,11 +99,18 @@ pub struct Established {
     /// `quick::negotiated_p2_lifetime`. A caller scheduling a
     /// [`crate::ikev1::quick::rekey_child`] call ahead of expiry reads this
     /// rather than assuming `InitiatorConfig::p2_lifetime_secs` was actually
-    /// honored. It is a time limit only: a volume (kilobytes) limit the gateway
-    /// stated is neither held here nor anywhere else in this crate (see
-    /// `quick`'s "SA lifetimes" section), so nothing tells the caller when the
-    /// gateway's volume limit is near.
+    /// honored. It is a time limit only; the volume limit the answer stated, if
+    /// any, is [`Self::p2_lifetime_kilobytes`].
     pub p2_lifetime_secs: u32,
+    /// The CHILD SA's negotiated volume limit, in kilobytes (RFC 2407 §4.5),
+    /// when the gateway's answer stated one -- an independent limit beside
+    /// [`Self::p2_lifetime_secs`], the SA ending at whichever is reached first
+    /// (see [`crate::ikev1::quick::SaLifetime`]). This crate does not carry the
+    /// data plane and cannot count what the SA protects: the caller that does
+    /// is the one to renew the SA ahead of this limit and to stop using it at
+    /// it. Nothing here offers a volume limit, so a gateway's own is the only
+    /// way this is ever `Some` (a Cisco IOS default is 4608000 KB).
+    pub p2_lifetime_kilobytes: Option<u32>,
     /// The traffic selectors this CHILD SA was actually established with --
     /// `ts_local` may differ from `InitiatorConfig::ts_local` when
     /// Mode-Config narrowed it to the assigned address (see `connect`'s own
@@ -727,15 +735,18 @@ impl<E: Entropy> Client<E> {
             initiate_quick_with_pfs(&phase1, &mut self.entropy, cfg.esp_cipher, ts_local, cfg.ts_remote, cfg.pfs_group, cfg.p2_lifetime_secs)?;
         let qm1_msgid = IsakmpHeader::parse(&qm1)?.message_id;
         let qm2 = self.send_and_await(&qm1, server, &Awaiting::in_sa(&phase1, exchange::QUICK, server).msg_id(qm1_msgid).handled(&handled))?;
-        let (qm3, child, p2_lifetime_secs) = qi.complete(&qm2)?;
+        let (qm3, child, p2_lifetime) = qi.complete_with_lifetime(&qm2)?;
+        let (p2_lifetime_secs, p2_lifetime_kilobytes) = (p2_lifetime.seconds, p2_lifetime.kilobytes);
         // Quick Mode message 3 is the last of the exchange and nothing answers it:
         // keep the pair, so the gateway repeating message 2 gets it sent again --
         // also once this returns, whenever the caller next reads this socket.
         phase1.finals.retain(&qm2, &qm3);
         self.send_step(&qm3, server, phase1.floated)?;
         ike_debug!(
-            "Quick Mode (IPv4 CHILD SA): complete -- spi_in={:08x} spi_out={:08x}, lifetime {p2_lifetime_secs}s",
-            child.inbound.spi(), child.outbound.spi()
+            "Quick Mode (IPv4 CHILD SA): complete -- spi_in={:08x} spi_out={:08x}, lifetime {p2_lifetime_secs}s{}",
+            child.inbound.spi(),
+            child.outbound.spi(),
+            p2_lifetime_kilobytes.map(|kb| format!(" / {kb} KB")).unwrap_or_default()
         );
 
         // Post-float, our own reported address's port must be 4500 too, not
@@ -747,7 +758,7 @@ impl<E: Entropy> Client<E> {
         // an IKEv2 NAT-T path would use too.
         let local_addr =
             if phase1.floated { SocketAddr::new(our_addr.ip(), crate::natt_port()) } else { self.transport.local_addr_for(server)? };
-        Ok(Established { phase1, child, assigned_ip4, netmask, dns, subnets, assigned_ip6, dns6, subnets6, local_addr, p2_lifetime_secs, ts_local, ts_remote: cfg.ts_remote })
+        Ok(Established { phase1, child, assigned_ip4, netmask, dns, subnets, assigned_ip6, dns6, subnets6, local_addr, p2_lifetime_secs, p2_lifetime_kilobytes, ts_local, ts_remote: cfg.ts_remote })
     }
 }
 

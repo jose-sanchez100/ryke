@@ -1112,4 +1112,166 @@ mod tests {
         gw_sock.send_to(&crate::ikev2::natt::wrap_ike_4500(&esp_msg), client_addr).unwrap();
         assert_eq!(peek(&io, &client_st, &mut e, gw_addr, std::time::Duration::from_secs(2), 0x77, None).unwrap(), Liveness::PeerTornDown);
     }
+
+    // --- Quick Mode message 3 recovery (RFC 2408 §3.1, Commit Bit NOTE). The liveness checks are what
+    // reads the socket between the exchanges we start -- the daemon's own upkeep sends them, with or
+    // without anyone asking for statistics -- so a message 2 the gateway repeats while nothing else is
+    // going on must get our message 3 again from here, and nothing else must.
+
+    /// A Quick Mode message of `st`'s ISAKMP SA with `message_id`, standing for the gateway's message 2,
+    /// and the message 3 we answered it with, as [`Phase1State::finals`] keeps such a pair. The bytes are
+    /// not a real exchange's: what these tests pin is which datagrams the resend answers, and that it
+    /// sends the retained bytes untouched.
+    fn quick_mode_pair(st: &Phase1State, message_id: u32) -> (Vec<u8>, Vec<u8>) {
+        let hdr = IsakmpHeader {
+            init_cookie: st.cky_i,
+            resp_cookie: st.cky_r,
+            next_payload: payload::NONE,
+            version: IsakmpHeader::VERSION_1_0,
+            exchange_type: exchange::QUICK,
+            flags: 0,
+            message_id,
+            length: 0,
+        };
+        let message_2 = super::super::isakmp::build_message(hdr, &[(payload::HASH, vec![0xAB; 20])]);
+        let message_3 = [b"our Quick Mode message 3 for ".as_slice(), &message_id.to_be_bytes()].concat();
+        (message_2, message_3)
+    }
+
+    /// A client socket and a gateway socket on loopback, the gateway's read timeout `wait`.
+    fn loopback_pair(wait: std::time::Duration) -> (std::net::UdpSocket, SocketAddr, std::net::UdpSocket, SocketAddr) {
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let gateway = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        gateway.set_read_timeout(Some(wait)).unwrap();
+        let gateway_addr = gateway.local_addr().unwrap();
+        (client, client_addr, gateway, gateway_addr)
+    }
+
+    /// Like [`loopback_pair`] for a floated tunnel: a floated final message is sent to port 4500 of the
+    /// peer's address (`quick::send_ike`), so the gateway takes that port on an address of its own,
+    /// which `host` names, so that tests in parallel never share it.
+    fn floated_loopback_pair(host: [u8; 4], wait: std::time::Duration) -> (std::net::UdpSocket, SocketAddr, std::net::UdpSocket, SocketAddr) {
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let gateway = std::net::UdpSocket::bind((std::net::Ipv4Addr::from(host), crate::natt_port())).unwrap();
+        gateway.set_read_timeout(Some(wait)).unwrap();
+        let gateway_addr = gateway.local_addr().unwrap();
+        (client, client_addr, gateway, gateway_addr)
+    }
+
+    /// The passive check answers each repeat of the gateway's message 2 with message 3, the same bytes
+    /// every time -- a gateway that never got it may ask more than once -- and still reports the tunnel
+    /// alive: the repeat is neither processed as a new exchange nor a reason to end the wait.
+    #[test]
+    fn peek_sends_message_3_again_each_time_the_gateway_repeats_message_2() {
+        let (client_st, _gw_st) = phase1_pair();
+        let (client_sock, client_addr, gw_sock, gw_addr) = loopback_pair(std::time::Duration::from_secs(2));
+        let (message_2, message_3) = quick_mode_pair(&client_st, 0x1111_2222);
+        client_st.finals.retain(&message_2, &message_3);
+
+        let mut e = SeedEntropy::new(0x40);
+        for round in 1..=3 {
+            gw_sock.send_to(&message_2, client_addr).unwrap();
+            let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(50), 0, None).unwrap();
+            assert_eq!(got, Liveness::Alive, "repeat {round}");
+            let mut buf = [0u8; 256];
+            let n = gw_sock.recv(&mut buf).unwrap_or_else(|e| panic!("message 3 was not sent again for repeat {round}: {e}"));
+            assert_eq!(&buf[..n], &message_3[..], "repeat {round}");
+        }
+    }
+
+    /// Only the exact message a final message answered is answered: another Quick Mode exchange's message
+    /// (another Message ID) and the same bytes under another ISAKMP SA's cookies get nothing.
+    #[test]
+    fn peek_sends_nothing_for_another_exchange_or_another_sa() {
+        let (client_st, _gw_st) = phase1_pair();
+        let (client_sock, client_addr, gw_sock, gw_addr) = loopback_pair(std::time::Duration::from_millis(300));
+        let (message_2, message_3) = quick_mode_pair(&client_st, 0x1111_2222);
+        client_st.finals.retain(&message_2, &message_3);
+
+        let (other_exchange, _) = quick_mode_pair(&client_st, 0x3333_4444);
+        let mut other_sa = message_2.clone();
+        other_sa[..8].copy_from_slice(&[0x5A; 8]);
+        gw_sock.send_to(&other_exchange, client_addr).unwrap();
+        gw_sock.send_to(&other_sa, client_addr).unwrap();
+
+        let mut e = SeedEntropy::new(0x41);
+        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(50), 0, None).unwrap();
+        assert_eq!(got, Liveness::Alive);
+        let mut buf = [0u8; 256];
+        assert!(gw_sock.recv(&mut buf).is_err(), "nothing answered either datagram, so nothing may be sent");
+
+        // Control: the datagram the final message answered still is answered.
+        gw_sock.send_to(&message_2, client_addr).unwrap();
+        peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(50), 0, None).unwrap();
+        gw_sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        let n = gw_sock.recv(&mut buf).expect("the control repeat must be answered");
+        assert_eq!(&buf[..n], &message_3[..]);
+    }
+
+    /// The active check waits for its ACK through the same reads, so a repeat that arrives first is
+    /// answered on the way and the ACK behind it still ends the wait.
+    #[test]
+    fn probe_sends_message_3_again_and_still_takes_its_ack() {
+        let (client_st, gw_st) = phase1_pair();
+        let (client_sock, client_addr, gw_sock, gw_addr) = loopback_pair(std::time::Duration::from_secs(2));
+        let (message_2, message_3) = quick_mode_pair(&client_st, 0x1111_2222);
+        client_st.finals.retain(&message_2, &message_3);
+
+        gw_sock.send_to(&message_2, client_addr).unwrap();
+        let ack = build_r_u_there_ack(&gw_st, &mut SeedEntropy::new(0x42), 5).unwrap();
+        gw_sock.send_to(&ack, client_addr).unwrap();
+
+        let got = probe(&client_sock, &client_st, &mut SeedEntropy::new(0x43), gw_addr, 5, std::time::Duration::from_secs(2), 0, None).unwrap();
+        assert_eq!(got, Liveness::Alive);
+        let mut buf = [0u8; 2048];
+        gw_sock.recv(&mut buf).expect("the R-U-THERE itself");
+        let n = gw_sock.recv(&mut buf).expect("message 3 must have been sent again while the probe waited");
+        assert_eq!(&buf[..n], &message_3[..]);
+    }
+
+    /// On UDP 4500 the repeat is a marked datagram and message 3 goes back marked; an unmarked datagram
+    /// with the same bytes is ESP or a keepalive as far as that port is concerned, and is not answered.
+    #[test]
+    fn floated_peek_sends_message_3_again_marked_and_ignores_an_unmarked_repeat() {
+        let (client_st, _gw_st) = floated_pair();
+        let (client_sock, client_addr, gw_sock, gw_addr) = floated_loopback_pair([127, 79, 1, 1], std::time::Duration::from_millis(300));
+        let (message_2, message_3) = quick_mode_pair(&client_st, 0x1111_2222);
+        client_st.finals.retain(&message_2, &message_3);
+
+        let mut e = SeedEntropy::new(0x44);
+        gw_sock.send_to(&message_2, client_addr).unwrap(); // no marker
+        peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(50), 0, None).unwrap();
+        let mut buf = [0u8; 256];
+        assert!(gw_sock.recv(&mut buf).is_err(), "an unmarked datagram on 4500 is not IKE");
+
+        gw_sock.send_to(&crate::ikev2::natt::wrap_ike_4500(&message_2), client_addr).unwrap();
+        peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(50), 0, None).unwrap();
+        gw_sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        let n = gw_sock.recv(&mut buf).expect("message 3 was not sent again");
+        assert_eq!(crate::ikev2::natt::unwrap_ike_4500(&buf[..n]), Some(&message_3[..]), "message 3 must go back with the non-ESP marker");
+    }
+
+    /// With a pump owning the socket (Windows) the repeat arrives through the channel and message 3 goes
+    /// out on the pump's socket -- the same single reader as for every other IKE datagram.
+    #[test]
+    fn floated_peek_sends_message_3_again_through_a_channel_while_a_pump_owns_the_socket() {
+        use crate::transport::{spawn_pump_reader, ChannelIo};
+        let (client_st, _gw_st) = floated_pair();
+        let (client_sock, client_addr, gw_sock, gw_addr) = floated_loopback_pair([127, 79, 2, 1], std::time::Duration::from_secs(2));
+        let (message_2, message_3) = quick_mode_pair(&client_st, 0x1111_2222);
+        client_st.finals.retain(&message_2, &message_3);
+        let (rx, _pump) = spawn_pump_reader(&client_sock, true);
+        let io = ChannelIo::new(client_sock, rx, gw_addr);
+
+        gw_sock.send_to(&[0xFF], client_addr).unwrap(); // NAT keepalive, kept by the pump
+        gw_sock.send_to(&[0x5a; 96], client_addr).unwrap(); // ESP, kept by the pump
+        gw_sock.send_to(&crate::ikev2::natt::wrap_ike_4500(&message_2), client_addr).unwrap();
+        let got = peek(&io, &client_st, &mut SeedEntropy::new(0x45), gw_addr, std::time::Duration::from_millis(500), 0, None).unwrap();
+        assert_eq!(got, Liveness::Alive);
+        let mut buf = [0u8; 256];
+        let n = gw_sock.recv(&mut buf).expect("message 3 was not sent again");
+        assert_eq!(crate::ikev2::natt::unwrap_ike_4500(&buf[..n]), Some(&message_3[..]));
+    }
 }

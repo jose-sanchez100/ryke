@@ -104,10 +104,18 @@
 //! [`Ikev2Session`] and [`LivenessSession`] reassemble each fragmented
 //! message the peer sends -- the answers to their requests, in the
 //! handshake and after it, and the peer's own requests -- and every
-//! fragment is authenticated before it is kept. What they send, requests
-//! and answers alike, goes out whole: a large `IKE_AUTH` request (one
-//! carrying a certificate chain, say) is left to IP fragmentation, and
-//! there is no path MTU discovery.
+//! fragment is authenticated before it is kept. What they send after
+//! `IKE_SA_INIT` (which is never fragmented), requests and answers alike,
+//! goes out whole when it fits the [`DatagramLimit`] -- 576 bytes for an
+//! IPv4 datagram and 1280 for an IPv6 one by default, the IP and UDP
+//! headers and the non-ESP marker included
+//! ([`Ikev2Session::with_datagram_limit`]) -- and otherwise in fragments
+//! that each fit, when the peer negotiated fragmentation. A retransmission
+//! sends the same datagrams again, never a new fragmentation. A peer that
+//! did not negotiate it gets the message whole all the same, with a
+//! diagnostic: it may then be fragmented at the IP layer or dropped. The
+//! limit is a fixed figure; there is no path MTU discovery, and a path
+//! narrower than the limit still fragments at the IP layer.
 //!
 //! ### Bundled servers
 //!
@@ -115,8 +123,9 @@
 //! responders for tests and examples, not gateways: a PSK or certificates
 //! (in IKEv1, Main Mode only), one CHILD SA at a time, no EAP or XAUTH, no
 //! NAT-T, and never an exchange of their own. Their module docs list what
-//! they do. The IKEv2 one reassembles a request that comes in fragments and
-//! answers it in fragments no larger than the request's.
+//! they do. The IKEv2 one reassembles a request that comes in fragments,
+//! and answers beyond its [`DatagramLimit`] in fragments -- no larger than
+//! the request's, when it came in fragments -- if the peer negotiated them.
 //!
 //! [`ikev2::client::Client`] is the matching minimal IKEv2 initiator: the
 //! handshake, nothing after it. It reassembles a fragmented `IKE_AUTH`

@@ -1274,4 +1274,31 @@ mod tests {
         let n = gw_sock.recv(&mut buf).expect("message 3 was not sent again");
         assert_eq!(crate::ikev2::natt::unwrap_ike_4500(&buf[..n]), Some(&message_3[..]));
     }
+
+    /// The retained final message has a time to live: within it a repeat of message 2 is answered, after
+    /// it the repeat is a stray datagram like any other. Told by a clock the test moves.
+    #[test]
+    fn peek_stops_answering_a_repeat_once_the_final_message_has_outlived_its_time() {
+        use crate::ikev1::phase1::{RetainedFinals, TestClock};
+        let (mut client_st, _gw_st) = phase1_pair();
+        let clock = TestClock::new();
+        client_st.finals = clock.finals();
+        let (client_sock, client_addr, gw_sock, gw_addr) = loopback_pair(std::time::Duration::from_millis(300));
+        let (message_2, message_3) = quick_mode_pair(&client_st, 0x1111_2222);
+        client_st.finals.retain(&message_2, &message_3);
+        let mut e = SeedEntropy::new(0x46);
+        let mut buf = [0u8; 256];
+
+        clock.advance(RetainedFinals::KEPT_FOR - std::time::Duration::from_secs(1));
+        gw_sock.send_to(&message_2, client_addr).unwrap();
+        peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(50), 0, None).unwrap();
+        let n = gw_sock.recv(&mut buf).expect("still inside its time: message 3 must be sent again");
+        assert_eq!(&buf[..n], &message_3[..]);
+
+        clock.advance(std::time::Duration::from_secs(1));
+        gw_sock.send_to(&message_2, client_addr).unwrap();
+        let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(50), 0, None).unwrap();
+        assert_eq!(got, Liveness::Alive);
+        assert!(gw_sock.recv(&mut buf).is_err(), "past its time to live nothing is answered");
+    }
 }

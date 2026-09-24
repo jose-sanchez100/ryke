@@ -30,10 +30,13 @@
 //! again, untouched, when the gateway repeats that message -- on the port the
 //! exchange floated to, and also on port 500 while it waits after a floated
 //! Aggressive Mode third message, which is where a gateway that never saw it
-//! (and so has not floated) repeats its second (RFC 3947 §5.3); a bit-for-bit
-//! repeat of a message the handshake already took is dropped, never read as
-//! the next one, and the whole wait for a message ends at its deadline, however
-//! many other datagrams come in meanwhile.
+//! (and so has not floated) repeats its second (RFC 3947 §5.3). What is kept is
+//! bounded -- at most eight pairs, 32 KiB in all, and no pair beyond two minutes
+//! from when it was kept, which covers a gateway's own retransmission schedule --
+//! so a repeat that comes after that is a stray datagram like any other. A
+//! bit-for-bit repeat of a message the handshake already took is dropped, never
+//! read as the next one, and the whole wait for a message ends at its deadline,
+//! however many other datagrams come in meanwhile.
 //!
 //! What this does not do: recognise a repeat that the gateway re-encrypted
 //! (only identical bytes count); measure the round-trip time the retransmission

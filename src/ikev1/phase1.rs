@@ -30,6 +30,7 @@ use crate::ikev2::sign::{cert_subject_dn, cert_subject_issuer_display, check_sig
 use crate::ikev2::sk::SkCipher;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Well-known XAUTH capability Vendor ID (`09002689dfd6b712`, the de-facto marker
 /// from draft-beaulieu-ike-xauth). An XAUTH initiator refuses to authenticate a
@@ -319,28 +320,95 @@ pub struct Phase1State {
 /// message ... has been determined to actually advance the IKE state machine --
 /// i.e. it is not a retransmission").
 ///
-/// Only the newest [`Self::KEPT`] pairs are kept; a peer that repeats a message
-/// older than that is treated as any other stray datagram.
-#[derive(Clone, Default)]
-pub(crate) struct RetainedFinals(Arc<std::sync::Mutex<FinalPairs>>);
+/// What is kept is bounded three ways, so that a session that lives for weeks
+/// cannot grow it and a peer cannot make it grow: at most [`Self::KEPT`] pairs,
+/// at most [`Self::BUDGET`] bytes in all (the newest pairs stay, the oldest give
+/// way), and no pair for longer than [`Self::KEPT_FOR`] from the moment it was
+/// kept. A peer that repeats a message that no longer has its pair is treated as
+/// any other stray datagram. The state goes when the [`Phase1State`]'s last
+/// clone does (the ISAKMP SA's end), and starts empty after
+/// [`Phase1State::resume`].
+#[derive(Clone)]
+pub(crate) struct RetainedFinals {
+    pairs: Arc<std::sync::Mutex<FinalPairs>>,
+    /// What "now" is for [`Self::KEPT_FOR`]: the monotonic clock, which no change
+    /// of the system time can move -- except in tests, which hold it still or
+    /// move it, so that none of them sleeps.
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+}
 
-/// Each pair is (the peer's message, our final message answering it).
-type FinalPairs = std::collections::VecDeque<(Vec<u8>, Vec<u8>)>;
+/// One retained pair -- the peer's message and our final message answering it,
+/// both exactly as they were on the wire -- and when it was kept.
+struct Retained {
+    theirs: Vec<u8>,
+    ours: Vec<u8>,
+    kept_at: Instant,
+}
+
+type FinalPairs = std::collections::VecDeque<Retained>;
+
+impl Default for RetainedFinals {
+    fn default() -> Self {
+        Self { pairs: Arc::default(), clock: Arc::new(Instant::now) }
+    }
+}
+
+impl Retained {
+    fn size(&self) -> usize {
+        self.theirs.len() + self.ours.len()
+    }
+}
 
 impl RetainedFinals {
     const KEPT: usize = 8;
 
+    /// The most bytes all the pairs kept together may hold. What is retained are
+    /// messages of the exchanges we completed -- a Quick Mode message is a few
+    /// hundred bytes, an Aggressive Mode one carrying a certificate chain a few
+    /// thousand -- so this is room for the pairs of several exchanges, while
+    /// what the count alone allows (eight datagrams of up to 64 KiB each, both
+    /// ways) is not. A pair that is larger than the whole budget is not kept.
+    const BUDGET: usize = 32 * 1024;
+
+    /// How long a pair is kept, from the moment it was kept (answering a repeat
+    /// does not extend it, so a peer that keeps repeating cannot keep it for
+    /// ever). It has to outlast the time a gateway keeps repeating its message
+    /// for, which is the gateway's own retransmission schedule -- RFC 2408 §5.1
+    /// fixes none: strongSwan's default gives up on an exchange after about 90
+    /// seconds -- and be no longer than needed: past the schedule a repeat is a
+    /// replay or a stale datagram, not a gateway asking again.
+    pub(crate) const KEPT_FOR: Duration = Duration::from_secs(120);
+
     fn pairs(&self) -> std::sync::MutexGuard<'_, FinalPairs> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.pairs.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Remember that `ours` is the final message we answered `theirs` with.
-    pub(crate) fn retain(&self, theirs: &[u8], ours: &[u8]) {
+    /// The pairs still inside their time, the expired ones already forgotten.
+    fn live(&self) -> std::sync::MutexGuard<'_, FinalPairs> {
+        let now = (self.clock)();
         let mut pairs = self.pairs();
-        if pairs.len() == Self::KEPT {
-            pairs.pop_front();
+        pairs.retain(|kept| now.saturating_duration_since(kept.kept_at) < Self::KEPT_FOR);
+        pairs
+    }
+
+    /// Remember that `ours` is the final message we answered `theirs` with. The
+    /// oldest pairs give way as far as the count and the byte budget need; the
+    /// pair kept for the same message before, if any, is replaced.
+    pub(crate) fn retain(&self, theirs: &[u8], ours: &[u8]) {
+        let size = theirs.len() + ours.len();
+        if size > Self::BUDGET {
+            ike_debug!("not keeping a final message for a repeat of {} bytes: more than the {} bytes kept in all", size, Self::BUDGET);
+            return;
         }
-        pairs.push_back((theirs.to_vec(), ours.to_vec()));
+        let kept_at = (self.clock)();
+        let mut pairs = self.live();
+        pairs.retain(|kept| kept.theirs != theirs);
+        let mut held: usize = pairs.iter().map(Retained::size).sum();
+        while pairs.len() >= Self::KEPT || held + size > Self::BUDGET {
+            let Some(oldest) = pairs.pop_front() else { break };
+            held -= oldest.size();
+        }
+        pairs.push_back(Retained { theirs: theirs.to_vec(), ours: ours.to_vec(), kept_at });
     }
 
     /// Our final message that answered `datagram`, when `datagram` is, bit for
@@ -348,7 +416,47 @@ impl RetainedFinals {
     /// gateway that re-encrypts what it sends again) is not recognised: without
     /// the exchange's state there is no way to tell it from a different message.
     pub(crate) fn answer_to(&self, datagram: &[u8]) -> Option<Vec<u8>> {
-        self.pairs().iter().find(|(theirs, _)| theirs == datagram).map(|(_, ours)| ours.clone())
+        self.live().iter().find(|kept| kept.theirs == datagram).map(|kept| kept.ours.clone())
+    }
+
+    /// How many pairs are stored, expired or not: what memory actually holds, whatever the reads forget.
+    #[cfg(test)]
+    fn stored(&self) -> usize {
+        self.pairs().len()
+    }
+
+    /// (pairs kept, bytes they hold), after forgetting what expired.
+    #[cfg(test)]
+    fn held(&self) -> (usize, usize) {
+        let pairs = self.live();
+        (pairs.len(), pairs.iter().map(Retained::size).sum())
+    }
+
+    /// Retained finals that tell the time by `clock`.
+    #[cfg(test)]
+    pub(crate) fn with_clock(clock: Arc<dyn Fn() -> Instant + Send + Sync>) -> Self {
+        Self { pairs: Arc::default(), clock }
+    }
+}
+
+/// A clock the test moves, for [`RetainedFinals::with_clock`].
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestClock(Arc<std::sync::Mutex<Instant>>);
+
+#[cfg(test)]
+impl TestClock {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Instant::now())))
+    }
+
+    pub(crate) fn advance(&self, by: Duration) {
+        *self.0.lock().unwrap() += by;
+    }
+
+    pub(crate) fn finals(&self) -> RetainedFinals {
+        let now = self.0.clone();
+        RetainedFinals::with_clock(Arc::new(move || *now.lock().unwrap()))
     }
 }
 
@@ -1895,6 +2003,153 @@ mod tests {
         for i in 1..(RetainedFinals::KEPT as u8 + 1) {
             assert_eq!(finals.answer_to(&[i]), Some(vec![i, 0xFF]), "pair {i} is still kept");
         }
+    }
+
+    /// RFC 2408 §5.1 leaves the retransmission schedule to the implementation, so how long a repeat can
+    /// come is the gateway's own; the pair is kept for `KEPT_FOR` from being kept, to the nanosecond.
+    #[test]
+    fn a_retained_final_is_answered_until_its_time_to_live_and_not_after() {
+        let clock = TestClock::new();
+        let finals = clock.finals();
+        finals.retain(b"theirs", b"ours");
+        assert_eq!(finals.answer_to(b"theirs"), Some(b"ours".to_vec()));
+        clock.advance(RetainedFinals::KEPT_FOR - Duration::from_nanos(1));
+        assert_eq!(finals.answer_to(b"theirs"), Some(b"ours".to_vec()), "still inside its time");
+        clock.advance(Duration::from_nanos(1));
+        assert_eq!(finals.answer_to(b"theirs"), None, "at its time to live it is gone");
+        assert_eq!(finals.held(), (0, 0), "and what it held is freed, not merely hidden");
+    }
+
+    /// The policy the number stands for: long enough for a gateway to go through the whole of its own
+    /// retransmission schedule (strongSwan's default: about 90 s), short enough that a repeat after it is
+    /// not a gateway asking again. Changing it outside these bounds is changing that policy.
+    #[test]
+    fn the_time_to_live_covers_a_gateways_retransmission_schedule_and_no_more() {
+        assert!(RetainedFinals::KEPT_FOR >= Duration::from_secs(90), "shorter than a gateway may keep repeating for");
+        assert!(RetainedFinals::KEPT_FOR <= Duration::from_secs(600), "longer than any retransmission schedule");
+    }
+
+    /// Outside the tests the time is the monotonic clock's: it moves, and it only moves forward.
+    #[test]
+    fn the_default_clock_is_the_monotonic_one() {
+        let finals = RetainedFinals::default();
+        let before = (finals.clock)();
+        std::thread::sleep(Duration::from_millis(2));
+        let after = (finals.clock)();
+        assert!(after > before, "the clock a real session uses did not move");
+        assert!(before >= Instant::now() - Duration::from_secs(5) && after <= Instant::now(), "and it is the current time");
+    }
+
+    /// Answering a repeat does not renew the pair: a peer that keeps repeating cannot keep it for ever.
+    #[test]
+    fn the_time_to_live_runs_from_when_the_pair_was_kept_not_from_when_it_was_last_asked_for() {
+        let clock = TestClock::new();
+        let finals = clock.finals();
+        finals.retain(b"theirs", b"ours");
+        let step = RetainedFinals::KEPT_FOR / 4;
+        for _ in 0..3 {
+            clock.advance(step);
+            assert!(finals.answer_to(b"theirs").is_some());
+        }
+        clock.advance(step);
+        assert_eq!(finals.answer_to(b"theirs"), None, "asked for again and again, it still ended at its own time");
+    }
+
+    /// Each pair has a time of its own: an older one ends while a newer one goes on.
+    #[test]
+    fn pairs_kept_at_different_times_end_at_different_times() {
+        let clock = TestClock::new();
+        let finals = clock.finals();
+        finals.retain(b"older", b"first");
+        clock.advance(RetainedFinals::KEPT_FOR / 2);
+        finals.retain(b"newer", b"second");
+        clock.advance(RetainedFinals::KEPT_FOR / 2);
+        assert_eq!(finals.answer_to(b"older"), None);
+        assert_eq!(finals.answer_to(b"newer"), Some(b"second".to_vec()));
+        assert_eq!(finals.held(), (1, b"newer".len() + b"second".len()));
+    }
+
+    /// A full set of pairs, all expired, leaves the room to a new one without any eviction: what expired
+    /// is forgotten before the count and the budget are looked at.
+    #[test]
+    fn expired_pairs_give_their_place_and_bytes_to_the_next_one() {
+        let clock = TestClock::new();
+        let finals = clock.finals();
+        for i in 0..RetainedFinals::KEPT as u8 {
+            finals.retain(&[i], &[i; 4096]);
+        }
+        clock.advance(RetainedFinals::KEPT_FOR);
+        finals.retain(b"new", b"pair");
+        assert_eq!(finals.stored(), 1, "keeping the new pair forgot the expired ones, they are not left in memory for a later read to find");
+        assert_eq!(finals.held(), (1, b"new".len() + b"pair".len()));
+        assert_eq!(finals.answer_to(b"new"), Some(b"pair".to_vec()));
+    }
+
+    /// The count alone would let eight big pairs stay: the bytes are limited too, and it is the oldest
+    /// pairs that give way.
+    #[test]
+    fn retained_finals_never_hold_more_than_their_byte_budget() {
+        let clock = TestClock::new();
+        let finals = clock.finals();
+        let tagged = |i: u8| [&[i][..], &[0u8; 9_999][..]].concat(); // 10_000 bytes
+        for i in 0..5u8 {
+            finals.retain(&tagged(i), &[i; 2_000]);
+            let (pairs, bytes) = finals.held();
+            assert!(bytes <= RetainedFinals::BUDGET, "after pair {i}: {pairs} pairs hold {bytes} bytes");
+        }
+        // 12_000 bytes a pair: two fit in 32 KiB, three do not.
+        assert_eq!(finals.held(), (2, 24_000));
+        for gone in 0..3u8 {
+            assert_eq!(finals.answer_to(&tagged(gone)), None, "pair {gone} had to give way");
+        }
+        for kept in 3..5u8 {
+            assert_eq!(finals.answer_to(&tagged(kept)), Some(vec![kept; 2_000]), "pair {kept} is the newest");
+        }
+    }
+
+    /// The budget is a limit on what is held, not a bound to stay under: pairs that add up to exactly the
+    /// budget are all kept, and one more byte of a newcomer pushes out the oldest.
+    #[test]
+    fn pairs_that_fill_the_budget_exactly_are_all_kept() {
+        let clock = TestClock::new();
+        let finals = clock.finals();
+        let half = RetainedFinals::BUDGET / 2;
+        finals.retain(&vec![1u8; half - 1], b"a");
+        finals.retain(&vec![2u8; half - 1], b"b");
+        assert_eq!(finals.held(), (2, 2 * half), "two halves make the whole budget, and fit");
+        finals.retain(b"c", b"d");
+        assert_eq!(finals.held(), (2, half + 2), "a third does not: the oldest gave way");
+        assert_eq!(finals.answer_to(&vec![1u8; half - 1]), None);
+        assert_eq!(finals.answer_to(&vec![2u8; half - 1]), Some(b"b".to_vec()));
+    }
+
+    /// A pair that cannot fit even alone is not kept, and does not push out the pairs that do fit; one
+    /// that fits exactly is kept.
+    #[test]
+    fn a_pair_larger_than_the_whole_budget_is_not_kept_and_costs_no_other_pair_its_place() {
+        let clock = TestClock::new();
+        let finals = clock.finals();
+        finals.retain(b"small", b"pair");
+        finals.retain(&vec![1u8; RetainedFinals::BUDGET], b"x");
+        assert_eq!(finals.answer_to(&vec![1u8; RetainedFinals::BUDGET]), None, "one byte over the budget");
+        assert_eq!(finals.answer_to(b"small"), Some(b"pair".to_vec()), "the pair that was there stays");
+
+        finals.retain(&vec![2u8; RetainedFinals::BUDGET - 1], b"y");
+        assert_eq!(finals.answer_to(&vec![2u8; RetainedFinals::BUDGET - 1]), Some(b"y".to_vec()), "exactly the budget fits");
+        assert_eq!(finals.held(), (1, RetainedFinals::BUDGET), "and the small one had to give way for it");
+    }
+
+    /// Keeping a final for a message that already has one replaces it, rather than taking another place.
+    #[test]
+    fn keeping_a_final_for_the_same_peer_message_again_replaces_the_one_before() {
+        let clock = TestClock::new();
+        let finals = clock.finals();
+        finals.retain(b"theirs", b"first");
+        clock.advance(RetainedFinals::KEPT_FOR - Duration::from_secs(1));
+        finals.retain(b"theirs", b"second");
+        assert_eq!(finals.held(), (1, b"theirs".len() + b"second".len()));
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(finals.answer_to(b"theirs"), Some(b"second".to_vec()), "the replacement has its own time");
     }
 
     #[test]

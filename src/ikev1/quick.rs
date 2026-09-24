@@ -97,7 +97,7 @@ use super::payloads::{
 };
 use super::phase1::Phase1State;
 use super::phase2;
-use super::retransmit_waits;
+use super::rtt;
 use crate::crypto::{DhGroup, IntegAlgorithm};
 use crate::debug::ike_debug;
 use crate::entropy::Entropy;
@@ -1240,16 +1240,21 @@ fn delete_superseded(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl 
     }
 }
 
-/// How many times [`quick_exchange`] sends message 1: once, then again, the
-/// identical bytes, each time the wait for message 2 runs out (RFC 2408 §5.1)
-/// -- the same count `LivenessSession` uses for its IKEv2 requests. The waits
-/// are `retransmit_waits(3 * timeout, ..)`: growing, and three `timeout`s in all.
+/// How many times [`quick_exchange`] sends message 1 at least: once, then again,
+/// the identical bytes, each time the wait for message 2 runs out (RFC 2408
+/// §5.1) -- the same count `LivenessSession` uses for its IKEv2 requests. The
+/// waits grow, and are three `timeout`s in all: `retransmit_waits(3 * timeout,
+/// ..)` until a round trip has been measured, and from then on a first wait that
+/// follows it, doubling, with up to seven resends in the same time
+/// ([`rtt::retransmit_plan`]).
 const QUICK_MODE_ATTEMPTS: u32 = 3;
 
 /// Drive one initiator Quick Mode exchange to completion over `sock`: send
 /// `msg1`, wait for the matching message 2 -- resending `msg1` unchanged when
-/// none comes, up to [`QUICK_MODE_ATTEMPTS`] sends in all, after waits that grow
-/// and add up to that many `timeout`s -- answer with message 3, and hand back the derived CHILD SA's
+/// none comes, at least [`QUICK_MODE_ATTEMPTS`] sends in all, after waits that
+/// grow and add up to that many `timeout`s, the first following the round trip
+/// this ISAKMP SA has measured ([`Phase1State::rtt`]) once it has -- answer with
+/// message 3, and hand back the derived CHILD SA's
 /// SPIs/keys plus the negotiated lifetime. Datagrams that aren't this
 /// exchange's message 2 are skipped -- except an error Notify from the peer
 /// for this ISAKMP SA, which ends the wait at once as
@@ -1273,20 +1278,20 @@ fn quick_exchange(
     what: &str,
 ) -> Result<(RekeyedChild, SaLifetime), DriverError> {
     let msgid = IsakmpHeader::parse(&msg1)?.message_id;
-    let mut msg2 = None;
-    for (i, wait) in retransmit_waits(timeout.saturating_mul(QUICK_MODE_ATTEMPTS), QUICK_MODE_ATTEMPTS).into_iter().enumerate() {
-        let attempt = i + 1;
-        if attempt == 1 {
-            ike_debug!("Quick Mode ({what}): sending msg1 to {peer} (msgid={msgid:08x})");
-        } else {
-            ike_debug!("Quick Mode ({what}): no reply, retransmitting msg1 (attempt {attempt}/{QUICK_MODE_ATTEMPTS})");
-        }
-        send_ike(sock, st, peer, &msg1)?;
-        msg2 = await_quick_reply(sock, st, peer, msgid, wait, what)?;
-        if msg2.is_some() {
-            break;
-        }
-    }
+    let msg2 = rtt::exchange(
+        Some(&st.rtt),
+        Some((timeout, QUICK_MODE_ATTEMPTS)),
+        &Instant::now,
+        |sent| {
+            if sent == 0 {
+                ike_debug!("Quick Mode ({what}): sending msg1 to {peer} (msgid={msgid:08x})");
+            } else {
+                ike_debug!("Quick Mode ({what}): no reply, retransmitting msg1 (send {} of it)", sent + 1);
+            }
+            send_ike(sock, st, peer, &msg1).map_err(DriverError::from)
+        },
+        |wait| await_quick_reply(sock, st, peer, msgid, wait.unwrap_or(timeout), what),
+    )?;
     let Some(msg2) = msg2 else {
         ike_debug!("Quick Mode ({what}): no reply to msgid={msgid:08x}, retransmissions included");
         return Err(IkeError::Crypto("Quick Mode: timed out waiting for the Quick Mode reply").into());
@@ -1329,10 +1334,11 @@ fn await_quick_reply(
     timeout: Duration,
     what: &str,
 ) -> Result<Option<Vec<u8>>, DriverError> {
-    let deadline = Instant::now() + timeout;
+    // A `timeout` too long for the clock to count is not one the clock can end.
+    let deadline = Instant::now().checked_add(timeout);
     let mut buf = [0u8; 8192];
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.map_or(timeout, |deadline| deadline.saturating_duration_since(Instant::now()));
         if remaining.is_zero() {
             return Ok(None);
         }
@@ -2299,6 +2305,102 @@ mod tests {
         assert!(gaps.windows(2).all(|g| g[1] >= g[0] + Duration::from_millis(100)), "the waits between the sends were {gaps:?}");
         let budget = timeout * QUICK_MODE_ATTEMPTS;
         assert!(elapsed >= budget && elapsed < budget + Duration::from_millis(600), "gave up after {elapsed:?}, budget {budget:?}");
+    }
+
+    /// RFC 2408 §5.1: the rekey's timer follows what the ISAKMP SA has measured of the
+    /// path, and the caller's patience still ends it. 20 ms measured is a timer of 60 ms
+    /// (the floor here is 50 ms), so the 900 ms of a 300 ms timeout hold four sends, at
+    /// 0, 60, 180 and 420 ms with the last wait to 900, where the fixed schedule makes
+    /// three -- and the rekey that nothing answers backs the timer off once per wait.
+    #[test]
+    fn a_quick_mode_rekey_follows_the_round_trip_the_isakmp_sa_measured() {
+        let (isock, rsock, iaddr, raddr) = loopback_pair();
+        let (mut istate, _rstate, mut ie, _re) = phase1_pair(0x9b51, 0x9b52, iaddr, raddr);
+        istate.rtt = rtt::RoundTrips::with_floor(Duration::from_millis(50));
+        istate.rtt.sampled(Duration::from_millis(20));
+        let ts = ([10, 212, 134, 202], [255, 255, 255, 255]);
+        let timeout = Duration::from_millis(300);
+        rsock.set_read_timeout(Some(timeout * 5)).unwrap();
+        let recorder = std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            let mut times = Vec::new();
+            while rsock.recv(&mut buf).is_ok() {
+                times.push(Instant::now());
+            }
+            times
+        });
+        let started = Instant::now();
+        let err = rekey_child(&isock, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, ts, ([0; 4], [0; 4]), 3600, timeout, 0x0bad_beef);
+        let elapsed = started.elapsed();
+        assert!(matches!(err, Err(DriverError::Ike(IkeError::Crypto(m))) if m.contains("timed out")), "got {:?}", err.map(|_| ()));
+        let times = recorder.join().unwrap();
+        assert_eq!(times.len(), 4, "the measured timer fits four sends in three timeouts");
+        let at: Vec<u128> = times.iter().map(|t| (*t - times[0]).as_millis() / 20).collect();
+        assert!(at[1] >= 2 && at[1] <= 6 && at[2] >= 8 && at[2] <= 12, "the sends were at {:?} ms", times.iter().map(|t| (*t - times[0]).as_millis()).collect::<Vec<_>>());
+        let budget = timeout * QUICK_MODE_ATTEMPTS;
+        assert!(elapsed >= budget && elapsed < budget + Duration::from_millis(600), "gave up after {elapsed:?}, budget {budget:?}");
+        assert_eq!(istate.rtt.backoff(), 4, "four timers ran out");
+    }
+
+    /// The same with a stream of datagrams for some other exchange arriving all the while:
+    /// what is read cannot lengthen the measured timer's waits or the patience.
+    #[test]
+    fn a_measured_quick_mode_rekey_keeps_its_schedule_however_many_stray_datagrams_arrive() {
+        let (isock, rsock, iaddr, raddr) = loopback_pair();
+        let (mut istate, _rstate, mut ie, _re) = phase1_pair(0x9b61, 0x9b62, iaddr, raddr);
+        istate.rtt = rtt::RoundTrips::with_floor(Duration::from_millis(50));
+        istate.rtt.sampled(Duration::from_millis(20));
+        let ts = ([10, 212, 134, 202], [255, 255, 255, 255]);
+        let timeout = Duration::from_millis(300);
+        rsock.set_read_timeout(Some(timeout * 5)).unwrap();
+        let recorder = std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            let mut count = 0;
+            while rsock.recv(&mut buf).is_ok() {
+                count += 1;
+            }
+            count
+        });
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let flood = std::thread::spawn(move || {
+            let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let stray =
+                IsakmpHeader { init_cookie: [0x11; 8], resp_cookie: [0x22; 8], next_payload: 0, version: 0x10, exchange_type: exchange::QUICK, flags: 0, message_id: 7, length: 28 }
+                    .to_bytes();
+            let end = Instant::now() + Duration::from_secs(3);
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < end {
+                let _ = sender.send_to(&stray, iaddr);
+            }
+        });
+
+        let started = Instant::now();
+        let err = rekey_child(&isock, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, ts, ([0; 4], [0; 4]), 3600, timeout, 0x0bad_beef);
+        let elapsed = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        flood.join().unwrap();
+        assert!(matches!(err, Err(DriverError::Ike(IkeError::Crypto(m))) if m.contains("timed out")), "got {:?}", err.map(|_| ()));
+        assert_eq!(recorder.join().unwrap(), 4, "four sends, however much else was read");
+        let budget = timeout * QUICK_MODE_ATTEMPTS;
+        assert!(elapsed >= budget && elapsed < budget + Duration::from_millis(600), "gave up after {elapsed:?}, budget {budget:?}");
+    }
+
+    /// A rekey that is answered is a sample of the path, in the estimate of the SA it ran
+    /// under (every copy of it): what the next rekey's timer follows.
+    #[test]
+    fn a_quick_mode_rekey_that_is_answered_is_measured_in_the_isakmp_sas_estimate() {
+        let (isock, rsock, iaddr, raddr) = loopback_pair();
+        let (istate, rstate, mut ie, re) = phase1_pair(0x9b71, 0x9b72, iaddr, raddr);
+        let copy = istate.clone();
+        assert_eq!(istate.rtt.samples(), 0);
+        let responder = spawn_quick_responder(rsock, rstate, re, iaddr, true);
+        let ts = ([10, 212, 134, 202], [255, 255, 255, 255]);
+        rekey_child(&isock, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, ts, ([0; 4], [0; 4]), 1800, Duration::from_secs(5), 0x0bad_f00d).unwrap();
+        responder.join().unwrap();
+        assert_eq!(copy.rtt.samples(), 1, "one Quick Mode message 2, answered the first time");
+        let measured = copy.rtt.smoothed().unwrap();
+        assert!(measured > Duration::ZERO && measured < Duration::from_secs(2), "measured {measured:?} on loopback");
+        assert_eq!(copy.rtt.backoff(), 0);
     }
 
     /// A `timeout` of nothing leaves no time to wait anywhere: message 1 still
@@ -3289,5 +3391,21 @@ mod tests {
         let mut buf = [0u8; 256];
         let (n, _) = gateway.recv_from(&mut buf).expect("the previous exchange's message 3 must have been sent again");
         assert_eq!(&buf[..n], &previous_msg3[..]);
+    }
+
+    /// A wait too long for the clock to count is not a panic on adding it to the time now:
+    /// the message that is there is read, and the one that is not is waited for by the
+    /// socket alone (a wait nobody will see the end of). The plans of a measured timer
+    /// hand waits of such sizes to this when the caller's timeout is enormous.
+    #[test]
+    fn a_wait_beyond_what_the_clock_can_count_reads_what_is_there_without_panicking() {
+        let (cky_i, cky_r) = ([0xAA; 8], [0xBB; 8]);
+        let st = Phase1State::resume(crate::ikev1::crypto1::Prf::Sha256, DhGroup::Modp2048, cky_i, cky_r, vec![], vec![], vec![], vec![], 16, vec![]);
+        let awaited = message_of(cky_i, cky_r, 0x2222);
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        gateway.send_to(&awaited, client.local_addr().unwrap()).unwrap();
+        let got = await_quick_reply(&client, &st, gateway.local_addr().unwrap(), 0x2222, Duration::MAX, "test").unwrap();
+        assert_eq!(got, Some(awaited));
     }
 }

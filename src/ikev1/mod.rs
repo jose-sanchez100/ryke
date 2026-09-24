@@ -20,8 +20,6 @@ pub mod phase2;
 pub mod quick;
 #[cfg(test)]
 mod retransmit_tests;
-// Not used until the client and Quick Mode run their exchanges through it.
-#[allow(dead_code)]
 mod rtt;
 pub mod server;
 pub mod xauth;
@@ -43,7 +41,11 @@ use std::time::Duration;
 /// already accepted for a gateway that is gone; only how it is split changes.
 ///
 /// What §5.1 also asks -- an interval "adjusted dynamically based on measured
-/// round trip times" -- is not done: the split is the same whatever the path.
+/// round trip times" -- is [`rtt`]'s: once a round trip has been measured, the
+/// callers that measure ([`client::Client`]'s Phase 1 and Quick Mode exchanges,
+/// [`quick`]'s rekeys) cut the same total after a first wait that follows it. This
+/// split is what they use until then, and what an exchange that does not measure
+/// (XAUTH, Mode-Config) always uses.
 /// `sends` is a small constant of the caller's (at most 16). A `total` below
 /// `2^sends - 1` nanoseconds cannot be cut into unequal parts: the leading waits
 /// are then zero and the last one holds all the time.

@@ -62,9 +62,15 @@
 //! between them grow (RFC 2408 §5.1: "MUST NOT use a fixed timer"): for a
 //! read timeout `T`, a request goes out at 0, 3T/7 and 9T/7 (waits of 3T/7,
 //! 6T/7 and 12T/7, 1 : 2 : 4) and is given up on at 3T, which is what a
-//! silent gateway was already waited for. They follow no measured round-trip
-//! time, which §5.1 also asks for: the split is the same on every path. The
-//! messages that nothing answers -- Aggressive Mode's third, the XAUTH ACK,
+//! silent gateway was already waited for. That is the schedule until a round
+//! trip has been measured; §5.1 also asks for timers "adjusted dynamically
+//! based on measured round trip times", and once the ISAKMP SA has one -- from
+//! its Phase 1 messages and its Quick Modes, not from XAUTH or Mode-Config,
+//! whose replies wait on a backend -- a request that gets no answer is sent
+//! again after that round trip's RFC 6298 timer (never under a second, never
+//! after more than the 3T/7 above), each wait twice the one before, with up to
+//! seven resends inside the same 3T. Only a reply to a request sent once is
+//! measured (Karn's rule). The messages that nothing answers -- Aggressive Mode's third, the XAUTH ACK,
 //! Quick Mode's third -- are kept, and sent again untouched when the gateway
 //! repeats the message before them (RFC 2408 §3.1, Commit Bit NOTE; RFC 2409
 //! §5: no IV or state moves for a retransmission), and a gateway's repeat of

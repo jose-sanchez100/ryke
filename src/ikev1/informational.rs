@@ -343,10 +343,11 @@ fn watch(
     current_peer_spi: u32,
     current_peer_spi_ipv6: Option<u32>,
 ) -> std::io::Result<Seen> {
-    let deadline = Instant::now() + timeout;
+    // A `timeout` too long for the clock to count is not one the clock can end.
+    let deadline = Instant::now().checked_add(timeout);
     let mut buf = [0u8; 8192];
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.map_or(timeout, |deadline| deadline.saturating_duration_since(Instant::now()));
         if remaining.is_zero() {
             return Ok(Seen::Nothing);
         }
@@ -790,6 +791,33 @@ mod tests {
 
         let mut ce = SeedEntropy::new(0x6);
         let got = probe(&client_sock, &client_st, &mut ce, gw_addr, 42, std::time::Duration::from_secs(2), 0, None).unwrap();
+        assert_eq!(got, Liveness::Alive);
+        responder.join().unwrap();
+    }
+
+    /// A timeout too long for the clock to count is no panic on adding it to the time now:
+    /// the acknowledgement that comes is taken.
+    #[test]
+    fn probe_with_the_largest_timeout_there_is_takes_the_ack_without_panicking() {
+        let (client_st, gw_st) = phase1_pair();
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        let gw_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gw_addr = gw_sock.local_addr().unwrap();
+        let responder = std::thread::spawn(move || {
+            gw_sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let mut buf = [0u8; 8192];
+            let n = gw_sock.recv(&mut buf).unwrap();
+            let hdr = IsakmpHeader::parse(&buf[..n]).unwrap();
+            let iv0 = crypto1::phase2_iv(gw_st.prf, &gw_st.phase1_iv, hdr.message_id, gw_st.enc_block);
+            let (_h, payloads, _next) = phase2::parse_encrypted(&buf[..n], gw_st.prf, &gw_st.skeyid_a, &gw_st.enc_key, gw_st.enc_block, &iv0).unwrap();
+            let notify = payloads.into_iter().find(|p| p.payload_type == payload::NOTIFY).unwrap();
+            let (_msg_type, data) = parse_notify(&notify.data).unwrap();
+            let seq = u32::from_be_bytes(<[u8; 4]>::try_from(data).unwrap());
+            let ack = build_r_u_there_ack(&gw_st, &mut SeedEntropy::new(0x5), seq).unwrap();
+            gw_sock.send_to(&ack, client_addr).unwrap();
+        });
+        let got = probe(&client_sock, &client_st, &mut SeedEntropy::new(0x6), gw_addr, 42, std::time::Duration::MAX, 0, None).unwrap();
         assert_eq!(got, Liveness::Alive);
         responder.join().unwrap();
     }

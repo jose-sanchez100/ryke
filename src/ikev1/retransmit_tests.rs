@@ -602,3 +602,35 @@ fn a_reply_that_followed_a_retransmission_is_used_but_not_measured() {
         assert_eq!(est.phase1.rtt.backoff(), 0, "the samples that came after ended the backoff");
     }
 }
+
+/// One estimate for the life of the ISAKMP SA: the rekey that a caller runs later, on
+/// its copy of the state, is measured into what `connect` measured, and follows it.
+#[test]
+fn a_rekey_adds_its_round_trip_to_what_connect_measured() {
+    let run = connect_with_timeout(Script { lose_rekey_msg3: true, ..Script::default() }, Duration::from_secs(3));
+    let est = run.established.expect("the handshake must complete");
+    assert_eq!(est.phase1.rtt.samples(), 2, "Aggressive Mode message 2 and Quick Mode message 2");
+    let mut entropy = SeedEntropy::new(0x3333);
+    let ts = ([10, 0, 99, 0], [255, 255, 255, 0]);
+    let copy = est.phase1.clone();
+    let (rekeyed, _lifetime) = quick::rekey_child(
+        &run.client_sock,
+        &copy,
+        &mut entropy,
+        run.gateway_addr,
+        SkCipher::Aes256Gcm,
+        None,
+        ts,
+        ts,
+        3600,
+        Duration::from_millis(1000),
+        est.child.inbound.spi(),
+    )
+    .expect("rekey");
+    assert_eq!(est.phase1.rtt.samples(), 3, "the rekey's Quick Mode message 2, measured on a copy of the state");
+    // The gateway is waiting for the message 3 it never saw: a look at the socket answers it.
+    let seen = informational::peek(&run.client_sock, &est.phase1, &mut entropy, run.gateway_addr, Duration::from_millis(1000), rekeyed.peer_spi, None)
+        .expect("peek");
+    assert_eq!(seen, Liveness::Alive);
+    run.gateway.join().unwrap().expect("gateway");
+}

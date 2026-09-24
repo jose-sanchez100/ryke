@@ -72,6 +72,7 @@ use super::payloads::{
 };
 use super::phase1::Phase1State;
 use super::phase2;
+use super::retransmit_waits;
 use crate::crypto::{DhGroup, IntegAlgorithm};
 use crate::debug::ike_debug;
 use crate::entropy::Entropy;
@@ -912,9 +913,10 @@ impl QuickResponder {
 /// itself: the new CHILD SA is already live by that point, and the old one
 /// will eventually be reaped by its own lifetime expiry either way.
 ///
-/// `timeout` is per attempt: message 1 goes out up to three times, the same
-/// bytes each time, before the rekey fails as timed out -- with the old
-/// CHILD SA left alone, no Delete sent.
+/// Message 1 goes out up to three times, the same bytes each time, before the
+/// rekey fails as timed out -- with the old CHILD SA left alone, no Delete sent.
+/// `timeout` is the wait for each send on average: the waits grow (1 : 2 : 4,
+/// RFC 2408 §5.1) and add up to three times `timeout`.
 #[allow(clippy::too_many_arguments)]
 pub fn rekey_child(
     sock: &dyn IkeSocket,
@@ -940,7 +942,7 @@ pub fn rekey_child(
 /// (`ts_local`/`ts_remote` as `(network, prefix length)`, see
 /// [`initiate_quick_ipv6`]). Same transport handling as [`rekey_child`]
 /// (`sock` must be the socket the peer is reachable on, NAT-T floated per
-/// `st.floated`, `timeout` per attempt), minus the trailing Delete: nothing is
+/// `st.floated`, `timeout` as for [`rekey_child`]), minus the trailing Delete: nothing is
 /// being replaced. An error Notify from the peer (typically NO-PROPOSAL-CHOSEN /
 /// INVALID-ID-INFORMATION when its Phase 2 has no IPv6 selector) comes back as
 /// [`IkeError::PeerRejected`] straight away rather than after the
@@ -1052,14 +1054,15 @@ fn delete_superseded(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl 
 }
 
 /// How many times [`quick_exchange`] sends message 1: once, then again, the
-/// identical bytes, each time `timeout` passes without message 2 (RFC 2408
-/// §5.1) -- the same count `LivenessSession` uses for its IKEv2 requests.
+/// identical bytes, each time the wait for message 2 runs out (RFC 2408 §5.1)
+/// -- the same count `LivenessSession` uses for its IKEv2 requests. The waits
+/// are `retransmit_waits(3 * timeout, ..)`: growing, and three `timeout`s in all.
 const QUICK_MODE_ATTEMPTS: u32 = 3;
 
 /// Drive one initiator Quick Mode exchange to completion over `sock`: send
-/// `msg1`, wait up to `timeout` for the matching message 2 -- resending
-/// `msg1` unchanged when none comes, up to [`QUICK_MODE_ATTEMPTS`] sends in
-/// all -- answer with message 3, and hand back the derived CHILD SA's
+/// `msg1`, wait for the matching message 2 -- resending `msg1` unchanged when
+/// none comes, up to [`QUICK_MODE_ATTEMPTS`] sends in all, after waits that grow
+/// and add up to that many `timeout`s -- answer with message 3, and hand back the derived CHILD SA's
 /// SPIs/keys plus the negotiated lifetime. Datagrams that aren't this
 /// exchange's message 2 are skipped -- except an error Notify from the peer
 /// for this ISAKMP SA, which ends the wait at once as
@@ -1084,14 +1087,15 @@ fn quick_exchange(
 ) -> Result<(RekeyedChild, u32), DriverError> {
     let msgid = IsakmpHeader::parse(&msg1)?.message_id;
     let mut msg2 = None;
-    for attempt in 1..=QUICK_MODE_ATTEMPTS {
+    for (i, wait) in retransmit_waits(timeout.saturating_mul(QUICK_MODE_ATTEMPTS), QUICK_MODE_ATTEMPTS).into_iter().enumerate() {
+        let attempt = i + 1;
         if attempt == 1 {
             ike_debug!("Quick Mode ({what}): sending msg1 to {peer} (msgid={msgid:08x})");
         } else {
-            ike_debug!("Quick Mode ({what}): no reply within {timeout:?}, retransmitting msg1 (attempt {attempt}/{QUICK_MODE_ATTEMPTS})");
+            ike_debug!("Quick Mode ({what}): no reply, retransmitting msg1 (attempt {attempt}/{QUICK_MODE_ATTEMPTS})");
         }
         send_ike(sock, st, peer, &msg1)?;
-        msg2 = await_quick_reply(sock, st, peer, msgid, timeout, what)?;
+        msg2 = await_quick_reply(sock, st, peer, msgid, wait, what)?;
         if msg2.is_some() {
             break;
         }
@@ -2070,6 +2074,37 @@ mod tests {
         assert_eq!(sent.len(), 3, "message 1 and two retransmissions, and no Delete");
         assert!(sent.iter().all(|m| *m == sent[0]), "a retransmission must be the same bytes");
         assert_eq!(IsakmpHeader::parse(&sent[0]).unwrap().exchange_type, exchange::QUICK);
+    }
+
+    /// RFC 2408 §5.1: the retransmissions of message 1 are separated by longer and
+    /// longer intervals, not by a fixed timer, and the exchange is given up on
+    /// after the same time a fixed timer of `timeout` per send would have taken:
+    /// the caller's timeout policy for a gateway that is gone is unchanged.
+    #[test]
+    fn a_quick_mode_rekey_separates_its_retransmissions_by_longer_and_longer_intervals() {
+        let (isock, rsock, iaddr, raddr) = loopback_pair();
+        let (istate, _rstate, mut ie, _re) = phase1_pair(0x9b11, 0x9b12, iaddr, raddr);
+        let ts = ([10, 212, 134, 202], [255, 255, 255, 255]);
+        let timeout = Duration::from_millis(500);
+        rsock.set_read_timeout(Some(timeout * 5)).unwrap();
+        let recorder = std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            let mut times = Vec::new();
+            while rsock.recv(&mut buf).is_ok() {
+                times.push(Instant::now());
+            }
+            times
+        });
+        let started = Instant::now();
+        let err = rekey_child(&isock, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, ts, ([0; 4], [0; 4]), 3600, timeout, 0x0bad_beef);
+        let elapsed = started.elapsed();
+        assert!(matches!(err, Err(DriverError::Ike(IkeError::Crypto(m))) if m.contains("timed out")), "got {:?}", err.map(|_| ()));
+        let times = recorder.join().unwrap();
+        assert_eq!(times.len() as u32, QUICK_MODE_ATTEMPTS);
+        let gaps: Vec<Duration> = times.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.windows(2).all(|g| g[1] >= g[0] + Duration::from_millis(100)), "the waits between the sends were {gaps:?}");
+        let budget = timeout * QUICK_MODE_ATTEMPTS;
+        assert!(elapsed >= budget && elapsed < budget + Duration::from_millis(600), "gave up after {elapsed:?}, budget {budget:?}");
     }
 
     /// The reason `IkeSocket` exists: a host whose ESP pump is the only reader

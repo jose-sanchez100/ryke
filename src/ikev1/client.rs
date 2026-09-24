@@ -19,26 +19,31 @@
 //! detected. See `phase1.rs`'s own NAT-T doc comments for the detection
 //! details; this module only owns the transport-switching side of it.
 //!
-//! Retransmissions and duplicates (RFC 2408 §3.1, RFC 2409 §5): every request
-//! is sent again, the same bytes, when its answer does not come
-//! (`Client::send_and_await`) -- at a fixed interval, the read timeout, where
-//! RFC 2408 §5.1 says "MUST NOT use a fixed timer" (a known deviation, see
-//! `MAX_RETRANSMITS`). The messages nothing answers -- Aggressive Mode's third,
-//! the XAUTH ACK, Quick Mode's third -- are kept with the message they answered
-//! ([`crate::ikev1::phase1::Phase1State`]'s retained finals) and sent again,
-//! untouched, when the gateway repeats that message; a bit-for-bit repeat of a
-//! message the handshake already took is dropped, never read as the next one,
-//! and the whole wait for a message ends at the read timeout, however many
-//! other datagrams come in meanwhile.
+//! Retransmissions and duplicates (RFC 2408 §3.1, §5.1, RFC 2409 §5): every
+//! request is sent again, the same bytes, when its answer does not come
+//! (`Client::send_and_await`), at longer and longer intervals
+//! ([`crate::ikev1::retransmit_waits`]; the read timeout, once per send, is the
+//! whole time a caller waits for a silent gateway) and never more than
+//! `MAX_RETRANSMITS` times. The messages nothing answers -- Aggressive Mode's
+//! third, the XAUTH ACK, Quick Mode's third -- are kept with the message they
+//! answered ([`crate::ikev1::phase1::Phase1State`]'s retained finals) and sent
+//! again, untouched, when the gateway repeats that message -- on the port the
+//! exchange floated to, and also on port 500 while it waits after a floated
+//! Aggressive Mode third message, which is where a gateway that never saw it
+//! (and so has not floated) repeats its second (RFC 3947 §5.3); a bit-for-bit
+//! repeat of a message the handshake already took is dropped, never read as
+//! the next one, and the whole wait for a message ends at its deadline, however
+//! many other datagrams come in meanwhile.
 //!
 //! What this does not do: recognise a repeat that the gateway re-encrypted
-//! (only identical bytes count); recover an Aggressive Mode third message lost
-//! after NAT-T floated (the gateway repeats its second to port 500 and the
-//! client listens on 4500); answer a Quick Mode or a Phase 1 that the gateway
-//! starts (this is an initiator only); or rekey the ISAKMP SA. Quick Mode's
-//! third message, sent by `connect` or by a rekey, is sent again only when the
-//! caller next reads the socket (`informational::peek`, `probe`, the next
-//! rekey), since nothing runs in the background.
+//! (only identical bytes count); measure the round-trip time the retransmission
+//! interval should follow (RFC 2408 §5.1 asks for it); answer a Quick Mode or a
+//! Phase 1 that the gateway starts (this is an initiator only); or rekey the
+//! ISAKMP SA. Quick Mode's third message, sent by `connect` or by a rekey, is
+//! sent again only when the caller next reads the socket
+//! (`informational::peek`, `probe`, the next rekey), since nothing runs in the
+//! background: a gateway whose Quick Mode message 2 is answered by nothing waits
+//! until then.
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
@@ -55,6 +60,7 @@ use crate::ikev1::phase1::{
     initiate_aggressive, initiate_main, Ikev1ExchangeMode, Ikev1LocalAuth, InitiatorConfig, Phase1State,
 };
 use crate::ikev1::quick::initiate_quick_with_pfs;
+use crate::ikev1::retransmit_waits;
 use crate::ikev1::xauth;
 use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
 use crate::transport::{DriverError, UdpTransport};
@@ -330,31 +336,98 @@ impl<E: Entropy> Client<E> {
     /// `floated` is `true` is dropped as unparseable-for-this-step, same as
     /// any other stray/foreign datagram.
     fn recv_matching(&self, want: &Awaiting) -> Result<Vec<u8>, DriverError> {
-        let transport = if want.floated {
-            self.natt_transport.as_ref().ok_or(IkeError::Crypto(
+        let transport = self.transport_for(want)?;
+        self.recv_matching_for(transport, want, transport.read_timeout()?)
+    }
+
+    /// The socket `want`'s messages arrive on: the port-4500 one once floated.
+    fn transport_for(&self, want: &Awaiting) -> Result<&UdpTransport, DriverError> {
+        if want.floated {
+            Ok(self.natt_transport.as_ref().ok_or(IkeError::Crypto(
                 "NAT-T floating required but this Client has no port-4500 socket (use Client::from_sockets)",
-            ))?
+            ))?)
         } else {
-            &self.transport
-        };
+            Ok(&self.transport)
+        }
+    }
+
+    /// [`Self::recv_matching`] for a wait of `wait` in all (`None`: never gives
+    /// up), on `transport`, whose read timeout is left as it was found.
+    fn recv_matching_for(&self, transport: &UdpTransport, want: &Awaiting, wait: Option<Duration>) -> Result<Vec<u8>, DriverError> {
         let bound = transport.read_timeout()?;
-        let result = self.recv_matching_until(transport, want, bound.map(|b| Instant::now() + b));
+        let result = self.recv_matching_until(transport, want, wait.map(|w| Instant::now() + w));
         transport.set_read_timeout(bound)?;
         result
     }
 
+    /// How long a wait on the floated socket lasts before the well-known port is
+    /// looked at ([`Self::answer_repeats_on_port_500`]).
+    const PORT_500_SLICE: Duration = Duration::from_millis(100);
+
+    /// How many datagrams one look at the well-known port takes, so that a flood
+    /// there cannot keep a wait from ending.
+    const PORT_500_LOOK_MAX: usize = 8;
+
+    /// One look at the well-known port while the exchange has floated to 4500 and
+    /// a final message of ours is waiting to be asked for: the gateway that never
+    /// saw our Aggressive Mode message 3 has not floated (it learns of NAT from
+    /// that very message, RFC 3947 §5.3), so it repeats its message 2 *there*
+    /// (RFC 2408 §3.1, Commit Bit NOTE), and nothing else would read it. What it
+    /// repeats, bit for bit, is answered with the retained final message, sent as
+    /// the exchange is now sent (floated); anything else on that port is dropped.
+    /// The socket is read without blocking beyond a poll (at most
+    /// [`Self::PORT_500_LOOK_MAX`] datagrams), and its read timeout is left as found.
+    fn answer_repeats_on_port_500(&self, want: &Awaiting) -> Result<(), DriverError> {
+        let Some((st, server)) = want.resend else { return Ok(()) };
+        let bound = self.transport.read_timeout()?;
+        self.transport.set_read_timeout(Some(Duration::from_millis(1)))?;
+        for _ in 0..Self::PORT_500_LOOK_MAX {
+            let Ok((raw, from)) = self.transport.recv_from() else { break };
+            match st.finals.answer_to(&raw) {
+                Some(final_message) => {
+                    ike_debug!("the gateway repeated a message our final message answered, on port 500 -- sending that final message again");
+                    if let Err(e) = self.send_step(&final_message, server, want.floated) {
+                        ike_debug!("failed to send the final message again: {e:?}");
+                    }
+                }
+                None => ike_debug!("dropping a datagram from {from} on port 500 ({} bytes): the exchange has floated to 4500", raw.len()),
+            }
+        }
+        self.transport.set_read_timeout(bound)?;
+        Ok(())
+    }
+
     /// [`Self::recv_matching`]'s loop, giving up at `deadline` (`None`: never).
+    /// While the exchange is floated and final messages of ours are retained
+    /// (`want.resend`), the wait is cut into slices of [`Self::PORT_500_SLICE`],
+    /// between which port 500 is looked at ([`Self::answer_repeats_on_port_500`]):
+    /// one thread, one socket read at a time, and the deadline is still absolute.
     fn recv_matching_until(&self, transport: &UdpTransport, want: &Awaiting, deadline: Option<Instant>) -> Result<Vec<u8>, DriverError> {
         let Awaiting { cky_i, cky_r, exchange_type, floated, .. } = *want;
+        let also_port_500 = floated && want.resend.is_some();
         loop {
+            let mut slice = None;
             if let Some(deadline) = deadline {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Err(io::Error::from(io::ErrorKind::TimedOut).into());
                 }
-                transport.set_read_timeout(Some(remaining))?;
+                slice = Some(remaining);
             }
-            let (raw, from) = transport.recv_from()?;
+            if also_port_500 {
+                slice = Some(slice.map_or(Self::PORT_500_SLICE, |s| s.min(Self::PORT_500_SLICE)));
+            }
+            if slice.is_some() {
+                transport.set_read_timeout(slice)?;
+            }
+            let (raw, from) = match transport.recv_from() {
+                Ok(read) => read,
+                Err(e) if also_port_500 && matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                    self.answer_repeats_on_port_500(want)?;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             let msg = if floated {
                 match unwrap_ike_4500(&raw) {
                     Some(m) => m.to_vec(),
@@ -408,42 +481,50 @@ impl<E: Entropy> Client<E> {
     /// How many times to resend a request (unchanged: same message-id and
     /// cookies, exactly what a retransmission must be) after its answer
     /// times out, before [`Self::send_and_await`] gives up and surfaces the
-    /// read timeout as a real error. RFC 2408 leaves retransmission timing
-    /// to the implementation; this crate doesn't run a full backoff timer,
-    /// just enough resends to ride out one lost UDP datagram without failing
-    /// the whole handshake over it.
+    /// timeout as a real error: enough resends to ride out a lost UDP datagram
+    /// without failing the whole handshake over it, and no more (RFC 2408 §5.1:
+    /// a retry counter, then RETRY LIMIT REACHED).
     ///
-    /// **Known deviation:** the wait between two sends is always the socket's
-    /// read timeout, a fixed timer, where RFC 2408 §5.1 says "Implementations
-    /// MUST NOT use a fixed timer" and that successive retransmissions "should
-    /// be separated by increasingly longer time intervals (e.g., exponential
-    /// backoff)". Backing off would also change how long a dead gateway takes to
-    /// be reported, which is the caller's timeout policy, so it is left as it is
-    /// and recorded here rather than presented as compliant.
+    /// The waits between the sends are not equal (RFC 2408 §5.1: "MUST NOT use a
+    /// fixed timer"): they grow as 1 : 2 : 4 ([`retransmit_waits`]) and add up
+    /// to the read timeout once for the first send and once for each
+    /// retransmission -- exactly what the caller's read timeout already asked a
+    /// dead gateway to be waited for, so that policy is unchanged. They do not
+    /// follow a measured round-trip time, which §5.1 also asks for.
     const MAX_RETRANSMITS: u32 = 2;
 
-    /// Send `msg` and wait for its matching reply via [`Self::recv_matching`],
-    /// resending `msg` up to [`Self::MAX_RETRANSMITS`] more times if the wait
-    /// times out before a match arrives. Every request/response round trip in
+    /// Send `msg` and wait for its matching reply via [`Self::recv_matching_for`],
+    /// resending `msg` up to [`Self::MAX_RETRANSMITS`] more times if a wait
+    /// times out before a match arrives, each wait longer than the one before it
+    /// (see [`Self::MAX_RETRANSMITS`]). Every request/response round trip in
     /// [`Self::connect`] used to be a bare `send_step` + `recv_matching`: a
     /// single, unacknowledged UDP send with no recovery if that one datagram
     /// (or its reply) is dropped -- the whole handshake just times out. This
     /// covers exactly that case. Each resend is the same bytes (nothing is
-    /// rebuilt, no IV advances: RFC 2409 §5), and the timeout that triggers it
-    /// is absolute (see [`Self::recv_matching`]), so stray datagrams cannot hold
-    /// the retransmission off.
+    /// rebuilt, no IV advances: RFC 2409 §5), and each wait is absolute (see
+    /// [`Self::recv_matching`]), so stray datagrams cannot hold the
+    /// retransmission off. A socket with no read timeout waits for ever, as
+    /// before, and so never retransmits.
     fn send_and_await(&self, msg: &[u8], server: SocketAddr, want: &Awaiting) -> Result<Vec<u8>, DriverError> {
         self.send_step(msg, server, want.floated)?;
+        let transport = self.transport_for(want)?;
+        let sends = Self::MAX_RETRANSMITS + 1;
+        let waits: Vec<Option<Duration>> = match transport.read_timeout()? {
+            Some(timeout) => retransmit_waits(timeout.saturating_mul(sends), sends).into_iter().map(Some).collect(),
+            None => vec![None],
+        };
+        let mut waits = waits.into_iter();
+        let mut wait = waits.next().flatten();
         let mut retransmits_left = Self::MAX_RETRANSMITS;
         loop {
-            match self.recv_matching(want) {
+            match self.recv_matching_for(transport, want, wait) {
                 Ok(reply) => return Ok(reply),
-                Err(DriverError::Io(e))
-                    if retransmits_left > 0 && matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
-                {
+                Err(DriverError::Io(e)) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                    let Some(next) = waits.next() else { return Err(DriverError::Io(e)) };
+                    wait = next;
                     retransmits_left -= 1;
                     ike_debug!(
-                        "retransmitting exchange={} after a read timeout ({retransmits_left} retransmit(s) left)",
+                        "retransmitting exchange={}, now waiting {wait:?} for the answer ({retransmits_left} retransmit(s) left)",
                         want.exchange_type
                     );
                     self.send_step(msg, server, want.floated)?;
@@ -1058,6 +1139,167 @@ mod tests {
             self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             self.thread.join().unwrap();
         }
+    }
+
+    /// A client that has floated to port 4500 (both sockets on loopback), and a
+    /// gateway at an address of its own -- port 4500 of it is where a floated
+    /// client sends -- with the socket it uses for port 500.
+    struct Floated {
+        client: Client<SeedEntropy>,
+        gateway_500: UdpSocket,
+        gateway_4500: UdpSocket,
+        server: SocketAddr,
+    }
+
+    fn floated_client(gateway_host: [u8; 4]) -> Floated {
+        let client = Client {
+            transport: UdpTransport::bind("127.0.0.1:0").unwrap(),
+            natt_transport: Some(UdpTransport::bind("127.0.0.1:0").unwrap()),
+            entropy: SeedEntropy::new(1),
+        };
+        let host = Ipv4Addr::from(gateway_host);
+        let gateway_4500 = UdpSocket::bind((host, crate::natt_port())).unwrap();
+        let gateway_500 = UdpSocket::bind((host, 0)).unwrap();
+        let server = gateway_500.local_addr().unwrap();
+        Floated { client, gateway_500, gateway_4500, server }
+    }
+
+    impl Floated {
+        fn port_500(&self) -> SocketAddr {
+            self.client.transport.local_addr().unwrap()
+        }
+
+        fn port_4500(&self) -> SocketAddr {
+            self.client.natt_transport.as_ref().unwrap().local_addr().unwrap()
+        }
+
+        /// What the gateway's port 4500 has received, without the non-ESP marker.
+        fn received_on_4500(&self, wait: Duration) -> Option<Vec<u8>> {
+            self.gateway_4500.set_read_timeout(Some(wait)).unwrap();
+            let mut buf = [0u8; 512];
+            let (n, _) = self.gateway_4500.recv_from(&mut buf).ok()?;
+            Some(unwrap_ike_4500(&buf[..n]).expect("a floated message carries the non-ESP marker").to_vec())
+        }
+    }
+
+    /// RFC 2408 §3.1 with RFC 3947 §5.3: the gateway that never saw our Aggressive
+    /// Mode message 3 has not floated, and repeats its message 2 to port 500. A
+    /// wait on port 4500 hears it there and sends the retained final message
+    /// again -- floated, untouched, while the wait goes on for what it really
+    /// awaits -- and leaves the sockets' timeouts as it found them.
+    #[test]
+    fn a_floated_wait_answers_a_repeat_on_port_500_with_the_retained_final_message() {
+        let f = floated_client([127, 78, 1, 1]);
+        f.client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let (cky_i, cky_r) = ([0xAA; 8], [0xBB; 8]);
+        let st = phase1_with_cookies(cky_i, cky_r);
+        let repeated = message(cky_i, cky_r, exchange::AGGRESSIVE, 0);
+        let mut our_final = message(cky_i, cky_r, exchange::AGGRESSIVE, 0);
+        our_final.extend_from_slice(b"our final message");
+        st.finals.retain(&repeated, &our_final);
+        let next = message(cky_i, cky_r, exchange::TRANSACTION, 12);
+
+        f.gateway_500.send_to(&repeated, f.port_500()).unwrap();
+        let (gateway_4500, to) = (f.gateway_4500.try_clone().unwrap(), f.port_4500());
+        let late = next.clone();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            gateway_4500.send_to(&wrap_ike_4500(&late), to).unwrap();
+        });
+        let got = f.client.recv_matching(&Awaiting::in_sa(&st, exchange::TRANSACTION, f.server).floated(true)).unwrap();
+        sender.join().unwrap();
+        assert_eq!(got, next, "the wait goes on for the message it awaits");
+        assert_eq!(f.received_on_4500(Duration::from_secs(2)), Some(our_final), "the retained final message, floated");
+        assert_eq!(f.client.transport.read_timeout().unwrap(), Some(Duration::from_secs(3)), "the port-500 socket's timeout must be left as it was");
+        assert_eq!(f.client.natt_transport.as_ref().unwrap().read_timeout().unwrap(), Some(Duration::from_secs(3)));
+    }
+
+    /// Datagrams on port 500 that no final message answered get nothing sent, and
+    /// however fast they come the wait still ends at its deadline: a look at the
+    /// port takes a few datagrams, not all that arrive.
+    #[test]
+    fn a_floated_wait_ends_at_its_deadline_however_fast_datagrams_reach_port_500() {
+        let f = floated_client([127, 78, 1, 2]);
+        f.client.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let (cky_i, cky_r) = ([0xAA; 8], [0xBB; 8]);
+        let st = phase1_with_cookies(cky_i, cky_r);
+        st.finals.retain(&message(cky_i, cky_r, exchange::AGGRESSIVE, 0), b"our final message");
+        let (stop, to) = (std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), f.port_500());
+        let flag = stop.clone();
+        let flood = std::thread::spawn(move || {
+            let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let similar = message(cky_i, cky_r, exchange::AGGRESSIVE, 1);
+            let end = std::time::Instant::now() + Duration::from_millis(1500);
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) && std::time::Instant::now() < end {
+                let _ = sender.send_to(&similar, to);
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let err = f.client.recv_matching(&Awaiting::in_sa(&st, exchange::TRANSACTION, f.server).floated(true)).unwrap_err();
+        let waited = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        flood.join().unwrap();
+        assert!(matches!(&err, DriverError::Io(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)), "{err:?}");
+        assert!(waited < Duration::from_millis(800), "waited {waited:?} for a 300 ms timeout");
+        assert_eq!(f.received_on_4500(Duration::from_millis(200)), None, "no final message answered any of them");
+    }
+
+    /// Without a final message of ours retained (`resend: None`) there is nothing a
+    /// repeat on port 500 could ask for, so that port is left alone: what waits
+    /// there is still there afterwards.
+    #[test]
+    fn a_floated_wait_with_nothing_to_resend_leaves_port_500_unread() {
+        let f = floated_client([127, 78, 1, 3]);
+        f.client.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let (cky_i, cky_r) = ([0xAA; 8], [0xBB; 8]);
+        let waiting = message(cky_i, cky_r, exchange::AGGRESSIVE, 0);
+        f.gateway_500.send_to(&waiting, f.port_500()).unwrap();
+
+        let want = Awaiting::new(cky_i, Some(cky_r), exchange::TRANSACTION).floated(true);
+        let err = f.client.recv_matching(&want).unwrap_err();
+        assert!(matches!(&err, DriverError::Io(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)), "{err:?}");
+        let still_there = f.client.recv_matching(&Awaiting::new(cky_i, Some(cky_r), exchange::AGGRESSIVE)).unwrap();
+        assert_eq!(still_there, waiting);
+    }
+
+    /// The times at which each of the sends of one request reaches a listener that
+    /// never answers, and when `send_and_await` gave up.
+    fn send_times_of_an_unanswered_request(read_timeout: Duration) -> (Vec<std::time::Instant>, Duration) {
+        let client = Client { transport: UdpTransport::bind("127.0.0.1:0").unwrap(), natt_transport: None, entropy: SeedEntropy::new(1) };
+        client.set_read_timeout(Some(read_timeout)).unwrap();
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        listener.set_read_timeout(Some(read_timeout * 5)).unwrap();
+        let recorder = std::thread::spawn(move || {
+            let mut buf = [0u8; 128];
+            let mut times = Vec::new();
+            while listener.recv_from(&mut buf).is_ok() {
+                times.push(std::time::Instant::now());
+            }
+            times
+        });
+        let started = std::time::Instant::now();
+        let err = client.send_and_await(&blank_header(exchange::MAIN), listener_addr, &Awaiting::new([0xAA; 8], None, exchange::AGGRESSIVE)).unwrap_err();
+        let gave_up_after = started.elapsed();
+        assert!(matches!(&err, DriverError::Io(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)), "{err:?}");
+        (recorder.join().unwrap(), gave_up_after)
+    }
+
+    /// RFC 2408 §5.1: "Implementations MUST NOT use a fixed timer" and successive
+    /// retransmissions are "separated by increasingly longer time intervals".
+    /// Every wait is longer than the one before it, and the request is given up on
+    /// when the read timeout, once for the send and once for each retransmission,
+    /// says so -- the time a caller was already told to wait for a dead gateway.
+    #[test]
+    fn send_and_await_separates_its_retransmissions_by_longer_and_longer_intervals() {
+        let read_timeout = Duration::from_millis(500);
+        let (times, gave_up_after) = send_times_of_an_unanswered_request(read_timeout);
+        assert_eq!(times.len() as u32, Client::<SeedEntropy>::MAX_RETRANSMITS + 1);
+        let gaps: Vec<Duration> = times.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.windows(2).all(|g| g[1] >= g[0] + Duration::from_millis(100)), "the waits between the sends were {gaps:?}");
+        let budget = read_timeout * (Client::<SeedEntropy>::MAX_RETRANSMITS + 1);
+        assert!(gave_up_after >= budget - Duration::from_millis(50) && gave_up_after < budget + Duration::from_millis(600), "gave up after {gave_up_after:?}, budget {budget:?}");
     }
 
     /// With no reply at all, `send_and_await` must give up after

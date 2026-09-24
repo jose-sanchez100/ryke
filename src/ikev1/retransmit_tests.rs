@@ -4,6 +4,7 @@
 //! the gateway never sees, repeats, or sends twice.
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use super::cfg;
@@ -17,6 +18,7 @@ use super::xauth::test_gateway;
 use crate::crypto::DhGroup;
 use crate::entropy::SeedEntropy;
 use crate::esp::ChildSa;
+use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
 use crate::ikev2::sk::SkCipher;
 use crate::transport::DriverError;
 
@@ -48,6 +50,12 @@ struct Script {
     late_request_repeat: bool,
     /// The gateway also serves a Mode-Config round (after XAUTH, before Quick Mode).
     mode_cfg: bool,
+    /// The client forces NAT traversal, so both sides float to port 4500 with
+    /// Aggressive Mode's message 3 (RFC 3947 §5.3): the gateway has a socket on
+    /// port 4500 of its own address, and everything from message 3 on goes
+    /// there, with the non-ESP marker. A gateway that never saw message 3 has not
+    /// floated yet, so what it repeats -- message 2 -- still goes to port 500.
+    floated: bool,
 }
 
 struct Report {
@@ -62,6 +70,11 @@ struct Report {
 
 struct Gateway {
     sock: UdpSocket,
+    /// Port 4500 of the gateway's address, for a `floated` script.
+    natt: Option<UdpSocket>,
+    /// Everything the gateway sends and reads now goes through `natt`.
+    on_4500: bool,
+    peer4500: Option<SocketAddr>,
     script: Script,
     entropy: SeedEntropy,
     peer: Option<SocketAddr>,
@@ -70,14 +83,27 @@ struct Gateway {
     /// first message of the next exchange, ahead of a retransmission), for the
     /// step that reads them.
     pending: Vec<Vec<u8>>,
+    /// Set while the gateway waits for the message 3 it has not seen (see
+    /// [`Self::send_repeat`]).
+    repeats_on_500: bool,
 }
 
 impl Gateway {
     fn send(&self, msg: &[u8]) {
-        let peer = self.peer.expect("the client has written by now");
-        self.sock.send_to(msg, peer).unwrap();
+        self.send_once(msg);
         if self.script.duplicate_replies {
-            self.sock.send_to(msg, peer).unwrap();
+            self.send_once(msg);
+        }
+    }
+
+    fn send_once(&self, msg: &[u8]) {
+        match &self.natt {
+            Some(natt) if self.on_4500 => {
+                natt.send_to(&wrap_ike_4500(msg), self.peer4500.expect("the client has written to port 4500 by now")).unwrap();
+            }
+            _ => {
+                self.sock.send_to(msg, self.peer.expect("the client has written by now")).unwrap();
+            }
         }
     }
 
@@ -95,9 +121,21 @@ impl Gateway {
     fn recv_socket(&mut self, exchange_type: u8) -> Result<Vec<u8>, String> {
         let mut buf = [0u8; 8192];
         loop {
-            let (n, from) = self.sock.recv_from(&mut buf).map_err(|e| format!("gateway: waiting for exchange type {exchange_type}: {e}"))?;
-            self.peer.get_or_insert(from);
-            let datagram = buf[..n].to_vec();
+            let datagram = match &self.natt {
+                Some(natt) if self.on_4500 => {
+                    let (n, from) = natt.recv_from(&mut buf).map_err(|e| format!("gateway: waiting on port 4500 for exchange type {exchange_type}: {e}"))?;
+                    self.peer4500.get_or_insert(from);
+                    match unwrap_ike_4500(&buf[..n]) {
+                        Some(message) => message.to_vec(),
+                        None => continue,
+                    }
+                }
+                _ => {
+                    let (n, from) = self.sock.recv_from(&mut buf).map_err(|e| format!("gateway: waiting for exchange type {exchange_type}: {e}"))?;
+                    self.peer.get_or_insert(from);
+                    buf[..n].to_vec()
+                }
+            };
             if IsakmpHeader::parse(&datagram).is_ok_and(|h| h.exchange_type == exchange_type) {
                 return Ok(datagram);
             }
@@ -124,7 +162,7 @@ impl Gateway {
     /// exchange type meanwhile (the first message of what follows) is kept for
     /// the next step.
     fn lose_then_repeat(&mut self, lost: Vec<u8>, own: &[u8], exchange_type: u8, request: &[u8]) -> Result<(), String> {
-        self.send(own);
+        self.send_repeat(own);
         loop {
             let datagram = self.recv_socket(exchange_type)?;
             if datagram == lost {
@@ -132,10 +170,21 @@ impl Gateway {
                 return Ok(());
             }
             if datagram == request {
-                self.send(own);
+                self.send_repeat(own);
             } else {
                 self.pending.push(datagram);
             }
+        }
+    }
+
+    /// The gateway repeating `own` because the client's answer never came. On
+    /// the well-known port while the gateway has not floated: it has not seen
+    /// the message that would have told it the client did (RFC 3947 §5.3).
+    fn send_repeat(&self, own: &[u8]) {
+        if self.natt.is_some() && self.on_4500 && self.repeats_on_500 {
+            self.sock.send_to(own, self.peer.expect("the client has written by now")).unwrap();
+        } else {
+            self.send(own);
         }
     }
 
@@ -163,9 +212,12 @@ impl Gateway {
         let msg1 = self.recv(exchange::AGGRESSIVE)?;
         let (msg2, st) = respond_aggressive(cfg, &msg1, &mut self.entropy, our_addr, self.peer.unwrap()).map_err(|e| format!("gateway: msg1: {e:?}"))?;
         self.send(&msg2);
+        self.on_4500 = self.natt.is_some();
         let msg3 = self.recv_answering(exchange::AGGRESSIVE, &msg1, &msg2)?;
         if self.script.lose_am_msg3 {
+            self.repeats_on_500 = true;
             self.lose_then_repeat(msg3.clone(), &msg2, exchange::AGGRESSIVE, &msg1)?;
+            self.repeats_on_500 = false;
         }
         st.verify_hash_i(&msg3).map_err(|e| format!("gateway: msg3: {e:?}"))?;
         Ok(st)
@@ -244,7 +296,7 @@ fn initiator_config(script: Script) -> InitiatorConfig {
         mode: if script.main_mode { Ikev1ExchangeMode::Main } else { Ikev1ExchangeMode::Aggressive },
         p1_lifetime_secs: 28800,
         p2_lifetime_secs: 3600,
-        force_natt: false,
+        force_natt: script.floated,
     }
 }
 
@@ -259,14 +311,39 @@ struct Run {
 /// `connect` against a gateway following `script`, with a short read timeout so
 /// that a failure shows quickly.
 fn connect(script: Script) -> Run {
-    let gw_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    // A floating client sends to port 4500 of the gateway's address, whatever
+    // port the gateway's first socket has: each such run takes an address of its
+    // own, so that runs in parallel never share the port.
+    static NEXT_GATEWAY_HOST: AtomicU8 = AtomicU8::new(1);
+    let host = if script.floated { Ipv4Addr::new(127, 77, NEXT_GATEWAY_HOST.fetch_add(1, Ordering::Relaxed), 1) } else { Ipv4Addr::LOCALHOST };
+    let gw_sock = UdpSocket::bind((host, 0)).unwrap();
     gw_sock.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+    let natt = script.floated.then(|| {
+        let natt = UdpSocket::bind((host, crate::natt_port())).unwrap();
+        natt.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+        natt
+    });
     let gateway_addr = gw_sock.local_addr().unwrap();
-    let gateway = Gateway { sock: gw_sock, script, entropy: SeedEntropy::new(0x2222), peer: None, resent: Vec::new(), pending: Vec::new() };
+    let gateway = Gateway {
+        sock: gw_sock,
+        natt,
+        on_4500: false,
+        peer4500: None,
+        script,
+        entropy: SeedEntropy::new(0x2222),
+        peer: None,
+        resent: Vec::new(),
+        pending: Vec::new(),
+        repeats_on_500: false,
+    };
     let gateway = std::thread::spawn(move || gateway.serve());
 
     let client_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let mut client = Client::from_socket(client_sock.try_clone().unwrap(), SeedEntropy::new(0x1111));
+    let mut client = if script.floated {
+        Client::from_sockets(client_sock.try_clone().unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap(), SeedEntropy::new(0x1111))
+    } else {
+        Client::from_socket(client_sock.try_clone().unwrap(), SeedEntropy::new(0x1111))
+    };
     client.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
     let established = client.connect(gateway_addr, &initiator_config(script));
     Run { established, client_sock, gateway_addr, gateway }
@@ -303,6 +380,31 @@ fn aggressive_mode_survives_every_gateway_reply_arriving_twice() {
 #[test]
 fn aggressive_mode_message_3_is_sent_again_when_the_gateway_repeats_message_2() {
     let run = connect(Script { lose_am_msg3: true, ..Script::default() });
+    let est = run.established.expect("the handshake must complete");
+    let report = run.gateway.join().unwrap().expect("gateway");
+    assert_resent_identically(&report, 1);
+    assert_eq!(est.child.inbound.spi(), report.child.outbound.spi());
+}
+
+/// Control for the floated harness: with forced NAT traversal both sides move
+/// to port 4500 with message 3, and nothing lost, the handshake completes there.
+#[test]
+fn control_a_floated_aggressive_mode_handshake_completes_on_port_4500() {
+    let run = connect(Script { floated: true, ..Script::default() });
+    let est = run.established.expect("the handshake must complete");
+    let report = run.gateway.join().unwrap().expect("gateway");
+    assert!(est.phase1.floated, "the handshake was to float");
+    assert_resent_identically(&report, 0);
+    assert_eq!(est.child.inbound.spi(), report.child.outbound.spi());
+}
+
+/// RFC 2408 §3.1 with RFC 3947 §5.3: message 3 goes out on port 4500, the
+/// gateway never sees it, and it has not floated yet, so it repeats message 2
+/// to port 500 -- where the initiator, now listening on 4500, must still hear
+/// it and send the same message 3 again.
+#[test]
+fn a_floated_aggressive_mode_message_3_is_sent_again_when_the_gateway_repeats_message_2_on_port_500() {
+    let run = connect(Script { floated: true, lose_am_msg3: true, ..Script::default() });
     let est = run.established.expect("the handshake must complete");
     let report = run.gateway.join().unwrap().expect("gateway");
     assert_resent_identically(&report, 1);

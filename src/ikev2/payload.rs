@@ -65,6 +65,12 @@ pub mod transform_id {
     /// proposal but names nothing we run -- a private-use ID no candidate list
     /// holds -- so it is never selected, yet still counts as a transform of its
     /// type that was offered (or answered). Never sent.
+    ///
+    /// This is the *selectable* side of such a transform only: the ID it was
+    /// sent with is gone from the [`Transform`](super::Transform), and is kept
+    /// alongside it by the crate's `ReceivedSa` for what depends on it (the
+    /// group a KE payload must find in a proposal, RFC 7296 §3.4). It is not
+    /// a stand-in for that ID -- it names no group, so it is no group's match.
     pub const UNUSABLE: u16 = 0xFFFF;
 }
 
@@ -93,7 +99,9 @@ fn push_u16(out: &mut Vec<u8>, value: u16) {
 /// transform of its type that names [`transform_id::UNUSABLE`] -- never
 /// selected, but not gone either, because what the peer offered or answered
 /// is more than the transforms we could use (a type it insisted on, two
-/// transforms where one was to be answered).
+/// transforms where one was to be answered). What ID it was sent with, for
+/// what depends on the group a transform names rather than on whether we can
+/// take it, is kept by the crate's `ReceivedSa`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transform {
     pub transform_type: u8,
@@ -103,12 +111,14 @@ pub struct Transform {
 }
 
 impl Transform {
-    /// Parse one transform from the front of `buf`; returns it and the number of
-    /// bytes consumed (its declared Transform Length). One that carries an
-    /// attribute we do not understand is RFC 7296 §3.3.6's unacceptable
-    /// transform: it comes back as [`transform_id::UNUSABLE`] of its type,
-    /// while other transforms of the type still count.
-    fn parse(buf: &[u8]) -> Result<(Transform, usize), IkeError> {
+    /// Parse one transform from the front of `buf`; returns it, the Transform
+    /// ID it was sent with, and the number of bytes consumed (its declared
+    /// Transform Length). One that carries an attribute we do not understand
+    /// is RFC 7296 §3.3.6's unacceptable transform: it comes back as
+    /// [`transform_id::UNUSABLE`] of its type, while other transforms of the
+    /// type still count -- and the ID it was sent with is the second value,
+    /// which is the transform's own ID for any other.
+    fn parse(buf: &[u8]) -> Result<(Transform, u16, usize), IkeError> {
         if buf.len() < 8 {
             return Err(IkeError::Truncated { need: 8, have: buf.len() });
         }
@@ -120,12 +130,12 @@ impl Transform {
             return Err(IkeError::BadLength { declared: length, available: buf.len() });
         }
         let transform_type = buf[4];
-        let transform_id = u16be(buf, 6);
+        let sent_id = u16be(buf, 6);
         let transform = match Self::read_attributes(&buf[8..length])? {
-            Some(key_length) => Transform { transform_type, transform_id, key_length },
+            Some(key_length) => Transform { transform_type, transform_id: sent_id, key_length },
             None => Transform { transform_type, transform_id: transform_id::UNUSABLE, key_length: None },
         };
-        Ok((transform, length))
+        Ok((transform, sent_id, length))
     }
 
     /// The Key Length in a transform's attribute area (RFC 7296 §3.3.5):
@@ -192,7 +202,9 @@ pub struct Proposal {
 }
 
 impl Proposal {
-    fn parse(buf: &[u8]) -> Result<(Proposal, usize), IkeError> {
+    /// Parse one proposal from the front of `buf`: it, the Transform ID each of
+    /// its transforms was sent with ([`Transform::parse`]), and the bytes consumed.
+    fn parse(buf: &[u8]) -> Result<(Proposal, Vec<u16>, usize), IkeError> {
         if buf.len() < 8 {
             return Err(IkeError::Truncated { need: 8, have: buf.len() });
         }
@@ -214,16 +226,18 @@ impl Proposal {
 
         let mut off = 8 + spi_size;
         let mut transforms = Vec::with_capacity(transform_count);
+        let mut sent_ids = Vec::with_capacity(transform_count);
         for _ in 0..transform_count {
-            let (transform, consumed) = Transform::parse(&buf[off..length])?;
+            let (transform, sent_id, consumed) = Transform::parse(&buf[off..length])?;
             transforms.push(transform);
+            sent_ids.push(sent_id);
             off += consumed;
         }
         // The transforms fill the proposal: its Length has no room for more.
         if off != length {
             return Err(IkeError::BadLength { declared: length, available: off });
         }
-        Ok((Proposal { num, protocol_id, spi, transforms }, length))
+        Ok((Proposal { num, protocol_id, spi, transforms }, sent_ids, length))
     }
 
     fn write(&self, out: &mut Vec<u8>, is_last: bool) {
@@ -252,14 +266,7 @@ pub struct SecurityAssociation {
 
 impl SecurityAssociation {
     pub fn parse(body: &[u8]) -> Result<SecurityAssociation, IkeError> {
-        let mut off = 0;
-        let mut proposals = Vec::new();
-        while off < body.len() {
-            let (proposal, consumed) = Proposal::parse(&body[off..])?;
-            proposals.push(proposal);
-            off += consumed;
-        }
-        Ok(SecurityAssociation { proposals })
+        ReceivedSa::parse(body).map(|received| received.sa)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -268,6 +275,58 @@ impl SecurityAssociation {
             proposal.write(&mut out, i + 1 == self.proposals.len());
         }
         out
+    }
+}
+
+/// An SA payload as received, with what [`SecurityAssociation::parse`] cannot
+/// say in a [`Transform`]: the Transform ID each transform was sent with.
+///
+/// A transform we cannot take -- one with an attribute this crate does not
+/// understand -- is unacceptable, not absent (RFC 7296 §3.3.6): it is
+/// parsed as [`transform_id::UNUSABLE`] of its type, which no selection can
+/// pick. That says it is not selectable, and only that; *which* group or
+/// algorithm it names is a fact of its own, and is what the group of a KE
+/// payload is matched against (§1.3, §3.4: some proposal of the message names
+/// it, whatever that transform carries). Keeping the two apart -- the
+/// placeholder for selection, the ID sent for naming -- is what stops an
+/// unacceptable transform from either being selected or standing for any
+/// group at all.
+///
+/// The public [`SecurityAssociation`] and [`Transform`] stay as they were:
+/// callers build them field by field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReceivedSa {
+    /// The proposals as [`SecurityAssociation::parse`] gives them.
+    pub sa: SecurityAssociation,
+    /// `sent_ids[p][t]`: the Transform ID that `sa.proposals[p].transforms[t]`
+    /// was sent with.
+    sent_ids: Vec<Vec<u16>>,
+}
+
+impl ReceivedSa {
+    /// Parse the SA payload body `body`.
+    pub(crate) fn parse(body: &[u8]) -> Result<ReceivedSa, IkeError> {
+        let mut off = 0;
+        let mut proposals = Vec::new();
+        let mut sent_ids = Vec::new();
+        while off < body.len() {
+            let (proposal, sent, consumed) = Proposal::parse(&body[off..])?;
+            proposals.push(proposal);
+            sent_ids.push(sent);
+            off += consumed;
+        }
+        Ok(ReceivedSa { sa: SecurityAssociation { proposals }, sent_ids })
+    }
+
+    /// Whether some proposal names `id` as a transform of type `transform_type`,
+    /// whatever that transform carries and whether or not we could take it: an
+    /// unacceptable transform still names what it was sent with.
+    pub(crate) fn names(&self, transform_type: u8, id: u16) -> bool {
+        self.sa
+            .proposals
+            .iter()
+            .zip(&self.sent_ids)
+            .any(|(proposal, sent)| proposal.transforms.iter().zip(sent).any(|(t, &sent_id)| t.transform_type == transform_type && sent_id == id))
     }
 }
 
@@ -1952,6 +2011,79 @@ mod tests {
                 unusable(transform_type::DH),
             ]
         );
+    }
+
+    /// RFC 7296 §3.3.6, §3.4: a transform we cannot take is unacceptable, and it still names what it
+    /// was sent with -- the group a KE payload has to find in some proposal. Parsed for selection it
+    /// is the [`transform_id::UNUSABLE`] of its type (the public `SecurityAssociation` is what it was),
+    /// and `ReceivedSa` keeps the ID it was sent with beside it: it names that, and nothing else, and
+    /// only as the type it was sent as.
+    #[test]
+    fn a_transform_we_cannot_take_names_what_it_was_sent_with_and_no_other() {
+        use super::test_wire::{proposal, sa, transform, KEY_LENGTH_128, KEY_LENGTH_256, UNKNOWN_ATTRIBUTE};
+        let body = sa(&[
+            proposal(
+                1,
+                protocol_id::ESP,
+                &[1, 2, 3, 4],
+                &[
+                    transform(transform_type::ENCR, transform_id::AES_GCM_16, &KEY_LENGTH_256),
+                    transform(transform_type::DH, transform_id::X25519, &UNKNOWN_ATTRIBUTE),
+                    transform(transform_type::DH, 0, &[]),
+                    transform(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, &UNKNOWN_ATTRIBUTE),
+                ],
+            ),
+            proposal(2, protocol_id::ESP, &[1, 2, 3, 4], &[transform(transform_type::DH, transform_id::MODP_2048, &KEY_LENGTH_128)]),
+        ]);
+        let received = ReceivedSa::parse(&body).unwrap();
+
+        // Selection sees what it always saw.
+        assert_eq!(received.sa, SecurityAssociation::parse(&body).unwrap());
+        let dh = |p: usize| received.sa.proposals[p].transforms.iter().filter(|t| t.transform_type == transform_type::DH).cloned().collect::<Vec<_>>();
+        assert_eq!(
+            dh(0),
+            [
+                Transform { transform_type: transform_type::DH, transform_id: transform_id::UNUSABLE, key_length: None },
+                Transform { transform_type: transform_type::DH, transform_id: 0, key_length: None },
+            ],
+            "the unacceptable transform is the placeholder, and there are two of them"
+        );
+
+        // Naming sees what was sent: an unreadable X25519 is X25519, and a NONE is a NONE...
+        assert!(received.names(transform_type::DH, transform_id::X25519));
+        assert!(received.names(transform_type::DH, 0));
+        // ... a group with a Key Length it must not have is named too, though it is not one we take.
+        assert!(received.names(transform_type::DH, transform_id::MODP_2048));
+        // Nothing else: not any group the placeholder could be mistaken for...
+        for id in [transform_id::MODP_1024, transform_id::ECP256, transform_id::UNUSABLE] {
+            assert!(!received.names(transform_type::DH, id), "group {id}");
+        }
+        // ... and not as another type: the X25519 ID is not an algorithm of any other transform type.
+        for ty in [transform_type::ENCR, transform_type::PRF, transform_type::INTEG, transform_type::ESN] {
+            assert!(!received.names(ty, transform_id::X25519), "type {ty}");
+        }
+        assert!(received.names(transform_type::ENCR, transform_id::AES_GCM_16));
+        assert!(received.names(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128), "an unreadable INTEG names its algorithm too");
+    }
+
+    /// The ID a transform was sent with is kept per transform of the message, however many proposals
+    /// and however they are ordered -- an SA with no proposal names nothing.
+    #[test]
+    fn a_received_sa_names_by_the_proposal_and_the_transform_it_was_sent_in() {
+        use super::test_wire::{proposal, sa, transform, UNKNOWN_ATTRIBUTE};
+        assert!(!ReceivedSa::parse(&[]).unwrap().names(transform_type::DH, 0));
+        let esp = |num: u8, dh: &[(u16, bool)]| {
+            let transforms: Vec<Vec<u8>> =
+                dh.iter().map(|&(id, readable)| transform(transform_type::DH, id, if readable { &[] } else { &UNKNOWN_ATTRIBUTE })).collect();
+            proposal(num, protocol_id::ESP, &[1, 2, 3, 4], &transforms)
+        };
+        // The second proposal's unreadable group, after readable transforms of other IDs in the first.
+        let received = ReceivedSa::parse(&sa(&[esp(1, &[(transform_id::MODP_2048, true), (0, true)]), esp(2, &[(transform_id::ECP256, false)])])).unwrap();
+        for (id, named) in [(transform_id::MODP_2048, true), (0, true), (transform_id::ECP256, true), (transform_id::X25519, false)] {
+            assert_eq!(received.names(transform_type::DH, id), named, "group {id}");
+        }
+        // And the malformed stays malformed, whichever way it is parsed.
+        assert!(ReceivedSa::parse(&[0, 0, 0]).is_err());
     }
 
     #[test]

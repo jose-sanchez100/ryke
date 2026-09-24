@@ -199,7 +199,7 @@ pub(crate) fn esp_spi(proposal: &Proposal) -> Result<u32, IkeError> {
 /// runs AES-GCM-16/256 (`esp::ChildSa::derive`), so that is what is taken:
 /// the first ESP proposal offering it without ESN, with one transform of each
 /// type the proposal included, numbered as the peer did and carrying our
-/// `child_spi` ([`rekey::choose_child_proposal`], as for a CHILD SA rekey the
+/// `child_spi` ([`rekey::select_child_proposal`], as for a CHILD SA rekey the
 /// peer starts). A DH group in SAi2 -- which §1.2 rules out, and older
 /// versions of this crate sent -- is passed over rather than run: there is no
 /// KE in `IKE_AUTH`.
@@ -208,7 +208,7 @@ pub(crate) fn answer_esp_offer(sai2: &SecurityAssociation, child_spi: u32) -> Op
     for p in &mut sai2.proposals {
         p.transforms.retain(|t| t.transform_type != transform_type::DH || t.transform_id == 0);
     }
-    let (proposal, peer_spi, _) = rekey::choose_child_proposal(&sai2, SkCipher::Aes256Gcm, child_spi, None, &rekey::PfsPolicy::none()).ok()?;
+    let (proposal, peer_spi, _) = rekey::select_child_proposal(&sai2, SkCipher::Aes256Gcm, child_spi, None, &rekey::PfsPolicy::none()).ok()?;
     Some((proposal, peer_spi))
 }
 

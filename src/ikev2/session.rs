@@ -3766,6 +3766,19 @@ mod tests {
         ke: Option<crate::ikev2::payload::KeyExchange>,
         ts: &TrafficSelectors,
     ) -> Vec<u8> {
+        hand_built_peer_rekey_wire(sa, rekeyed_spi, &SecurityAssociation { proposals }.to_bytes(), ke, ts)
+    }
+
+    /// [`hand_built_peer_rekey_with_ts`] with the SA payload body `sa_body` as it goes on
+    /// the wire -- proposals `SecurityAssociation` cannot express, with an
+    /// attribute we do not understand.
+    fn hand_built_peer_rekey_wire(
+        sa: &CompletedSaInit,
+        rekeyed_spi: u32,
+        sa_body: &[u8],
+        ke: Option<crate::ikev2::payload::KeyExchange>,
+        ts: &TrafficSelectors,
+    ) -> Vec<u8> {
         use crate::ikev2::message::{encode_payload_chain, first_payload_type};
         use crate::ikev2::payload::Notify;
 
@@ -3773,7 +3786,7 @@ mod tests {
             Notify { protocol_id: protocol_id::ESP, spi: rekeyed_spi.to_be_bytes().to_vec(), notify_type: notify_type::REKEY_SA, data: Vec::new() };
         let mut inner = vec![
             (PayloadType::Notify, rekey_sa.to_bytes()),
-            (PayloadType::SecurityAssociation, SecurityAssociation { proposals }.to_bytes()),
+            (PayloadType::SecurityAssociation, sa_body.to_vec()),
             (PayloadType::Nonce, PEER_NI.to_vec()),
         ];
         inner.extend(ke.map(|ke| (PayloadType::KeyExchange, ke.to_bytes())));
@@ -3862,6 +3875,153 @@ mod tests {
         )
         .expect("answered without PFS");
         assert_eq!(liveness.take_peer_rekeys().len(), 1);
+    }
+
+    /// The ESP proposals of a gateway's rekey as they go on the wire, one per entry of
+    /// `dh`, numbered from 1: AES-GCM-256 without ESN and the DH transforms `(id, readable)`
+    /// of the entry -- one that is not `readable` carries an attribute we do not understand
+    /// (RFC 7296 §3.3.6).
+    fn wire_esp_offer(dh: &[&[(u16, bool)]]) -> Vec<u8> {
+        use crate::ikev2::payload::test_wire::{proposal, sa, transform, KEY_LENGTH_256, UNKNOWN_ATTRIBUTE};
+        use crate::ikev2::payload::{transform_id, transform_type};
+
+        let proposals: Vec<Vec<u8>> = (1u8..)
+            .zip(dh)
+            .map(|(num, dh)| {
+                let mut transforms = vec![
+                    transform(transform_type::ENCR, transform_id::AES_GCM_16, &KEY_LENGTH_256),
+                    transform(transform_type::ESN, transform_id::ESN_NONE, &[]),
+                ];
+                transforms.extend(dh.iter().map(|&(id, readable)| transform(transform_type::DH, id, if readable { &[] } else { &UNKNOWN_ATTRIBUTE })));
+                proposal(num, protocol_id::ESP, &PEER_NEW_SPI.to_be_bytes(), &transforms)
+            })
+            .collect();
+        sa(&proposals)
+    }
+
+    /// RFC 7296 §1.3, §3.4: the KE of a rekey names a DH group of one of its proposals -- what
+    /// the group's transform carries changes nothing about that. A transform we cannot read
+    /// (§3.3.6) still names the group it was sent with: one of MODP-2048 does not stand for
+    /// the X25519 of the KE, and one of X25519 does not stop being X25519 for being unacceptable.
+    /// So a KE of a group no proposal names is a malformed request, `INVALID_SYNTAX` and the end of
+    /// the IKE SA (§2.21.3), whatever transform is unreadable next to it; a group named but never
+    /// offered in a transform we can take is only `NO_PROPOSAL_CHOSEN`; and an alternative that we
+    /// can take -- a NONE the policy allows, the group in another transform or another proposal --
+    /// still completes the negotiation.
+    #[test]
+    fn a_peer_rekey_ke_group_is_named_by_a_transform_we_can_read_or_not_and_only_by_what_it_names() {
+        use crate::ikev2::payload::transform_id::{MODP_2048, X25519};
+        use crate::ikev2::payload::KeyExchange;
+
+        enum Outcome {
+            /// Answered with the proposal `.0`, on PFS in the group `.1`.
+            Answered(u8, Option<u16>),
+            Refused(u16, Vec<u8>),
+            /// `INVALID_SYNTAX`: the IKE SA is gone.
+            Malformed,
+        }
+        use Outcome::{Answered, Malformed, Refused};
+        /// What the session runs, what the peer offers, the group of its KE, and what comes of it.
+        type Case = (&'static str, PfsPolicy, Vec<&'static [(u16, bool)]>, u16, Outcome);
+
+        let optional = || PfsPolicy::none();
+        let required_x25519 = || PfsPolicy::from_offer(&gcm_esp_offer_with_dh(0, &[X25519])).unwrap();
+        let no_proposal = || Refused(notify_type::NO_PROPOSAL_CHOSEN, Vec::new());
+        let cases: Vec<Case> = vec![
+            ("A: X25519 unreadable + NONE, KE X25519", optional(), vec![&[(X25519, false), (0, true)]], X25519, Answered(1, None)),
+            ("B: MODP-2048 + NONE, KE X25519, which no proposal names", optional(), vec![&[(MODP_2048, true), (0, true)]], X25519, Malformed),
+            ("C: MODP-2048 unreadable + NONE, KE X25519, which no proposal names", optional(), vec![&[(MODP_2048, false), (0, true)]], X25519, Malformed),
+            ("C, MODP-2048 unreadable alone", optional(), vec![&[(MODP_2048, false)]], X25519, Malformed),
+            ("X25519 unreadable alone, KE X25519: named, nothing to take", optional(), vec![&[(X25519, false)]], X25519, no_proposal()),
+            ("X25519 unreadable and X25519, in one proposal", optional(), vec![&[(X25519, false), (X25519, true)]], X25519, Answered(1, Some(X25519))),
+            ("X25519 unreadable, then X25519 in another proposal", optional(), vec![&[(X25519, false)], &[(X25519, true)]], X25519, Answered(2, Some(X25519))),
+            (
+                "X25519 unreadable and MODP-2048 in one proposal: the group we can take is asked for",
+                optional(),
+                vec![&[(X25519, false), (MODP_2048, true)]],
+                X25519,
+                Refused(notify_type::INVALID_KE_PAYLOAD, MODP_2048.to_be_bytes().to_vec()),
+            ),
+            (
+                "an unreadable MODP-2048 + NONE, and X25519 in another proposal, which names the KE's group",
+                optional(),
+                vec![&[(MODP_2048, false), (0, true)], &[(X25519, true)]],
+                X25519,
+                Answered(1, None),
+            ),
+            ("PFS required: X25519 unreadable + NONE takes no NONE", required_x25519(), vec![&[(X25519, false), (0, true)]], X25519, no_proposal()),
+            ("PFS required: X25519 unreadable + NONE, then X25519", required_x25519(), vec![&[(X25519, false), (0, true)], &[(X25519, true)]], X25519, Answered(2, Some(X25519))),
+            ("PFS required: X25519, control", required_x25519(), vec![&[(X25519, true)]], X25519, Answered(1, Some(X25519))),
+            // 20 is the ID of AES-GCM-16, the offer's ENCR transform, and of ECP-384: a group only a DH transform can name.
+            ("a KE of 20, the number of the ENCR transform, no DH names it", optional(), vec![&[(MODP_2048, true), (0, true)]], 20, Malformed),
+            ("PFS required: a KE of 20, the number of the ENCR transform", required_x25519(), vec![&[(X25519, true)]], 20, Malformed),
+        ];
+        for (what, pfs, offer, ke_group, outcome) in cases {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut liveness = session_facing(&gateway, init_sa, None);
+            liveness.pfs = pfs;
+            let group = if ke_group == X25519 { DhGroup::X25519 } else { DhGroup::Modp2048 };
+            let ke = KeyExchange { dh_group: ke_group, data: group.public(&PEER_DH) };
+            let request = hand_built_peer_rekey_wire(&resp_sa, 0xAAAA, &wire_esp_offer(&offer), Some(ke), &TrafficSelectors::ipv4_full_tunnel());
+
+            let alive = if matches!(outcome, Malformed) { Liveness::PeerTornDown } else { Liveness::Alive };
+            let taken_on = matches!(outcome, Answered(..));
+            assert_eq!(deliver(&mut liveness, &gateway, &request), alive, "{what}");
+            let answer = sent_to(&gateway).unwrap_or_else(|| panic!("{what}: answered"));
+            match outcome {
+                Answered(num, pfs_group) => {
+                    let inner = open_informational(&resp_sa, &answer).unwrap();
+                    let body_of = |ty: PayloadType| inner.iter().find(|(t, _)| *t == ty).map(|(_, body)| body.clone());
+                    assert!(inner.iter().all(|(t, _)| *t != PayloadType::Notify), "{what}: an answer, not a refusal: {inner:?}");
+                    let answered = SecurityAssociation::parse(&body_of(PayloadType::SecurityAssociation).expect("the answer's SA")).unwrap();
+                    assert_eq!(answered.proposals.len(), 1, "{what}");
+                    assert_eq!(answered.proposals[0].num, num, "{what}: the proposal answered");
+                    let dh: Vec<u16> = answered.proposals[0].transforms.iter().filter(|t| t.transform_type == crate::ikev2::payload::transform_type::DH).map(|t| t.transform_id).collect();
+                    assert_eq!(dh, [pfs_group.unwrap_or(0)], "{what}: its one DH transform");
+                    let ke_back = body_of(PayloadType::KeyExchange).map(|body| KeyExchange::parse(&body).unwrap().dh_group);
+                    assert_eq!(ke_back, pfs_group, "{what}: a KE exactly when PFS runs");
+                    let taken = liveness.take_peer_rekeys();
+                    assert_eq!(taken.len(), 1, "{what}: the rekey is taken on");
+                    if pfs_group.is_none() {
+                        // Whole answer, checked as the peer does against the offer it sent.
+                        let (peer_child, _) = rekey::initiator_complete_child(
+                            &resp_sa,
+                            &PEER_NI,
+                            PEER_NEW_SPI,
+                            SkCipher::Aes256Gcm,
+                            None,
+                            &TrafficSelectors::ipv4_full_tunnel(),
+                            &answer,
+                        )
+                        .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                        assert_eq!(taken[0].child.key_in.enc, peer_child.outbound.enc_material(), "{what}: the keys match");
+                    }
+                }
+                Refused(notify, data) => {
+                    assert_eq!(error_answer(&resp_sa, &answer, ExchangeType::CreateChildSa, 0), (notify, data), "{what}");
+                    assert!(liveness.take_peer_rekeys().is_empty(), "{what}: nothing taken on");
+                }
+                Malformed => {
+                    let refusal = error_answer(&resp_sa, &answer, ExchangeType::CreateChildSa, 0);
+                    assert_eq!(refusal, (notify_type::INVALID_SYNTAX, Vec::new()), "{what}");
+                    assert!(liveness.take_peer_rekeys().is_empty(), "{what}: nothing taken on");
+                }
+            }
+            if !taken_on {
+                assert_eq!((liveness.child_local_spi, liveness.child_peer_spi), (0xBBBB, 0xAAAA), "{what}: the CHILD SA as it was");
+            }
+            // The IKE SA: gone after a malformed request, serving the peer's DPD otherwise.
+            let dpd = build_informational(&resp_sa, 1, false, &[], &[1u8; 8]).unwrap();
+            let next = deliver(&mut liveness, &gateway, &dpd);
+            if alive == Liveness::Alive {
+                assert_eq!(next, Liveness::Alive, "{what}");
+                let dpd_answer = sent_to(&gateway).unwrap_or_else(|| panic!("{what}: the DPD is answered"));
+                assert!(open_informational(&resp_sa, &dpd_answer).unwrap().is_empty(), "{what}: an empty answer to the DPD");
+            } else {
+                assert_eq!(sent_to(&gateway), None, "{what}: the IKE SA is gone, nothing new is answered on it");
+            }
+        }
     }
 
     /// RFC 7296 §2.9: a gateway's rekey proposing only selectors of a type we

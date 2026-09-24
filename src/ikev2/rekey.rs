@@ -31,7 +31,8 @@ use crate::ikev2::ike_auth::{assigned_ipv4_policy, check_granted_ts, esp_offer_f
 use crate::ikev2::message::{encode_payload_chain, first_payload_type, payloads, ExchangeType, Flags, IkeHeader, PayloadType};
 use crate::ikev2::negotiate;
 use crate::ikev2::payload::{
-    notify_type, protocol_id, transform_id, transform_type, KeyExchange, Nonce, Notify, Proposal, SecurityAssociation, TrafficSelector, TrafficSelectors, Transform,
+    notify_type, protocol_id, transform_id, transform_type, KeyExchange, Nonce, Notify, Proposal, ReceivedSa, SecurityAssociation, TrafficSelector, TrafficSelectors,
+    Transform,
 };
 use crate::ikev2::sk::{build_encrypted, open_encrypted, SkCipher};
 use crate::role::Role;
@@ -136,15 +137,14 @@ fn first_proposal_dh_ids(sa: &SecurityAssociation) -> Vec<u16> {
 
 /// Whether any proposal of `sa` names the DH group `id` -- whatever the transform
 /// that names it carries, a KE payload of a group no proposal lists being a
-/// malformed request rather than a proposal to weigh. A DH transform we could
-/// not read (an attribute we do not understand, RFC 7296 §3.3.6) may name it
-/// too: that transform is unacceptable, and the request is not for that reason
-/// malformed -- which would be `INVALID_SYNTAX`, fatal to the IKE SA (§2.21.3),
-/// instead of `NO_PROPOSAL_CHOSEN`.
-fn proposals_name_dh(sa: &SecurityAssociation, id: u16) -> bool {
-    sa.proposals
-        .iter()
-        .any(|p| p.transforms.iter().any(|t| t.transform_type == transform_type::DH && (t.transform_id == id || t.transform_id == transform_id::UNUSABLE)))
+/// malformed request rather than a proposal to weigh (RFC 7296 §1.3, §3.4). A DH
+/// transform we could not read (an attribute we do not understand, §3.3.6)
+/// names the group it was sent with, and no other: the request is then not
+/// malformed for that group's transform being unacceptable -- which would be
+/// `INVALID_SYNTAX`, fatal to the IKE SA (§2.21.3), instead of
+/// `NO_PROPOSAL_CHOSEN` -- but it is for a KE of some other group.
+fn proposals_name_dh(sa: &ReceivedSa, id: u16) -> bool {
+    sa.names(transform_type::DH, id)
 }
 
 /// Our ephemeral share of a PFS exchange: the DH group both sides will use,
@@ -430,7 +430,7 @@ pub fn responder_process_rekey_with_pfs(
     let message_id = IkeHeader::parse(request)?.message_id;
     let (first, inner) = open_encrypted(sa.suite.sk_cipher(), request, peer_sk_e(sa), peer_sk_a(sa))?;
     let (sa_bytes, ni) = find_sa_and_nonce(sa, first, &inner)?;
-    let peer_sa = SecurityAssociation::parse(&sa_bytes)?;
+    let peer_sa = ReceivedSa::parse(&sa_bytes)?;
     let peer_ke = find_ke(first, &inner)?;
 
     // The proposal to answer is one the peer offered (RFC 7296 §2.7, §3.3.6), chosen as the
@@ -523,11 +523,19 @@ const ESP_TRANSFORM_TYPES: &[u8] = &[transform_type::ENCR, transform_type::INTEG
 /// group, for the peer to retry with), and a KE of a group no proposal names
 /// is a malformed request (§3.4), `Crypto`.
 ///
+/// What "no proposal names" is judged on is what each transform was sent with
+/// ([`ReceivedSa`]), not what we could take of it: a DH transform we cannot
+/// read (§3.3.6) names its group, for the KE to match, and is not selectable,
+/// so the proposal is weighed on its other transforms -- a KE of a group it
+/// names but no transform we can take offers is `NoProposalChosen`, and one of
+/// a group it does not name at all is malformed, as when the transform is
+/// readable.
+///
 /// Returns the proposal to send back (the
 /// chosen one's number, our `new_spi`, one transform per type), the peer's
 /// SPI from it, and the DH group PFS runs on, if any.
 pub(crate) fn choose_child_proposal(
-    peer_sa: &SecurityAssociation,
+    peer_sa: &ReceivedSa,
     cipher: SkCipher,
     new_spi: u32,
     ke_group: Option<u16>,
@@ -536,6 +544,22 @@ pub(crate) fn choose_child_proposal(
     if ke_group.is_some_and(|g| !proposals_name_dh(peer_sa, g)) {
         return Err(IkeError::Crypto("CREATE_CHILD_SA: a KE payload of a DH group no proposal names"));
     }
+    select_child_proposal(&peer_sa.sa, cipher, new_spi, ke_group, pfs)
+}
+
+/// [`choose_child_proposal`] on the transforms we can take, for a request whose
+/// KE (`ke_group`, if any) has been found among what the proposals name -- or
+/// that has none, as `IKE_AUTH`'s SAi2 (RFC 7296 §1.2). A transform that was
+/// unacceptable when parsed ([`transform_id::UNUSABLE`]) or carries a Key
+/// Length it must not is never selected and matches no group, but still counts
+/// as a DH transform the proposal has.
+pub(crate) fn select_child_proposal(
+    peer_sa: &SecurityAssociation,
+    cipher: SkCipher,
+    new_spi: u32,
+    ke_group: Option<u16>,
+    pfs: &PfsPolicy,
+) -> Result<(Proposal, u32, Option<DhGroup>), IkeError> {
     let ours = esp_offer_for_cipher(new_spi, cipher).proposals.remove(0);
     // The group of the first proposal we'd take, but not on the KE's group.
     let mut wanted_group = None;
@@ -566,23 +590,27 @@ pub(crate) fn choose_child_proposal(
         if !offers_all || integ_forced {
             continue;
         }
-        // Every DH transform it names, an unreadable one (or one with a Key Length) as `UNUSABLE`: the
-        // proposal does insist on a group, just not on one we can take.
-        let dh_offered: Vec<u16> = of_type(transform_type::DH)
-            .map(|t| if t.key_length.is_none() { t.transform_id } else { transform_id::UNUSABLE })
+        // Whether it has a DH transform at all -- one we cannot read, or with a Key Length, does count:
+        // the proposal does insist on a group, just not on one we can take -- and which DH transforms
+        // we can take. Only those are candidates, for the KE's group, for NONE and for the group we would
+        // ask for instead; what an unacceptable one was sent with is the KE check's (`ReceivedSa`).
+        let dh_present = of_type(transform_type::DH).next().is_some();
+        let dh_takeable: Vec<u16> = of_type(transform_type::DH)
+            .filter(|t| t.key_length.is_none() && t.transform_id != transform_id::UNUSABLE)
+            .map(|t| t.transform_id)
             .collect();
         let group = match ke_group {
-            Some(g) if dh_offered.contains(&g) && pfs.allows_group(g) => match negotiate::ikev2_dh_group(g) {
+            Some(g) if dh_takeable.contains(&g) && pfs.allows_group(g) => match negotiate::ikev2_dh_group(g) {
                 Some(group) => Some(group),
                 None => continue,
             },
             // A proposal with no DH of its own answers a rekey without PFS: the KE is
             // there for the proposals that do list its group (strongSwan sends
             // both kinds side by side, so a peer that can't do PFS still fits).
-            _ if pfs.optional && (dh_offered.is_empty() || dh_offered.contains(&0)) => None,
+            _ if pfs.optional && (!dh_present || dh_takeable.contains(&0)) => None,
             _ => {
                 wanted_group =
-                    wanted_group.or_else(|| dh_offered.iter().filter(|&&g| pfs.allows_group(g)).find_map(|&g| negotiate::ikev2_dh_group(g)));
+                    wanted_group.or_else(|| dh_takeable.iter().filter(|&&g| pfs.allows_group(g)).find_map(|&g| negotiate::ikev2_dh_group(g)));
                 continue;
             }
         };
@@ -601,7 +629,7 @@ pub(crate) fn choose_child_proposal(
             Some(group) => {
                 reply.transforms.push(Transform { transform_type: transform_type::DH, transform_id: group.transform_id(), key_length: None })
             }
-            None if !dh_offered.is_empty() => reply.transforms.push(Transform { transform_type: transform_type::DH, transform_id: 0, key_length: None }),
+            None if dh_present => reply.transforms.push(Transform { transform_type: transform_type::DH, transform_id: 0, key_length: None }),
             None => {}
         }
         let peer_spi = u32::from_be_bytes(p.spi[..4].try_into().unwrap());
@@ -644,7 +672,7 @@ pub fn responder_answer_child_rekey(
     let message_id = IkeHeader::parse(request)?.message_id;
     let (first, inner) = open_encrypted(sa.suite.sk_cipher(), request, peer_sk_e(sa), peer_sk_a(sa))?;
     let (sa_bytes, ni) = find_sa_and_nonce(sa, first, &inner)?;
-    let peer_sa = SecurityAssociation::parse(&sa_bytes)?;
+    let peer_sa = ReceivedSa::parse(&sa_bytes)?;
     let peer_ke = find_ke(first, &inner)?;
     let (tsi, tsr) = requested_ts(first, &inner)?;
     let any = TrafficSelectors::unified_full_tunnel();
@@ -1462,8 +1490,15 @@ mod tests {
 
     /// [`hand_built_answer`] with the SA payload `sa` as it is.
     fn hand_built_answer_with(resp_sa: &CompletedSaInit, sa: SecurityAssociation, ke: Option<KeyExchange>) -> Vec<u8> {
+        hand_built_answer_wire(resp_sa, &sa.to_bytes(), ke)
+    }
+
+    /// [`hand_built_answer`] with the SA payload body `sa_body` as it goes on the
+    /// wire -- transforms `SecurityAssociation` cannot express, with an attribute
+    /// we do not understand.
+    fn hand_built_answer_wire(resp_sa: &CompletedSaInit, sa_body: &[u8], ke: Option<KeyExchange>) -> Vec<u8> {
         let ts = TrafficSelectors::ipv4_full_tunnel();
-        let mut inner = vec![(PayloadType::SecurityAssociation, sa.to_bytes()), (PayloadType::Nonce, vec![0x44; 32])];
+        let mut inner = vec![(PayloadType::SecurityAssociation, sa_body.to_vec()), (PayloadType::Nonce, vec![0x44; 32])];
         inner.extend(ke.map(|ke| (PayloadType::KeyExchange, ke.to_bytes())));
         inner.push((PayloadType::TrafficSelectorInitiator, ts.to_bytes()));
         inner.push((PayloadType::TrafficSelectorResponder, ts.to_bytes()));
@@ -1548,6 +1583,61 @@ mod tests {
         assert_eq!(complete(&hand_built_answer(&resp_sa, &[0], None)), Ok(()));
         assert_eq!(complete(&hand_built_answer(&resp_sa, &[transform_id::MODP_2048], Some(ke.clone()))), Err(IkeError::NoProposalChosen));
         assert!(matches!(complete(&hand_built_answer(&resp_sa, &[], Some(ke))), Err(IkeError::Crypto(_))));
+    }
+
+    /// RFC 7296 §2.7, §3.3.6: what answers our CHILD SA request is one transform of each type we
+    /// offered, and none we cannot read. An answer that keeps the type and the ID of what we
+    /// offered but sends a transform with an attribute we do not understand -- or a second transform
+    /// of a type, one of them unreadable -- is not our proposal returned, and is refused whichever
+    /// group the transform names or the KE is of; the untouched answer of each shape completes.
+    #[test]
+    fn a_child_sa_answer_with_a_transform_we_cannot_read_is_refused_and_two_of_a_type_are_too() {
+        use crate::ikev2::payload::test_wire::{proposal, sa, transform, KEY_LENGTH_256, UNKNOWN_ATTRIBUTE};
+        let (init_sa, resp_sa) = sa_pair();
+        let (ni, init_dh, resp_dh) = ([0x33u8; 32], [5u8; 32], [6u8; 32]);
+        let modp2048 = DhGroup::Modp2048;
+        let spi = 0x2222_2222u32.to_be_bytes();
+        let gcm = || transform(transform_type::ENCR, transform_id::AES_GCM_16, &KEY_LENGTH_256);
+        let esn_none = || transform(transform_type::ESN, transform_id::ESN_NONE, &[]);
+        let group = |attrs: &[u8]| transform(transform_type::DH, transform_id::MODP_2048, attrs);
+        let unreadable = |ty: u8, id: u16| transform(ty, id, &UNKNOWN_ATTRIBUTE);
+        let answer = |transforms: &[Vec<u8>], ke: Option<KeyExchange>| {
+            hand_built_answer_wire(&resp_sa, &sa(&[proposal(1, protocol_id::ESP, &spi, transforms)]), ke)
+        };
+        let ke = || Some(ke_of(modp2048, &resp_dh));
+        let with_pfs = |resp: &[u8]| {
+            initiator_complete_child(&init_sa, &ni, 0x1111_1111, SkCipher::Aes256Gcm, Some((modp2048, &init_dh)), &TrafficSelectors::ipv4_full_tunnel(), resp).map(|_| ())
+        };
+        let without_pfs = |resp: &[u8]| {
+            initiator_complete_child(&init_sa, &ni, 0x1111_1111, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), resp).map(|_| ())
+        };
+
+        // We asked for PFS on MODP-2048.
+        assert_eq!(with_pfs(&answer(&[gcm(), esn_none(), group(&[])], ke())), Ok(()), "control");
+        let refused_with_pfs = [
+            ("the group as a transform we cannot read", vec![gcm(), esn_none(), unreadable(transform_type::DH, transform_id::MODP_2048)]),
+            ("the group, and a second DH we cannot read", vec![gcm(), esn_none(), group(&[]), unreadable(transform_type::DH, transform_id::MODP_2048)]),
+            ("a second DH, NONE, we cannot read", vec![gcm(), esn_none(), group(&[]), unreadable(transform_type::DH, 0)]),
+            ("two ENCR, the second we cannot read", vec![gcm(), unreadable(transform_type::ENCR, transform_id::AES_GCM_16), esn_none(), group(&[])]),
+            ("two ENCR, the first we cannot read", vec![unreadable(transform_type::ENCR, transform_id::AES_GCM_16), gcm(), esn_none(), group(&[])]),
+            ("the ESN as a transform we cannot read", vec![gcm(), unreadable(transform_type::ESN, transform_id::ESN_NONE), group(&[])]),
+            ("an integrity algorithm we cannot read", vec![gcm(), unreadable(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128), esn_none(), group(&[])]),
+        ];
+        for (what, transforms) in refused_with_pfs {
+            assert_eq!(with_pfs(&answer(&transforms, ke())), Err(IkeError::NoProposalChosen), "PFS asked, {what}");
+        }
+
+        // We asked for none: what comes back has to be the offer, not a NONE or a group of another shape.
+        assert_eq!(without_pfs(&answer(&[gcm(), esn_none()], None)), Ok(()), "control");
+        let refused_without_pfs = [
+            ("DH NONE as a transform we cannot read", vec![gcm(), esn_none(), unreadable(transform_type::DH, 0)]),
+            ("a group we cannot read", vec![gcm(), esn_none(), unreadable(transform_type::DH, transform_id::MODP_2048)]),
+            ("two ENCR, the second we cannot read", vec![gcm(), unreadable(transform_type::ENCR, transform_id::AES_GCM_16), esn_none()]),
+            ("the ESN as a transform we cannot read", vec![gcm(), unreadable(transform_type::ESN, transform_id::ESN_NONE)]),
+        ];
+        for (what, transforms) in refused_without_pfs {
+            assert_eq!(without_pfs(&answer(&transforms, None)), Err(IkeError::NoProposalChosen), "no PFS asked, {what}");
+        }
     }
 
     /// RFC 7296 §2.7, §3.3.1, §3.3.6: the answer to our CHILD SA request is
@@ -2002,6 +2092,153 @@ mod tests {
                 assert_eq!(entry(&request(std::slice::from_ref(refused))), Err(IkeError::NoProposalChosen), "{name}: {what}");
                 let next = entry(&request(&[refused.clone(), esp(2, &[gcm(), esn_none(), group()])])).unwrap_or_else(|e| panic!("{name}: {what}, then a proposal that is fine: {e:?}"));
                 assert_eq!(next.num, 2, "{name}: {what}, then a proposal that is fine");
+            }
+        }
+    }
+
+    /// RFC 7296 §1.3, §3.4: the KE of a CHILD SA rekey has to name the DH group of one of the
+    /// request's proposals, and a transform we cannot read (§3.3.6) still names the group it
+    /// was sent with -- it does not name any other. An unreadable MODP-2048 is no reason for a
+    /// KE of X25519 to be a group "some proposal names": that request is as malformed as one
+    /// whose readable proposal says MODP-2048, and no more acceptable for the transform being
+    /// one we cannot take. Every responder that runs a KE says so alike.
+    #[test]
+    fn a_rekey_ke_group_is_named_by_the_transform_that_names_it_readable_or_not() {
+        use crate::ikev2::payload::test_wire::{proposal, sa, transform, KEY_LENGTH_256, UNKNOWN_ATTRIBUTE};
+        let (our_sa, peer_sa) = sa_pair();
+        let (nr, iv, resp_dh, peer_dh) = ([0x44u8; 32], [2u8; 8], [6u8; 32], [5u8; 32]);
+        let spi = 0x2222_2222u32.to_be_bytes();
+        let (modp, x25519) = (transform_id::MODP_2048, transform_id::X25519);
+        let esp = |num: u8, dh: &[(u16, bool)]| {
+            let mut transforms =
+                vec![transform(transform_type::ENCR, transform_id::AES_GCM_16, &KEY_LENGTH_256), transform(transform_type::ESN, transform_id::ESN_NONE, &[])];
+            transforms.extend(dh.iter().map(|&(id, readable)| transform(transform_type::DH, id, if readable { &[] } else { &UNKNOWN_ATTRIBUTE })));
+            proposal(num, protocol_id::ESP, &spi, &transforms)
+        };
+        let ke = |group: u16| {
+            let dh = if group == x25519 { DhGroup::X25519 } else { DhGroup::Modp2048 };
+            KeyExchange { dh_group: group, data: dh.public(&peer_dh) }
+        };
+        let answered = |response: Vec<u8>| {
+            let (proposal, _, _, has_ke) = read_rekey_response(&response, &peer_sa);
+            (proposal.num, proposal.transforms.iter().filter(|t| t.transform_type == transform_type::DH).map(|t| t.transform_id).collect::<Vec<_>>(), has_ke)
+        };
+        type Answer = Result<(u8, Vec<u16>, bool), IkeError>;
+        let with_key = |req: &[u8]| -> Answer {
+            responder_process_rekey_with_pfs(&our_sa, req, 0x1111_1111, &nr, SkCipher::Aes256Gcm, Some(&resp_dh), &iv, None).map(|(r, _)| answered(r))
+        };
+        let optional = |req: &[u8]| -> Answer {
+            responder_answer_child_rekey(&our_sa, req, 0x1111_1111, &nr, SkCipher::Aes256Gcm, &PfsPolicy::none(), &resp_dh, &iv).map(|(r, _)| answered(r))
+        };
+        let required_modp = PfsPolicy::from_offer(&SecurityAssociation {
+            proposals: vec![esp_proposal(1, 0, (transform_id::AES_GCM_16, Some(256)), None, &[modp])],
+        })
+        .unwrap();
+        let required = |req: &[u8]| -> Answer {
+            responder_answer_child_rekey(&our_sa, req, 0x1111_1111, &nr, SkCipher::Aes256Gcm, &required_modp, &resp_dh, &iv).map(|(r, _)| answered(r))
+        };
+        #[derive(Clone, Copy, PartialEq)]
+        enum Policy {
+            /// A key and no policy: PFS is required, on any group we can run.
+            AnyGroup,
+            /// No PFS configured: with or without.
+            Optional,
+            /// PFS required, on MODP-2048.
+            RequiredModp,
+        }
+        type Entry<'a> = (&'a str, Policy, &'a dyn Fn(&[u8]) -> Answer);
+        let entries: [Entry; 3] = [
+            ("responder_process_rekey_with_pfs, a key", Policy::AnyGroup, &with_key),
+            ("responder_answer_child_rekey, PFS optional", Policy::Optional, &optional),
+            ("responder_answer_child_rekey, PFS required on MODP-2048", Policy::RequiredModp, &required),
+        ];
+        let request = |proposals: &[Vec<u8>], group: u16| peer_rekey_request_wire(&peer_sa, &sa(proposals), Some(ke(group)));
+
+        for (name, policy, entry) in &entries {
+            // B: the KE's group is in no proposal (MODP-2048 is what the proposal names).
+            let b = entry(&request(&[esp(1, &[(modp, true), (0, true)])], x25519));
+            // C: the same request with MODP-2048 as a transform we cannot read.
+            let c = entry(&request(&[esp(1, &[(modp, false), (0, true)])], x25519));
+            assert_eq!(c, b, "{name}: an unreadable MODP-2048 is not the X25519 of the KE, as a readable one is not");
+            // ... and with nothing else next to it.
+            let c_alone = entry(&request(&[esp(1, &[(modp, false)])], x25519));
+            let b_alone = entry(&request(&[esp(1, &[(modp, true)])], x25519));
+            assert_eq!(c_alone, b_alone, "{name}: alone");
+            // ... or in a proposal of its own, next to a proposal we could take.
+            let c_next = entry(&request(&[esp(1, &[(modp, false)]), esp(2, &[(0, true)])], x25519));
+            let b_next = entry(&request(&[esp(1, &[(modp, true)]), esp(2, &[(0, true)])], x25519));
+            assert_eq!(c_next, b_next, "{name}: in a proposal of its own");
+            // What it is refused as: `NoProposalChosen` by the responder that runs the KE with the
+            // key it was given, a malformed request (`Crypto`) by the ones that weigh it with the proposals.
+            let malformed = |a: &Answer| match policy {
+                Policy::AnyGroup => a == &Err(IkeError::NoProposalChosen),
+                Policy::Optional | Policy::RequiredModp => matches!(a, Err(IkeError::Crypto(_))),
+            };
+            assert!(malformed(&b) && malformed(&c) && malformed(&c_alone) && malformed(&c_next), "{name}: a KE no proposal names: {b:?} {c:?} {c_alone:?} {c_next:?}");
+        }
+
+        // The KE names the group of a transform we cannot read: named, though there is nothing to take.
+        for (name, policy, entry) in &entries {
+            let group = if *policy == Policy::RequiredModp { modp } else { x25519 };
+            let unreadable = entry(&request(&[esp(1, &[(group, false)])], group));
+            assert_eq!(unreadable, Err(IkeError::NoProposalChosen), "{name}: named by a transform that cannot be taken, not malformed");
+            // A NONE beside it is the way out only where PFS is optional, and never PFS in disguise.
+            let with_none = entry(&request(&[esp(1, &[(group, false), (0, true)])], group));
+            let expected = if *policy == Policy::Optional { Ok((1, vec![0], false)) } else { Err(IkeError::NoProposalChosen) };
+            assert_eq!(with_none, expected, "{name}: the NONE it offered");
+            // The group in a transform we can read, in the same proposal or in another, is the one taken.
+            let same = entry(&request(&[esp(1, &[(group, false), (group, true)])], group));
+            assert_eq!(same, Ok((1, vec![group], true)), "{name}: a readable transform of the group in the same proposal");
+            let other = entry(&request(&[esp(1, &[(group, false), (0, true)]), esp(2, &[(group, true)])], group));
+            let expected = if *policy == Policy::Optional { Ok((1, vec![0], false)) } else { Ok((2, vec![group], true)) };
+            assert_eq!(other, expected, "{name}: another proposal");
+            // A group we could take instead, next to it, is the one asked for -- where any group will do.
+            let other_group = if group == modp { x25519 } else { modp };
+            let asks_for = entry(&request(&[esp(1, &[(group, false), (other_group, true)])], group));
+            let expected = if *policy == Policy::Optional { Err(IkeError::InvalidKeGroup(other_group)) } else { Err(IkeError::NoProposalChosen) };
+            assert_eq!(asks_for, expected, "{name}: the group we can take instead");
+        }
+
+        // What an unreadable transform stands for once parsed ([`transform_id::UNUSABLE`], private use) is
+        // no group's match either: sent with that very ID, it is named by a KE of it, and is still nothing to take.
+        for (name, policy, entry) in &entries {
+            let stand_in = transform_id::UNUSABLE;
+            let unreadable = entry(&request(&[esp(1, &[(stand_in, false)])], stand_in));
+            assert_eq!(unreadable, Err(IkeError::NoProposalChosen), "{name}: named by a transform that cannot be taken");
+            let with_none = entry(&request(&[esp(1, &[(stand_in, false), (0, true)])], stand_in));
+            let expected = if *policy == Policy::Optional { Ok((1, vec![0], false)) } else { Err(IkeError::NoProposalChosen) };
+            assert_eq!(with_none, expected, "{name}: the NONE it offered");
+        }
+
+        // A group is named by a DH transform and by nothing else: the number of another type's
+        // transform is no group's. AES-GCM-16 is 20, as ECP-384 is; the integrity algorithm
+        // HMAC-SHA2-256-128 is 12 and ESN NONE is 0, where a KE of "group" 12 or 0 is no group of
+        // any proposal below -- refused as malformed, not carried on into a selection.
+        let integ_proposal = |num: u8| {
+            let transforms = [
+                transform(transform_type::ENCR, transform_id::AES_CBC, &KEY_LENGTH_256),
+                transform(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, &[]),
+                transform(transform_type::ESN, transform_id::ESN_NONE, &[]),
+            ];
+            proposal(num, protocol_id::ESP, &spi, &transforms)
+        };
+        for (name, policy, entry) in &entries {
+            let malformed = |a: &Answer| match policy {
+                Policy::AnyGroup => a == &Err(IkeError::NoProposalChosen),
+                Policy::Optional | Policy::RequiredModp => matches!(a, Err(IkeError::Crypto(_))),
+            };
+            let (as_encr, as_integ, as_esn) = (transform_id::AES_GCM_16, transform_id::AUTH_HMAC_SHA2_256_128, transform_id::ESN_NONE);
+            let cases = [
+                ("the ENCR transform's number, no DH", request(&[esp(1, &[])], as_encr)),
+                ("the ENCR transform's number, a DH of another group", request(&[esp(1, &[(modp, true)])], as_encr)),
+                ("the ENCR transform's number, a DH of another group and NONE", request(&[esp(1, &[(modp, true), (0, true)])], as_encr)),
+                ("the INTEG transform's number, no DH", request(&[integ_proposal(1)], as_integ)),
+                ("the ESN transform's number, no DH", request(&[esp(1, &[])], as_esn)),
+                ("the ESN transform's number, a DH of another group", request(&[esp(1, &[(modp, true)])], as_esn)),
+            ];
+            for (what, req) in &cases {
+                let answer = entry(req);
+                assert!(malformed(&answer), "{name}: a KE of {what}: {answer:?}");
             }
         }
     }

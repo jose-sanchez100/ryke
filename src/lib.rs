@@ -225,6 +225,7 @@ pub use ikev2::sign::{SigningKey, VerifyingKey};
 pub use role::Role;
 pub use ikev2::sk::{build_encrypted_gcm, open_encrypted_gcm, SkCipher};
 pub use ikev2::server::{Server, ServerEvent};
+pub use ikev2::fragment::{DatagramLimit, DatagramLimitError};
 pub use transport::{DriverError, UdpTransport};
 pub use tunnel::Tunnel;
 

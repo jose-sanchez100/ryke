@@ -530,6 +530,99 @@ pub fn fragment_message(cipher: SkCipher, message: &[u8], sk_e: &[u8], sk_a: &[u
     build_fragments(cipher, &header, first_inner, &inner, sk_e, sk_a, iv_base, content_per_fragment)
 }
 
+/// The smallest IKE message [`fragment_message`] can put content in under
+/// every cipher: AES-CBC with HMAC-SHA2-512-256 takes 28 (IKE header) + 8
+/// (SKF header) + 16 (IV) + 32 (ICV) and a whole 16-byte block.
+const MIN_FRAGMENT_MESSAGE_LEN: usize = 100;
+
+const IPV4_HEADER_LEN: usize = 20; // without options
+const IPV6_HEADER_LEN: usize = 40; // without extension headers
+const UDP_HEADER_LEN: usize = 8;
+const NON_ESP_MARKER_LEN: usize = 4;
+
+/// The largest whole IP datagram, per family of the outer transport, that
+/// a message of ours may travel in. A message larger than that is sent in
+/// fragments when the peer negotiated them (RFC 7383), each fragment's
+/// datagram within the limit.
+///
+/// The limit covers the IP and UDP headers and, once the transport has
+/// floated to port 4500, the non-ESP marker; [`Self::max_message_len`]
+/// takes them off. It is a fixed figure: nothing here discovers the path
+/// MTU, and a path narrower than the limit still fragments at the IP layer.
+///
+/// [`DatagramLimit::DEFAULT`] takes 576 bytes for IPv4 and 1280 for IPv6,
+/// the datagram every IPv4 host must accept and the IPv6 minimum link MTU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatagramLimit {
+    ipv4: usize,
+    ipv6: usize,
+}
+
+/// A [`DatagramLimit`] no IKE fragment fits in, or no IP datagram reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("a limit of {requested} bytes for an {family} datagram is outside {min}..={max}")]
+pub struct DatagramLimitError {
+    family: &'static str,
+    requested: usize,
+    min: usize,
+    max: usize,
+}
+
+impl DatagramLimit {
+    /// 576 bytes for IPv4, 1280 for IPv6.
+    pub const DEFAULT: DatagramLimit = DatagramLimit { ipv4: 576, ipv6: 1280 };
+
+    /// A limit of `ipv4` bytes for an IPv4 datagram and `ipv6` for an IPv6
+    /// one, headers included. Each must leave room, past the IP header
+    /// (20 or 40 bytes), UDP header and non-ESP marker, for a fragment that
+    /// carries content under every cipher, and be no larger than the
+    /// family's largest datagram (65535 bytes for IPv4; for IPv6, a
+    /// payload of 65535 bytes past its header).
+    pub fn new(ipv4: usize, ipv6: usize) -> Result<DatagramLimit, DatagramLimitError> {
+        check_family("IPv4", ipv4, IPV4_HEADER_LEN, 65535)?;
+        check_family("IPv6", ipv6, IPV6_HEADER_LEN, IPV6_HEADER_LEN + 65535)?;
+        Ok(DatagramLimit { ipv4, ipv6 })
+    }
+
+    /// The limit for an IPv4 datagram, headers included.
+    pub fn ipv4(&self) -> usize {
+        self.ipv4
+    }
+
+    /// The limit for an IPv6 datagram, headers included.
+    pub fn ipv6(&self) -> usize {
+        self.ipv6
+    }
+
+    /// The largest IKE message, its header included, that fits the limit
+    /// when sent to `peer`, with the non-ESP marker in front when
+    /// `non_esp_marker`. An IPv4-mapped IPv6 address travels as IPv4.
+    pub fn max_message_len(&self, peer: std::net::IpAddr, non_esp_marker: bool) -> usize {
+        let v4 = match peer {
+            std::net::IpAddr::V4(_) => true,
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some(),
+        };
+        let (total, ip_header) = if v4 { (self.ipv4, IPV4_HEADER_LEN) } else { (self.ipv6, IPV6_HEADER_LEN) };
+        let marker = if non_esp_marker { NON_ESP_MARKER_LEN } else { 0 };
+        total - ip_header - UDP_HEADER_LEN - marker
+    }
+}
+
+impl Default for DatagramLimit {
+    fn default() -> Self {
+        DatagramLimit::DEFAULT
+    }
+}
+
+fn check_family(family: &'static str, requested: usize, ip_header: usize, max: usize) -> Result<(), DatagramLimitError> {
+    let min = ip_header + UDP_HEADER_LEN + NON_ESP_MARKER_LEN + MIN_FRAGMENT_MESSAGE_LEN;
+    if (min..=max).contains(&requested) {
+        Ok(())
+    } else {
+        Err(DatagramLimitError { family, requested, min, max })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -859,5 +952,73 @@ mod tests {
             }
             assert!(fragment_message(cipher, &whole, &sk_e, &sk_a, 7, 60).is_err(), "no room for any content");
         }
+    }
+
+    /// Every cipher, under every integrity algorithm, fragments a message
+    /// at [`MIN_FRAGMENT_MESSAGE_LEN`], the floor [`DatagramLimit::new`]
+    /// is built on; the costliest cannot do with a byte less.
+    #[test]
+    fn every_cipher_fragments_at_the_smallest_message_a_limit_allows() {
+        use IntegAlgorithm::*;
+        let integs = [HmacMd5_96, HmacSha1_96, HmacSha2_256_128, HmacSha2_384_192, HmacSha2_512_256];
+        let ciphers = aead_ciphers().into_iter().chain(integs.iter().flat_map(|&i| {
+            [SkCipher::Aes128Cbc(i), SkCipher::Aes192Cbc(i), SkCipher::Aes256Cbc(i), SkCipher::TripleDesCbc(i)]
+        }));
+        for cipher in ciphers {
+            let (sk_e, sk_a) = keys_for(cipher);
+            let inner = vec![9u8; 300];
+            let whole = crate::ikev2::sk::build_encrypted(cipher, header(), PayloadType::IdInitiator, &inner, &sk_e, &sk_a, &[1u8; 8]).unwrap();
+            let frags = fragment_message(cipher, &whole, &sk_e, &sk_a, 7, MIN_FRAGMENT_MESSAGE_LEN).unwrap();
+            assert!(frags.iter().all(|f| f.len() <= MIN_FRAGMENT_MESSAGE_LEN), "{cipher:?}");
+            assert_eq!(reassemble(cipher, &frags, &sk_e, &sk_a).unwrap().1, inner, "{cipher:?}");
+        }
+        let cipher = SkCipher::Aes256Cbc(HmacSha2_512_256);
+        let (sk_e, sk_a) = keys_for(cipher);
+        let whole = crate::ikev2::sk::build_encrypted(cipher, header(), PayloadType::IdInitiator, &[9u8; 300], &sk_e, &sk_a, &[1u8; 8]).unwrap();
+        assert!(fragment_message(cipher, &whole, &sk_e, &sk_a, 7, MIN_FRAGMENT_MESSAGE_LEN - 1).is_err());
+    }
+
+    #[test]
+    fn the_default_limit_is_576_bytes_for_ipv4_and_1280_for_ipv6() {
+        assert_eq!(DatagramLimit::default(), DatagramLimit::DEFAULT);
+        assert_eq!((DatagramLimit::DEFAULT.ipv4(), DatagramLimit::DEFAULT.ipv6()), (576, 1280));
+        assert_eq!(DatagramLimit::new(576, 1280), Ok(DatagramLimit::DEFAULT));
+    }
+
+    /// A limit leaves room for a fragment behind the IP and UDP headers
+    /// and the non-ESP marker, and fits the family's largest datagram.
+    #[test]
+    fn a_limit_no_fragment_fits_in_or_no_datagram_reaches_is_refused() {
+        assert!(DatagramLimit::new(132, 152).is_ok());
+        assert!(DatagramLimit::new(65535, 65575).is_ok());
+        let low4 = DatagramLimit::new(131, 1280).unwrap_err();
+        assert_eq!(low4.to_string(), "a limit of 131 bytes for an IPv4 datagram is outside 132..=65535");
+        let low6 = DatagramLimit::new(576, 151).unwrap_err();
+        assert_eq!(low6.to_string(), "a limit of 151 bytes for an IPv6 datagram is outside 152..=65575");
+        assert!(DatagramLimit::new(65536, 1280).is_err());
+        assert!(DatagramLimit::new(576, 65576).is_err());
+        assert!(DatagramLimit::new(0, 0).is_err());
+    }
+
+    /// What is left for the IKE message: the limit of the outer family,
+    /// less its IP header, the UDP header and, once floated, the marker.
+    #[test]
+    fn the_message_gets_what_the_family_limit_leaves_past_the_headers() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let limit = DatagramLimit::new(600, 1400).unwrap();
+        let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let mapped = IpAddr::V6(Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped());
+        assert_eq!(limit.max_message_len(v4, false), 600 - 20 - 8);
+        assert_eq!(limit.max_message_len(v4, true), 600 - 20 - 8 - 4);
+        assert_eq!(limit.max_message_len(v6, false), 1400 - 40 - 8);
+        assert_eq!(limit.max_message_len(v6, true), 1400 - 40 - 8 - 4);
+        assert_eq!(limit.max_message_len(mapped, true), 600 - 20 - 8 - 4, "an IPv4-mapped peer travels as IPv4");
+        assert_eq!(DatagramLimit::DEFAULT.max_message_len(v4, true), 544);
+        assert_eq!(DatagramLimit::DEFAULT.max_message_len(v6, false), 1232);
+        // The smallest limit still leaves room for a fragment.
+        let floor = DatagramLimit::new(132, 152).unwrap();
+        assert_eq!(floor.max_message_len(v4, true), MIN_FRAGMENT_MESSAGE_LEN);
+        assert_eq!(floor.max_message_len(v6, true), MIN_FRAGMENT_MESSAGE_LEN);
     }
 }

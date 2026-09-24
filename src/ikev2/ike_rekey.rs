@@ -721,6 +721,72 @@ mod tests {
         assert_eq!(new_init.keys.sk_d, new_resp.keys.sk_d);
     }
 
+    /// RFC 7296 §3.3.5, §3.3.6, as `IKE_SA_INIT` has it (`exchange.rs`): a PRF,
+    /// DH or INTEG NONE transform takes no Key Length, so one that carries it
+    /// is unacceptable in an IKE SA rekey too. The responder passes over the
+    /// proposal that has it for the next one (whose SPI keys the new SA) and
+    /// answers the plain transform of its type when both are offered; the
+    /// initiator takes back no answer that names it.
+    #[test]
+    fn an_ike_rekey_transform_with_a_key_length_it_must_not_have_is_unacceptable_in_both_directions() {
+        use crate::ikev2::payload::{transform_id, transform_type, Transform};
+
+        let (init_sa, resp_sa) = sa_pair();
+        let group = DhGroup::from_transform_id(init_sa.suite.dh_id).unwrap();
+        let ke = || Some(KeyExchange { dh_group: group.transform_id(), data: group.public(&[3u8; 32]) });
+        let with_key_length = |proposal: &Proposal, ty: u8| {
+            let mut p = proposal.clone();
+            p.transforms.iter_mut().filter(|t| t.transform_type == ty).for_each(|t| t.key_length = Some(128));
+            p
+        };
+        let of_type = |proposal: &Proposal, ty: u8| proposal.transforms.iter().filter(|t| t.transform_type == ty).cloned().collect::<Vec<_>>();
+        let (plain, plain_none) = (ike_rekey_proposal(&init_sa, false), ike_rekey_proposal(&init_sa, true));
+
+        // The responder's side.
+        let answer = |proposals: Vec<Proposal>| {
+            responder_process_ike_rekey(&resp_sa, &ike_rekey_message_with(&init_sa, false, proposals, ke()), 0x99, &[9u8; 32], &[0x66u8; 32], &[2u8; 8])
+        };
+        let answered = |response: &[u8]| {
+            let (first, inner) = open_encrypted(init_sa.suite.sk_cipher(), response, peer_sk_e(&init_sa), peer_sk_a(&init_sa)).unwrap();
+            let sa = payloads(first, &inner).map(Result::unwrap).find(|p| p.payload_type == PayloadType::SecurityAssociation).unwrap();
+            SecurityAssociation::parse(sa.data).unwrap().proposals.remove(0)
+        };
+        assert!(answer(vec![plain.clone()]).is_ok(), "control");
+        let next_spi = 0x0102_0304_0506_0708u64;
+        let next = Proposal { num: 2, spi: next_spi.to_be_bytes().to_vec(), ..plain.clone() };
+        let refused = [
+            ("a PRF", with_key_length(&plain, transform_type::PRF)),
+            ("a DH", with_key_length(&plain, transform_type::DH)),
+            ("an INTEG NONE", with_key_length(&plain_none, transform_type::INTEG)),
+        ];
+        for (what, bad) in &refused {
+            assert_eq!(answer(vec![bad.clone()]).map(|_| ()), Err(IkeError::NoProposalChosen), "responder: {what}");
+            let (_, new_sa) = answer(vec![bad.clone(), next.clone()]).unwrap_or_else(|e| panic!("responder: {what}, then a proposal that is fine: {e:?}"));
+            assert_eq!(new_sa.spi_i, next_spi, "responder: {what}, then a proposal that is fine: the new SA is keyed on that one's SPI");
+        }
+        for (what, ty, mut both) in [
+            ("a PRF", transform_type::PRF, plain.clone()),
+            ("an INTEG NONE", transform_type::INTEG, plain_none.clone()),
+        ] {
+            let at = both.transforms.iter().position(|t| t.transform_type == ty).unwrap();
+            let fine = both.transforms[at].clone();
+            both.transforms.insert(at, Transform { key_length: Some(128), ..fine.clone() });
+            let (response, _) = answer(vec![both]).unwrap_or_else(|e| panic!("responder: {what}, both kinds: {e:?}"));
+            assert_eq!(of_type(&answered(&response), ty), [fine], "responder: {what}, both kinds: the plain one is answered");
+        }
+        assert_eq!(of_type(&plain_none, transform_type::INTEG), [Transform { transform_type: transform_type::INTEG, transform_id: transform_id::INTEG_NONE, key_length: None }], "the fixture offers a plain INTEG NONE");
+
+        // The initiator's side: an answer that names the transform with the Key Length is not our proposal.
+        let (ni, dh, new_spi_i) = ([0x55u8; 32], [3u8; 32], 0xAABB_CCDD_1122_3344);
+        let ke = || Some(KeyExchange { dh_group: group.transform_id(), data: group.public(&[9u8; 32]) });
+        let complete = |proposal: Proposal| initiator_complete_ike_rekey(&init_sa, &ni, new_spi_i, &dh, &ike_rekey_message_with(&resp_sa, true, vec![proposal], ke())).map(|_| ());
+        let ours = ike_rekey_proposal(&resp_sa, false);
+        assert_eq!(complete(ours.clone()), Ok(()), "initiator: control");
+        for ty in [transform_type::PRF, transform_type::DH] {
+            assert_eq!(complete(with_key_length(&ours, ty)), Err(IkeError::NoProposalChosen), "initiator: transform type {ty} with a Key Length");
+        }
+    }
+
     /// RFC 7296 §3.3.1: each proposal of an IKE SA rekey carries the SPI the
     /// initiator wants for the new SA *if that proposal is the one chosen*, so
     /// the responder keys the new SA on the SPI of the proposal it picked -- not

@@ -1446,6 +1446,97 @@ pub(crate) mod tests {
         }
     }
 
+    /// RFC 7296 §3.3.5, §3.3.6 on the SAi2 the responder reads off the wire: a
+    /// transform with a Key Length it must not have (ESN NONE, INTEG NONE) or an
+    /// attribute we cannot read (ENCR, INTEG, ESN) is unacceptable, so a
+    /// proposal that has it -- and no other of its type -- is passed over for
+    /// the next one, and one that has it next to a plain one is answered with
+    /// the plain one. Only DH is passed over whatever it carries, because a DH
+    /// group has no place in SAi2 to begin with (§1.2: "cannot contain ... any
+    /// value other than NONE"): a leniency this crate always had, not a rule.
+    /// And the forged SAr2 that names them is not our proposal.
+    #[test]
+    fn the_ike_auth_sa_payloads_take_no_transform_with_a_key_length_it_must_not_have_or_an_attribute_it_cannot_read() {
+        use crate::ikev2::payload::test_wire::{proposal, sa, transform, KEY_LENGTH_128, KEY_LENGTH_256, UNKNOWN_ATTRIBUTE};
+        let (init_sa, resp_sa) = run_sa_init();
+        let psk = b"pw".to_vec();
+        let icfg = AuthConfig::psk(Identification::fqdn("client.example"), psk.clone());
+        let rcfg = AuthConfig::psk(Identification::fqdn("gw.example"), psk);
+        let req = initiator_auth_request(&init_sa, &icfg, 1, &esp_offer(0), &[1u8; 8]).unwrap();
+        let answer = |proposals: &[Vec<u8>]| {
+            let req = with_sa_body(init_sa.suite.sk_cipher(), &req, &init_sa.keys.sk_ei, &init_sa.keys.sk_ai, sa(proposals));
+            let (resp, _, peer_child_spi, _) = responder_process_auth(&resp_sa, &req, &rcfg, 0xCAFE_BABE, &[2u8; 8], None).unwrap();
+            let sar2 = sa_of(init_sa.suite.sk_cipher(), &resp, &init_sa.keys.sk_er, &init_sa.keys.sk_ar);
+            (resp, sar2, peer_child_spi)
+        };
+        let esp = |num: u8, transforms: &[Vec<u8>]| proposal(num, protocol_id::ESP, &(0x1000 + num as u32).to_be_bytes(), transforms);
+        let gcm = || transform(transform_type::ENCR, transform_id::AES_GCM_16, &KEY_LENGTH_256);
+        let esn_none = || transform(transform_type::ESN, transform_id::ESN_NONE, &[]);
+        let fine = || esp(2, &[gcm(), esn_none()]);
+        let ours = |num: u8| esp_proposal(num, 0xCAFE_BABE, &[GCM256, ESN_NONE]);
+
+        let (_, taken, spi) = answer(&[esp(1, &[gcm(), esn_none()])]);
+        assert_eq!((taken, spi), (Some(SecurityAssociation { proposals: vec![ours(1)] }), Some(0x1001)), "control");
+        let refused = [
+            ("an ESN NONE with a Key Length", esp(1, &[gcm(), transform(transform_type::ESN, transform_id::ESN_NONE, &KEY_LENGTH_128)])),
+            ("an INTEG NONE with a Key Length", esp(1, &[gcm(), transform(transform_type::INTEG, transform_id::INTEG_NONE, &KEY_LENGTH_128), esn_none()])),
+            ("an ENCR we cannot read", esp(1, &[transform(transform_type::ENCR, transform_id::AES_GCM_16, &UNKNOWN_ATTRIBUTE), esn_none()])),
+            ("an INTEG we cannot read", esp(1, &[gcm(), transform(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, &UNKNOWN_ATTRIBUTE), esn_none()])),
+            ("an ESN we cannot read", esp(1, &[gcm(), transform(transform_type::ESN, transform_id::ESN_NONE, &UNKNOWN_ATTRIBUTE)])),
+        ];
+        for (what, bad) in &refused {
+            let (resp, sar2, peer_spi) = answer(std::slice::from_ref(bad));
+            assert_eq!((sar2, peer_spi), (None, None), "{what}: no CHILD SA");
+            assert_eq!(answered_ts(&init_sa, &resp), (None, None, vec![notify_type::NO_PROPOSAL_CHOSEN]), "{what}");
+            let (_, sar2, peer_spi) = answer(&[bad.clone(), fine()]);
+            assert_eq!((sar2, peer_spi), (Some(SecurityAssociation { proposals: vec![ours(2)] }), Some(0x1002)), "{what}, then a proposal that is fine");
+        }
+        // Next to the plain transform of its type, in one proposal.
+        for (what, transforms, answered) in [
+            ("an ESN NONE", vec![gcm(), transform(transform_type::ESN, transform_id::ESN_NONE, &KEY_LENGTH_128), esn_none()], vec![GCM256, ESN_NONE]),
+            ("an ESN we cannot read", vec![gcm(), transform(transform_type::ESN, transform_id::ESN_NONE, &UNKNOWN_ATTRIBUTE), esn_none()], vec![GCM256, ESN_NONE]),
+            ("an INTEG we cannot read", vec![gcm(), transform(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, &UNKNOWN_ATTRIBUTE), transform(transform_type::INTEG, transform_id::INTEG_NONE, &[]), esn_none()], vec![GCM256, (transform_type::INTEG, transform_id::INTEG_NONE, None), ESN_NONE]),
+        ] {
+            // The order of the transforms in a proposal is not significant (§3.3), so it is not compared.
+            let (_, sar2, peer_spi) = answer(&[esp(1, &transforms)]);
+            let sorted = |sa: SecurityAssociation| {
+                let mut proposals = sa.proposals;
+                proposals.iter_mut().for_each(|p| p.transforms.sort_by_key(|t| (t.transform_type, t.transform_id)));
+                proposals
+            };
+            let expected = sorted(SecurityAssociation { proposals: vec![esp_proposal(1, 0xCAFE_BABE, &answered)] });
+            assert_eq!((sar2.map(sorted), peer_spi), (Some(expected), Some(0x1001)), "{what}, next to a plain one");
+        }
+        // A DH group passed over whatever it carries.
+        for (what, dh) in [
+            ("a DH group", transform(transform_type::DH, transform_id::MODP_2048, &[])),
+            ("a DH group with a Key Length", transform(transform_type::DH, transform_id::MODP_2048, &KEY_LENGTH_128)),
+            ("a DH group we cannot read", transform(transform_type::DH, transform_id::MODP_2048, &UNKNOWN_ATTRIBUTE)),
+        ] {
+            let (_, sar2, peer_spi) = answer(&[esp(1, &[gcm(), dh, esn_none()])]);
+            assert_eq!((sar2, peer_spi), (Some(SecurityAssociation { proposals: vec![ours(1)] }), Some(0x1001)), "{what} in SAi2 is left out");
+        }
+
+        // The initiator's side: a forged SAr2 naming them is not the proposal we sent.
+        let (resp, ..) = responder_process_auth(&resp_sa, &req, &rcfg, 0xCAFE_BABE, &[2u8; 8], None).unwrap();
+        let verify = |sar2: Vec<u8>| {
+            let resp = with_sa_body(resp_sa.suite.sk_cipher(), &resp, &resp_sa.keys.sk_er, &resp_sa.keys.sk_ar, sar2);
+            initiator_verify_auth(&init_sa, &resp, &icfg, &esp_offer(0), ChildTsOffer::Ipv4).map(|(_, spi, ..)| spi)
+        };
+        let answered = |transforms: &[Vec<u8>]| sa(&[proposal(1, protocol_id::ESP, &0xCAFE_BABEu32.to_be_bytes(), transforms)]);
+        assert_eq!(verify(answered(&[gcm(), esn_none()])), Ok(0xCAFE_BABE), "control");
+        let cases = [
+            ("an ESN NONE with a Key Length", answered(&[gcm(), transform(transform_type::ESN, transform_id::ESN_NONE, &KEY_LENGTH_128)])),
+            ("an ESN we cannot read instead of ours", answered(&[gcm(), transform(transform_type::ESN, transform_id::ESN_NONE, &UNKNOWN_ATTRIBUTE)])),
+            ("an ESN we cannot read added", answered(&[gcm(), esn_none(), transform(transform_type::ESN, transform_id::ESN_NONE, &UNKNOWN_ATTRIBUTE)])),
+            ("an ENCR we cannot read added", answered(&[gcm(), transform(transform_type::ENCR, transform_id::AES_GCM_16, &UNKNOWN_ATTRIBUTE), esn_none()])),
+            ("an INTEG NONE with a Key Length added", answered(&[gcm(), transform(transform_type::INTEG, transform_id::INTEG_NONE, &KEY_LENGTH_128), esn_none()])),
+        ];
+        for (what, sar2) in cases {
+            assert_eq!(verify(sar2), Err(IkeError::NoProposalChosen), "{what}");
+        }
+    }
+
     /// RFC 7296 §3.3.6, §2.7, §3.3.1: the initiator takes back one of its SAi2
     /// proposals -- a single one, by its number, one transform of each type --
     /// or nothing: each forged SAr2 below names the very suite we offered and

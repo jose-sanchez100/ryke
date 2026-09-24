@@ -136,9 +136,15 @@ fn first_proposal_dh_ids(sa: &SecurityAssociation) -> Vec<u16> {
 
 /// Whether any proposal of `sa` names the DH group `id` -- whatever the transform
 /// that names it carries, a KE payload of a group no proposal lists being a
-/// malformed request rather than a proposal to weigh.
+/// malformed request rather than a proposal to weigh. A DH transform we could
+/// not read (an attribute we do not understand, RFC 7296 §3.3.6) may name it
+/// too: that transform is unacceptable, and the request is not for that reason
+/// malformed -- which would be `INVALID_SYNTAX`, fatal to the IKE SA (§2.21.3),
+/// instead of `NO_PROPOSAL_CHOSEN`.
 fn proposals_name_dh(sa: &SecurityAssociation, id: u16) -> bool {
-    sa.proposals.iter().any(|p| p.transforms.iter().any(|t| t.transform_type == transform_type::DH && t.transform_id == id))
+    sa.proposals
+        .iter()
+        .any(|p| p.transforms.iter().any(|t| t.transform_type == transform_type::DH && (t.transform_id == id || t.transform_id == transform_id::UNUSABLE)))
 }
 
 /// Our ephemeral share of a PFS exchange: the DH group both sides will use,
@@ -1904,6 +1910,100 @@ mod tests {
         assert_eq!(with_esn(vec![esn(None)]).unwrap().transforms.last(), Some(&esn(None)), "control: ESN_NONE");
         assert_eq!(with_esn(vec![esn(Some(32))]), Err(IkeError::NoProposalChosen), "ESN_NONE with a Key Length");
         assert_eq!(with_esn(vec![esn(Some(32)), esn(None)]).unwrap().transforms.last(), Some(&esn(None)), "the ESN_NONE with a Key Length next to the plain one");
+    }
+
+    /// The responders of a CHILD SA rekey the peer started weigh a Key Length
+    /// and an attribute they cannot read alike, whichever entry point a caller
+    /// has (RFC 7296 §3.3.5, §3.3.6): the older [`responder_process_rekey`], and
+    /// [`responder_process_rekey_with_pfs`] and [`responder_answer_child_rekey`]
+    /// with no PFS and with a group. A Key Length on a DH, integrity or ESN
+    /// transform -- which take none -- and an attribute we do not understand each
+    /// make that transform unacceptable, not absent: the proposal is passed
+    /// over for the next one, and the transforms of its type that are fine
+    /// are weighed as usual.
+    #[test]
+    fn every_rekey_responder_takes_no_transform_with_a_key_length_it_must_not_have_or_an_attribute_it_cannot_read() {
+        use crate::ikev2::payload::test_wire::{proposal, sa, transform, KEY_LENGTH_128, KEY_LENGTH_256, UNKNOWN_ATTRIBUTE};
+        let (our_sa, peer_sa) = sa_pair();
+        let (nr, iv, resp_dh, peer_dh) = ([0x44u8; 32], [2u8; 8], [6u8; 32], [5u8; 32]);
+        let spi = 0x2222_2222u32.to_be_bytes();
+        let gcm = || transform(transform_type::ENCR, transform_id::AES_GCM_16, &KEY_LENGTH_256);
+        let esn_none = || transform(transform_type::ESN, transform_id::ESN_NONE, &[]);
+        let group = || transform(transform_type::DH, transform_id::MODP_2048, &[]);
+        let with_kl = |ty: u8, id: u16| transform(ty, id, &KEY_LENGTH_128);
+        let unreadable = |ty: u8, id: u16| transform(ty, id, &UNKNOWN_ATTRIBUTE);
+        let esp = |num: u8, transforms: &[Vec<u8>]| proposal(num, protocol_id::ESP, &spi, transforms);
+        let ke = || KeyExchange { dh_group: transform_id::MODP_2048, data: DhGroup::Modp2048.public(&peer_dh) };
+        let answered = |response: Vec<u8>| read_rekey_response(&response, &peer_sa).0;
+        let required = PfsPolicy::from_offer(&SecurityAssociation {
+            proposals: vec![esp_proposal(1, 0, (transform_id::AES_GCM_16, Some(256)), None, &[transform_id::MODP_2048])],
+        })
+        .unwrap();
+
+        let old_api = |req: &[u8]| responder_process_rekey(&our_sa, req, 0x1111_1111, &nr, &iv, None).map(|(r, _)| answered(r));
+        let no_key = |req: &[u8]| {
+            responder_process_rekey_with_pfs(&our_sa, req, 0x1111_1111, &nr, SkCipher::Aes256Gcm, None, &iv, None).map(|(r, _)| answered(r))
+        };
+        let no_pfs_policy = |req: &[u8]| {
+            responder_answer_child_rekey(&our_sa, req, 0x1111_1111, &nr, SkCipher::Aes256Gcm, &PfsPolicy::none(), &resp_dh, &iv).map(|(r, _)| answered(r))
+        };
+        let with_key = |req: &[u8]| {
+            responder_process_rekey_with_pfs(&our_sa, req, 0x1111_1111, &nr, SkCipher::Aes256Gcm, Some(&resp_dh), &iv, None).map(|(r, _)| answered(r))
+        };
+        let group_policy = |req: &[u8]| {
+            responder_answer_child_rekey(&our_sa, req, 0x1111_1111, &nr, SkCipher::Aes256Gcm, &required, &resp_dh, &iv).map(|(r, _)| answered(r))
+        };
+        type Entry<'a> = (&'a str, &'a dyn Fn(&[u8]) -> Result<Proposal, IkeError>);
+        let without_pfs: [Entry; 3] = [
+            ("responder_process_rekey", &old_api),
+            ("responder_process_rekey_with_pfs, no key", &no_key),
+            ("responder_answer_child_rekey, no PFS policy", &no_pfs_policy),
+        ];
+        let with_pfs: [Entry; 2] = [("responder_process_rekey_with_pfs, a key", &with_key), ("responder_answer_child_rekey, a PFS group", &group_policy)];
+        let transforms_of = |p: &Proposal, ty: u8| p.transforms.iter().filter(|t| t.transform_type == ty).cloned().collect::<Vec<_>>();
+        let plain = |ty: u8, id: u16| Transform { transform_type: ty, transform_id: id, key_length: None };
+
+        // No PFS: a proposal is refused for the transform it cannot take, and the next one is answered.
+        let refused_without_pfs = [
+            ("DH NONE with a Key Length", esp(1, &[gcm(), esn_none(), with_kl(transform_type::DH, 0)])),
+            ("INTEG NONE with a Key Length", esp(1, &[gcm(), with_kl(transform_type::INTEG, 0), esn_none()])),
+            ("ESN NONE with a Key Length", esp(1, &[gcm(), with_kl(transform_type::ESN, transform_id::ESN_NONE)])),
+            ("a DH we cannot read", esp(1, &[gcm(), esn_none(), unreadable(transform_type::DH, transform_id::MODP_2048)])),
+            ("an integrity algorithm we cannot read", esp(1, &[gcm(), unreadable(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128), esn_none()])),
+            ("an ESN we cannot read", esp(1, &[gcm(), unreadable(transform_type::ESN, transform_id::ESN_NONE)])),
+        ];
+        for (name, entry) in &without_pfs {
+            let request = |proposals: &[Vec<u8>]| peer_rekey_request_wire(&peer_sa, &sa(proposals), None);
+            assert_eq!(entry(&request(&[esp(1, &[gcm(), esn_none()])])).unwrap().num, 1, "{name}: control");
+            for (what, refused) in &refused_without_pfs {
+                assert_eq!(entry(&request(std::slice::from_ref(refused))), Err(IkeError::NoProposalChosen), "{name}: {what}");
+                let next = entry(&request(&[refused.clone(), esp(2, &[gcm(), esn_none()])])).unwrap_or_else(|e| panic!("{name}: {what}, then a proposal that is fine: {e:?}"));
+                assert_eq!(next.num, 2, "{name}: {what}, then a proposal that is fine");
+            }
+            // The transform with the Key Length next to the plain one of its type, in one proposal: the plain one is answered.
+            let dh_siblings = esp(1, &[gcm(), esn_none(), with_kl(transform_type::DH, 0), transform(transform_type::DH, 0, &[])]);
+            assert_eq!(transforms_of(&entry(&request(&[dh_siblings])).unwrap(), transform_type::DH), [plain(transform_type::DH, 0)], "{name}: DH NONE, both kinds");
+            let integ_siblings = esp(1, &[gcm(), with_kl(transform_type::INTEG, 0), transform(transform_type::INTEG, 0, &[]), esn_none()]);
+            assert_eq!(transforms_of(&entry(&request(&[integ_siblings])).unwrap(), transform_type::INTEG), [plain(transform_type::INTEG, 0)], "{name}: INTEG NONE, both kinds");
+        }
+
+        // PFS: the group has to be one we can read, plain, and the transforms around it too.
+        let refused_with_pfs = [
+            ("the group with a Key Length", esp(1, &[gcm(), esn_none(), with_kl(transform_type::DH, transform_id::MODP_2048)])),
+            ("a group we cannot read", esp(1, &[gcm(), esn_none(), unreadable(transform_type::DH, transform_id::MODP_2048)])),
+            ("INTEG NONE with a Key Length", esp(1, &[gcm(), with_kl(transform_type::INTEG, 0), esn_none(), group()])),
+            ("ESN NONE with a Key Length", esp(1, &[gcm(), with_kl(transform_type::ESN, transform_id::ESN_NONE), group()])),
+        ];
+        for (name, entry) in &with_pfs {
+            let request = |proposals: &[Vec<u8>]| peer_rekey_request_wire(&peer_sa, &sa(proposals), Some(ke()));
+            let control = entry(&request(&[esp(1, &[gcm(), esn_none(), group()])])).unwrap();
+            assert_eq!((control.num, transforms_of(&control, transform_type::DH)), (1, vec![plain(transform_type::DH, transform_id::MODP_2048)]), "{name}: control");
+            for (what, refused) in &refused_with_pfs {
+                assert_eq!(entry(&request(std::slice::from_ref(refused))), Err(IkeError::NoProposalChosen), "{name}: {what}");
+                let next = entry(&request(&[refused.clone(), esp(2, &[gcm(), esn_none(), group()])])).unwrap_or_else(|e| panic!("{name}: {what}, then a proposal that is fine: {e:?}"));
+                assert_eq!(next.num, 2, "{name}: {what}, then a proposal that is fine");
+            }
+        }
     }
 
     /// RFC 7296 §2.7, §3.3.6: [`responder_process_rekey_with_pfs`] answers with

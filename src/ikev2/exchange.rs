@@ -1281,6 +1281,100 @@ mod tests {
         }
     }
 
+    /// RFC 7296 §3.3.5, §3.3.6: a PRF, DH or integrity transform takes no Key
+    /// Length ("MUST NOT be used with transforms that use a fixed-length key"),
+    /// so one that carries it is unacceptable -- not one to take with the
+    /// attribute dropped: the responder passes over the proposal that has it
+    /// for the next one, and weighs the transforms of its type that are fine as
+    /// usual; the initiator takes back no answer that names it, "attributes
+    /// ... returned unmodified".
+    #[test]
+    fn an_ike_transform_with_a_key_length_it_must_not_have_is_unacceptable_in_both_directions() {
+        use crate::ikev2::payload::test_wire::{proposal, sa, transform, KEY_LENGTH_128, KEY_LENGTH_256};
+        const NONE: u16 = transform_id::INTEG_NONE;
+        let gcm = || transform(transform_type::ENCR, transform_id::AES_GCM_16, &KEY_LENGTH_256);
+        let prf = || transform(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, &[]);
+        let dh = || transform(transform_type::DH, transform_id::X25519, &[]);
+        let integ_none = || transform(transform_type::INTEG, NONE, &[]);
+        let with_kl = |ty: u8, id: u16| transform(ty, id, &KEY_LENGTH_128);
+        let ike = |num: u8, transforms: &[Vec<u8>]| proposal(num, protocol_id::IKE, &[], transforms);
+        let plain = |ty: u8, id: u16| Transform { transform_type: ty, transform_id: id, key_length: None };
+        let of_type = |proposal: &Proposal, ty: u8| proposal.transforms.iter().filter(|t| t.transform_type == ty).cloned().collect::<Vec<_>>();
+        let refused = [
+            ("a PRF with a Key Length", vec![gcm(), with_kl(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256), dh()]),
+            ("a DH with a Key Length", vec![gcm(), prf(), with_kl(transform_type::DH, transform_id::X25519)]),
+            ("an INTEG NONE with a Key Length", vec![gcm(), prf(), with_kl(transform_type::INTEG, NONE), dh()]),
+        ];
+
+        // The responder's side: what the peer offers, as it went on the wire.
+        let respond = |proposals: &[Vec<u8>]| responder_respond(&raw_sa_init(&sa(proposals), false), &resp_secret());
+        let (_, control) = respond(&[ike(1, &[gcm(), prf(), dh()])]).expect("control: a proposal with nothing to refuse");
+        assert_eq!(control.suite.proposal_num, 1);
+        for (what, transforms) in &refused {
+            assert_eq!(respond(&[ike(1, transforms)]).map(|_| ()), Err(IkeError::NoProposalChosen), "responder: {what}");
+            let (_, next) = respond(&[ike(1, transforms), ike(2, &[gcm(), prf(), dh()])]).unwrap_or_else(|e| panic!("responder: {what}, then a proposal that is fine: {e:?}"));
+            assert_eq!(next.suite.proposal_num, 2, "responder: {what}, then a proposal that is fine");
+        }
+        // The transform with the Key Length next to the plain one of its type, in one proposal.
+        for (what, ty, id, siblings) in [
+            ("a PRF", transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, vec![gcm(), with_kl(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256), prf(), dh()]),
+            ("an INTEG NONE", transform_type::INTEG, NONE, vec![gcm(), prf(), with_kl(transform_type::INTEG, NONE), integ_none(), dh()]),
+        ] {
+            let (response, _) = respond(&[ike(1, &siblings)]).unwrap_or_else(|e| panic!("responder: {what}, both kinds: {e:?}"));
+            let header = IkeHeader::parse(&response).unwrap();
+            let answer = parse_sa_init(&header, &response[IkeHeader::LEN..]).unwrap().sa;
+            assert_eq!(of_type(&answer.proposals[0], ty), [plain(ty, id)], "responder: {what}, both kinds: the plain one is answered");
+        }
+
+        // The initiator's side: an answer to `offer` that names the transform with the Key Length is not our offer.
+        let init = init_secret();
+        let complete = |offer: &SecurityAssociation, transforms: &[Vec<u8>]| {
+            let request = initiator_request(&init, offer);
+            initiator_complete(&init, &request, &raw_sa_init(&sa(&[ike(1, transforms)]), true)).map(|_| ())
+        };
+        let ours = default_offer();
+        assert_eq!(complete(&ours, &[gcm(), prf(), dh()]), Ok(()), "initiator: control");
+        for (what, transforms) in &refused[..2] {
+            assert_eq!(complete(&ours, transforms), Err(IkeError::NoProposalChosen), "initiator: {what}");
+        }
+        let with_none = SecurityAssociation { proposals: vec![gcm_offer(&[NONE])] };
+        assert_eq!(complete(&with_none, &[gcm(), prf(), integ_none(), dh()]), Ok(()), "initiator: an INTEG NONE offered, answered plain");
+        assert_eq!(complete(&with_none, &refused[2].1), Err(IkeError::NoProposalChosen), "initiator: an INTEG NONE offered plain, answered with a Key Length");
+
+        // The same for a cipher that goes with a separate integrity algorithm, whose PRF and INTEG are picked apart from an AEAD's.
+        let cbc = || transform(transform_type::ENCR, transform_id::AES_CBC, &KEY_LENGTH_256);
+        let sha = || transform(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, &[]);
+        let cbc_refused = [
+            ("a PRF with a Key Length, with AES-CBC", vec![cbc(), sha(), with_kl(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256), dh()]),
+            ("an INTEG with a Key Length, with AES-CBC", vec![cbc(), with_kl(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128), prf(), dh()]),
+        ];
+        let (_, control) = respond(&[ike(1, &[cbc(), sha(), prf(), dh()])]).expect("control: AES-CBC with its integrity algorithm");
+        assert_eq!(control.suite.integ_id, Some(transform_id::AUTH_HMAC_SHA2_256_128));
+        for (what, transforms) in &cbc_refused {
+            assert_eq!(respond(&[ike(1, transforms)]).map(|_| ()), Err(IkeError::NoProposalChosen), "responder: {what}");
+            let (_, next) = respond(&[ike(1, transforms), ike(2, &[cbc(), sha(), prf(), dh()])]).unwrap_or_else(|e| panic!("responder: {what}, then a proposal that is fine: {e:?}"));
+            assert_eq!(next.suite.proposal_num, 2, "responder: {what}, then a proposal that is fine");
+        }
+        let plain_of = |ty: u8, id: u16, key_length: Option<u16>| Transform { transform_type: ty, transform_id: id, key_length };
+        let cbc_offer = SecurityAssociation {
+            proposals: vec![Proposal {
+                num: 1,
+                protocol_id: protocol_id::IKE,
+                spi: Vec::new(),
+                transforms: vec![
+                    plain_of(transform_type::ENCR, transform_id::AES_CBC, Some(256)),
+                    plain_of(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, None),
+                    plain_of(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, None),
+                    plain_of(transform_type::DH, transform_id::X25519, None),
+                ],
+            }],
+        };
+        assert_eq!(complete(&cbc_offer, &[cbc(), sha(), prf(), dh()]), Ok(()), "initiator: control, AES-CBC");
+        for (what, transforms) in &cbc_refused {
+            assert_eq!(complete(&cbc_offer, transforms), Err(IkeError::NoProposalChosen), "initiator: {what}");
+        }
+    }
+
     #[test]
     fn responder_rejects_wrong_ke_group() {
         // SA offers X25519 (accepted) but the KE payload claims MODP-2048.

@@ -7623,6 +7623,36 @@ mod tests {
         assert!(next_on_theirs, "our rekey is dropped, not retransmitted, and the session is on the gateway's IKE SA");
     }
 
+    /// Another way the wait for an IKE rekey that crossed the gateway's ends in
+    /// a teardown: the gateway, having rekeyed the IKE SA itself, deletes the
+    /// tunnel's only CHILD SA. The IKE SA has not ended -- only an
+    /// `INVALID_SYNTAX` on it lets the session go on under the gateway's new one
+    /// (RFC 7296 §2.8.2, §2.21.3) -- so that is the tunnel going down, whether
+    /// or not a rekey of ours was crossed.
+    #[test]
+    fn the_gateway_deleting_the_last_child_sa_after_its_own_crossed_ike_rekey_is_a_teardown() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let _ours = recv_from_client(&sock); // never answered
+                let ni = [0x55u8; 32];
+                sock.send_to(&gateway_ike_rekey(&sa, 0, &ni), from).unwrap();
+                let _theirs = gateway_ike_rekey_done(&sa, &ni, &recv_from_client(&sock));
+                sock.send_to(&esp_delete_request(&sa, 1, RESPONDER_CHILD_SPI), from).unwrap();
+                (client_spi, delete_in(&sa, &recv_response_from_client(&sock)))
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        assert_eq!(tunnel.liveness.rekey_ike(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown, "the tunnel has no CHILD SA left");
+        let (client_spi, answered) = gateway.join().unwrap();
+        assert_eq!(answered, Some(Delete::esp(vec![client_spi])), "the Delete is answered as usual, with our Delete for it");
+    }
+
     /// The same collision from the other side: the gateway finished its rekey
     /// first and refuses ours with `TEMPORARY_FAILURE` -- the IKE SA it is
     /// about is on its way out (RFC 7296 §2.8.2). The gateway's IKE SA

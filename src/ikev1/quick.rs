@@ -25,6 +25,40 @@
 //! a later `CREATE_CHILD_SA` rekey -- see [`crate::ikev2::rekey`]), IKEv1
 //! Quick Mode negotiates PFS on the *initial* Phase-2 exchange, so it's
 //! testable at connect time.
+//!
+//! # SA lifetimes: seconds are held, volume is not counted
+//!
+//! A lifetime can be stated in seconds and in kilobytes, several pairs at once
+//! ("100 MB or 24 hours": RFC 2407 §4.5, §4.5.2; RFC 2409 App. A for Phase 1),
+//! and the SA ends when the first of them runs out. This crate keeps the time
+//! limit and counts no volume: it does not carry the ESP data plane (the caller
+//! runs the traffic; [`crate::esp::EspSa`] only seals and opens what it is
+//! handed), so nothing here knows how many kilobytes an SA has protected, and
+//! there is no counter for a limit to be checked against. What follows is
+//! deliberate, and the same in Phase 1 (`phase1::p1_life`) and Phase 2
+//! ([`lifetime_seconds`]):
+//!
+//! - what we offer is one seconds pair and nothing else, so we never ask the
+//!   peer to hold us to a volume;
+//! - what we answer as a responder is one seconds pair too -- our own limit --
+//!   and never a kilobytes pair: agreeing to a limit we do not enforce would
+//!   state something false (RFC 2407 §4.5.4: a responder may answer with a
+//!   shorter lifetime, and the answer is what it will keep to);
+//! - a kilobytes pair in an offer or an answer must still be well formed
+//!   (Type, then a Duration that is not zero, empty or absurdly wide; no two
+//!   values for one unit), or the exchange ends -- and is otherwise not read as
+//!   anything: never as seconds, and never as a limit this side holds;
+//! - a volume limit the peer states is the peer's to enforce on its side: this
+//!   side holds no count of its own and does not rekey ahead of it.
+//!
+//! What this leaves open is a decision about policy, or a change outside this
+//! crate (counters in the data plane, which the caller owns): a responder
+//! answers an offer that includes a volume limit as though it had none, so the
+//! SA it grants may protect more than the initiator was willing to; and an SA
+//! the peer limits by volume is not renewed by this side before that limit is
+//! reached. Refusing either outright (RFC 2407 §4.5.3 can be read as aborting
+//! the negotiation on a defined value we do not support) would end the
+//! negotiation with any gateway that states a volume limit.
 
 use std::net::{Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -173,7 +207,7 @@ fn find(ps: &[Payload], t: u8) -> Option<&Payload> {
 /// a Type that is not a basic attribute or not seconds/kilobytes, a Duration
 /// that is empty, wider than eight octets or zero, and two different durations
 /// for one unit. A kilobytes pair is checked and otherwise left alone -- see
-/// the module's limitations.
+/// the module's "SA lifetimes" section.
 fn lifetime_seconds(t: &Transform) -> Result<Option<u32>, IkeError> {
     let (mut seconds, mut kilobytes): (Option<u32>, Option<u32>) = (None, None);
     let mut pending: Option<u16> = None;
@@ -217,8 +251,8 @@ fn lifetime_seconds(t: &Transform) -> Result<Option<u32>, IkeError> {
 /// none) counts, but never beyond `offered`: what we offered is our own limit,
 /// and a longer answer only says the peer would keep the SA longer. A
 /// kilobytes pair is not a number of seconds. `offered` is also what an
-/// answer we can't read leaves us with. Mirrors
-/// `phase1::negotiated_p1_lifetime`, against the ESP DOI's attribute registry.
+/// answer we can't read leaves us with. `phase1::negotiated_p1_lifetime` is
+/// the Phase-1 counterpart, which has no default lifetime to fall back on.
 fn negotiated_p2_lifetime(ps: &[Payload], offered: u32) -> u32 {
     let Ok(sa) = single_sa(ps) else { return offered };
     let Some(transform) = sa.proposals.first().and_then(|p| p.transforms.first()) else { return offered };
@@ -2538,6 +2572,45 @@ mod tests {
         assert_eq!(seconds(vec![life_type(2), life_dur(100_000), life_type(1), life_dur(900)]), 900);
         assert_eq!(seconds(vec![life_type(1), Attribute::long_bytes(esp_attr::LIFE_DURATION, vec![0x03, 0x84])]), 900);
         assert_eq!(seconds(vec![]), 3600);
+    }
+
+    /// The lifetime attributes of every transform of `sa`, in order.
+    fn life_attributes(sa: &SaPayload) -> Vec<Attribute> {
+        let is_life = |a: &&Attribute| matches!(a.attr_type, esp_attr::LIFE_TYPE | esp_attr::LIFE_DURATION);
+        sa.proposals.iter().flat_map(|p| p.transforms.iter()).flat_map(|t| t.attributes.iter().filter(is_life)).cloned().collect()
+    }
+
+    /// This side counts no volume, so what it offers and what it answers states
+    /// its lifetime as one seconds pair and never as a kilobytes one: it neither
+    /// asks the peer to hold it to a volume nor agrees to one it cannot keep (see
+    /// the module's "SA lifetimes" section; RFC 2407 §4.5, §4.5.4).
+    #[test]
+    fn quick_mode_states_seconds_only_in_what_it_offers_and_what_it_answers() {
+        let mut wrong = Vec::new();
+        let pair = |seconds: u32| vec![life_type(1), life_dur(seconds)];
+        for (name, sa) in [
+            ("AES-GCM", esp_sa(1, SkCipher::Aes256Gcm, None, false, 900)),
+            ("AES-GCM with PFS, UDP-encapsulated", esp_sa(1, SkCipher::Aes128Gcm, Some(DhGroup::Modp2048), true, 900)),
+            ("AES-CBC with HMAC", esp_sa(1, SkCipher::Aes256Cbc(IntegAlgorithm::HmacSha2_256_128), None, false, 900)),
+        ] {
+            if life_attributes(&sa) != pair(900) {
+                wrong.push(format!("offer, {name}: {:?}", life_attributes(&sa)));
+            }
+        }
+        let kilobytes = |n: u32| vec![life_type(2), life_dur(n)];
+        let cases = [
+            ("kilobytes only", kilobytes(100_000), 3600),
+            ("seconds, then kilobytes", [pair(900), kilobytes(100_000)].concat(), 900),
+            ("kilobytes, then seconds", [kilobytes(100_000), pair(900)].concat(), 900),
+            ("the same kilobytes pair twice", [kilobytes(100_000), kilobytes(100_000)].concat(), 3600),
+        ];
+        for (name, life, granted) in cases {
+            let answer = responder_answer(false, &[offer(|sa| set_life(sa, life))]).unwrap();
+            if life_attributes(&answer) != pair(granted) {
+                wrong.push(format!("answer to {name}: {:?}, wanted a seconds pair of {granted}", life_attributes(&answer)));
+            }
+        }
+        assert!(wrong.is_empty(), "lifetimes stated beyond seconds:\n{}", wrong.join("\n"));
     }
 
     fn message_of(cky_i: [u8; 8], cky_r: [u8; 8], message_id: u32) -> Vec<u8> {

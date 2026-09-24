@@ -9,6 +9,10 @@
 //!
 //! After this, both sides hold `SKEYID_{d,a,e}`; the Xauth, Mode-Config and
 //! Quick-Mode exchanges follow, encrypted under `SKEYID_e`.
+//!
+//! The ISAKMP SA's lifetime is held in seconds only, like the IPsec SA's: see
+//! `quick.rs`'s "SA lifetimes" section for why no volume limit is counted and
+//! what that leaves open.
 
 use super::crypto1::{self, Prf, AES_BLOCK};
 use super::isakmp::{self, exchange, payload, IsakmpHeader};
@@ -3345,6 +3349,31 @@ mod tests {
             }
         }
         assert!(accepted.is_empty(), "{} unreadable answers not refused:\n{}", accepted.len(), accepted.join("\n"));
+    }
+
+    /// What this side offers is one seconds pair, in both modes and whatever the
+    /// lifetime it is configured with: it counts no volume, so it does not ask the
+    /// peer to hold it to one (`quick.rs`, "SA lifetimes").
+    #[test]
+    fn what_an_initiator_offers_states_its_lifetime_in_seconds_and_nothing_else() {
+        let mut wrong = Vec::new();
+        for mode in BOTH_MODES {
+            for seconds in [1200, 28800, 86400] {
+                let mut icfg = life_initiator_cfg(mode);
+                icfg.p1_lifetime_secs = seconds;
+                let (ours, theirs): (SocketAddr, SocketAddr) = (LIFE_INITIATOR_ADDR.parse().unwrap(), LIFE_RESPONDER_ADDR.parse().unwrap());
+                let mut ie = SeedEntropy::new(0xC1);
+                let msg1 = match mode {
+                    Ikev1ExchangeMode::Aggressive => initiate_aggressive(&icfg, &mut ie, ours, theirs).0,
+                    Ikev1ExchangeMode::Main => initiate_main(&icfg, &mut ie).0,
+                };
+                let got = sa_life(&msg1);
+                if got != vec![life_type(1), life_secs(seconds)] {
+                    wrong.push(format!("{mode:?}, {seconds} s: offered {got:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "offers that state more than seconds:\n{}", wrong.join("\n"));
     }
 
     /// The responder grants only a limit it can state and keep: the seconds pair

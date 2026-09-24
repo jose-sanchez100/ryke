@@ -234,6 +234,9 @@ struct PeerRequests {
     /// The fragments in hand of the next request, if it comes fragmented
     /// (RFC 7383), and since when.
     fragments: Option<(Reassembly, Instant)>,
+    /// Whether the request being answered came in fragments: its answer
+    /// then goes in fragments too (RFC 7383 §2.4, see [`prepare`]).
+    answering_fragmented: bool,
     /// The IKE SA is gone -- the peer deleted it (§1.4.1), or a request of
     /// its was answered `INVALID_SYNTAX` (§2.21.3): nothing but a
     /// retransmission of that last request is answered on it any more.
@@ -1225,15 +1228,15 @@ impl LivenessSession {
             crate::debug::dump("<<<", self.dest, &buf[..n]);
             let Ok(msg) = unwrap(&buf[..n], self.float) else { continue };
             let Ok(header) = IkeHeader::parse(&msg) else { continue };
-            let (header, msg) = if header.next_payload == PayloadType::EncryptedFragment {
+            let (header, msg, fragmented) = if header.next_payload == PayloadType::EncryptedFragment {
                 match self.take_fragment(&header, &msg, awaited.as_deref_mut())? {
-                    Fragmented::Whole(header, msg) => (header, msg),
+                    Fragmented::Whole(header, msg) => (header, msg, true),
                     Fragmented::Pending => continue,
                     Fragmented::AnsweredAgain { tears_down: true } => return Ok(Liveness::PeerTornDown),
                     Fragmented::AnsweredAgain { tears_down: false } => continue,
                 }
             } else {
-                (header, msg)
+                (header, msg, false)
             };
             if header.flags.response {
                 let answer = awaited.as_deref().map(Reassembly::key);
@@ -1245,7 +1248,7 @@ impl LivenessSession {
                 }
                 continue;
             }
-            if self.answer_peer_request(&header, &msg)? {
+            if self.answer_peer_request(&header, &msg, fragmented)? {
                 return Ok(Liveness::PeerTornDown);
             }
         }
@@ -1394,8 +1397,11 @@ impl LivenessSession {
 
     /// `message`, ours and sealed on the IKE SA `on`, ready for the wire:
     /// whole or in fragments within the datagram limit (see [`prepare`]).
+    /// An answer to a request of the peer's that came in fragments goes in
+    /// fragments whatever its size.
     fn outgoing(&self, on: OnIkeSa, message: Vec<u8>) -> Result<Outgoing, DriverError> {
-        prepare(self.ike_sa(on), message, self.dest, self.float, self.datagram_limit, &mut OsEntropy::new()?)
+        let answer_to_fragments = self.peer_requests(on).answering_fragmented && IkeHeader::parse(&message)?.flags.response;
+        prepare(self.ike_sa(on), message, self.dest, self.float, self.datagram_limit, answer_to_fragments, &mut OsEntropy::new()?)
     }
 
     fn peer_requests(&self, on: OnIkeSa) -> &PeerRequests {
@@ -1436,8 +1442,10 @@ impl LivenessSession {
     /// [`Self::answer_peer_informational`], a `CREATE_CHILD_SA` by
     /// [`Self::answer_peer_create_child_sa`] -- on the retired IKE SA it is
     /// refused with `NO_ADDITIONAL_SAS`, the CHILD SAs having moved to the
-    /// new one -- and nothing else.
-    fn answer_peer_request(&mut self, header: &IkeHeader, msg: &[u8]) -> Result<bool, DriverError> {
+    /// new one -- and nothing else. `fragmented`: the request came in
+    /// fragments (RFC 7383), `msg` being their reassembly, and the answer
+    /// goes in fragments too (§2.4, see [`prepare`]).
+    fn answer_peer_request(&mut self, header: &IkeHeader, msg: &[u8], fragmented: bool) -> Result<bool, DriverError> {
         if self.ike.retired.as_ref().is_some_and(|r| r.since.elapsed() > RETIRED_IKE_SA_TTL) {
             self.ike.retired = None;
         }
@@ -1479,6 +1487,7 @@ impl LivenessSession {
         if !matches!(header.exchange_type, ExchangeType::Informational | ExchangeType::CreateChildSa) {
             return Ok(false);
         }
+        self.peer_requests_on(on).answering_fragmented = fragmented;
         let mut iv = [0u8; 8];
         OsEntropy::new()?.fill(&mut iv);
         let (inner, deletes) = match payload_list(first, &body).and_then(|inner| deletes_in(&inner).map(|deletes| (inner, deletes))) {
@@ -2123,15 +2132,15 @@ impl LivenessSession {
                 crate::debug::dump("<<<", self.dest, &buf[..n]);
                 let Ok(msg) = unwrap(&buf[..n], self.float) else { continue };
                 let Ok(header) = IkeHeader::parse(&msg) else { continue };
-                let (header, msg) = if header.next_payload == PayloadType::EncryptedFragment {
+                let (header, msg, fragmented) = if header.next_payload == PayloadType::EncryptedFragment {
                     match self.take_fragment(&header, &msg, Some(&mut answer))? {
-                        Fragmented::Whole(header, msg) => (header, msg),
+                        Fragmented::Whole(header, msg) => (header, msg, true),
                         Fragmented::Pending => continue,
                         Fragmented::AnsweredAgain { tears_down: true } => return Ok(Reply::PeerTornDown),
                         Fragmented::AnsweredAgain { tears_down: false } => continue,
                     }
                 } else {
-                    (header, msg)
+                    (header, msg, false)
                 };
                 if header.flags.response {
                     if self.is_answer(&header, &msg, mid, exchange) {
@@ -2142,7 +2151,7 @@ impl LivenessSession {
                     }
                     continue; // stale, unrelated or forged -- keep waiting
                 }
-                if self.answer_peer_request(&header, &msg)? {
+                if self.answer_peer_request(&header, &msg, fragmented)? {
                     return Ok(Reply::PeerTornDown);
                 }
                 if self.ike.rekeying.as_ref().is_some_and(|own| own.old_deleted) {
@@ -2241,16 +2250,23 @@ impl Outgoing {
 /// peer that did not negotiate fragmentation gets it whole all the same,
 /// and a diagnostic says so: it may then be fragmented at the IP layer or
 /// dropped. Not for `IKE_SA_INIT`, which is never fragmented.
+///
+/// `answer_to_fragments`: `message` answers a request that came in
+/// fragments, and goes in fragments whatever its size -- a single one if
+/// it fits -- to a peer that negotiated them (RFC 7383 §2.4: none of the
+/// other guidelines there applies, the peer having fragmented the request,
+/// so the response takes the same form).
 fn prepare(
     sa: &CompletedSaInit,
     message: Vec<u8>,
     dest: SocketAddr,
     float: bool,
     limit: DatagramLimit,
+    answer_to_fragments: bool,
     entropy: &mut impl Entropy,
 ) -> Result<Outgoing, DriverError> {
     let max = limit.max_message_len(dest.ip(), float);
-    if message.len() <= max {
+    if message.len() <= max && !(answer_to_fragments && sa.peer_supports_fragmentation) {
         return Ok(Outgoing::whole(wrap(&message, float)));
     }
     let header = IkeHeader::parse(&message)?;
@@ -2649,7 +2665,9 @@ impl<E: Entropy> Ikev2Session<E> {
     /// `IKE_AUTH` on, rather than [`DatagramLimit::DEFAULT`]: our requests
     /// and our answers, those of the tunnel's [`LivenessSession`] included.
     /// A larger message goes in RFC 7383 fragments when the peer negotiated
-    /// them, and whole otherwise. `IKE_SA_INIT` is never fragmented. The
+    /// them, and whole otherwise; so does the answer to a request of the
+    /// peer's that came in fragments, whatever its size (a single fragment
+    /// if it fits, §2.4). `IKE_SA_INIT` is never fragmented. The
     /// limit is not discovered from the path.
     pub fn with_datagram_limit(mut self, limit: DatagramLimit) -> Self {
         self.datagram_limit = limit;
@@ -3045,7 +3063,7 @@ impl<E: Entropy> Ikev2Session<E> {
         self.entropy.fill(&mut iv);
         let req = ike_auth::initiator_auth_request_with_cfg(&sa, cfg, local_spi, want_cfg, esp_offer, ts_offer, &iv)?;
         ike_debug!("IKE_AUTH: sending to {dest} (local_spi={local_spi:08x}, floated={float}, ts={ts_offer:?})");
-        let outgoing = prepare(&sa, req, dest, float, self.datagram_limit, &mut self.entropy)?;
+        let outgoing = prepare(&sa, req, dest, float, self.datagram_limit, false, &mut self.entropy)?;
         let response =
             send_and_retry_reassembling(&sock, dest, &outgoing, float, sa.suite.sk_cipher(), &sa.keys.sk_er, &sa.keys.sk_ar)?;
 
@@ -3317,7 +3335,7 @@ impl<E: Entropy> Ikev2Session<E> {
         loop {
             round += 1;
             let sa = initiator.ike_sa();
-            let outgoing = prepare(sa, msg, dest, float, self.datagram_limit, &mut self.entropy)?;
+            let outgoing = prepare(sa, msg, dest, float, self.datagram_limit, false, &mut self.entropy)?;
             let ike_msg =
                 send_and_retry_reassembling(&sock, dest, &outgoing, float, cipher, &sa.keys.sk_er, &sa.keys.sk_ar)?;
             last_message = ike_msg.clone();
@@ -3355,7 +3373,7 @@ impl<E: Entropy> Ikev2Session<E> {
                 EapEvent::Established(final_msg) => {
                     ike_debug!("IKE_AUTH (EAP-MSCHAPv2): authentication succeeded after {round} round(s)");
                     if let Some(fm) = final_msg {
-                        prepare(initiator.ike_sa(), fm, dest, float, self.datagram_limit, &mut self.entropy)?.send(&sock, dest)?;
+                        prepare(initiator.ike_sa(), fm, dest, float, self.datagram_limit, false, &mut self.entropy)?.send(&sock, dest)?;
                     }
                     break;
                 }
@@ -5673,7 +5691,7 @@ mod tests {
         let (ours, _) = liveness_sa_pair();
         let msg = delete_request_of(&ours, 1);
         for float in [false, true] {
-            let out = prepare(&ours, msg.clone(), V4_PEER, float, DatagramLimit::DEFAULT, &mut OsEntropy::new().unwrap()).unwrap();
+            let out = prepare(&ours, msg.clone(), V4_PEER, float, DatagramLimit::DEFAULT, false, &mut OsEntropy::new().unwrap()).unwrap();
             assert_eq!(out, Outgoing::whole(wrap(&msg, float)));
         }
     }
@@ -5689,7 +5707,7 @@ mod tests {
         let (_, inner) = open_from_peer(&theirs, &msg).unwrap();
         let limit = DatagramLimit::new(300, 400).unwrap();
         for (peer, float, ip_header) in [(V4_PEER, false, 20), (V4_PEER, true, 20), (V6_PEER, false, 40), (V6_PEER, true, 40)] {
-            let out = prepare(&ours, msg.clone(), peer, float, limit, &mut OsEntropy::new().unwrap()).unwrap();
+            let out = prepare(&ours, msg.clone(), peer, float, limit, false, &mut OsEntropy::new().unwrap()).unwrap();
             let total = if peer.is_ipv4() { 300 } else { 400 };
             assert!(out.datagrams.len() > 1, "{peer} {float}");
             assert!(out.datagrams.iter().all(|d| ip_header + 8 + d.len() <= total), "{peer} {float}: a datagram beyond the limit");
@@ -5700,6 +5718,29 @@ mod tests {
         }
     }
 
+    /// RFC 7383 §2.4: an answer to a request that came in fragments goes in
+    /// fragments even when it fits -- here one, 1 of 1, behind the marker
+    /// when floated -- but whole to a peer that did not negotiate them.
+    #[test]
+    fn prepare_sends_an_answer_to_fragments_in_fragments_even_when_it_fits() {
+        let (mut ours, theirs) = liveness_sa_pair();
+        let msg = delete_request_of(&ours, 1);
+        let (_, inner) = open_from_peer(&theirs, &msg).unwrap();
+        for float in [false, true] {
+            let out = prepare(&ours, msg.clone(), V4_PEER, float, DatagramLimit::DEFAULT, true, &mut OsEntropy::new().unwrap()).unwrap();
+            assert_eq!(out.datagrams.len(), 1, "{float}");
+            assert_eq!(out.oversize, None);
+            let fragment = unwrap(&out.datagrams[0], float).unwrap();
+            let cipher = ours.suite.sk_cipher();
+            assert_eq!(fragment::verify_fragment(cipher, &fragment, peer_sk_e(&theirs), peer_sk_a(&theirs)).unwrap(), (1, 1), "{float}");
+            let (_, got) = fragment::reassemble(cipher, &[fragment], peer_sk_e(&theirs), peer_sk_a(&theirs)).unwrap();
+            assert_eq!(got, inner, "{float}");
+        }
+        ours.peer_supports_fragmentation = false;
+        let out = prepare(&ours, msg.clone(), V4_PEER, false, DatagramLimit::DEFAULT, true, &mut OsEntropy::new().unwrap()).unwrap();
+        assert_eq!(out, Outgoing::whole(msg));
+    }
+
     /// A peer that did not negotiate fragmentation gets no SKF: the
     /// message goes whole, and why it may go unanswered is said, with
     /// sizes, exchange and Message ID only.
@@ -5708,7 +5749,7 @@ mod tests {
         let (mut ours, _) = liveness_sa_pair();
         ours.peer_supports_fragmentation = false;
         let msg = delete_request_of(&ours, 300);
-        let out = prepare(&ours, msg.clone(), V4_PEER, true, DatagramLimit::DEFAULT, &mut OsEntropy::new().unwrap()).unwrap();
+        let out = prepare(&ours, msg.clone(), V4_PEER, true, DatagramLimit::DEFAULT, false, &mut OsEntropy::new().unwrap()).unwrap();
         assert_eq!(out.datagrams, vec![wrap(&msg, true)]);
         let expected = format!(
             "the INFORMATIONAL request 3 went whole, {} bytes, above the 544 bytes an IKE message may take within the datagram limit, as the peer did not negotiate IKE fragmentation (RFC 7383): it may be fragmented at the IP layer or dropped",
@@ -5726,7 +5767,7 @@ mod tests {
         let (ours, _) = liveness_sa_pair();
         let msg = delete_request_of(&ours, 3000);
         let limit = DatagramLimit::new(132, 1280).unwrap();
-        let err = prepare(&ours, msg.clone(), V4_PEER, false, limit, &mut OsEntropy::new().unwrap()).unwrap_err();
+        let err = prepare(&ours, msg.clone(), V4_PEER, false, limit, false, &mut OsEntropy::new().unwrap()).unwrap_err();
         let DriverError::Io(err) = err else { panic!("expected an I/O error, got {err:?}") };
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         let text = err.to_string();
@@ -6835,9 +6876,10 @@ mod tests {
     }
 
     /// RFC 7383 §2.6 and §2.6.1, a request from the gateway in fragments:
-    /// it is answered once complete. Of a retransmission of it, fragment 1
-    /// gets the same answer again and any other fragment is ignored. It
-    /// used to be dropped unanswered.
+    /// it is answered once complete, in the same form (§2.4: one fragment,
+    /// 1 of 1). Of a retransmission of it, fragment 1 gets the same answer
+    /// again and any other fragment is ignored. It used to be dropped
+    /// unanswered.
     #[test]
     fn a_request_from_the_peer_in_fragments_is_answered_and_only_its_first_fragment_repeats_the_answer() {
         let bind = next_addr();
@@ -6852,8 +6894,10 @@ mod tests {
                 send_fragments_after_a_forgery(&sock, from, &fragments);
                 sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
                 let answer = recv_from_client(&sock);
-                let answered =
-                    open_informational(&sa, &answer).is_ok_and(|payloads| payloads.is_empty()) && IkeHeader::parse(&answer).unwrap().message_id == 0;
+                let whole = request_from_fragments(&sa, std::slice::from_ref(&answer));
+                let answered = fragment::verify_fragment(sa.suite.sk_cipher(), &answer, peer_sk_e(&sa), peer_sk_a(&sa)).is_ok_and(|n| n == (1, 1))
+                    && open_informational(&sa, &whole).is_ok_and(|payloads| payloads.is_empty())
+                    && IkeHeader::parse(&answer).unwrap().message_id == 0;
                 sock.send_to(&fragments[1], from).unwrap();
                 sock.send_to(&flip_last_byte(fragments[0].clone()), from).unwrap();
                 let quiet_on_others = client_stays_quiet(&sock);
@@ -6868,7 +6912,7 @@ mod tests {
         let live = tunnel.liveness.peek(Duration::from_secs(4)).unwrap();
         let (answered, quiet_on_others, answered_again) = gateway.join().unwrap();
         assert_eq!(live, Liveness::Alive);
-        assert!(answered, "the reassembled request is answered, under its Message ID");
+        assert!(answered, "the reassembled request is answered, under its Message ID, in one fragment 1 of 1");
         assert!(quiet_on_others, "a fragment other than 1 of a request answered, or a forged fragment 1, is ignored");
         assert!(answered_again, "fragment 1 of a request answered gets the same answer again");
     }
@@ -6993,6 +7037,79 @@ mod tests {
         assert_eq!(all_sent_to(&gateway), answer, "fragment 1 again gets the same datagrams");
         assert!(liveness.take_peer_rekeys().is_empty(), "a retransmission is not a second rekey");
         assert_eq!(liveness.peer_child.superseded.len(), 1);
+    }
+
+    /// The gateway's liveness check, 0 of its requests, in 3 fragments.
+    fn gateway_liveness_in_fragments(sa: &CompletedSaInit) -> Vec<Vec<u8>> {
+        let note = crate::ikev2::payload::Notify::status(40_000, vec![0x5a; 60]);
+        let request = build_informational(sa, 0, false, &[(PayloadType::Notify, note.to_bytes())], &[3u8; 8]).unwrap();
+        gateway_fragments(sa, &request, 3, 900)
+    }
+
+    /// RFC 7383 §2.4: the answer to a request that came in fragments goes
+    /// in fragments too, here a single one, Fragment Number 1 of Total
+    /// Fragments 1, well within the default limit it would have fit whole
+    /// in. Of the request again, only an authentic fragment 1 gets that
+    /// same datagram (§2.6.1, RFC 7296 §2.1), and the window does not move.
+    #[test]
+    fn an_answer_to_a_fragmented_request_that_fits_goes_in_one_fragment_and_again_the_same() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        let fragments = gateway_liveness_in_fragments(&resp_sa);
+        let to = liveness.sock.local_addr().unwrap();
+        let send = |liveness: &mut LivenessSession, datagrams: &[&Vec<u8>]| {
+            for datagram in datagrams {
+                gateway.send_to(datagram, to).unwrap();
+            }
+            assert_eq!(liveness.peek(Duration::from_millis(100)).unwrap(), Liveness::Alive);
+        };
+
+        send(&mut liveness, &[&fragments[0], &fragments[1], &fragments[2]]);
+        let answer = all_sent_to(&gateway);
+        assert_eq!(answer.len(), 1, "one fragment");
+        let header = IkeHeader::parse(&answer[0]).unwrap();
+        assert_eq!((header.message_id, header.flags.response, header.next_payload), (0, true, PayloadType::EncryptedFragment));
+        let cipher = resp_sa.suite.sk_cipher();
+        assert_eq!(fragment::verify_fragment(cipher, &answer[0], peer_sk_e(&resp_sa), peer_sk_a(&resp_sa)).unwrap(), (1, 1));
+        assert!(open_informational(&resp_sa, &request_from_fragments(&resp_sa, &answer)).unwrap().is_empty());
+        assert_eq!(liveness.peer_requests.next, 1);
+
+        send(&mut liveness, &[&fragments[1], &fragments[2], &flip_last_byte(fragments[0].clone())]);
+        assert_eq!(all_sent_to(&gateway), Vec::<Vec<u8>>::new(), "only an authentic fragment 1 repeats the answer");
+        send(&mut liveness, &[&fragments[0]]);
+        assert_eq!(all_sent_to(&gateway), answer, "fragment 1 again gets the very same datagram");
+        assert_eq!(liveness.peer_requests.next, 1, "and the request is not taken again");
+    }
+
+    /// RFC 7383 §2.4: a whole request that fits gets its answer whole, as
+    /// before, and so does a fragmented one from a peer that did not
+    /// negotiate fragmentation.
+    #[test]
+    fn an_answer_goes_whole_to_a_whole_request_or_a_peer_without_fragmentation() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa.clone(), None);
+        let note = crate::ikev2::payload::Notify::status(40_000, vec![0x5a; 60]);
+        let request = build_informational(&resp_sa, 0, false, &[(PayloadType::Notify, note.to_bytes())], &[3u8; 8]).unwrap();
+        assert_eq!(deliver(&mut liveness, &gateway, &request), Liveness::Alive);
+        let answer = all_sent_to(&gateway);
+        assert_eq!(answer.len(), 1);
+        assert_eq!(IkeHeader::parse(&answer[0]).unwrap().next_payload, PayloadType::Encrypted);
+
+        let (mut init_sa, resp_sa) = liveness_sa_pair();
+        init_sa.peer_supports_fragmentation = false;
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        let to = liveness.sock.local_addr().unwrap();
+        for datagram in gateway_liveness_in_fragments(&resp_sa) {
+            gateway.send_to(&datagram, to).unwrap();
+        }
+        assert_eq!(liveness.peek(Duration::from_millis(100)).unwrap(), Liveness::Alive);
+        let answer = all_sent_to(&gateway);
+        assert_eq!(answer.len(), 1);
+        assert_eq!(IkeHeader::parse(&answer[0]).unwrap().next_payload, PayloadType::Encrypted);
+        assert!(open_informational(&resp_sa, &answer[0]).unwrap().is_empty());
     }
 
     /// RFC 7383: no SKF to a peer that did not negotiate fragmentation. The

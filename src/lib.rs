@@ -110,7 +110,9 @@
 //! IPv4 datagram and 1280 for an IPv6 one by default, the IP and UDP
 //! headers and the non-ESP marker included
 //! ([`Ikev2Session::with_datagram_limit`]) -- and otherwise in fragments
-//! that each fit, when the peer negotiated fragmentation. A retransmission
+//! that each fit, when the peer negotiated fragmentation. The answer to a
+//! request of the peer's that came in fragments goes in fragments whatever
+//! its size, a single one if it fits (RFC 7383 §2.4). A retransmission
 //! sends the same datagrams again, never a new fragmentation. A peer that
 //! did not negotiate it gets the message whole all the same, with a
 //! diagnostic: it may then be fragmented at the IP layer or dropped. The

@@ -934,10 +934,11 @@ pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) 
 /// [`respond_quick`] for a responder that limits the volume of an SA to
 /// `volume_cap_kilobytes` of its own: the limit stated is the offer's, shortened
 /// to that (see [`granted_volume`]), and stated even when the offer had none. It
-/// exists so the test double [`crate::ikev1::server::Server`] can play a gateway
-/// with a volume limit, which is what a client's handling of one is tested
-/// against.
-pub(crate) fn respond_quick_capped(
+/// is what lets a gateway that has such a limit be played -- by
+/// [`crate::ikev1::server::Server`] (`set_child_volume_limit`), or by a consumer
+/// whose tests answer Quick Modes themselves -- which is what a client's
+/// handling of one is tested against.
+pub fn respond_quick_capped(
     st: &Phase1State,
     msg1: &[u8],
     entropy: &mut impl Entropy,

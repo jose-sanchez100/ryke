@@ -39,8 +39,9 @@
 //! (only identical bytes count); measure the round-trip time the retransmission
 //! interval should follow (RFC 2408 §5.1 asks for it); answer a Quick Mode or a
 //! Phase 1 that the gateway starts (this is an initiator only); rekey the
-//! ISAKMP SA; or hold a lifetime in kilobytes (a volume limit is accepted and
-//! left to the gateway, see `quick`'s "SA lifetimes"). The look at port 500
+//! ISAKMP SA; or hold a Phase-2 lifetime in kilobytes (a volume limit is
+//! accepted and left to the gateway, see `quick`'s "SA lifetimes"; a Phase-1 one
+//! is refused). The look at port 500
 //! after a floated Aggressive Mode third message is `connect`'s own, made only
 //! while it waits: once `connect` has returned nothing looks there. Quick
 //! Mode's third message, sent by `connect` or by a rekey, is

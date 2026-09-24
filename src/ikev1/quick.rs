@@ -39,12 +39,23 @@
 //! stops at its sequence number, never at a byte count), so nothing here knows
 //! how many kilobytes an SA has protected, no field of `Phase1State`, of the
 //! Quick Mode results or of `EspSa` holds a limit, and there is no counter for
-//! one to be checked against (tests: `..accepts_a_volume_limit_in_the_..` in
-//! `phase1` and here, and `esp`'s `an_esp_sa_holds_no_byte_counter_and_no_lifetime`).
-//! A volume limit stated by a peer is accepted -- the exchange goes on as
-//! though it had not been there -- and left to the peer. What follows is
-//! deliberate, and the same in Phase 1 (`phase1::p1_life`) and Phase 2
-//! ([`lifetime_seconds`]):
+//! one to be checked against (test: `esp`'s
+//! `an_esp_sa_holds_no_byte_counter_and_no_lifetime`).
+//!
+//! **Phase 1** does not accept a volume limit at all, and that is settled: an
+//! ISAKMP SA is limited in seconds only. A transform that states a kilobytes pair
+//! is passed over by a responder (another transform of the offer is taken if
+//! there is one; none is `NoProposalChosen`), and an answer whose transform states
+//! one is refused by an initiator (`NoProposalChosen`), in Aggressive and in Main
+//! Mode, rather than taken and then ignored (tests: `phase1`'s
+//! `..states_a_volume_limit..`). This is a limit of this implementation, not of the
+//! RFC: RFC 2409 App. A allows the pair, and the bytes an ISAKMP SA protects are
+//! ones this crate does handle -- counting them is future work, not something the
+//! protocol rules out. A pair that cannot be read stays `MalformedPayload`.
+//!
+//! **Phase 2** (the rest of this section, until it is superseded below) still
+//! accepts a volume limit a peer states and leaves it to the peer. What follows is
+//! deliberate:
 //!
 //! - what we offer is one seconds pair and nothing else, so we never ask the
 //!   peer to hold us to a volume;

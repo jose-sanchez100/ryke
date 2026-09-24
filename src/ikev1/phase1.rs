@@ -10,9 +10,10 @@
 //! After this, both sides hold `SKEYID_{d,a,e}`; the Xauth, Mode-Config and
 //! Quick-Mode exchanges follow, encrypted under `SKEYID_e`.
 //!
-//! The ISAKMP SA's lifetime is held in seconds only, like the IPsec SA's: see
-//! `quick.rs`'s "SA lifetimes" section for why no volume limit is counted and
-//! what that leaves open.
+//! The ISAKMP SA's lifetime is held in seconds only: a transform that states a
+//! limit in kilobytes is passed over (as responder) or refused (as initiator),
+//! never taken and then ignored -- a limit of this implementation, not of the
+//! RFC. See `quick.rs`'s "SA lifetimes" section.
 
 use super::crypto1::{self, Prf, AES_BLOCK};
 use super::isakmp::{self, exchange, payload, IsakmpHeader};
@@ -290,11 +291,11 @@ pub struct Phase1State {
     /// offered, and it is applied here to the ISAKMP SA by analogy -- one longer
     /// than this side offered counts as what it offered), and what this side
     /// offered when the transform states none in seconds. As responder: the
-    /// seconds limit it granted, `0` when the initiator's offer stated none. A
-    /// kilobytes limit is not a number of seconds and is neither held nor
-    /// enforced here or anywhere else (no field of this struct keeps one): see
-    /// `quick`'s "SA lifetimes" section. See [`negotiated_p1_lifetime`] and
-    /// [`answer_transform`].
+    /// seconds limit it granted, `0` when the initiator's offer stated none. An
+    /// ISAKMP SA is limited in seconds only: a transform that states a limit in
+    /// kilobytes is never the one negotiated (it is passed over or refused, see
+    /// `quick`'s "SA lifetimes" section), so no field of this struct keeps a
+    /// volume. See [`negotiated_p1_lifetime`] and [`answer_transform`].
     #[zeroize(skip)]
     pub negotiated_lifetime_secs: u32,
     /// Final messages of ours that nothing answers, kept to be sent again
@@ -377,9 +378,14 @@ fn select_transform(sa: &SaPayload, want_sig: bool) -> Option<(Transform, Prf, D
 /// primitives if we support it, TripleDES-CBC only when `allow_3des`. The
 /// transform returned is the one to answer with -- the offered one, its
 /// lifetime restated as the limit we grant ([`answer_transform`]) -- and a
-/// transform whose lifetime we cannot read ([`p1_life`]) is not one we take.
+/// transform whose lifetime we cannot read ([`p1_life`]), or that limits the SA
+/// by volume, is not one we take.
 fn accept_transform(t: &Transform, want_sig: bool, allow_3des: bool) -> Option<(Transform, Prf, DhGroup, usize, usize)> {
-    p1_life(t).ok()?;
+    let (_seconds, kilobytes) = p1_life(t).ok()?;
+    if kilobytes.is_some() {
+        ike_debug!("Phase 1: transform {} states a lifetime in kilobytes, which this side does not count under an ISAKMP SA -- passed over", t.num);
+        return None;
+    }
     let (key_len, block) = match t.attr(attr::ENCRYPTION)? {
         enc::AES_CBC => match t.attr(attr::KEY_LENGTH)? {
             128 => (16, crypto1::AES_BLOCK),
@@ -474,23 +480,27 @@ fn p1_life(t: &Transform) -> Result<(Option<u32>, Option<u32>), IkeError> {
 /// SA by its cookies) -- so the answer's seconds pair counts, but never
 /// beyond `offered`: what we offered is our own limit, and a longer answer only
 /// says the peer would keep the SA longer. An answer with no seconds pair states
-/// no limit of its own (a kilobytes pair is a volume, not a time, and RFC 2409
-/// has no default lifetime to assume), so `offered` stands. `MalformedPayload`
-/// when the lifetime attributes cannot be read ([`p1_life`]).
+/// no limit of its own (RFC 2409 has no default lifetime to assume), so `offered`
+/// stands. `MalformedPayload` when the lifetime attributes cannot be read
+/// ([`p1_life`]); `NoProposalChosen` when the answer also limits the SA by
+/// volume: RFC 2409 App. A allows that, but this side counts no bytes under an
+/// ISAKMP SA, so it cannot keep the limit and does not take the SA at all rather
+/// than let it live past what the peer stated.
 fn negotiated_p1_lifetime(chosen: &Transform, offered: u32) -> Result<u32, IkeError> {
-    let (seconds, _kilobytes) = p1_life(chosen)?;
+    let (seconds, kilobytes) = p1_life(chosen)?;
+    if kilobytes.is_some() {
+        ike_debug!("Phase 1: the answered transform states a lifetime in kilobytes, which this side does not count under an ISAKMP SA -- refused");
+        return Err(IkeError::NoProposalChosen);
+    }
     Ok(seconds.map_or(offered, |s| s.min(offered)))
 }
 
 /// The transform a responder answers with: `offered` (which [`p1_life`] has
-/// read) as it stands, its lifetime restated as the one limit we grant -- the
-/// first seconds pair the initiator offered, encoded as offered (RFC 2409 App.
-/// A lets it come back either way) -- and no kilobytes pair: we count no volume
-/// under an SA, so we do not agree to a limit of it. The initiator's own limit
-/// is its own. What answers an offer that includes a volume limit is, then, an SA
-/// the initiator may have wanted to end sooner than this side will: accepting the
-/// offer without keeping that limit is a gap of policy (see `quick`'s "SA
-/// lifetimes" section), not something either RFC asks for.
+/// read, and [`accept_transform`] has found to state no volume limit) as it
+/// stands, its lifetime restated as the one limit we grant -- the first seconds
+/// pair the initiator offered, encoded as offered (RFC 2409 App. A lets it come
+/// back either way). A transform that limits the SA by volume never gets here: it
+/// is passed over, so no answer leaves a volume limit of the initiator's out.
 fn answer_transform(offered: &Transform) -> Transform {
     let (mut unit, mut kept) = (None, false);
     let attributes = offered
@@ -3291,135 +3301,19 @@ mod tests {
         }
     }
 
-    /// Every field of `s`, by name and as text. Exhaustive on purpose (no `..`):
-    /// a field added to [`Phase1State`] -- a retained volume limit, say -- stops
-    /// this compiling until whoever adds it decides whether it has to match in
-    /// two runs that differ only by a volume limit.
-    fn state_fields(s: &Phase1State) -> Vec<(&'static str, String)> {
-        let Phase1State {
-            prf,
-            group,
-            cky_i,
-            cky_r,
-            skeyid,
-            skeyid_d,
-            skeyid_a,
-            skeyid_e,
-            enc_key,
-            enc_block,
-            phase1_iv,
-            gxi,
-            gxr,
-            ni,
-            nr,
-            sai_b,
-            idii_b,
-            peer_supports_dpd,
-            floated,
-            negotiated_lifetime_secs,
-            finals,
-        } = s;
-        vec![
-            ("prf", format!("{prf:?}")),
-            ("group", format!("{group:?}")),
-            ("cky_i", format!("{cky_i:02x?}")),
-            ("cky_r", format!("{cky_r:02x?}")),
-            ("skeyid", format!("{skeyid:02x?}")),
-            ("skeyid_d", format!("{skeyid_d:02x?}")),
-            ("skeyid_a", format!("{skeyid_a:02x?}")),
-            ("skeyid_e", format!("{skeyid_e:02x?}")),
-            ("enc_key", format!("{enc_key:02x?}")),
-            ("enc_block", format!("{enc_block}")),
-            ("phase1_iv", format!("{phase1_iv:02x?}")),
-            ("gxi", format!("{gxi:02x?}")),
-            ("gxr", format!("{gxr:02x?}")),
-            ("ni", format!("{ni:02x?}")),
-            ("nr", format!("{nr:02x?}")),
-            ("sai_b", format!("{sai_b:02x?}")),
-            ("idii_b", format!("{idii_b:02x?}")),
-            ("peer_supports_dpd", format!("{peer_supports_dpd}")),
-            ("floated", format!("{floated}")),
-            ("negotiated_lifetime_secs", format!("{negotiated_lifetime_secs}")),
-            ("finals", format!("{:02x?}", *finals.pairs())),
-        ]
-    }
-
-    /// [`state_fields`] for a Main Mode responder that has answered message 1.
-    fn main_responder_fields(s: &MainRespSaSent) -> Vec<(&'static str, String)> {
-        let MainRespSaSent {
-            prf,
-            group,
-            key_len,
-            block,
-            cky_i,
-            cky_r,
-            local_auth: _,
-            trusted_cas,
-            now_unix,
-            our_id: _,
-            sai_b,
-            peer_supports_natt,
-            our_addr,
-            peer_addr,
-            initiator_offered_lifetime,
-        } = s;
-        vec![
-            ("prf", format!("{prf:?}")),
-            ("group", format!("{group:?}")),
-            ("key_len", format!("{key_len}")),
-            ("block", format!("{block}")),
-            ("cky_i", format!("{cky_i:02x?}")),
-            ("cky_r", format!("{cky_r:02x?}")),
-            ("trusted_cas", format!("{trusted_cas:02x?}")),
-            ("now_unix", format!("{now_unix}")),
-            ("sai_b", format!("{sai_b:02x?}")),
-            ("peer_supports_natt", format!("{peer_supports_natt}")),
-            ("our_addr", format!("{our_addr}")),
-            ("peer_addr", format!("{peer_addr}")),
-            ("initiator_offered_lifetime", format!("{initiator_offered_lifetime}")),
-        ]
-    }
-
-    /// The names of the fields on which `a` and `b` differ, `skip` apart.
-    fn differing(a: &[(&'static str, String)], b: &[(&'static str, String)], skip: &[&str]) -> Vec<&'static str> {
-        assert_eq!(a.len(), b.len());
-        a.iter().zip(b).filter(|((name, x), (_, y))| !skip.contains(name) && x != y).map(|((name, _), _)| *name).collect()
-    }
-
-    /// What our responder holds after answering an initiator's message 1 whose
-    /// lifetime is `offered_life` (entropy fixed, so two runs differ only by
-    /// that lifetime), field by field.
-    fn responder_fields_after(mode: Ikev1ExchangeMode, offered_life: Vec<Attribute>) -> Vec<(&'static str, String)> {
-        let icfg = life_initiator_cfg(mode);
-        let rcfg = life_responder_cfg();
-        let (ours, theirs): (SocketAddr, SocketAddr) = (LIFE_INITIATOR_ADDR.parse().unwrap(), LIFE_RESPONDER_ADDR.parse().unwrap());
-        let mut ie = SeedEntropy::new(0xB1);
-        let mut re = SeedEntropy::new(0xB2);
-        match mode {
-            Ikev1ExchangeMode::Aggressive => {
-                let (msg1, _) = initiate_aggressive(&icfg, &mut ie, ours, theirs);
-                let (_msg2, state) = respond_aggressive(&rcfg, &with_sa_life(&msg1, offered_life), &mut re, theirs, ours).unwrap();
-                state_fields(&state)
-            }
-            Ikev1ExchangeMode::Main => {
-                let (msg1, _) = initiate_main(&icfg, &mut ie);
-                let (_msg2, state) = respond_main(&rcfg, &with_sa_life(&msg1, offered_life), &mut re, theirs, ours).unwrap();
-                main_responder_fields(&state)
-            }
-        }
-    }
-
     const BOTH_MODES: [Ikev1ExchangeMode; 2] = [Ikev1ExchangeMode::Aggressive, Ikev1ExchangeMode::Main];
 
     /// The initiator holds the responder's answered lifetime as the seconds
-    /// limit it was paired with -- never a kilobytes value read as seconds, never
-    /// the first Life Duration whatever its Life Type, and never beyond the 1200
-    /// seconds this side offered -- in Aggressive and in Main Mode. RFC 2409 App.
-    /// A: "For a given Life Type the value of the Life Duration attribute defines
-    /// the actual length of the SA life -- either a number of seconds, or a
-    /// number of kbytes protected"; RFC 2407 §4.5.4 (for an IPsec SA, applied to
-    /// the ISAKMP SA by analogy): the responder may use "a shorter lifetime than
-    /// what was offered", and this side does not take a longer one.
+    /// limit it was paired with -- never the first Life Duration whatever its
+    /// Life Type, and never beyond the 1200 seconds this side offered -- in
+    /// Aggressive and in Main Mode. RFC 2409 App. A: "For a given Life Type the
+    /// value of the Life Duration attribute defines the actual length of the SA
+    /// life -- either a number of seconds, or a number of kbytes protected";
+    /// RFC 2407 §4.5.4 (for an IPsec SA, applied to the ISAKMP SA by analogy):
+    /// the responder may use "a shorter lifetime than what was offered", and
+    /// this side does not take a longer one. (An answer that also states a
+    /// limit in kilobytes is not read here: see
+    /// `an_initiator_refuses_an_answer_that_states_a_volume_limit`.)
     #[test]
     fn an_initiator_takes_the_answered_seconds_limit_paired_with_its_type_and_never_beyond_its_offer() {
         let cases: Vec<(&str, Vec<Attribute>, u32)> = vec![
@@ -3432,9 +3326,6 @@ mod tests {
             ("a longer seconds pair", vec![life_type(1), life_secs(86_400)], 1200),
             ("a seconds pair past 32 bits", vec![life_type(1), life_octets(&[1, 0, 0, 0, 0])], 1200),
             ("no lifetime at all", vec![], 1200),
-            ("a kilobytes pair only", vec![life_type(2), life_secs(4_608_000)], 1200),
-            ("a seconds pair and a kilobytes pair", vec![life_type(1), life_secs(900), life_type(2), life_secs(4_608_000)], 900),
-            ("a kilobytes pair and a seconds pair", vec![life_type(2), life_secs(4_608_000), life_type(1), life_secs(900)], 900),
             ("the same seconds pair twice", vec![life_type(1), life_secs(900), life_type(1), life_secs(900)], 900),
         ];
         let mut wrong = Vec::new();
@@ -3511,10 +3402,10 @@ mod tests {
         assert!(wrong.is_empty(), "offers that state more than seconds:\n{}", wrong.join("\n"));
     }
 
-    /// The responder grants only a limit it can state and keep: the seconds pair
-    /// it was offered, as a Type followed by its Duration, and no kilobytes limit
-    /// (it counts no volume, so it does not agree to one). A kilobytes value is not
-    /// a number of seconds, and an offer with none in seconds is granted none.
+    /// The responder grants the seconds limit it was offered, as a Type followed by
+    /// its Duration, and no other: an offer with none in seconds is granted none.
+    /// (An offer that also states a limit in kilobytes is not taken: see
+    /// `a_responder_takes_no_offer_that_states_a_volume_limit`.)
     #[test]
     fn a_responder_grants_the_seconds_limit_it_was_offered_and_no_other() {
         let seconds = |n: u32| vec![life_type(1), life_secs(n)];
@@ -3524,10 +3415,7 @@ mod tests {
             ("a seconds pair", seconds(900), seconds(900), 900),
             ("a seconds pair as a basic attribute, answered as offered", basic.clone(), basic, 900),
             ("a seconds pair in two octets, answered as offered", two_octets.clone(), two_octets, 900),
-            ("a seconds pair and a kilobytes pair", vec![life_type(1), life_secs(900), life_type(2), life_secs(4_608_000)], seconds(900), 900),
-            ("a kilobytes pair and a seconds pair", vec![life_type(2), life_secs(4_608_000), life_type(1), life_secs(900)], seconds(900), 900),
             ("the same seconds pair twice", vec![life_type(1), life_secs(900), life_type(1), life_secs(900)], seconds(900), 900),
-            ("a kilobytes pair only", vec![life_type(2), life_secs(4_608_000)], vec![], 0),
             ("no lifetime at all", vec![], vec![], 0),
         ];
         let mut wrong = Vec::new();
@@ -3594,73 +3482,76 @@ mod tests {
         assert!(select_transform(&p1_offer(vec![sa.proposals[0].transforms[0].clone()]), false).is_none());
     }
 
-    /// What is pinned here is a gap, not a design goal: a kilobytes limit in the
-    /// answer of a Phase-1 responder is accepted, and then it is neither kept nor
-    /// applied. Two exchanges that differ only by the volume limit answered leave
-    /// the initiator with the very same state in every field (the entropy is
-    /// fixed) -- the 1 KB limit does not shorten the 1200 or 900 seconds, and no
-    /// field holds it. The comparison is proven able to see a difference by
-    /// answering another number of seconds. When a volume limit is one day kept or
-    /// enforced (see `quick.rs`, "SA lifetimes"), this test is to change with it.
-    #[test]
-    fn an_initiator_accepts_a_volume_limit_in_the_answer_and_keeps_and_applies_none_of_it() {
+    /// The volume limits a Phase-1 peer can state, alone and next to a seconds
+    /// limit, in either order (4608000 KB is a Cisco gateway's IPsec default).
+    fn volume_limit_cases() -> Vec<(&'static str, Vec<Attribute>)> {
         let seconds = |n: u32| vec![life_type(1), life_secs(n)];
         let kilobytes = |n: u32| vec![life_type(2), life_secs(n)];
-        let cases: Vec<(&str, Vec<Attribute>, Vec<Attribute>, u32)> = vec![
-            ("1 KB only", kilobytes(1), vec![], 1200),
-            ("4608000 KB only (a Cisco gateway's default)", kilobytes(4_608_000), vec![], 1200),
-            ("900 s, then 1 KB", [seconds(900), kilobytes(1)].concat(), seconds(900), 900),
-            ("1 KB, then 900 s", [kilobytes(1), seconds(900)].concat(), seconds(900), 900),
-            ("900 s, then 4608000 KB", [seconds(900), kilobytes(4_608_000)].concat(), seconds(900), 900),
-        ];
-        let mut wrong = Vec::new();
-        for mode in BOTH_MODES {
-            for (name, with_volume, without, held) in &cases {
-                let a = initiator_state_after(mode, with_volume.clone()).unwrap_or_else(|e| panic!("{mode:?}, {name}: refused: {e:?}"));
-                let b = initiator_state_after(mode, without.clone()).unwrap();
-                let (a, b) = (state_fields(&a), state_fields(&b));
-                let differ = differing(&a, &b, &[]);
-                if !differ.is_empty() {
-                    wrong.push(format!("{mode:?}, {name}: differs from the same answer without the volume limit in {differ:?}"));
-                }
-                if a.iter().find(|(n, _)| *n == "negotiated_lifetime_secs").map(|(_, v)| v.as_str()) != Some(held.to_string().as_str()) {
-                    wrong.push(format!("{mode:?}, {name}: the lifetime held is not {held} seconds"));
-                }
-            }
-            let (a, b) = (initiator_state_after(mode, seconds(900)).unwrap(), initiator_state_after(mode, seconds(600)).unwrap());
-            assert_eq!(differing(&state_fields(&a), &state_fields(&b), &[]), ["negotiated_lifetime_secs"], "{mode:?}: the comparison must see a different number of seconds");
-        }
-        assert!(wrong.is_empty(), "{} answers left something of their volume limit:\n{}", wrong.len(), wrong.join("\n"));
+        vec![
+            ("1 KB only", kilobytes(1)),
+            ("4608000 KB only", kilobytes(4_608_000)),
+            ("900 s, then 1 KB", [seconds(900), kilobytes(1)].concat()),
+            ("1 KB, then 900 s", [kilobytes(1), seconds(900)].concat()),
+            ("900 s, then 4608000 KB", [seconds(900), kilobytes(4_608_000)].concat()),
+            ("4608000 KB, then 900 s", [kilobytes(4_608_000), seconds(900)].concat()),
+        ]
     }
 
-    /// The responder counterpart: an offer that includes a volume limit is taken
-    /// as though it had none. What the responder holds after answering is the same
-    /// in every field as for the offer without it -- but `sai_b`, the offer as it
-    /// came on the wire, kept only so `HASH_I` can be checked and read as nothing
-    /// else -- in Aggressive and in Main Mode.
+    /// A Phase-1 SA limited by volume is not one this side can keep: it counts no
+    /// bytes under an ISAKMP SA, and a limit taken and then never applied would
+    /// leave the SA living past what the peer stated. So an answer that states one
+    /// is refused, in Aggressive and in Main Mode (`NoProposalChosen`: the transform
+    /// the responder chose is not one we can take), instead of the exchange going on
+    /// as though the limit were not there. This is a limit of this implementation
+    /// -- the ISAKMP SA is ours to count, and RFC 2409 App. A allows the pair -- not
+    /// of the RFC; the unreadable ones stay `MalformedPayload`
+    /// (`an_initiator_refuses_an_answer_whose_lifetime_cannot_be_read`).
     #[test]
-    fn a_responder_accepts_a_volume_limit_in_the_offer_and_keeps_and_applies_none_of_it() {
-        let seconds = |n: u32| vec![life_type(1), life_secs(n)];
-        let kilobytes = |n: u32| vec![life_type(2), life_secs(n)];
-        let cases: Vec<(&str, Vec<Attribute>, Vec<Attribute>)> = vec![
-            ("1 KB only", kilobytes(1), vec![]),
-            ("4608000 KB only (a Cisco gateway's default)", kilobytes(4_608_000), vec![]),
-            ("900 s, then 1 KB", [seconds(900), kilobytes(1)].concat(), seconds(900)),
-            ("1 KB, then 900 s", [kilobytes(1), seconds(900)].concat(), seconds(900)),
-        ];
-        let mut wrong = Vec::new();
+    fn an_initiator_refuses_an_answer_that_states_a_volume_limit() {
+        let mut taken = Vec::new();
         for mode in BOTH_MODES {
-            for (name, with_volume, without) in &cases {
-                let (a, b) = (responder_fields_after(mode, with_volume.clone()), responder_fields_after(mode, without.clone()));
-                let differ = differing(&a, &b, &["sai_b"]);
-                if !differ.is_empty() {
-                    wrong.push(format!("{mode:?}, {name}: differs from the same offer without the volume limit in {differ:?}"));
+            for (name, life) in volume_limit_cases() {
+                let got = initiator_state_after(mode, life);
+                if !matches!(got, Err(IkeError::NoProposalChosen)) {
+                    taken.push(format!("{mode:?}, {name}: expected NoProposalChosen, got {:?}", got.map(|s| s.negotiated_lifetime_secs)));
                 }
             }
-            let recorded = if mode == Ikev1ExchangeMode::Aggressive { "negotiated_lifetime_secs" } else { "initiator_offered_lifetime" };
-            let (a, b) = (responder_fields_after(mode, seconds(900)), responder_fields_after(mode, seconds(600)));
-            assert_eq!(differing(&a, &b, &["sai_b"]), [recorded], "{mode:?}: the comparison must see a different number of seconds");
         }
-        assert!(wrong.is_empty(), "{} offers left something of their volume limit:\n{}", wrong.len(), wrong.join("\n"));
+        assert!(taken.is_empty(), "{} answers with a volume limit taken:\n{}", taken.len(), taken.join("\n"));
+    }
+
+    /// The responder counterpart: an offer whose transform states a volume limit
+    /// is not taken (`NoProposalChosen`) -- it would answer with a limit it cannot
+    /// keep, or without the one the initiator asked for -- in Aggressive and in
+    /// Main Mode.
+    #[test]
+    fn a_responder_takes_no_offer_that_states_a_volume_limit() {
+        let mut taken = Vec::new();
+        for mode in BOTH_MODES {
+            for (name, life) in volume_limit_cases() {
+                let got = responder_after(mode, life);
+                if !matches!(got, Err(IkeError::NoProposalChosen)) {
+                    taken.push(format!("{mode:?}, {name}: expected NoProposalChosen, got {got:?}"));
+                }
+            }
+        }
+        assert!(taken.is_empty(), "{} offers with a volume limit taken:\n{}", taken.len(), taken.join("\n"));
+    }
+
+    /// Passing over a transform that states a volume limit is selection, not
+    /// failure: another transform of the offer without one is taken, whatever its
+    /// place in the offer, and the answer never carries the limit of the one
+    /// passed over. An offer with nothing else is refused.
+    #[test]
+    fn a_transform_that_states_a_volume_limit_is_passed_over_for_one_that_does_not() {
+        let mut limited = p1_transform(1, enc::AES_CBC);
+        limited.attributes.extend([life_type(2), life_secs(4_608_000)]);
+        let plain = p1_transform(2, enc::AES_CBC);
+        for offer in [p1_offer(vec![limited.clone(), plain.clone()]), p1_offer(vec![plain.clone(), limited.clone()])] {
+            let (chosen, ..) = select_transform(&offer, false).expect("the transform without a volume limit is acceptable");
+            assert_eq!(chosen.num, 2);
+            assert_eq!(p1_life(&chosen).unwrap(), (Some(28800), None), "the answer states the seconds limit only");
+        }
+        assert!(select_transform(&p1_offer(vec![limited]), false).is_none());
     }
 }

@@ -441,6 +441,19 @@ impl ChildSa {
 mod tests {
     use super::*;
 
+    /// An `EspSa` counts packets (`seq`, for the sequence number and the replay
+    /// window) and never bytes, and carries no lifetime: a volume limit
+    /// negotiated for an SA (RFC 2407 §4.5) has nowhere to live in it. The
+    /// destructuring is exhaustive on purpose -- a field added here, a byte
+    /// counter or a limit, stops this compiling until whoever adds it has read
+    /// `ikev1::quick`'s "SA lifetimes" section and changed it to match.
+    #[test]
+    fn an_esp_sa_holds_no_byte_counter_and_no_lifetime() {
+        let sa = EspSa::new(1, &[0x42u8; 36]).unwrap();
+        let EspSa { spi, cipher, enc_key, salt, integ_key, seq, replay_highest, replay_window } = sa;
+        assert_eq!((spi, cipher, enc_key.len(), salt.len(), integ_key.len(), seq, replay_highest, replay_window), (1, SkCipher::Aes256Gcm, 32, 4, 0, 0, 0, 0));
+    }
+
     #[test]
     fn seal_open_roundtrip() {
         let km = [0x42u8; 36];

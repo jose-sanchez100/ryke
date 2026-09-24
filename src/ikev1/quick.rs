@@ -26,15 +26,23 @@
 //! Quick Mode negotiates PFS on the *initial* Phase-2 exchange, so it's
 //! testable at connect time.
 //!
-//! # SA lifetimes: seconds are held, volume is not counted
+//! # SA lifetimes: seconds are held, volume is neither counted nor enforced
 //!
 //! A lifetime can be stated in seconds and in kilobytes, several pairs at once
-//! ("100 MB or 24 hours": RFC 2407 §4.5, §4.5.2; RFC 2409 App. A for Phase 1),
-//! and the SA ends when the first of them runs out. This crate keeps the time
-//! limit and counts no volume: it does not carry the ESP data plane (the caller
-//! runs the traffic; [`crate::esp::EspSa`] only seals and opens what it is
-//! handed), so nothing here knows how many kilobytes an SA has protected, and
-//! there is no counter for a limit to be checked against. What follows is
+//! ("100 MB or 24 hours": RFC 2407 §4.5.2; RFC 2409 App. A for Phase 1; the
+//! DOI's §4.5 says of a Duration only that it defines "either a number of
+//! seconds, or a number of Kbytes that can be protected" -- that the SA ends at
+//! whichever comes first is the usual reading of "either ... or", not a rule the
+//! RFCs spell out). **This crate does not enforce, and does not even keep, a
+//! volume limit**: it does not carry the ESP data plane (the caller runs the
+//! traffic; [`crate::esp::EspSa`] only seals and opens what it is handed, and
+//! stops at its sequence number, never at a byte count), so nothing here knows
+//! how many kilobytes an SA has protected, no field of `Phase1State`, of the
+//! Quick Mode results or of `EspSa` holds a limit, and there is no counter for
+//! one to be checked against (tests: `..accepts_a_volume_limit_in_the_..` in
+//! `phase1` and here, and `esp`'s `an_esp_sa_holds_no_byte_counter_and_no_lifetime`).
+//! A volume limit stated by a peer is accepted -- the exchange goes on as
+//! though it had not been there -- and left to the peer. What follows is
 //! deliberate, and the same in Phase 1 (`phase1::p1_life`) and Phase 2
 //! ([`lifetime_seconds`]):
 //!
@@ -42,8 +50,9 @@
 //!   peer to hold us to a volume;
 //! - what we answer as a responder is one seconds pair too -- our own limit --
 //!   and never a kilobytes pair: agreeing to a limit we do not enforce would
-//!   state something false (RFC 2407 §4.5.4: a responder may answer with a
-//!   shorter lifetime, and the answer is what it will keep to);
+//!   state something false (RFC 2407 §4.5.4 lets a responder complete the
+//!   negotiation "using a shorter lifetime than what was offered"; what the
+//!   answer states is then what it will keep to);
 //! - a kilobytes pair in an offer or an answer must still be well formed
 //!   (Type, then a Duration that is not zero, empty or absurdly wide; no two
 //!   values for one unit), or the exchange ends -- and is otherwise not read as
@@ -51,14 +60,17 @@
 //! - a volume limit the peer states is the peer's to enforce on its side: this
 //!   side holds no count of its own and does not rekey ahead of it.
 //!
-//! What this leaves open is a decision about policy, or a change outside this
-//! crate (counters in the data plane, which the caller owns): a responder
-//! answers an offer that includes a volume limit as though it had none, so the
-//! SA it grants may protect more than the initiator was willing to; and an SA
-//! the peer limits by volume is not renewed by this side before that limit is
-//! reached. Refusing either outright (RFC 2407 §4.5.3 can be read as aborting
-//! the negotiation on a defined value we do not support) would end the
-//! negotiation with any gateway that states a volume limit.
+//! What this leaves open, and is **not RFC-conformant behaviour so much as a
+//! policy decision waiting to be taken** (or a change outside this crate:
+//! counters in the data plane, which the caller owns): a responder answers an
+//! offer that includes a volume limit as though it had none, so the SA it
+//! grants may protect more than the initiator was willing to; and an SA the peer
+//! limits by volume is not renewed by this side before that limit is reached.
+//! RFC 2407 §4.5.3 requires aborting on "a defined IPSEC DOI attribute (or
+//! attribute value) which it does not support", and a Kilobytes Life Type is a
+//! defined one: refusing every such offer or answer is what the text asks of an
+//! implementation that cannot honour a volume, and it would end the negotiation
+//! with any gateway that states one (Cisco IOS's default is 4608000 KB).
 
 use std::net::{Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -2107,6 +2119,94 @@ mod tests {
         assert!(elapsed >= budget && elapsed < budget + Duration::from_millis(600), "gave up after {elapsed:?}, budget {budget:?}");
     }
 
+    /// A `timeout` of nothing leaves no time to wait anywhere: message 1 still
+    /// goes out three times, one after the other, and the rekey fails as timed out
+    /// -- no panic, no Delete.
+    #[test]
+    fn a_quick_mode_rekey_with_a_zero_timeout_sends_three_times_at_once_and_fails_as_timed_out() {
+        let (isock, rsock, iaddr, raddr) = loopback_pair();
+        let (istate, _rstate, mut ie, _re) = phase1_pair(0x9b21, 0x9b22, iaddr, raddr);
+        let ts = ([10, 212, 134, 202], [255, 255, 255, 255]);
+        let started = Instant::now();
+        let err = rekey_child(&isock, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, ts, ([0; 4], [0; 4]), 3600, Duration::ZERO, 0x0bad_beef);
+        let elapsed = started.elapsed();
+        assert!(matches!(err, Err(DriverError::Ike(IkeError::Crypto(m))) if m.contains("timed out")), "got {:?}", err.map(|_| ()));
+        assert!(elapsed < Duration::from_millis(500), "a zero timeout took {elapsed:?}");
+
+        rsock.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let mut buf = [0u8; 8192];
+        let mut sent = Vec::new();
+        while let Ok(n) = rsock.recv(&mut buf) {
+            sent.push(buf[..n].to_vec());
+        }
+        assert_eq!(sent.len() as u32, QUICK_MODE_ATTEMPTS, "message 1 and two retransmissions, and no Delete");
+        assert!(sent.iter().all(|m| *m == sent[0]));
+    }
+
+    /// The largest `Duration` there is as the timeout: the waits are sevenths of
+    /// it (`Duration::MAX` saturates the three-fold total), none of them overflows
+    /// the clock, and a gateway that answers at once is still answered. The
+    /// longest of the three waits, 4/7 of the largest `Duration`, would overflow
+    /// `Instant` -- but only after the first two, some 8e18 seconds, had run out.
+    #[test]
+    fn a_quick_mode_rekey_with_the_largest_timeout_there_is_completes_when_answered() {
+        let (isock, rsock, iaddr, raddr) = loopback_pair();
+        let (istate, rstate, mut ie, re) = phase1_pair(0x9b31, 0x9b32, iaddr, raddr);
+        let old_local_spi = 0x0bad_f00d;
+        let responder = spawn_quick_responder(rsock, rstate, re, iaddr, true);
+        let ts = ([10, 212, 134, 202], [255, 255, 255, 255]);
+        let (_rekeyed, lifetime) =
+            rekey_child(&isock, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, ts, ([0; 4], [0; 4]), 1800, Duration::MAX, old_local_spi).unwrap();
+        assert_eq!(lifetime, 1800);
+        responder.join().unwrap();
+    }
+
+    /// However many datagrams for some other exchange reach the socket, the
+    /// retransmissions leave when their waits say, and the rekey is given up on
+    /// when the timeouts say: what arrives cannot lengthen a wait, and reading it
+    /// cannot keep the next send from going out.
+    #[test]
+    fn a_quick_mode_rekey_keeps_its_schedule_however_many_stray_datagrams_arrive() {
+        let (isock, rsock, iaddr, raddr) = loopback_pair();
+        let (istate, _rstate, mut ie, _re) = phase1_pair(0x9b41, 0x9b42, iaddr, raddr);
+        let ts = ([10, 212, 134, 202], [255, 255, 255, 255]);
+        let timeout = Duration::from_millis(400);
+        rsock.set_read_timeout(Some(timeout * 5)).unwrap();
+        let recorder = std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            let mut times = Vec::new();
+            while rsock.recv(&mut buf).is_ok() {
+                times.push(Instant::now());
+            }
+            times
+        });
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let flood = std::thread::spawn(move || {
+            let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let stray =
+                IsakmpHeader { init_cookie: [0x11; 8], resp_cookie: [0x22; 8], next_payload: 0, version: 0x10, exchange_type: exchange::QUICK, flags: 0, message_id: 7, length: 28 }
+                    .to_bytes();
+            let end = Instant::now() + Duration::from_secs(3);
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < end {
+                let _ = sender.send_to(&stray, iaddr);
+            }
+        });
+
+        let started = Instant::now();
+        let err = rekey_child(&isock, &istate, &mut ie, raddr, SkCipher::Aes256Gcm, None, ts, ([0; 4], [0; 4]), 3600, timeout, 0x0bad_beef);
+        let elapsed = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        flood.join().unwrap();
+        assert!(matches!(err, Err(DriverError::Ike(IkeError::Crypto(m))) if m.contains("timed out")), "got {:?}", err.map(|_| ()));
+        let times = recorder.join().unwrap();
+        assert_eq!(times.len() as u32, QUICK_MODE_ATTEMPTS);
+        let gaps: Vec<Duration> = times.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.windows(2).all(|g| g[1] >= g[0] + Duration::from_millis(100)), "the waits between the sends were {gaps:?}");
+        let budget = timeout * QUICK_MODE_ATTEMPTS;
+        assert!(elapsed >= budget && elapsed < budget + Duration::from_millis(600), "gave up after {elapsed:?}, budget {budget:?}");
+    }
+
     /// The reason `IkeSocket` exists: a host whose ESP pump is the only reader
     /// of the IKE socket hands the exchange its IKE datagrams through a
     /// [`ChannelIo`]. A Quick Mode rekey then completes -- reply read from the
@@ -2230,11 +2330,24 @@ mod tests {
         matches!(e, IkeError::MalformedPayload(_))
     }
 
+    /// What an initiator is left with by [`initiator_holdings_sas`]: the payloads
+    /// of its message 3, its CHILD SA, and the lifetime it negotiated.
+    type InitiatorHoldings = (Vec<(u8, Vec<u8>)>, ChildSa, u32);
+
     /// The initiator's half of a Quick Mode against an authentic message 2
     /// carrying `sas` -- by default the one SA `esp_sa` builds for exactly
     /// what was offered (`offered_life` seconds, NAT-T `floated` or not), which
     /// `edit` may then alter. Yields the negotiated lifetime.
     fn initiator_answer_sas(floated: bool, offered_life: u32, edit: impl FnOnce(&mut Vec<SaPayload>)) -> Result<u32, IkeError> {
+        initiator_holdings_sas(floated, offered_life, edit).map(|(_msg3, _child, life)| life)
+    }
+
+    /// [`initiator_answer_sas`], yielding everything the initiator is left with:
+    /// the payloads of its message 3 (read back, for the wire bytes of a CBC
+    /// message follow from the ciphertext of message 2 and so from its every
+    /// byte), the CHILD SA and the lifetime. The entropy is fixed, so two runs
+    /// differ only by the answer.
+    fn initiator_holdings_sas(floated: bool, offered_life: u32, edit: impl FnOnce(&mut Vec<SaPayload>)) -> Result<InitiatorHoldings, IkeError> {
         let (mut istate, mut rstate, mut ie, mut re) = phase1_pair(0x5101, 0x5102, QM_ADDRS.0.parse().unwrap(), QM_ADDRS.1.parse().unwrap());
         istate.floated = floated;
         rstate.floated = floated;
@@ -2244,7 +2357,25 @@ mod tests {
         let refs: Vec<&SaPayload> = sas.iter().collect();
         let id = ts_id(QM_TS.0, QM_TS.1);
         let msg2 = forge_answer(&rstate, &qm1, &mut re, &refs, &[id.clone(), id]);
-        qi.complete(&msg2).map(|(_msg3, _child, life)| life)
+        let (msg3, child, life) = qi.complete(&msg2)?;
+        let iv0 = crypto1::phase2_iv(rstate.prf, &rstate.phase1_iv, IsakmpHeader::parse(&qm1).unwrap().message_id, rstate.enc_block);
+        let (_h, _ps, iv1) = phase2::parse_encrypted(&qm1, rstate.prf, &rstate.skeyid_a, &rstate.enc_key, rstate.enc_block, &iv0).unwrap();
+        let (_h, _ps, iv2) = phase2::decrypt_payloads(&msg2, &rstate.enc_key, rstate.enc_block, &iv1).unwrap();
+        let (_h, ps3, _iv) = phase2::decrypt_payloads(&msg3, &rstate.enc_key, rstate.enc_block, &iv2).unwrap();
+        Ok((ps3.into_iter().map(|p| (p.payload_type, p.data)).collect(), child, life))
+    }
+
+    fn initiator_holdings(offered_life: u32, edit: impl FnOnce(&mut SaPayload)) -> Result<InitiatorHoldings, IkeError> {
+        initiator_holdings_sas(false, offered_life, |sas| edit(&mut sas[0]))
+    }
+
+    /// Both SAs of `child` as far as this crate lets anyone read them -- SPI,
+    /// cipher, keys -- as text.
+    fn child_fields(child: &ChildSa) -> Vec<String> {
+        [&child.outbound, &child.inbound]
+            .iter()
+            .map(|sa| format!("spi {:08x}, {:?}, enc {:02x?}, integ {:02x?}", sa.spi(), sa.cipher(), sa.enc_material(), sa.integ_key()))
+            .collect()
     }
 
     fn initiator_answer(floated: bool, offered_life: u32, edit: impl FnOnce(&mut SaPayload)) -> Result<u32, IkeError> {
@@ -2646,6 +2777,113 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "lifetimes stated beyond seconds:\n{}", wrong.join("\n"));
+    }
+
+    /// [`responder_answer`], carried on to the end: the initiator's genuine
+    /// message 3 completes the exchange, and what comes back is the SA payload of
+    /// message 2 with the CHILD SA the responder is left with. The entropy is
+    /// fixed, so two runs differ only by the offer.
+    fn responder_holdings(sas: &[SaPayload]) -> (SaPayload, ChildSa) {
+        let (istate, rstate, _ie, mut re) = phase1_pair(0x5201, 0x5202, QM_ADDRS.0.parse().unwrap(), QM_ADDRS.1.parse().unwrap());
+        let refs: Vec<&SaPayload> = sas.iter().collect();
+        let msg1 = craft_msg1(&istate, &refs);
+        let (msg2, qr) = respond_quick(&rstate, &msg1, &mut re).unwrap();
+        let hdr = IsakmpHeader::parse(&msg1).unwrap();
+        let iv0 = crypto1::phase2_iv(rstate.prf, &rstate.phase1_iv, hdr.message_id, rstate.enc_block);
+        let (_h, ps1, iv1) = phase2::parse_encrypted(&msg1, rstate.prf, &rstate.skeyid_a, &rstate.enc_key, rstate.enc_block, &iv0).unwrap();
+        let (_h, ps2, iv2) = phase2::decrypt_payloads(&msg2, &rstate.enc_key, rstate.enc_block, &iv1).unwrap();
+        let (ni, nr) = (find(&ps1, payload::NONCE).unwrap().data.clone(), find(&ps2, payload::NONCE).unwrap().data.clone());
+        let h3 = hash3(rstate.prf, &rstate.skeyid_a, hdr.message_id, &ni, &nr);
+        let (msg3, _) = phase2::encrypt_payloads(qm_header(rstate.cky_i, rstate.cky_r, hdr.message_id), &rstate.enc_key, rstate.enc_block, &iv2, &[(payload::HASH, h3)]).unwrap();
+        let child = qr.complete(&msg3).unwrap();
+        (SaPayload::parse(&find(&ps2, payload::SA).unwrap().data).unwrap(), child)
+    }
+
+    /// What is pinned here is a gap, not a design goal: a kilobytes limit in the
+    /// answer of a Quick Mode responder is accepted, and then it is neither kept nor
+    /// applied. Two exchanges that differ only by the volume limit answered leave
+    /// the initiator with the same message 3, the same CHILD SA (SPIs, keys) and
+    /// the same lifetime in seconds -- a 1 KB limit does not shorten what is held,
+    /// and nothing is left for the caller to enforce it with. The comparison is
+    /// proven able to see a difference by answering another number of seconds.
+    /// When a volume limit is one day kept or enforced (module docs, "SA
+    /// lifetimes"), this test is to change with it.
+    #[test]
+    fn quick_mode_initiator_accepts_a_volume_limit_in_the_answer_and_keeps_and_applies_none_of_it() {
+        let seconds = |n: u32| vec![life_type(1), life_dur(n)];
+        let kilobytes = |n: u32| vec![life_type(2), life_dur(n)];
+        // (what is answered, the same without its volume limit, the seconds held)
+        let cases: Vec<(&str, Vec<Attribute>, Vec<Attribute>, u32)> = vec![
+            ("1 KB only", kilobytes(1), vec![], 3600),
+            ("4608000 KB only (a Cisco gateway's default)", kilobytes(4_608_000), vec![], 3600),
+            ("900 s, then 1 KB", [seconds(900), kilobytes(1)].concat(), seconds(900), 900),
+            ("1 KB, then 900 s", [kilobytes(1), seconds(900)].concat(), seconds(900), 900),
+            ("900 s, then 4608000 KB", [seconds(900), kilobytes(4_608_000)].concat(), seconds(900), 900),
+        ];
+        let hold = |life: Vec<Attribute>| {
+            let (msg3, child, held) = initiator_holdings(3600, |sa| set_life(sa, life)).unwrap();
+            (msg3, child_fields(&child), held)
+        };
+        let mut wrong = Vec::new();
+        for (name, with_volume, without, seconds_held) in cases {
+            let (a, b) = (hold(with_volume), hold(without));
+            let differ: Vec<&str> = [("message 3", a.0 != b.0), ("CHILD SA", a.1 != b.1), ("lifetime", a.2 != b.2)].into_iter().filter(|(_, d)| *d).map(|(what, _)| what).collect();
+            if !differ.is_empty() {
+                wrong.push(format!("{name}: differs from the same answer without the volume limit in {differ:?}"));
+            }
+            if a.2 != seconds_held {
+                wrong.push(format!("{name}: {} seconds held, wanted {seconds_held}", a.2));
+            }
+        }
+        assert!(wrong.is_empty(), "answers that left something of their volume limit:\n{}", wrong.join("\n"));
+        let (a, b) = (hold(seconds(900)), hold(seconds(600)));
+        assert_eq!((a.0 == b.0, a.1 == b.1, a.2, b.2), (true, true, 900, 600), "the comparison must see a different number of seconds");
+    }
+
+    /// The responder counterpart: an offer that includes a volume limit is taken
+    /// as though it had none. The answer (a seconds pair of the responder's own)
+    /// and the CHILD SA it is left with are the same as for the offer without it.
+    #[test]
+    fn quick_mode_responder_accepts_a_volume_limit_in_the_offer_and_keeps_and_applies_none_of_it() {
+        let seconds = |n: u32| vec![life_type(1), life_dur(n)];
+        let kilobytes = |n: u32| vec![life_type(2), life_dur(n)];
+        let cases: Vec<(&str, Vec<Attribute>, Vec<Attribute>)> = vec![
+            ("1 KB only", kilobytes(1), vec![]),
+            ("4608000 KB only (a Cisco gateway's default)", kilobytes(4_608_000), vec![]),
+            ("900 s, then 1 KB", [seconds(900), kilobytes(1)].concat(), seconds(900)),
+            ("1 KB, then 900 s", [kilobytes(1), seconds(900)].concat(), seconds(900)),
+            ("900 s, then 4608000 KB", [seconds(900), kilobytes(4_608_000)].concat(), seconds(900)),
+        ];
+        let hold = |life: Vec<Attribute>| {
+            let (answer, child) = responder_holdings(&[offer(|sa| set_life(sa, life))]);
+            (life_attributes(&answer), child_fields(&child))
+        };
+        let mut wrong = Vec::new();
+        for (name, with_volume, without) in cases {
+            if hold(with_volume) != hold(without) {
+                wrong.push(format!("{name}: what the responder answers and holds differs from the same offer without the volume limit"));
+            }
+        }
+        assert!(wrong.is_empty(), "offers that left something of their volume limit:\n{}", wrong.join("\n"));
+        let (a, b) = (hold(seconds(900)), hold(seconds(600)));
+        assert_eq!((a.0 == b.0, a.1 == b.1), (false, true), "the comparison must see a different number of seconds");
+    }
+
+    /// The other half of "not applied": a CHILD SA negotiated under a limit of one
+    /// kilobyte seals far more than that, on either end -- 16 packets of 1400
+    /// bytes. `EspSa` stops at the sequence number (2^32 packets, "rekey
+    /// required") and at nothing counted in bytes.
+    #[test]
+    fn a_child_sa_negotiated_under_a_one_kilobyte_limit_carries_on_past_it() {
+        let life = || vec![life_type(1), life_dur(900), life_type(2), life_dur(1)];
+        let (_msg3, mut initiator, _held) = initiator_holdings(3600, |sa| set_life(sa, life())).unwrap();
+        let (_answer, mut responder) = responder_holdings(&[offer(|sa| set_life(sa, life()))]);
+        let packet = [0x45u8; 1400];
+        for (end, sa) in [("initiator", &mut initiator.outbound), ("responder", &mut responder.outbound)] {
+            for n in 1..=16 {
+                assert!(sa.seal(&packet, 4).is_ok(), "the {end} could not seal packet {n} ({} bytes in all) under a 1 KB limit", n * packet.len());
+            }
+        }
     }
 
     fn message_of(cky_i: [u8; 8], cky_r: [u8; 8], message_id: u32) -> Vec<u8> {

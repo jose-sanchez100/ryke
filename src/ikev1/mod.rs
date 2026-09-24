@@ -41,7 +41,14 @@ use std::time::Duration;
 ///
 /// What §5.1 also asks -- an interval "adjusted dynamically based on measured
 /// round trip times" -- is not done: the split is the same whatever the path.
-/// `sends` is a small constant of the caller's (at most 16).
+/// `sends` is a small constant of the caller's (at most 16). A `total` below
+/// `2^sends - 1` nanoseconds cannot be cut into unequal parts: the leading waits
+/// are then zero and the last one holds all the time.
+///
+/// Callers pass `T * sends` for a per-send timeout `T` (the socket's read timeout
+/// or Quick Mode's `timeout`), so the *whole* wait is unchanged from a fixed `T`
+/// per send, but no single wait is `T`: for three sends they are 3T/7, 6T/7 and
+/// 12T/7, and the first retransmission leaves at 3T/7, not at T.
 pub(crate) fn retransmit_waits(total: Duration, sends: u32) -> Vec<Duration> {
     debug_assert!((1..=16).contains(&sends));
     let unit = total / ((1u32 << sends) - 1);
@@ -83,6 +90,41 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// At the ends of the range of durations: no overflow, no time lost or made
+    /// up, one wait per send, and no wait shorter than the one before it -- for a
+    /// total of nothing, of a nanosecond, and of the largest `Duration` there is.
+    #[test]
+    fn the_waits_keep_their_count_their_order_and_their_sum_at_the_extremes_of_duration() {
+        let mut wrong = Vec::new();
+        let totals = [Duration::ZERO, Duration::from_nanos(1), Duration::from_nanos(6), Duration::from_nanos(7), Duration::MAX - Duration::from_nanos(1), Duration::MAX];
+        for sends in 1..=16 {
+            for total in totals {
+                let waits = retransmit_waits(total, sends);
+                if waits.len() != sends as usize {
+                    wrong.push(format!("{sends} sends, {total:?}: {} waits", waits.len()));
+                }
+                if waits.iter().try_fold(Duration::ZERO, |sum, w| sum.checked_add(*w)) != Some(total) {
+                    wrong.push(format!("{sends} sends, {total:?}: the waits do not add up to the total, {waits:?}"));
+                }
+                if waits.windows(2).any(|w| w[1] < w[0]) {
+                    wrong.push(format!("{sends} sends, {total:?}: a wait shorter than the one before it, {waits:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// The limit of the split, pinned so that nobody takes the growth for
+    /// universal: a total below `2^sends - 1` nanoseconds cannot be cut into
+    /// unequal parts, so the sends before the last go out back to back and the
+    /// last wait holds all the time there is.
+    #[test]
+    fn a_total_too_short_to_split_sends_all_but_the_last_at_once() {
+        assert_eq!(retransmit_waits(Duration::from_nanos(1), 3), [Duration::ZERO, Duration::ZERO, Duration::from_nanos(1)]);
+        assert_eq!(retransmit_waits(Duration::ZERO, 3), [Duration::ZERO; 3]);
+        assert_eq!(retransmit_waits(Duration::from_nanos(7), 3), [Duration::from_nanos(1), Duration::from_nanos(2), Duration::from_nanos(4)]);
     }
 
     /// The split this crate uses for a request: three sends, waits of 1 : 2 : 4

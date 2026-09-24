@@ -207,7 +207,7 @@ enum OnIkeSa {
 struct AnsweredRequest {
     message_id: u32,
     request: Vec<u8>,
-    response: Vec<u8>,
+    response: Outgoing,
     /// Whether it ended the tunnel.
     tears_down: bool,
 }
@@ -266,7 +266,7 @@ struct IkeSaState {
     /// The peer's last IKE SA rekey request this session answered and the
     /// answer (as sent), to resend if the peer retransmits the request because
     /// that answer was lost -- by then the IKE SA it went out on may be gone.
-    answered_rekey: Option<(Vec<u8>, Vec<u8>)>,
+    answered_rekey: Option<(Vec<u8>, Outgoing)>,
     /// Our own rekey of the IKE SA, while its request is unanswered.
     rekeying: Option<OwnIkeRekey>,
     /// We are deleting the current IKE SA and wait for the answer: a rekey of
@@ -626,14 +626,14 @@ impl LivenessSession {
         self.next_message_id >= u32::MAX - MESSAGE_IDS_KEPT_FOR_ENDING
     }
 
-    /// Send `wire` (already built for Message ID `expected_mid`) and wait up
+    /// Send `request` (already built for Message ID `expected_mid`) and wait up
     /// to `timeout` for its response via [`Self::recv_and_classify`],
     /// retransmitting the identical bytes up to a few times on
     /// [`Liveness::NoReply`] (RFC 7296 §2.1) before giving up -- a single
     /// dropped datagram in either direction shouldn't read as a dead peer or
     /// a torn-down tunnel. Each retry gets its own full `timeout` window, not
     /// a shrinking remainder.
-    fn send_and_await(&mut self, wire: &[u8], expected_mid: u32, timeout: Duration) -> Result<Liveness, DriverError> {
+    fn send_and_await(&mut self, request: &Outgoing, expected_mid: u32, timeout: Duration) -> Result<Liveness, DriverError> {
         const ATTEMPTS: u32 = 3;
         let mut last = Liveness::NoReply;
         let mut answer = Reassembly::new(self.answer_key(expected_mid, ExchangeType::Informational));
@@ -641,8 +641,7 @@ impl LivenessSession {
             if attempt > 0 {
                 ike_debug!("INFORMATIONAL: retransmitting to {} (attempt {}/{ATTEMPTS})", self.dest, attempt + 1);
             }
-            crate::debug::dump(">>>", self.dest, wire);
-            self.sock.send_to(wire, self.dest)?;
+            request.send(&self.sock, self.dest)?;
             last = self.recv_and_classify(timeout, Some(&mut answer))?;
             if last != Liveness::NoReply {
                 return Ok(last);
@@ -664,8 +663,8 @@ impl LivenessSession {
         let mut iv = [0u8; 8];
         OsEntropy::new()?.fill(&mut iv);
         let req = dpd_request(&self.sa, mid, &iv)?;
-        let wire = wrap(&req, self.float);
-        self.send_and_await(&wire, mid, timeout)
+        let request = Outgoing::whole(wrap(&req, self.float));
+        self.send_and_await(&request, mid, timeout)
     }
 
     /// Cheap, side-effect-free (no outgoing packet) check for whether the
@@ -716,11 +715,11 @@ impl LivenessSession {
         let del = Delete::ike_sa();
         let req = build_informational(&self.sa, mid, false, &[(PayloadType::Delete, del.to_bytes())], &iv)?;
         ike_debug!("INFORMATIONAL: sending IKE_SA Delete to {} ({why})", self.dest);
-        let wire = wrap(&req, self.float);
+        let request = Outgoing::whole(wrap(&req, self.float));
         // Best-effort ack wait -- RFC 7296 says the requester may consider
         // the SA closed immediately, it doesn't need to wait for this.
         self.ike.closing = true;
-        let _ = self.send_and_await(&wire, mid, Duration::from_millis(500));
+        let _ = self.send_and_await(&request, mid, Duration::from_millis(500));
         self.ike.closing = false;
         Ok(())
     }
@@ -1097,7 +1096,7 @@ impl LivenessSession {
         // request or response is retransmitted, the same bytes every time
         // (§2.1): the peer answers a retransmission with the answer it already
         // gave, so no second SA is made.
-        let response = match self.request_response(&wrap(&req, self.float), mid, timeout)? {
+        let response = match self.request_response(&Outgoing::whole(wrap(&req, self.float)), mid, timeout)? {
             Reply::Response(response) => response,
             Reply::PeerTornDown => return Err(IkeError::PeerTornDown.into()),
             Reply::Unanswered => {
@@ -1177,13 +1176,13 @@ impl LivenessSession {
         let del = Delete::esp(vec![child.local]);
         let req = build_informational(&self.sa, mid, false, &[(PayloadType::Delete, del.to_bytes())], &iv)?;
         ike_debug!("INFORMATIONAL: sending ESP Delete for CHILD SA spi_in={:08x} to {}", child.local, self.dest);
-        let wire = wrap(&req, self.float);
+        let request = Outgoing::whole(wrap(&req, self.float));
         // Until it's answered, the peer's requests about this SA collide
         // with it (RFC 7296 §2.25.1).
         let outer = self.peer_child.in_flight.replace(OwnChildOp { op: ChildOp::Close(child), crossed: None, old_deleted: false });
         // Best-effort ack wait, same reasoning as `close()`: the peer may
         // consider the SA gone immediately either way.
-        let _ = self.send_and_await(&wire, mid, Duration::from_millis(500));
+        let _ = self.send_and_await(&request, mid, Duration::from_millis(500));
         self.peer_child.in_flight = outer;
         Ok(())
     }
@@ -1298,7 +1297,7 @@ impl LivenessSession {
                 return Ok(Fragmented::Pending);
             }
             ike_debug!("request {mid} from the peer: retransmitted (fragment 1) -- resending our answer");
-            let _ = self.sock.send_to(&last.response, self.dest);
+            let _ = last.response.send(&self.sock, self.dest);
             return Ok(Fragmented::AnsweredAgain { tears_down: last.tears_down });
         }
         if self.peer_requests(on).next != u64::from(mid) || self.peer_requests(on).gone {
@@ -1399,17 +1398,16 @@ impl LivenessSession {
         }
     }
 
-    /// Send `wire`, our answer to the peer's request `request` (with
+    /// Send `response`, our answer to the peer's request `request` (with
     /// `header`) on the IKE SA `on`, and keep it as that IKE SA's answer to
     /// resend should the peer retransmit the request (RFC 7296 §2.1). The
     /// peer's next request is then the one after it. `tears_down` is whether
     /// the request ended the tunnel, for the retransmission to say so again.
-    fn respond(&mut self, on: OnIkeSa, header: &IkeHeader, request: &[u8], wire: Vec<u8>, tears_down: bool) {
-        crate::debug::dump(">>>", self.dest, &wire);
-        let _ = self.sock.send_to(&wire, self.dest);
+    fn respond(&mut self, on: OnIkeSa, header: &IkeHeader, request: &[u8], response: Outgoing, tears_down: bool) {
+        let _ = response.send(&self.sock, self.dest);
         let requests = self.peer_requests_on(on);
         requests.next = u64::from(header.message_id) + 1;
-        requests.last = Some(AnsweredRequest { message_id: header.message_id, request: request.to_vec(), response: wire, tears_down });
+        requests.last = Some(AnsweredRequest { message_id: header.message_id, request: request.to_vec(), response, tears_down });
     }
 
     /// Answer one request the peer sent on its own initiative -- `true` when
@@ -1435,7 +1433,7 @@ impl LivenessSession {
         // answer was lost: send it again. The IKE SA it came on may be gone.
         if let Some((_, response)) = self.ike.answered_rekey.as_ref().filter(|(request, _)| request == msg) {
             ike_debug!("CREATE_CHILD_SA: the peer retransmitted its IKE SA rekey -- resending our answer");
-            let _ = self.sock.send_to(response, self.dest);
+            let _ = response.send(&self.sock, self.dest);
             return Ok(false);
         }
         let Some(on) = self.ike_sa_of(header) else {
@@ -1449,7 +1447,7 @@ impl LivenessSession {
                 return Ok(false);
             }
             ike_debug!("request {mid} from the peer: retransmitted -- resending our answer");
-            let _ = self.sock.send_to(&last.response, self.dest);
+            let _ = last.response.send(&self.sock, self.dest);
             return Ok(last.tears_down);
         }
         if requests.next != u64::from(mid) {
@@ -1519,7 +1517,7 @@ impl LivenessSession {
         if fatal {
             self.peer_requests_on(on).gone = true;
         }
-        self.respond(on, header, msg, wrap(&answer, self.float), tears_down);
+        self.respond(on, header, msg, Outgoing::whole(wrap(&answer, self.float)), tears_down);
         Ok(tears_down)
     }
 
@@ -1569,7 +1567,7 @@ impl LivenessSession {
             if (on == OnIkeSa::Retired && ike_deleted) || tears_down {
                 self.peer_requests_on(on).gone = true;
             }
-            self.respond(on, header, msg, wrap(&ack, self.float), tears_down);
+            self.respond(on, header, msg, Outgoing::whole(wrap(&ack, self.float)), tears_down);
             if tears_down {
                 ike_debug!("INFORMATIONAL: peer deleted the IKE SA -- tunnel torn down by the gateway");
             }
@@ -1642,7 +1640,7 @@ impl LivenessSession {
                 self.peer_child.deleted.push(ChildKind::Ipv6);
             }
         }
-        self.respond(on, header, msg, wrap(&ack, self.float), tears_down);
+        self.respond(on, header, msg, Outgoing::whole(wrap(&ack, self.float)), tears_down);
         if tears_down {
             ike_debug!("INFORMATIONAL: peer deleted the tunnel's CHILD SAs -- tunnel torn down by the gateway");
         }
@@ -1725,9 +1723,9 @@ impl LivenessSession {
         };
         // Recorded in the window of the IKE SA it came on before this session
         // leaves that IKE SA.
-        let wire = wrap(&response, self.float);
-        self.respond(OnIkeSa::Current, header, msg, wire.clone(), false);
-        self.ike.answered_rekey = Some((msg.to_vec(), wire));
+        let answer = Outgoing::whole(wrap(&response, self.float));
+        self.respond(OnIkeSa::Current, header, msg, answer.clone(), false);
+        self.ike.answered_rekey = Some((msg.to_vec(), answer));
         match self.ike.rekeying.as_mut() {
             Some(own) => {
                 ike_debug!(
@@ -1835,7 +1833,7 @@ impl LivenessSession {
         };
         match rekey::responder_answer_child_rekey(&self.sa, msg, new_spi, &nr, self.cipher, &self.pfs, &dh_private, iv) {
             Ok((response, child)) => {
-                self.respond(current, header, msg, wrap(&response, self.float), false);
+                self.respond(current, header, msg, Outgoing::whole(wrap(&response, self.float)), false);
                 let rekeyed = rekeyed_child(&child);
                 ike_debug!(
                     "CREATE_CHILD_SA: the peer rekeyed the {kind:?} CHILD SA (message id {}) -- new spi_in={:08x} spi_out={:08x}",
@@ -1903,7 +1901,7 @@ impl LivenessSession {
         if fatal {
             self.peer_requests_on(on).gone = true;
         }
-        self.respond(on, header, msg, wrap(&refusal, self.float), fatal && on == OnIkeSa::Current);
+        self.respond(on, header, msg, Outgoing::whole(wrap(&refusal, self.float)), fatal && on == OnIkeSa::Current);
         Ok(())
     }
 
@@ -2001,7 +1999,7 @@ impl LivenessSession {
         ike_debug!("CREATE_CHILD_SA (IKE SA rekey): initiating -- new_spi_i={new_spi_i:016x}");
         let req = ike_rekey::build_ike_rekey_request(&self.sa, mid, new_spi_i, &ni, &dh_private, &iv)?;
         self.ike.rekeying = Some(OwnIkeRekey::default());
-        let reply = self.request_response(&wrap(&req, self.float), mid, timeout);
+        let reply = self.request_response(&Outgoing::whole(wrap(&req, self.float)), mid, timeout);
         let own = self.ike.rekeying.take().unwrap_or_default();
         let ours = match reply {
             // `INVALID_SYNTAX`, in either direction, ended the IKE SA this rekey
@@ -2076,7 +2074,7 @@ impl LivenessSession {
         self.switch_ike_sa(new_sa);
     }
 
-    /// Send `wire`, a request already built for Message ID `mid`, and wait for
+    /// Send `request`, already built for Message ID `mid`, and wait for
     /// its response, retransmitting the identical bytes (RFC 7296 §2.1) a few
     /// times when `timeout` passes without one. Only the genuine answer counts
     /// (see [`Self::is_answer`]); anything else with its Message ID is passed
@@ -2084,16 +2082,15 @@ impl LivenessSession {
     /// [`Reply::Unanswered`] too when the peer deleted the IKE SA after
     /// rekeying it itself (see [`OwnIkeRekey::old_deleted`]): no answer is
     /// coming.
-    fn request_response(&mut self, wire: &[u8], mid: u32, timeout: Duration) -> Result<Reply, DriverError> {
+    fn request_response(&mut self, request: &Outgoing, mid: u32, timeout: Duration) -> Result<Reply, DriverError> {
         const ATTEMPTS: u32 = 3;
-        let exchange = IkeHeader::parse(&unwrap(wire, self.float)?)?.exchange_type;
+        let exchange = request.header(self.float)?.exchange_type;
         let mut answer = Reassembly::new(self.answer_key(mid, exchange));
         for attempt in 0..ATTEMPTS {
             if attempt > 0 {
                 ike_debug!("request {mid}: retransmitting to {} (attempt {}/{ATTEMPTS})", self.dest, attempt + 1);
             }
-            crate::debug::dump(">>>", self.dest, wire);
-            self.sock.send_to(wire, self.dest)?;
+            request.send(&self.sock, self.dest)?;
             let deadline = Instant::now() + timeout;
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2170,6 +2167,39 @@ fn local_ip_for(peer: SocketAddr) -> io::Result<std::net::IpAddr> {
 /// colliding with each other or a real 4500 already in use on the box.
 fn natt_local_port(local_port: u16) -> u16 {
     local_port + (crate::natt_port() - IKE_PORT)
+}
+
+/// A message of ours as it goes on the wire: its datagrams, each ready to
+/// send (behind the non-ESP marker on a floated transport). Kept as sent,
+/// so that a retransmission sends the same bytes again (RFC 7296 §2.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Outgoing {
+    datagrams: Vec<Vec<u8>>,
+}
+
+impl Outgoing {
+    /// `datagram`, the whole message in one.
+    fn whole(datagram: Vec<u8>) -> Outgoing {
+        Outgoing { datagrams: vec![datagram] }
+    }
+
+    /// Send every datagram to `dest`, in order, stopping at the first that
+    /// fails.
+    fn send(&self, sock: &UdpSocket, dest: SocketAddr) -> io::Result<()> {
+        for datagram in &self.datagrams {
+            crate::debug::dump(">>>", dest, datagram);
+            sock.send_to(datagram, dest)?;
+        }
+        Ok(())
+    }
+
+    /// The IKE header of the message, read off its first datagram: every
+    /// fragment carries the message's own SPIs, exchange, flags and
+    /// Message ID (RFC 7383 §2.5).
+    fn header(&self, float: bool) -> Result<IkeHeader, DriverError> {
+        let first = self.datagrams.first().ok_or(IkeError::Truncated { need: IkeHeader::LEN, have: 0 })?;
+        Ok(IkeHeader::parse(&unwrap(first, float)?)?)
+    }
 }
 
 /// Per-attempt read timeouts for [`send_and_retry`] (RFC 7296 §2.1: "It is
@@ -2254,7 +2284,7 @@ fn send_and_retry<T>(
     Err(io::Error::new(io::ErrorKind::TimedOut, format!("no IKE_SA_INIT answer after {} attempts", RETRY_BACKOFFS.len())).into())
 }
 
-/// Like [`send_and_retry`], for the `IKE_AUTH` request `wire` (sealed under
+/// Like [`send_and_retry`], for the `IKE_AUTH` request `outgoing` (sealed under
 /// `cipher`; `sk_e`/`sk_a` are the *peer's* send keys, the ones the caller
 /// then opens the answer with): returns the peer's response to it, whole or
 /// reassembled from RFC 7383 fragments.
@@ -2277,13 +2307,13 @@ fn send_and_retry<T>(
 fn send_and_retry_reassembling(
     sock: &UdpSocket,
     dest: SocketAddr,
-    wire: &[u8],
+    outgoing: &Outgoing,
     float: bool,
     cipher: SkCipher,
     sk_e: &[u8],
     sk_a: &[u8],
 ) -> Result<Vec<u8>, DriverError> {
-    let request = IkeHeader::parse(&unwrap(wire, float)?)?;
+    let request = outgoing.header(float)?;
     let key = MessageKey { initiator: !request.flags.initiator, response: true, ..MessageKey::of(&request) };
     let mut reassembly = Reassembly::new(key);
     let mut buf = [0u8; MAX_DATAGRAM];
@@ -2291,8 +2321,7 @@ fn send_and_retry_reassembling(
         if attempt > 0 {
             ike_debug!("retransmitting request to {dest} (attempt {}/{})", attempt + 1, RETRY_BACKOFFS.len());
         }
-        crate::debug::dump(">>>", dest, wire);
-        sock.send_to(wire, dest)?;
+        outgoing.send(sock, dest)?;
         let deadline = Instant::now() + *timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2920,9 +2949,9 @@ impl<E: Entropy> Ikev2Session<E> {
         self.entropy.fill(&mut iv);
         let req = ike_auth::initiator_auth_request_with_cfg(&sa, cfg, local_spi, want_cfg, esp_offer, ts_offer, &iv)?;
         ike_debug!("IKE_AUTH: sending to {dest} (local_spi={local_spi:08x}, floated={float}, ts={ts_offer:?})");
-        let wire = wrap(&req, float);
+        let outgoing = Outgoing::whole(wrap(&req, float));
         let response =
-            send_and_retry_reassembling(&sock, dest, &wire, float, sa.suite.sk_cipher(), &sa.keys.sk_er, &sa.keys.sk_ar)?;
+            send_and_retry_reassembling(&sock, dest, &outgoing, float, sa.suite.sk_cipher(), &sa.keys.sk_er, &sa.keys.sk_ar)?;
 
         let (_peer_id, peer_spi, esp_suite, assigned_ip4, tsr) = match ike_auth::initiator_verify_auth(&sa, &response, cfg, esp_offer, ts_offer) {
             Ok(v) => v,
@@ -3191,10 +3220,10 @@ impl<E: Entropy> Ikev2Session<E> {
         let cipher = initiator.ike_sa().suite.sk_cipher();
         loop {
             round += 1;
-            let wire = wrap(&msg, float);
+            let outgoing = Outgoing::whole(wrap(&msg, float));
             let sa = initiator.ike_sa();
             let ike_msg =
-                send_and_retry_reassembling(&sock, dest, &wire, float, cipher, &sa.keys.sk_er, &sa.keys.sk_ar)?;
+                send_and_retry_reassembling(&sock, dest, &outgoing, float, cipher, &sa.keys.sk_er, &sa.keys.sk_ar)?;
             last_message = ike_msg.clone();
             let event = match initiator.handle(&ike_msg, &mut self.entropy) {
                 Ok(event) => event,
@@ -3230,9 +3259,7 @@ impl<E: Entropy> Ikev2Session<E> {
                 EapEvent::Established(final_msg) => {
                     ike_debug!("IKE_AUTH (EAP-MSCHAPv2): authentication succeeded after {round} round(s)");
                     if let Some(fm) = final_msg {
-                        let wire = wrap(&fm, float);
-                        crate::debug::dump(">>>", dest, &wire);
-                        sock.send_to(&wire, dest)?;
+                        Outgoing::whole(wrap(&fm, float)).send(&sock, dest)?;
                     }
                     break;
                 }
@@ -5498,6 +5525,38 @@ mod tests {
     fn next_addr() -> SocketAddr {
         let port = NEXT_PORT.fetch_add(1, Ordering::SeqCst) as u16;
         format!("127.0.0.1:{port}").parse().unwrap()
+    }
+
+    /// A message's datagrams all go out, in order, and the same bytes go
+    /// out again when it is sent again. Its header is read off the first,
+    /// behind the non-ESP marker when floated.
+    #[test]
+    fn an_outgoing_message_sends_every_datagram_in_order_every_time() {
+        let sender = UdpSocket::bind(next_addr()).unwrap();
+        let receiver = UdpSocket::bind(next_addr()).unwrap();
+        receiver.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let header = IkeHeader {
+            initiator_spi: 1,
+            responder_spi: 2,
+            next_payload: PayloadType::EncryptedFragment,
+            major_version: 2,
+            minor_version: 0,
+            exchange_type: ExchangeType::Informational,
+            flags: Flags { initiator: true, version: false, response: false },
+            message_id: 7,
+            length: IkeHeader::LEN as u32,
+        };
+        let first = wrap(&header.to_bytes(), true);
+        let out = Outgoing { datagrams: vec![first, vec![2; 20], vec![3; 5]] };
+        assert_eq!(out.header(true).unwrap().message_id, 7);
+        out.send(&sender, receiver.local_addr().unwrap()).unwrap();
+        out.send(&sender, receiver.local_addr().unwrap()).unwrap();
+        let mut buf = [0u8; 64];
+        for expected in out.datagrams.iter().chain(&out.datagrams) {
+            let n = receiver.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], expected.as_slice());
+        }
+        assert!(Outgoing { datagrams: Vec::new() }.header(false).is_err());
     }
 
     /// [`next_addr`]'s IPv6-loopback twin, `None` on a host with no IPv6

@@ -14,8 +14,8 @@ use super::crypto1::{self, Prf, AES_BLOCK};
 use super::isakmp::{self, exchange, payload, IsakmpHeader};
 use super::phase2;
 use super::payloads::{
-    attr, auth, cert_payload_body, enc, hash, id_type, life, protocol, Attribute, Id, Proposal, SaPayload,
-    Transform, IPSEC_DOI, SIT_IDENTITY_ONLY,
+    attr, auth, cert_payload_body, enc, hash, id_type, life, life_duration_value, protocol, AttrValue, Attribute, Id,
+    Proposal, SaPayload, Transform, IPSEC_DOI, SIT_IDENTITY_ONLY,
 };
 use crate::crypto::DhGroup;
 use crate::entropy::Entropy;
@@ -279,12 +279,14 @@ pub struct Phase1State {
     /// know to keep using the port-4500 socket regardless.
     #[zeroize(skip)]
     pub floated: bool,
-    /// The Phase-1 SA lifetime actually in force, in seconds -- the
-    /// responder's own value if it echoed one (RFC 2407 §4.5: the responder
-    /// is never bound to the initiator's offered lifetime and may
-    /// unilaterally choose a shorter one), falling back to whatever this
-    /// side itself offered if the responder's chosen transform carried no
-    /// `LIFE_DURATION` attribute at all. See [`negotiated_p1_lifetime`].
+    /// The Phase-1 SA lifetime in force, in seconds. As initiator: the
+    /// responder's seconds limit if its chosen transform states one (RFC 2407
+    /// §4.5.4: it may choose a shorter lifetime than offered, never a longer
+    /// -- one past what this side offered counts as what it offered), and
+    /// what this side offered when the transform states none in seconds. As
+    /// responder: the seconds limit it granted, `0` when the initiator's
+    /// offer stated none. A kilobytes limit is not a number of seconds and is
+    /// not counted here. See [`negotiated_p1_lifetime`] and [`answer_transform`].
     #[zeroize(skip)]
     pub negotiated_lifetime_secs: u32,
     /// Final messages of ours that nothing answers, kept to be sent again
@@ -364,8 +366,12 @@ fn select_transform(sa: &SaPayload, want_sig: bool) -> Option<(Transform, Prf, D
 }
 
 /// One transform's worth of [`select_transform`]: `Some` with the mapped
-/// primitives if we support it, TripleDES-CBC only when `allow_3des`.
+/// primitives if we support it, TripleDES-CBC only when `allow_3des`. The
+/// transform returned is the one to answer with -- the offered one, its
+/// lifetime restated as the limit we grant ([`answer_transform`]) -- and a
+/// transform whose lifetime we cannot read ([`p1_life`]) is not one we take.
 fn accept_transform(t: &Transform, want_sig: bool, allow_3des: bool) -> Option<(Transform, Prf, DhGroup, usize, usize)> {
+    p1_life(t).ok()?;
     let (key_len, block) = match t.attr(attr::ENCRYPTION)? {
         enc::AES_CBC => match t.attr(attr::KEY_LENGTH)? {
             128 => (16, crypto1::AES_BLOCK),
@@ -391,22 +397,113 @@ fn accept_transform(t: &Transform, want_sig: bool, allow_3des: bool) -> Option<(
     } else {
         matches!(t.attr(attr::AUTH_METHOD), Some(auth::PSK) | Some(auth::XAUTH_INIT_PSK))
     };
-    auth_ok.then(|| (t.clone(), prf, group, key_len, block))
+    auth_ok.then(|| (answer_transform(t), prf, group, key_len, block))
 }
 
 fn find(payloads: &[isakmp::Payload], t: u8) -> Option<&isakmp::Payload> {
     payloads.iter().find(|p| p.payload_type == t)
 }
 
-/// Pull the responder's actually-chosen Phase-1 SA lifetime back out of its
-/// SA payload (RFC 2407 §4.5: the responder may unilaterally shorten the
-/// initiator's offered lifetime), falling back to `offered` if the chosen
-/// transform carried no `LIFE_DURATION` attribute at all.
-fn negotiated_p1_lifetime(ps: &[isakmp::Payload], offered: u32) -> u32 {
-    find(ps, payload::SA)
-        .and_then(|p| SaPayload::parse(&p.data).ok())
-        .and_then(|sa| sa.proposals.first().and_then(|prop| prop.transforms.first().and_then(|t| t.attr_u32(attr::LIFE_DURATION))))
-        .unwrap_or(offered)
+/// What a Phase-1 transform's lifetime attributes state (RFC 2409 App. A):
+/// its limit in seconds and its limit in kilobytes, each `None` when not
+/// stated. A Life Type (11, basic) gives the unit of the Life Duration (12,
+/// variable) that follows it -- 1 seconds, 2 kilobytes: "For a given Life Type
+/// the value of the Life Duration attribute defines the actual length of the SA
+/// life". So a Duration is read only with the Type before it, and a kilobytes
+/// Duration is never a number of seconds. `MalformedPayload` for: a Duration
+/// with no Type before it (its unit is not ours to guess), a Type with no
+/// Duration after it, a Type that is not a basic attribute (App. A: basic
+/// attributes "MUST NOT be encoded as variable") or names neither unit (3-65000
+/// are reserved, 65001 and up private "among mutually consenting parties", and
+/// we consent to none), a Duration of zero, of no octets or of more than eight
+/// ([`life_duration_value`]), and two different limits for one unit. Unlike
+/// Quick Mode's IPsec DOI attributes there is no default here (the 28800 seconds
+/// of RFC 2407 §4.5 are that DOI's) and no rule that the Duration comes right
+/// behind its Type (also §4.5's): a limit that is not stated is not one.
+fn p1_life(t: &Transform) -> Result<(Option<u32>, Option<u32>), IkeError> {
+    let (mut seconds, mut kilobytes): (Option<u32>, Option<u32>) = (None, None);
+    let mut unit: Option<u16> = None;
+    for a in &t.attributes {
+        match a.attr_type {
+            attr::LIFE_TYPE => {
+                if unit.is_some() {
+                    return Err(IkeError::MalformedPayload("Life Type not followed by its Life Duration"));
+                }
+                unit = match a.value {
+                    AttrValue::Short(kind @ (life::SECONDS | life::KILOBYTES)) => Some(kind),
+                    AttrValue::Short(_) => return Err(IkeError::MalformedPayload("unsupported Life Type")),
+                    AttrValue::Long(_) => return Err(IkeError::MalformedPayload("Life Type sent as a variable-length attribute")),
+                };
+            }
+            attr::LIFE_DURATION => {
+                let Some(kind) = unit.take() else {
+                    return Err(IkeError::MalformedPayload("Life Duration with no Life Type before it"));
+                };
+                let value = life_duration_value(&a.value).ok_or(IkeError::MalformedPayload("Life Duration of unusable length"))?;
+                if value == 0 {
+                    return Err(IkeError::MalformedPayload("Life Duration of zero"));
+                }
+                let slot = if kind == life::SECONDS { &mut seconds } else { &mut kilobytes };
+                match *slot {
+                    Some(previous) if previous != value => return Err(IkeError::MalformedPayload("conflicting Life Durations for one unit")),
+                    _ => *slot = Some(value),
+                }
+            }
+            _ => {}
+        }
+    }
+    if unit.is_some() {
+        return Err(IkeError::MalformedPayload("Life Type not followed by its Life Duration"));
+    }
+    Ok((seconds, kilobytes))
+}
+
+/// The Phase-1 SA lifetime, in seconds, that the transform the responder chose
+/// leaves us with. RFC 2407 §4.5.4: the responder may go on "using a shorter
+/// lifetime than what was offered" -- so its seconds pair counts, but never
+/// beyond `offered`: what we offered is our own limit, and a longer answer only
+/// says the peer would keep the SA longer. An answer with no seconds pair states
+/// no limit of its own (a kilobytes pair is a volume, not a time, and RFC 2409
+/// has no default lifetime to assume), so `offered` stands. `MalformedPayload`
+/// when the lifetime attributes cannot be read ([`p1_life`]).
+fn negotiated_p1_lifetime(chosen: &Transform, offered: u32) -> Result<u32, IkeError> {
+    let (seconds, _kilobytes) = p1_life(chosen)?;
+    Ok(seconds.map_or(offered, |s| s.min(offered)))
+}
+
+/// The transform a responder answers with: `offered` (which [`p1_life`] has
+/// read) as it stands, its lifetime restated as the one limit we grant -- the
+/// first seconds pair the initiator offered, encoded as offered (RFC 2409 App.
+/// A lets it come back either way) -- and no kilobytes pair: we count no volume
+/// under an SA, so we do not agree to a limit of it. The initiator's own limit
+/// is its own; RFC 2407 §4.5.4 lets a responder answer with a shorter lifetime,
+/// never with one it cannot keep.
+fn answer_transform(offered: &Transform) -> Transform {
+    let (mut unit, mut kept) = (None, false);
+    let attributes = offered
+        .attributes
+        .iter()
+        .filter(|a| match a.attr_type {
+            attr::LIFE_TYPE => {
+                unit = a.as_u16();
+                unit == Some(life::SECONDS) && !kept
+            }
+            attr::LIFE_DURATION => {
+                let keep = unit == Some(life::SECONDS) && !kept;
+                kept |= keep;
+                keep
+            }
+            _ => true,
+        })
+        .cloned()
+        .collect();
+    Transform { num: offered.num, transform_id: offered.transform_id, attributes }
+}
+
+/// The seconds limit an answered transform ([`answer_transform`]) states, `0`
+/// when it states none: this side then holds no time limit of its own for the SA.
+fn granted_lifetime_secs(answer: &Transform) -> u32 {
+    p1_life(answer).ok().and_then(|(seconds, _)| seconds).unwrap_or(0)
 }
 
 /// Collect every CERT payload's DER body (stripping the 1-byte encoding tag),
@@ -494,7 +591,7 @@ pub fn respond_aggressive(
 
     // Response SA: echo just the chosen transform.
     let chosen_auth = chosen.attr(attr::AUTH_METHOD).unwrap_or(0);
-    let initiator_offered_lifetime = chosen.attr_u32(attr::LIFE_DURATION).unwrap_or(0);
+    let initiator_offered_lifetime = granted_lifetime_secs(&chosen);
     let sar = SaPayload {
         doi: sa.doi,
         situation: sa.situation,
@@ -898,7 +995,7 @@ impl AggressiveInitiator {
         let hash_r_got = find(&ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
         let idr_b = find(&ps, payload::ID).ok_or(IkeError::MissingPayload("ID"))?.data.clone();
         let peer_supports_dpd = ps.iter().any(|p| p.payload_type == payload::VENDOR_ID && p.data == DPD_VENDOR_ID);
-        let negotiated_lifetime_secs = negotiated_p1_lifetime(&ps, self.offered_p1_lifetime);
+        let negotiated_lifetime_secs = negotiated_p1_lifetime(chosen, self.offered_p1_lifetime)?;
         // By message 2, both cookies are genuinely known, so this uses the
         // real `cky_r` (unlike message 1's own NAT-D, necessarily hashed
         // with CKY-R all-zero -- see `initiate_aggressive`'s doc).
@@ -1090,7 +1187,7 @@ impl MainSaSent {
         }
 
         let peer_supports_natt = peer_offers_natt(&ps);
-        let negotiated_p1_lifetime_secs = negotiated_p1_lifetime(&ps, self.offered_p1_lifetime);
+        let negotiated_p1_lifetime_secs = negotiated_p1_lifetime(chosen, self.offered_p1_lifetime)?;
 
         let dh_private = entropy.next_array32();
         let gxi = self.group.public(&dh_private);
@@ -1452,7 +1549,7 @@ pub fn respond_main(cfg: &Phase1Config, msg1: &[u8], entropy: &mut impl Entropy,
     let sa = SaPayload::parse(&sai_b)?;
     let want_sig = matches!(cfg.local_auth, Ikev1LocalAuth::Sig { .. });
     let (chosen, prf, group, key_len, block) = select_transform(&sa, want_sig).ok_or(IkeError::NoProposalChosen)?;
-    let initiator_offered_lifetime = chosen.attr_u32(attr::LIFE_DURATION).unwrap_or(0);
+    let initiator_offered_lifetime = granted_lifetime_secs(&chosen);
     let peer_supports_natt = peer_offers_natt(&ps);
 
     let mut cky_r = [0u8; 8];
@@ -2963,43 +3060,18 @@ mod tests {
     /// [`negotiated_p1_lifetime`] must prefer the responder's own chosen
     /// value (RFC 2407 §4.5: the responder may unilaterally shorten the
     /// initiator's offer) and fall back to `offered` only when the
-    /// responder's SA payload carries no `LIFE_DURATION` attribute at all.
+    /// responder's transform carries no seconds limit at all.
     #[test]
     fn negotiated_p1_lifetime_prefers_the_responders_value_and_falls_back_when_absent() {
-        let sa_with_lifetime = SaPayload {
-            doi: IPSEC_DOI,
-            situation: SIT_IDENTITY_ONLY,
-            proposals: vec![Proposal {
-                num: 1,
-                protocol_id: protocol::ISAKMP,
-                spi: Vec::new(),
-                transforms: vec![Transform {
-                    num: 1,
-                    transform_id: 1,
-                    attributes: vec![
-                        Attribute::short(attr::LIFE_TYPE, life::SECONDS),
-                        Attribute::long_u32(attr::LIFE_DURATION, 900),
-                    ],
-                }],
-            }],
+        let with = Transform {
+            num: 1,
+            transform_id: 1,
+            attributes: vec![Attribute::short(attr::LIFE_TYPE, life::SECONDS), Attribute::long_u32(attr::LIFE_DURATION, 900)],
         };
-        let ps_with = vec![isakmp::Payload { payload_type: payload::SA, data: sa_with_lifetime.to_bytes() }];
-        assert_eq!(negotiated_p1_lifetime(&ps_with, 28800), 900, "must prefer the responder's own chosen value");
+        assert_eq!(negotiated_p1_lifetime(&with, 28800).unwrap(), 900, "must prefer the responder's own chosen value");
 
-        let sa_without_lifetime = SaPayload {
-            doi: IPSEC_DOI,
-            situation: SIT_IDENTITY_ONLY,
-            proposals: vec![Proposal {
-                num: 1,
-                protocol_id: protocol::ISAKMP,
-                spi: Vec::new(),
-                transforms: vec![Transform { num: 1, transform_id: 1, attributes: vec![] }],
-            }],
-        };
-        let ps_without = vec![isakmp::Payload { payload_type: payload::SA, data: sa_without_lifetime.to_bytes() }];
-        assert_eq!(negotiated_p1_lifetime(&ps_without, 28800), 28800, "must fall back to the offered value when absent");
-
-        assert_eq!(negotiated_p1_lifetime(&[], 28800), 28800, "must fall back to the offered value when there's no SA payload at all");
+        let without = Transform { num: 1, transform_id: 1, attributes: vec![] };
+        assert_eq!(negotiated_p1_lifetime(&without, 28800).unwrap(), 28800, "must fall back to the offered value when absent");
     }
 
     /// End-to-end confirmation that a non-default `InitiatorConfig::p1_lifetime_secs`
@@ -3058,5 +3130,303 @@ mod tests {
         let istate = id_sent.complete_id(&msg6, &mut ie).unwrap();
         assert_eq!(istate.negotiated_lifetime_secs, 1200);
         assert_eq!(rstate.negotiated_lifetime_secs, 1200);
+    }
+
+    // ---- Phase-1 lifetimes: Life Type 11 / Life Duration 12 (RFC 2409 App. A) ----
+
+    fn life_type(kind: u16) -> Attribute {
+        Attribute::short(attr::LIFE_TYPE, kind)
+    }
+
+    fn life_secs(v: u32) -> Attribute {
+        Attribute::long_u32(attr::LIFE_DURATION, v)
+    }
+
+    fn life_octets(v: &[u8]) -> Attribute {
+        Attribute::long_bytes(attr::LIFE_DURATION, v.to_vec())
+    }
+
+    fn is_life(a: &Attribute) -> bool {
+        matches!(a.attr_type, attr::LIFE_TYPE | attr::LIFE_DURATION)
+    }
+
+    /// `msg` with the lifetime attributes of every transform in its SA payload
+    /// replaced by `life`; the header and every other payload as they were.
+    /// Neither side's HASH covers the SA payload the responder answers with (RFC
+    /// 2409 §5: HASH_R signs SAi_b, the initiator's own offer), so the rewritten
+    /// message 2 still authenticates.
+    fn with_sa_life(msg: &[u8], life: Vec<Attribute>) -> Vec<u8> {
+        let hdr = IsakmpHeader::parse(msg).unwrap();
+        let ps = isakmp::parse_payloads(hdr.next_payload, &msg[IsakmpHeader::LEN..]).unwrap();
+        let out: Vec<(u8, Vec<u8>)> = ps
+            .into_iter()
+            .map(|p| {
+                if p.payload_type != payload::SA {
+                    return (p.payload_type, p.data);
+                }
+                let mut sa = SaPayload::parse(&p.data).unwrap();
+                for t in sa.proposals.iter_mut().flat_map(|prop| prop.transforms.iter_mut()) {
+                    t.attributes.retain(|a| !is_life(a));
+                    t.attributes.extend(life.iter().cloned());
+                }
+                (payload::SA, sa.to_bytes())
+            })
+            .collect();
+        isakmp::build_message(IsakmpHeader { next_payload: payload::NONE, length: 0, ..hdr }, &out)
+    }
+
+    /// The lifetime attributes of the first transform of `msg`'s SA payload.
+    fn sa_life(msg: &[u8]) -> Vec<Attribute> {
+        let hdr = IsakmpHeader::parse(msg).unwrap();
+        let ps = isakmp::parse_payloads(hdr.next_payload, &msg[IsakmpHeader::LEN..]).unwrap();
+        let sa = SaPayload::parse(&find(&ps, payload::SA).unwrap().data).unwrap();
+        sa.proposals[0].transforms[0].attributes.iter().filter(|a| is_life(a)).cloned().collect()
+    }
+
+    fn life_initiator_cfg(mode: Ikev1ExchangeMode) -> InitiatorConfig {
+        InitiatorConfig {
+            local_auth: Ikev1LocalAuth::Psk(b"correct horse battery staple".to_vec()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            key_len: 32,
+            our_id: Id::ipv4([10, 1, 1, 1]),
+            group: DhGroup::Modp1024,
+            xauth: false,
+            xauth_creds: None,
+            ts_local: ([0, 0, 0, 0], [0, 0, 0, 0]),
+            ts_remote: ([0, 0, 0, 0], [0, 0, 0, 0]),
+            esp_cipher: crate::ikev2::sk::SkCipher::Aes256Gcm,
+            pfs_group: None,
+            mode_cfg: false,
+            ipv6: false,
+            mode,
+            p1_lifetime_secs: 1200,
+            p2_lifetime_secs: 3600,
+            force_natt: false,
+        }
+    }
+
+    fn life_responder_cfg() -> Phase1Config {
+        Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(b"correct horse battery staple".to_vec()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        }
+    }
+
+    const LIFE_INITIATOR_ADDR: &str = "10.1.1.1:500";
+    const LIFE_RESPONDER_ADDR: &str = "192.168.0.1:500";
+
+    /// A whole Phase-1 exchange, our initiator (which offers 1200 seconds) against
+    /// our responder, with the responder's message 2 rewritten in flight to carry
+    /// `answered_life`: the lifetime the initiator ends up holding, or why it
+    /// refused the answer.
+    fn initiator_lifetime_after(mode: Ikev1ExchangeMode, answered_life: Vec<Attribute>) -> Result<u32, IkeError> {
+        let icfg = life_initiator_cfg(mode);
+        let rcfg = life_responder_cfg();
+        let (ours, theirs): (SocketAddr, SocketAddr) = (LIFE_INITIATOR_ADDR.parse().unwrap(), LIFE_RESPONDER_ADDR.parse().unwrap());
+        let mut ie = SeedEntropy::new(0xA1);
+        let mut re = SeedEntropy::new(0xA2);
+        match mode {
+            Ikev1ExchangeMode::Aggressive => {
+                let (msg1, ai) = initiate_aggressive(&icfg, &mut ie, ours, theirs);
+                let (msg2, _) = respond_aggressive(&rcfg, &msg1, &mut re, theirs, ours).unwrap();
+                let (_msg3, state) = ai.complete(&with_sa_life(&msg2, answered_life), ours, theirs)?;
+                Ok(state.negotiated_lifetime_secs)
+            }
+            Ikev1ExchangeMode::Main => {
+                let (msg1, sa_sent) = initiate_main(&icfg, &mut ie);
+                let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re, theirs, ours).unwrap();
+                let (msg3, ke_sent) = sa_sent.complete_sa(&with_sa_life(&msg2, answered_life), &mut ie, ours, theirs)?;
+                let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
+                let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
+                let (msg6, _) = r2.complete_id(&msg5).unwrap();
+                Ok(id_sent.complete_id(&msg6, &mut ie).unwrap().negotiated_lifetime_secs)
+            }
+        }
+    }
+
+    /// Our responder handed an initiator's message 1 whose SA payload carries
+    /// `offered_life` (the initiator's other attributes as ours sends them):
+    /// the lifetime attributes of the SA it answers with and the lifetime it
+    /// records for the SA -- or why it took none of the offer.
+    fn responder_after(mode: Ikev1ExchangeMode, offered_life: Vec<Attribute>) -> Result<(Vec<Attribute>, u32), IkeError> {
+        let icfg = life_initiator_cfg(mode);
+        let rcfg = life_responder_cfg();
+        let (ours, theirs): (SocketAddr, SocketAddr) = (LIFE_INITIATOR_ADDR.parse().unwrap(), LIFE_RESPONDER_ADDR.parse().unwrap());
+        let mut ie = SeedEntropy::new(0xB1);
+        let mut re = SeedEntropy::new(0xB2);
+        match mode {
+            Ikev1ExchangeMode::Aggressive => {
+                let (msg1, _) = initiate_aggressive(&icfg, &mut ie, ours, theirs);
+                let (msg2, state) = respond_aggressive(&rcfg, &with_sa_life(&msg1, offered_life), &mut re, theirs, ours)?;
+                Ok((sa_life(&msg2), state.negotiated_lifetime_secs))
+            }
+            Ikev1ExchangeMode::Main => {
+                let (msg1, _) = initiate_main(&icfg, &mut ie);
+                let (msg2, state) = respond_main(&rcfg, &with_sa_life(&msg1, offered_life), &mut re, theirs, ours)?;
+                Ok((sa_life(&msg2), state.initiator_offered_lifetime))
+            }
+        }
+    }
+
+    const BOTH_MODES: [Ikev1ExchangeMode; 2] = [Ikev1ExchangeMode::Aggressive, Ikev1ExchangeMode::Main];
+
+    /// The initiator holds the responder's answered lifetime as the seconds
+    /// limit it was paired with -- never a kilobytes value read as seconds, never
+    /// the first Life Duration whatever its Life Type, and never beyond the 1200
+    /// seconds this side offered -- in Aggressive and in Main Mode. RFC 2409 App.
+    /// A: "For a given Life Type the value of the Life Duration attribute defines
+    /// the actual length of the SA life -- either a number of seconds, or a
+    /// number of kbytes protected"; RFC 2407 §4.5.4: the responder may use "a
+    /// shorter lifetime than what was offered", not a longer one.
+    #[test]
+    fn an_initiator_takes_the_answered_seconds_limit_paired_with_its_type_and_never_beyond_its_offer() {
+        let cases: Vec<(&str, Vec<Attribute>, u32)> = vec![
+            ("a shorter seconds pair", vec![life_type(1), life_secs(900)], 900),
+            ("the same seconds pair", vec![life_type(1), life_secs(1200)], 1200),
+            ("a seconds pair as a basic attribute", vec![life_type(1), Attribute::short(attr::LIFE_DURATION, 900)], 900),
+            ("a seconds pair in two octets", vec![life_type(1), life_octets(&[0x03, 0x84])], 900),
+            ("a seconds pair in three octets", vec![life_type(1), life_octets(&[0x00, 0x03, 0x84])], 900),
+            ("a seconds pair in eight octets", vec![life_type(1), life_octets(&[0, 0, 0, 0, 0, 0, 0x03, 0x84])], 900),
+            ("a longer seconds pair", vec![life_type(1), life_secs(86_400)], 1200),
+            ("a seconds pair past 32 bits", vec![life_type(1), life_octets(&[1, 0, 0, 0, 0])], 1200),
+            ("no lifetime at all", vec![], 1200),
+            ("a kilobytes pair only", vec![life_type(2), life_secs(4_608_000)], 1200),
+            ("a seconds pair and a kilobytes pair", vec![life_type(1), life_secs(900), life_type(2), life_secs(4_608_000)], 900),
+            ("a kilobytes pair and a seconds pair", vec![life_type(2), life_secs(4_608_000), life_type(1), life_secs(900)], 900),
+            ("the same seconds pair twice", vec![life_type(1), life_secs(900), life_type(1), life_secs(900)], 900),
+        ];
+        let mut wrong = Vec::new();
+        for mode in BOTH_MODES {
+            for (name, life, expected) in &cases {
+                let got = initiator_lifetime_after(mode, life.clone());
+                if !matches!(got, Ok(n) if n == *expected) {
+                    wrong.push(format!("{mode:?}, {name}: expected {expected} seconds, got {got:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{} answers misread:\n{}", wrong.len(), wrong.join("\n"));
+    }
+
+    /// A lifetime that cannot be read -- a Duration whose unit is not stated
+    /// (before its Type or without one), a Type with no Duration, a unit we do not
+    /// define, a basic attribute sent as a variable one (RFC 2409 App. A: "MUST
+    /// NOT be encoded as variable"), a Duration of no octets, too many, or none
+    /// at all, or two limits for one unit -- is no answer the initiator can
+    /// hold: the exchange ends, instead of the SA living by a number of seconds
+    /// nobody stated.
+    #[test]
+    fn an_initiator_refuses_an_answer_whose_lifetime_cannot_be_read() {
+        let refused: Vec<(&str, Vec<Attribute>)> = vec![
+            ("a Duration with no Type", vec![life_secs(900)]),
+            ("a Duration before its Type", vec![life_secs(900), life_type(1)]),
+            ("a Type with no Duration", vec![life_type(1)]),
+            ("a Type twice before a Duration", vec![life_type(1), life_type(2), life_secs(900)]),
+            ("a Type left over after a pair", vec![life_type(1), life_secs(900), life_type(2)]),
+            ("an unknown Type", vec![life_type(3), life_secs(900)]),
+            ("a private-use Type", vec![life_type(65_001), life_secs(900)]),
+            ("a Type sent as a variable attribute", vec![Attribute::long_bytes(attr::LIFE_TYPE, vec![0, 1]), life_secs(900)]),
+            ("a Duration of zero", vec![life_type(1), life_secs(0)]),
+            ("a Duration of no octets", vec![life_type(1), life_octets(&[])]),
+            ("a Duration of nine octets", vec![life_type(1), life_octets(&[0, 0, 0, 0, 0, 0, 0, 0, 5])]),
+            ("two different seconds limits", vec![life_type(1), life_secs(900), life_type(1), life_secs(600)]),
+            ("two different kilobytes limits", vec![life_type(1), life_secs(900), life_type(2), life_secs(100), life_type(2), life_secs(200)]),
+            ("a zero kilobytes limit", vec![life_type(1), life_secs(900), life_type(2), life_secs(0)]),
+        ];
+        let mut accepted = Vec::new();
+        for mode in BOTH_MODES {
+            for (name, life) in &refused {
+                let got = initiator_lifetime_after(mode, life.clone());
+                if !matches!(got, Err(IkeError::MalformedPayload(_))) {
+                    accepted.push(format!("{mode:?}, {name}: expected the answer to be refused as malformed, got {got:?}"));
+                }
+            }
+        }
+        assert!(accepted.is_empty(), "{} unreadable answers not refused:\n{}", accepted.len(), accepted.join("\n"));
+    }
+
+    /// The responder grants only a limit it can state and keep: the seconds pair
+    /// it was offered, as a Type followed by its Duration, and no kilobytes limit
+    /// (it counts no volume, so it does not agree to one). A kilobytes value is not
+    /// a number of seconds, and an offer with none in seconds is granted none.
+    #[test]
+    fn a_responder_grants_the_seconds_limit_it_was_offered_and_no_other() {
+        let seconds = |n: u32| vec![life_type(1), life_secs(n)];
+        let basic = vec![life_type(1), Attribute::short(attr::LIFE_DURATION, 900)];
+        let two_octets = vec![life_type(1), life_octets(&[0x03, 0x84])];
+        let cases: Vec<(&str, Vec<Attribute>, Vec<Attribute>, u32)> = vec![
+            ("a seconds pair", seconds(900), seconds(900), 900),
+            ("a seconds pair as a basic attribute, answered as offered", basic.clone(), basic, 900),
+            ("a seconds pair in two octets, answered as offered", two_octets.clone(), two_octets, 900),
+            ("a seconds pair and a kilobytes pair", vec![life_type(1), life_secs(900), life_type(2), life_secs(4_608_000)], seconds(900), 900),
+            ("a kilobytes pair and a seconds pair", vec![life_type(2), life_secs(4_608_000), life_type(1), life_secs(900)], seconds(900), 900),
+            ("the same seconds pair twice", vec![life_type(1), life_secs(900), life_type(1), life_secs(900)], seconds(900), 900),
+            ("a kilobytes pair only", vec![life_type(2), life_secs(4_608_000)], vec![], 0),
+            ("no lifetime at all", vec![], vec![], 0),
+        ];
+        let mut wrong = Vec::new();
+        for mode in BOTH_MODES {
+            for (name, offered, answered, recorded) in &cases {
+                match responder_after(mode, offered.clone()) {
+                    Ok(got) if got == (answered.clone(), *recorded) => {}
+                    got => wrong.push(format!("{mode:?}, {name}: expected the answer {answered:?} and {recorded} seconds, got {got:?}")),
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{} offers answered wrongly:\n{}", wrong.len(), wrong.join("\n"));
+    }
+
+    /// What the responder records as granted is read from the answer it built, and
+    /// only its seconds pair counts: a kilobytes limit, were one ever there, is a
+    /// volume and never a time.
+    #[test]
+    fn the_granted_lifetime_is_the_seconds_pair_of_the_answer_and_never_its_kilobytes() {
+        let answer = |life: Vec<Attribute>| Transform { num: 1, transform_id: 1, attributes: life };
+        assert_eq!(granted_lifetime_secs(&answer(vec![life_type(1), life_secs(900)])), 900);
+        assert_eq!(granted_lifetime_secs(&answer(vec![life_type(2), life_secs(4_608_000)])), 0);
+        assert_eq!(granted_lifetime_secs(&answer(vec![life_type(2), life_secs(4_608_000), life_type(1), life_secs(900)])), 900);
+        assert_eq!(granted_lifetime_secs(&answer(vec![])), 0);
+    }
+
+    /// An offer whose lifetime the responder cannot read is an offer it does not
+    /// take (`NoProposalChosen`), not one it echoes back: the answer would state a
+    /// limit the responder never understood.
+    #[test]
+    fn a_responder_takes_no_offer_whose_lifetime_cannot_be_read() {
+        let refused: Vec<(&str, Vec<Attribute>)> = vec![
+            ("a Duration with no Type", vec![life_secs(900)]),
+            ("a Type with no Duration", vec![life_type(1)]),
+            ("an unknown Type", vec![life_type(3), life_secs(900)]),
+            ("a Type sent as a variable attribute", vec![Attribute::long_bytes(attr::LIFE_TYPE, vec![0, 1]), life_secs(900)]),
+            ("a Duration of zero", vec![life_type(1), life_secs(0)]),
+            ("a Duration of nine octets", vec![life_type(1), life_octets(&[0, 0, 0, 0, 0, 0, 0, 0, 5])]),
+            ("two different seconds limits", vec![life_type(1), life_secs(900), life_type(1), life_secs(600)]),
+        ];
+        let mut taken = Vec::new();
+        for mode in BOTH_MODES {
+            for (name, life) in &refused {
+                let got = responder_after(mode, life.clone());
+                if !matches!(got, Err(IkeError::NoProposalChosen)) {
+                    taken.push(format!("{mode:?}, {name}: expected NoProposalChosen, got {got:?}"));
+                }
+            }
+        }
+        assert!(taken.is_empty(), "{} unreadable offers taken:\n{}", taken.len(), taken.join("\n"));
+    }
+
+    /// Passing over a transform whose lifetime cannot be read is selection, not
+    /// failure: the next transform of the offer is taken when it is acceptable.
+    #[test]
+    fn a_transform_whose_lifetime_cannot_be_read_is_passed_over_for_the_next_one() {
+        let mut unreadable = p1_transform(1, enc::AES_CBC);
+        unreadable.attributes.retain(|a| !is_life(a));
+        unreadable.attributes.extend([life_secs(900)]);
+        let readable = p1_transform(2, enc::AES_CBC);
+        let sa = p1_offer(vec![unreadable, readable]);
+        let (chosen, ..) = select_transform(&sa, false).expect("the second transform is acceptable");
+        assert_eq!(chosen.num, 2);
+        assert!(select_transform(&p1_offer(vec![sa.proposals[0].transforms[0].clone()]), false).is_none());
     }
 }

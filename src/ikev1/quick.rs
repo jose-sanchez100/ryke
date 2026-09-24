@@ -33,7 +33,8 @@ use super::crypto1::{self, Prf};
 use super::informational;
 use super::isakmp::{self, exchange, payload, IsakmpHeader, Payload};
 use super::payloads::{
-    id_type, life, protocol, AttrValue, Attribute, Id, Proposal, SaPayload, Transform, IPSEC_DOI, SIT_IDENTITY_ONLY,
+    id_type, life, life_duration_value, protocol, AttrValue, Attribute, Id, Proposal, SaPayload, Transform, IPSEC_DOI,
+    SIT_IDENTITY_ONLY,
 };
 use super::phase1::Phase1State;
 use super::phase2;
@@ -160,23 +161,6 @@ fn esp_transform_id(cipher: SkCipher) -> u8 {
 
 fn find(ps: &[Payload], t: u8) -> Option<&Payload> {
     ps.iter().find(|p| p.payload_type == t)
-}
-
-/// The value of an SA Life Duration attribute: a basic (two-octet) attribute
-/// or a variable-length one of up to eight octets, read as a big-endian
-/// integer (RFC 2407 §4.5: "Variable length attributes MAY be encoded as basic
-/// attributes if their value can fit into two octets"). Anything wider than
-/// 32 bits saturates -- far past any lifetime we would use -- and an empty or
-/// wider-than-eight-octet value is `None`.
-fn life_duration_value(v: &AttrValue) -> Option<u32> {
-    match v {
-        AttrValue::Short(n) => Some(u32::from(*n)),
-        AttrValue::Long(d) if (1..=8).contains(&d.len()) => {
-            let wide = d.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
-            Some(u32::try_from(wide).unwrap_or(u32::MAX))
-        }
-        AttrValue::Long(_) => None,
-    }
 }
 
 /// The SA lifetime, in seconds, that `t` states -- `None` when it states no

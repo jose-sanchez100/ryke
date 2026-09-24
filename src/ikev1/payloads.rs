@@ -57,6 +57,25 @@ pub mod life {
     pub const KILOBYTES: u16 = 2;
 }
 
+/// The value of a Life Duration attribute (Phase 1's class 12, the IPsec DOI's
+/// SA Life Duration): a basic (two-octet) attribute or a variable-length one of
+/// up to eight octets, read as a big-endian integer (RFC 2409 App. A, RFC 2407
+/// §4.5: "Variable length attributes MAY be encoded as basic attributes if
+/// their value can fit into two octets", and one offered either way may be
+/// returned the other). Anything wider than 32 bits saturates -- far past any
+/// lifetime we would use -- and an empty or wider-than-eight-octet value is
+/// `None`.
+pub(super) fn life_duration_value(v: &AttrValue) -> Option<u32> {
+    match v {
+        AttrValue::Short(n) => Some(u32::from(*n)),
+        AttrValue::Long(d) if (1..=8).contains(&d.len()) => {
+            let wide = d.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
+            Some(u32::try_from(wide).unwrap_or(u32::MAX))
+        }
+        AttrValue::Long(_) => None,
+    }
+}
+
 /// ISAKMP protocol IDs.
 pub mod protocol {
     pub const ISAKMP: u8 = 1;

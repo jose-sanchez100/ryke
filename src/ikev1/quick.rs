@@ -69,14 +69,21 @@
 //! `quick_mode_initiator_holds_the_volume_limit_the_answer_states` and
 //! `a_rekey_or_a_new_ipv6_child_sa_hands_over_the_volume_limit_the_gateway_states`).
 //!
-//! **Phase 2, as a responder**, is not changed yet by any of this: what it answers
-//! is one seconds pair -- its own limit -- and never a kilobytes pair, so an offer
-//! that includes a volume limit is answered as though it had none. That is the
-//! gap this section leaves open for the responder, and not RFC-conformant
-//! behaviour so much as a policy decision waiting to be taken: the SA it grants
-//! may protect more than the initiator was willing to. RFC 2407 §4.5.3 requires
-//! aborting on "a defined IPSEC DOI attribute (or attribute value) which it does
-//! not support", and a Kilobytes Life Type is a defined one.
+//! **Phase 2, as a responder**, grants the volume limit it is offered, as stated,
+//! and hands it over: the answer's transform carries its seconds pair (the
+//! offer's, or its own 3600 when the offer states none) followed by the
+//! kilobytes pair, and [`QuickResponder::negotiated_lifetime`] returns both. It
+//! never lengthens what it was offered (RFC 2407 §4.5.4: a responder may only
+//! complete "using a shorter lifetime than what was offered"), a limit of its own
+//! ([`respond_quick_capped`]) shortens the granted volume, and is stated even when
+//! the offer had none. So an offer that includes a volume limit is no longer taken
+//! as though it had none, and no limit is accepted in order to be forgotten: the
+//! one that runs the data plane holds the SA to what was granted, as for the
+//! initiator. The bundled `ikev1::server::Server` states the limit and exposes
+//! it (`Server::child_lifetime`) but, having no data plane, does not itself
+//! enforce it -- as it enforces no lifetime at all (tests:
+//! `quick_mode_responder_grants_the_volume_limit_it_is_offered_and_hands_it_over`
+//! and `a_responder_with_a_volume_limit_of_its_own_shortens_what_it_grants_and_never_lengthens_it`).
 
 use std::net::{Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -352,7 +359,7 @@ fn qm_header(cky_i: [u8; 8], cky_r: [u8; 8], msgid: u32) -> IsakmpHeader {
 /// unaffected by this attribute's value either way.
 fn esp_sa(spi: u32, cipher: SkCipher, pfs_group: Option<DhGroup>, floated: bool, life_duration: u32) -> SaPayload {
     let encap_mode = if floated { UDP_ENCAP_TUNNEL } else { ENCAP_TUNNEL };
-    esp_sa_numbered(spi, 1, 1, cipher, pfs_group, encap_mode, life_duration)
+    esp_sa_numbered(spi, 1, 1, cipher, pfs_group, encap_mode, SaLifetime { seconds: life_duration, kilobytes: None })
 }
 
 /// The one ESP transform `esp_sa` proposes (and a responder here answers)
@@ -361,11 +368,23 @@ fn esp_sa(spi: u32, cipher: SkCipher, pfs_group: Option<DhGroup>, floated: bool,
 /// [`select_offer`] to take it: each attribute once, basic-encoded, and no
 /// attribute that isn't part of the suite.
 fn esp_transform(num: u8, cipher: SkCipher, pfs_group: Option<DhGroup>, encap_mode: u16, life_duration: u32) -> Transform {
+    esp_transform_limited(num, cipher, pfs_group, encap_mode, life_duration, None)
+}
+
+/// [`esp_transform`] that also states a volume limit of `kilobytes` -- a second
+/// lifetime pair after the seconds one (RFC 2407 §4.5.2), the SA ending at
+/// whichever is reached first. Only a responder states one (what it grants, see
+/// [`respond_quick_capped`]): an offer of ours never does.
+fn esp_transform_limited(num: u8, cipher: SkCipher, pfs_group: Option<DhGroup>, encap_mode: u16, life_duration: u32, kilobytes: Option<u32>) -> Transform {
     let mut attributes = vec![
         Attribute::short(esp_attr::ENCAP_MODE, encap_mode),
         Attribute::short(esp_attr::LIFE_TYPE, life::SECONDS),
         Attribute::long_u32(esp_attr::LIFE_DURATION, life_duration),
     ];
+    if let Some(kilobytes) = kilobytes {
+        attributes.push(Attribute::short(esp_attr::LIFE_TYPE, life::KILOBYTES));
+        attributes.push(Attribute::long_u32(esp_attr::LIFE_DURATION, kilobytes));
+    }
     if !matches!(cipher, SkCipher::TripleDesCbc(_)) {
         attributes.push(Attribute::short(esp_attr::KEY_LENGTH, (cipher.key_len() * 8) as u16));
     }
@@ -389,7 +408,7 @@ fn esp_sa_numbered(
     cipher: SkCipher,
     pfs_group: Option<DhGroup>,
     encap_mode: u16,
-    life_duration: u32,
+    lifetime: SaLifetime,
 ) -> SaPayload {
     SaPayload {
         doi: IPSEC_DOI,
@@ -398,7 +417,7 @@ fn esp_sa_numbered(
             num: proposal_num,
             protocol_id: protocol::ESP,
             spi: spi.to_be_bytes().to_vec(),
-            transforms: vec![esp_transform(transform_num, cipher, pfs_group, encap_mode, life_duration)],
+            transforms: vec![esp_transform_limited(transform_num, cipher, pfs_group, encap_mode, lifetime.seconds, lifetime.kilobytes)],
         }],
     }
 }
@@ -443,6 +462,8 @@ struct AcceptableTransform {
     pfs_group: Option<DhGroup>,
     encap_mode: u16,
     life_seconds: u32,
+    /// The volume limit the offer states, if it does.
+    life_kilobytes: Option<u32>,
 }
 
 /// `Some` when `t` is a transform this side can build: tunnel mode, plain or
@@ -461,8 +482,8 @@ fn acceptable_transform(t: &Transform) -> Option<AcceptableTransform> {
     if !t.matches_offer(&esp_transform(t.num, cipher, pfs_group, encap_mode, 0), &LIFETIME_ATTRS) {
         return None;
     }
-    let life_seconds = stated_lifetime(t).ok()?.seconds.unwrap_or(RESPONDER_LIFE_SECONDS);
-    Some(AcceptableTransform { cipher, pfs_group, encap_mode, life_seconds })
+    let stated = stated_lifetime(t).ok()?;
+    Some(AcceptableTransform { cipher, pfs_group, encap_mode, life_seconds: stated.seconds.unwrap_or(RESPONDER_LIFE_SECONDS), life_kilobytes: stated.kilobytes })
 }
 
 /// The one ESP proposal and transform a responder takes from an initiator's
@@ -475,6 +496,7 @@ struct Selection {
     pfs_group: Option<DhGroup>,
     encap_mode: u16,
     life_seconds: u32,
+    life_kilobytes: Option<u32>,
 }
 
 /// Pick what to answer from the SA payload of Quick Mode message 1. RFC 2408
@@ -506,6 +528,7 @@ fn select_offer(ps: &[Payload]) -> Result<Selection, IkeError> {
                     pfs_group: a.pfs_group,
                     encap_mode: a.encap_mode,
                     life_seconds: a.life_seconds,
+                    life_kilobytes: a.life_kilobytes,
                 });
             }
         }
@@ -871,20 +894,55 @@ pub struct QuickResponder {
     /// [`Self::complete`] only needs to fold it into the KEYMAT once
     /// `HASH(3)` is verified.
     pfs_shared: Option<Vec<u8>>,
+    /// The lifetime message 2 grants the SA: what [`Self::negotiated_lifetime`]
+    /// hands over.
+    lifetime: SaLifetime,
+}
+
+/// The volume limit a responder grants: what the offer states, shortened to its
+/// own `cap` when it has one -- never lengthened (RFC 2407 §4.5.4: a responder
+/// may complete the negotiation "using a shorter lifetime than what was
+/// offered"), and its own limit when the offer states none.
+fn granted_volume(offered: Option<u32>, cap: Option<u32>) -> Option<u32> {
+    match (offered, cap) {
+        (Some(offered), Some(cap)) => Some(offered.min(cap)),
+        (offered, cap) => offered.or(cap),
+    }
 }
 
 /// Process Quick-Mode message 1 (`HASH(1), SA, Ni, [KE]`) and build message 2
 /// (`HASH(2), SA, Nr, [KE]`), choosing a fresh inbound ESP SPI. The SA of
 /// message 2 is the one transform [`select_offer`] took from the offer -- its
 /// Proposal #, Transform #, cipher and encapsulation mode as offered, with our
-/// own lifetime and SPI; nothing acceptable in the offer is
+/// own lifetime (see below) and SPI; nothing acceptable in the offer is
 /// [`IkeError::NoProposalChosen`]. PFS is automatic here (unlike the
 /// initiator's explicit `_with_pfs` entry point): whenever the selected
 /// transform names a GROUP DESCRIPTION, the responder generates its own
 /// ephemeral share in that same group and answers in kind -- there's no
 /// separate "did the responder want PFS" question, only "did the initiator ask
 /// for it".
+///
+/// A volume limit in the offer is granted as stated, beside the seconds pair, and
+/// [`QuickResponder::negotiated_lifetime`] hands both over: this crate does not
+/// count what an SA protects, so the one that runs the data plane holds the SA to
+/// it (see the module's "SA lifetimes" section). No limit of its own is applied
+/// here; [`respond_quick_capped`] is this with one.
 pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) -> Result<(Vec<u8>, QuickResponder), IkeError> {
+    respond_quick_capped(st, msg1, entropy, None)
+}
+
+/// [`respond_quick`] for a responder that limits the volume of an SA to
+/// `volume_cap_kilobytes` of its own: the limit stated is the offer's, shortened
+/// to that (see [`granted_volume`]), and stated even when the offer had none. It
+/// exists so the test double [`crate::ikev1::server::Server`] can play a gateway
+/// with a volume limit, which is what a client's handling of one is tested
+/// against.
+pub(crate) fn respond_quick_capped(
+    st: &Phase1State,
+    msg1: &[u8],
+    entropy: &mut impl Entropy,
+    volume_cap_kilobytes: Option<u32>,
+) -> Result<(Vec<u8>, QuickResponder), IkeError> {
     let hdr = IsakmpHeader::parse(msg1)?;
     if hdr.exchange_type != exchange::QUICK {
         return Err(IkeError::Crypto("not a Quick Mode message"));
@@ -897,7 +955,8 @@ pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) 
     let (_h, ps, iv1) = phase2::parse_encrypted(msg1, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0)?; // verifies HASH(1)
     let ni = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
     isakmp::check_nonce_len(&ni)?;
-    let Selection { proposal_num, transform_num, peer_spi, cipher, pfs_group, encap_mode, life_seconds } = select_offer(&ps)?;
+    let Selection { proposal_num, transform_num, peer_spi, cipher, pfs_group, encap_mode, life_seconds, life_kilobytes } = select_offer(&ps)?;
+    let life_kilobytes = granted_volume(life_kilobytes, volume_cap_kilobytes);
 
     let mut spi_b = [0u8; 4];
     entropy.fill(&mut spi_b);
@@ -905,7 +964,7 @@ pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) 
     let mut nr = vec![0u8; 16];
     entropy.fill(&mut nr);
 
-    let answer = esp_sa_numbered(local_spi, proposal_num, transform_num, cipher, pfs_group, encap_mode, life_seconds);
+    let answer = esp_sa_numbered(local_spi, proposal_num, transform_num, cipher, pfs_group, encap_mode, SaLifetime { seconds: life_seconds, kilobytes: life_kilobytes });
     let mut after: Vec<(u8, Vec<u8>)> = vec![(payload::SA, answer.to_bytes()), (payload::NONCE, nr.clone())];
     let pfs_shared = match pfs_group {
         Some(group) => {
@@ -935,10 +994,18 @@ pub fn respond_quick(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy) 
         iv2,
         cipher,
         pfs_shared,
+        lifetime: SaLifetime { seconds: life_seconds, kilobytes: life_kilobytes },
     }))
 }
 
 impl QuickResponder {
+    /// The lifetime message 2 granted the SA -- its seconds, and the volume limit
+    /// it states if it does -- for the caller that runs the data plane and holds
+    /// the SA to it (see [`SaLifetime`]).
+    pub fn negotiated_lifetime(&self) -> SaLifetime {
+        self.lifetime
+    }
+
     /// Process message 3 (`HASH(3)`), verify it, and return the established ESP
     /// CHILD SA.
     pub fn complete(self, msg3: &[u8]) -> Result<ChildSa, IkeError> {
@@ -2838,7 +2905,10 @@ mod tests {
     }
 
     /// The responder's own lifetime handling reads the seconds pair too: a
-    /// kilobytes duration is not a number of seconds.
+    /// kilobytes duration is not a number of seconds. (The seconds pair is the
+    /// first one its answer states, so `attr` reads it whatever came first in the
+    /// offer; the volume limit that may follow is checked by
+    /// `quick_mode_offers_seconds_only_and_answers_the_volume_limit_it_grants`.)
     #[test]
     fn quick_mode_responder_reads_the_offered_lifetime_in_its_own_units() {
         let seconds = |attrs: Vec<Attribute>| {
@@ -2860,12 +2930,14 @@ mod tests {
         sa.proposals.iter().flat_map(|p| p.transforms.iter()).flat_map(|t| t.attributes.iter().filter(is_life)).cloned().collect()
     }
 
-    /// This side counts no volume, so what it offers and what it answers states
-    /// its lifetime as one seconds pair and never as a kilobytes one: it neither
-    /// asks the peer to hold it to a volume nor agrees to one it cannot keep (see
-    /// the module's "SA lifetimes" section; RFC 2407 §4.5, §4.5.4).
+    /// What this side offers states its lifetime as one seconds pair and never a
+    /// kilobytes one -- it does not ask the peer to hold it to a volume. What it
+    /// answers is the seconds pair first (the offer's; its own 3600 when the offer
+    /// states none) and, when the offer states a volume limit, that limit as
+    /// stated after it: neither dropped nor read as seconds, whatever its
+    /// position in the offer (RFC 2407 §4.5.2, §4.5.4).
     #[test]
-    fn quick_mode_states_seconds_only_in_what_it_offers_and_what_it_answers() {
+    fn quick_mode_offers_seconds_only_and_answers_the_volume_limit_it_grants() {
         let mut wrong = Vec::new();
         let pair = |seconds: u32| vec![life_type(1), life_dur(seconds)];
         for (name, sa) in [
@@ -2878,19 +2950,24 @@ mod tests {
             }
         }
         let kilobytes = |n: u32| vec![life_type(2), life_dur(n)];
-        let cases = [
-            ("kilobytes only", kilobytes(100_000), 3600),
-            ("seconds, then kilobytes", [pair(900), kilobytes(100_000)].concat(), 900),
-            ("kilobytes, then seconds", [kilobytes(100_000), pair(900)].concat(), 900),
-            ("the same kilobytes pair twice", [kilobytes(100_000), kilobytes(100_000)].concat(), 3600),
+        let two_octets = vec![life_type(2), Attribute::long_bytes(esp_attr::LIFE_DURATION, vec![0x27, 0x10])];
+        // (what is offered, the pairs answered)
+        let cases: Vec<(&str, Vec<Attribute>, Vec<Attribute>)> = vec![
+            ("no lifetime", vec![], pair(3600)),
+            ("seconds only", pair(900), pair(900)),
+            ("kilobytes only", kilobytes(100_000), [pair(3600), kilobytes(100_000)].concat()),
+            ("seconds, then kilobytes", [pair(900), kilobytes(100_000)].concat(), [pair(900), kilobytes(100_000)].concat()),
+            ("kilobytes, then seconds", [kilobytes(100_000), pair(900)].concat(), [pair(900), kilobytes(100_000)].concat()),
+            ("the same kilobytes pair twice", [kilobytes(100_000), kilobytes(100_000)].concat(), [pair(3600), kilobytes(100_000)].concat()),
+            ("a Duration in the two-octet long form", two_octets, [pair(3600), kilobytes(10_000)].concat()),
         ];
-        for (name, life, granted) in cases {
+        for (name, life, answered) in cases {
             let answer = responder_answer(false, &[offer(|sa| set_life(sa, life))]).unwrap();
-            if life_attributes(&answer) != pair(granted) {
-                wrong.push(format!("answer to {name}: {:?}, wanted a seconds pair of {granted}", life_attributes(&answer)));
+            if life_attributes(&answer) != answered {
+                wrong.push(format!("answer to {name}: {:?}, wanted {answered:?}", life_attributes(&answer)));
             }
         }
-        assert!(wrong.is_empty(), "lifetimes stated beyond seconds:\n{}", wrong.join("\n"));
+        assert!(wrong.is_empty(), "lifetimes not stated as they must be:\n{}", wrong.join("\n"));
     }
 
     /// [`responder_answer`], carried on to the end: the initiator's genuine
@@ -2898,10 +2975,19 @@ mod tests {
     /// message 2 with the CHILD SA the responder is left with. The entropy is
     /// fixed, so two runs differ only by the offer.
     fn responder_holdings(sas: &[SaPayload]) -> (SaPayload, ChildSa) {
+        let (answer, child, _lifetime) = responder_holdings_capped(sas, None);
+        (answer, child)
+    }
+
+    /// [`responder_holdings`] for a responder that limits an SA's volume to
+    /// `volume_cap_kilobytes` of its own, and the lifetime it hands over
+    /// ([`QuickResponder::negotiated_lifetime`]) beside what it answers and holds.
+    fn responder_holdings_capped(sas: &[SaPayload], volume_cap_kilobytes: Option<u32>) -> (SaPayload, ChildSa, SaLifetime) {
         let (istate, rstate, _ie, mut re) = phase1_pair(0x5201, 0x5202, QM_ADDRS.0.parse().unwrap(), QM_ADDRS.1.parse().unwrap());
         let refs: Vec<&SaPayload> = sas.iter().collect();
         let msg1 = craft_msg1(&istate, &refs);
-        let (msg2, qr) = respond_quick(&rstate, &msg1, &mut re).unwrap();
+        let (msg2, qr) = respond_quick_capped(&rstate, &msg1, &mut re, volume_cap_kilobytes).unwrap();
+        let lifetime = qr.negotiated_lifetime();
         let hdr = IsakmpHeader::parse(&msg1).unwrap();
         let iv0 = crypto1::phase2_iv(rstate.prf, &rstate.phase1_iv, hdr.message_id, rstate.enc_block);
         let (_h, ps1, iv1) = phase2::parse_encrypted(&msg1, rstate.prf, &rstate.skeyid_a, &rstate.enc_key, rstate.enc_block, &iv0).unwrap();
@@ -2910,7 +2996,14 @@ mod tests {
         let h3 = hash3(rstate.prf, &rstate.skeyid_a, hdr.message_id, &ni, &nr);
         let (msg3, _) = phase2::encrypt_payloads(qm_header(rstate.cky_i, rstate.cky_r, hdr.message_id), &rstate.enc_key, rstate.enc_block, &iv2, &[(payload::HASH, h3)]).unwrap();
         let child = qr.complete(&msg3).unwrap();
-        (SaPayload::parse(&find(&ps2, payload::SA).unwrap().data).unwrap(), child)
+        (SaPayload::parse(&find(&ps2, payload::SA).unwrap().data).unwrap(), child, lifetime)
+    }
+
+    /// The lifetime an answer's SA states: its seconds pair and its volume
+    /// limit, if it has one.
+    fn stated_in(answer: &SaPayload) -> SaLifetime {
+        let stated = stated_lifetime(&answer.proposals[0].transforms[0]).unwrap();
+        SaLifetime { seconds: stated.seconds.unwrap(), kilobytes: stated.kilobytes }
     }
 
     /// A volume limit the answer states is held, not thrown away: RFC 2407 §4.5.2
@@ -3062,33 +3155,83 @@ mod tests {
         forge_answer(st, msg1, entropy, &[&sa], &ids)
     }
 
-    /// The responder counterpart: an offer that includes a volume limit is taken
-    /// as though it had none. The answer (a seconds pair of the responder's own)
-    /// and the CHILD SA it is left with are the same as for the offer without it.
+    /// The responder counterpart of the initiator's: an offer that includes a
+    /// volume limit gets it granted as stated, and handed over
+    /// ([`QuickResponder::negotiated_lifetime`]) -- not taken as though it had
+    /// none, which is what it used to be. What is handed over is what the answer
+    /// states on the wire, never more than was offered, and the limit changes
+    /// nothing else: the CHILD SA (SPIs, keys) is the one the same offer without
+    /// it yields.
     #[test]
-    fn quick_mode_responder_accepts_a_volume_limit_in_the_offer_and_keeps_and_applies_none_of_it() {
+    fn quick_mode_responder_grants_the_volume_limit_it_is_offered_and_hands_it_over() {
         let seconds = |n: u32| vec![life_type(1), life_dur(n)];
         let kilobytes = |n: u32| vec![life_type(2), life_dur(n)];
-        let cases: Vec<(&str, Vec<Attribute>, Vec<Attribute>)> = vec![
-            ("1 KB only", kilobytes(1), vec![]),
-            ("4608000 KB only (a Cisco gateway's default)", kilobytes(4_608_000), vec![]),
-            ("900 s, then 1 KB", [seconds(900), kilobytes(1)].concat(), seconds(900)),
-            ("1 KB, then 900 s", [kilobytes(1), seconds(900)].concat(), seconds(900)),
-            ("900 s, then 4608000 KB", [seconds(900), kilobytes(4_608_000)].concat(), seconds(900)),
+        // (what is offered, the same without its volume limit, what is granted)
+        let cases: Vec<(&str, Vec<Attribute>, Vec<Attribute>, SaLifetime)> = vec![
+            ("1 KB only", kilobytes(1), vec![], SaLifetime { seconds: 3600, kilobytes: Some(1) }),
+            ("4608000 KB only (a Cisco gateway's default)", kilobytes(4_608_000), vec![], SaLifetime { seconds: 3600, kilobytes: Some(4_608_000) }),
+            ("900 s, then 1 KB", [seconds(900), kilobytes(1)].concat(), seconds(900), SaLifetime { seconds: 900, kilobytes: Some(1) }),
+            ("1 KB, then 900 s", [kilobytes(1), seconds(900)].concat(), seconds(900), SaLifetime { seconds: 900, kilobytes: Some(1) }),
+            ("900 s, then 4608000 KB", [seconds(900), kilobytes(4_608_000)].concat(), seconds(900), SaLifetime { seconds: 900, kilobytes: Some(4_608_000) }),
+            ("900 s alone", seconds(900), seconds(900), SaLifetime { seconds: 900, kilobytes: None }),
+            ("no lifetime", vec![], vec![], SaLifetime { seconds: 3600, kilobytes: None }),
         ];
         let hold = |life: Vec<Attribute>| {
-            let (answer, child) = responder_holdings(&[offer(|sa| set_life(sa, life))]);
-            (life_attributes(&answer), child_fields(&child))
+            let (answer, child, held) = responder_holdings_capped(&[offer(|sa| set_life(sa, life))], None);
+            (stated_in(&answer), child_fields(&child), held)
         };
         let mut wrong = Vec::new();
-        for (name, with_volume, without) in cases {
-            if hold(with_volume) != hold(without) {
-                wrong.push(format!("{name}: what the responder answers and holds differs from the same offer without the volume limit"));
+        for (name, with_volume, without, wanted) in cases {
+            let (a, b) = (hold(with_volume), hold(without));
+            if a.2 != wanted {
+                wrong.push(format!("{name}: handed over {:?}, wanted {wanted:?}", a.2));
+            }
+            if a.0 != a.2 {
+                wrong.push(format!("{name}: the answer states {:?} but {:?} is what is handed over", a.0, a.2));
+            }
+            if a.1 != b.1 {
+                wrong.push(format!("{name}: the CHILD SA differs from the same offer without the volume limit"));
             }
         }
-        assert!(wrong.is_empty(), "offers that left something of their volume limit:\n{}", wrong.join("\n"));
+        assert!(wrong.is_empty(), "offers whose volume limit was not granted as stated:\n{}", wrong.join("\n"));
         let (a, b) = (hold(seconds(900)), hold(seconds(600)));
-        assert_eq!((a.0 == b.0, a.1 == b.1), (false, true), "the comparison must see a different number of seconds");
+        assert_eq!((a.2.seconds, b.2.seconds, a.1 == b.1), (900, 600, true), "the comparison must see a different number of seconds");
+    }
+
+    /// A responder with a volume limit of its own ([`respond_quick_capped`])
+    /// shortens what it grants and never lengthens it (RFC 2407 §4.5.4): the
+    /// offer's limit when that is the shorter, its own when it is, and its own
+    /// even when the offer states none. The seconds are not touched by it, and
+    /// what is handed over is what the answer states.
+    #[test]
+    fn a_responder_with_a_volume_limit_of_its_own_shortens_what_it_grants_and_never_lengthens_it() {
+        let seconds = |n: u32| vec![life_type(1), life_dur(n)];
+        let kilobytes = |n: u32| vec![life_type(2), life_dur(n)];
+        // (what is offered, the responder's own limit, the volume granted)
+        type Case = (&'static str, Vec<Attribute>, Option<u32>, Option<u32>);
+        let cases: Vec<Case> = vec![
+            ("an offer longer than the limit", [seconds(900), kilobytes(4_608_000)].concat(), Some(100_000), Some(100_000)),
+            ("an offer shorter than the limit", [seconds(900), kilobytes(50)].concat(), Some(100_000), Some(50)),
+            ("an offer equal to the limit", [seconds(900), kilobytes(100_000)].concat(), Some(100_000), Some(100_000)),
+            ("no volume in the offer", seconds(900), Some(100_000), Some(100_000)),
+            ("no lifetime in the offer", vec![], Some(100_000), Some(100_000)),
+            ("no limit of its own", [seconds(900), kilobytes(4_608_000)].concat(), None, Some(4_608_000)),
+            ("no volume anywhere", seconds(900), None, None),
+        ];
+        let mut wrong = Vec::new();
+        for (name, life, cap, granted) in cases {
+            let (answer, _child, held) = responder_holdings_capped(&[offer(|sa| set_life(sa, life))], cap);
+            if held.kilobytes != granted {
+                wrong.push(format!("{name}: handed over {:?}, wanted {granted:?}", held.kilobytes));
+            }
+            if stated_in(&answer) != held {
+                wrong.push(format!("{name}: the answer states {:?} but {held:?} is what is handed over", stated_in(&answer)));
+            }
+            if held.seconds != if name == "no lifetime in the offer" { 3600 } else { 900 } {
+                wrong.push(format!("{name}: the limit of its own changed the seconds to {}", held.seconds));
+            }
+        }
+        assert!(wrong.is_empty(), "volume limits granted wrongly:\n{}", wrong.join("\n"));
     }
 
     /// What this crate does not do about a volume limit: a CHILD SA negotiated

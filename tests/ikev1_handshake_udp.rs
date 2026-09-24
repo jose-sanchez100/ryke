@@ -237,3 +237,86 @@ fn ikev1_full_handshake_over_udp_loopback_main_mode() {
     let (got_r, _) = est.child.inbound.open(&sealed_r).unwrap();
     assert_eq!(got_r, pkt);
 }
+
+/// A full Aggressive Mode + Quick Mode handshake against a `Server` that limits
+/// the volume of an SA to `volume_limit_kilobytes` of its own (`None`: it states
+/// none). Returns what the client was left with, the lifetime the server says it
+/// granted, and the server's CHILD SA.
+fn handshake_against_a_gateway_with_volume_limit(
+    volume_limit_kilobytes: Option<u32>,
+    seed: u64,
+) -> (ryke::ikev1::Established, Option<ryke::SaLifetime>, ryke::esp::ChildSa) {
+    let psk = b"correct horse battery staple".to_vec();
+    let rcfg = Phase1Config {
+        local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+        trusted_cas: Vec::new(),
+        now_unix: 0,
+        our_id: Id::ipv4([192, 168, 0, 1]),
+    };
+    let mut server = Server::bind("127.0.0.1:0", SeedEntropy::new(seed), rcfg).unwrap();
+    server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    server.set_child_volume_limit(volume_limit_kilobytes);
+    let server_addr = server.local_addr().unwrap();
+
+    let handle = std::thread::spawn(move || {
+        let events = [server.handle_one().unwrap(), server.handle_one().unwrap(), server.handle_one().unwrap(), server.handle_one().unwrap()];
+        (events, server)
+    });
+
+    let icfg = InitiatorConfig {
+        local_auth: Ikev1LocalAuth::Psk(psk),
+        trusted_cas: Vec::new(),
+        now_unix: 0,
+        key_len: 32,
+        our_id: Id::ipv4([10, 1, 1, 1]),
+        group: DhGroup::Modp1024,
+        xauth: false,
+        xauth_creds: None,
+        ts_local: ([10, 0, 99, 0], [255, 255, 255, 0]),
+        ts_remote: ([10, 0, 99, 0], [255, 255, 255, 0]),
+        esp_cipher: SkCipher::Aes256Gcm,
+        pfs_group: None,
+        mode_cfg: false,
+        ipv6: false,
+        mode: Ikev1ExchangeMode::Aggressive,
+        p1_lifetime_secs: 28800,
+        p2_lifetime_secs: 3600,
+        force_natt: false,
+    };
+    let mut client = Client::bind("127.0.0.1:0", SeedEntropy::new(seed + 1)).unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let est = client.connect(server_addr, &icfg).unwrap();
+
+    let (events, mut server) = handle.join().unwrap();
+    assert_eq!(events[..3], [ServerEvent::Phase1SaInit, ServerEvent::Phase1Established, ServerEvent::QuickSaInit]);
+    assert!(matches!(events[3], ServerEvent::ChildSaEstablished { .. }));
+    let granted = server.child_lifetime(est.phase1.cky_i);
+    let rchild = server.take_child(est.phase1.cky_i).expect("server CHILD SA");
+    (est, granted, rchild)
+}
+
+/// A gateway that states no volume limit leaves the client with seconds alone --
+/// the lifetime is the one offered -- and the server says it granted the same.
+#[test]
+fn ikev1_quick_mode_without_a_volume_limit_holds_the_seconds_alone() {
+    let (est, granted, _rchild) = handshake_against_a_gateway_with_volume_limit(None, 0x7000);
+    assert_eq!((est.p2_lifetime_secs, est.p2_lifetime_kilobytes), (3600, None));
+    assert_eq!(granted, Some(ryke::SaLifetime { seconds: 3600, kilobytes: None }));
+}
+
+/// A gateway whose SAs are limited in volume (a Cisco IOS default, 4608000 KB):
+/// what it states in message 2 reaches the caller through `Established`, beside
+/// the seconds, and is the very limit the server says it granted -- and the
+/// limit changes nothing about the two CHILD SAs interoperating.
+#[test]
+fn ikev1_quick_mode_hands_the_gateways_volume_limit_to_the_caller() {
+    let (mut est, granted, mut rchild) = handshake_against_a_gateway_with_volume_limit(Some(4_608_000), 0x7100);
+    assert_eq!((est.p2_lifetime_secs, est.p2_lifetime_kilobytes), (3600, Some(4_608_000)));
+    assert_eq!(granted, Some(ryke::SaLifetime { seconds: 3600, kilobytes: Some(4_608_000) }));
+
+    let pkt: Vec<u8> = (0..40u8).collect();
+    let sealed = est.child.outbound.seal(&pkt, 4).unwrap();
+    assert_eq!(rchild.inbound.open(&sealed).unwrap().0, pkt);
+    let sealed_r = rchild.outbound.seal(&pkt, 4).unwrap();
+    assert_eq!(est.child.inbound.open(&sealed_r).unwrap().0, pkt);
+}

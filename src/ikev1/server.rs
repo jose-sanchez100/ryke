@@ -24,7 +24,12 @@
 //!   sequence number has not gone backwards (§6.2). A Delete closes what it
 //!   names; like every IKEv1 Delete it gets no answer;
 //! - it never starts an exchange (no DPD, rekey or Delete of its own). The
-//!   SAs last until the peer deletes them.
+//!   SAs last until the peer deletes them -- it enforces no lifetime, seconds
+//!   or volume. What it grants is stated in its Quick Mode answer and exposed
+//!   ([`Server::child_lifetime`]) for whoever runs the CHILD SA it hands out
+//!   ([`Server::take_child`]) to hold it to; [`Server::set_child_volume_limit`]
+//!   makes it play a gateway that limits the volume of an SA, which is what a
+//!   client's handling of one is tested against.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -39,7 +44,7 @@ use crate::ikev1::isakmp::{exchange, payload, IsakmpHeader};
 use crate::ikev1::payloads::protocol;
 use crate::ikev1::phase1::{respond_aggressive, respond_main, MainRespKeSent, MainRespSaSent, Phase1Config, Phase1State};
 use crate::ikev1::phase2;
-use crate::ikev1::quick::{respond_quick, QuickResponder};
+use crate::ikev1::quick::{respond_quick_capped, QuickResponder, SaLifetime};
 use crate::transport::{DriverError, UdpTransport};
 
 /// What [`Server::handle_one`] did with one datagram.
@@ -103,6 +108,8 @@ struct Session {
     /// The ESP SPIs of the CHILD SA, ours then the peer's, while it lasts --
     /// kept apart from [`Server::children`] since the caller may have taken it.
     child_spis: Option<(u32, u32)>,
+    /// The lifetime that CHILD SA was granted, likewise.
+    child_lifetime: Option<SaLifetime>,
     /// The highest R-U-THERE sequence number answered.
     dpd_seq: Option<u32>,
 }
@@ -115,6 +122,8 @@ pub struct Server<E> {
     cfg: Phase1Config,
     sessions: HashMap<([u8; 8], [u8; 8]), Session>,
     children: HashMap<[u8; 8], ChildSa>,
+    /// The volume, in kilobytes, this side limits a CHILD SA to, if it does.
+    child_volume_limit: Option<u32>,
 }
 
 impl<E: Entropy> Server<E> {
@@ -125,7 +134,25 @@ impl<E: Entropy> Server<E> {
             cfg,
             sessions: HashMap::new(),
             children: HashMap::new(),
+            child_volume_limit: None,
         })
+    }
+
+    /// Limit the volume of the CHILD SAs negotiated from now on to `kilobytes`
+    /// of this side's own (`None`: no limit, the default): what a Quick Mode
+    /// answer states is the offer's own volume limit if it has one, shortened to
+    /// this, and this alone when the offer has none (RFC 2407 §4.5.4). Stating
+    /// the limit is all this does -- see the module's note on lifetimes.
+    pub fn set_child_volume_limit(&mut self, kilobytes: Option<u32>) {
+        self.child_volume_limit = kilobytes;
+    }
+
+    /// The lifetime the CHILD SA of the ISAKMP SA opened with initiator cookie
+    /// `cky_i` was granted -- its seconds and its volume limit, if it has one --
+    /// for as long as the CHILD SA lasts, whether or not [`Self::take_child`]
+    /// took it.
+    pub fn child_lifetime(&self, cky_i: [u8; 8]) -> Option<SaLifetime> {
+        self.sessions.iter().find(|((i, _), _)| *i == cky_i).and_then(|(_, s)| s.child_lifetime)
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -184,6 +211,7 @@ impl<E: Entropy> Server<E> {
             quick: None,
             quick_ids: HashSet::new(),
             child_spis: None,
+            child_lifetime: None,
             dpd_seq: None,
         };
         self.sessions.insert((hdr.init_cookie, cky_r), session);
@@ -244,8 +272,10 @@ impl<E: Entropy> Server<E> {
                 return Ok(ServerEvent::Ignored);
             };
             let child = responder.clone().complete(&data)?;
+            let lifetime = responder.negotiated_lifetime();
             q.responder = None;
             s.child_spis = Some((child.inbound.spi(), child.outbound.spi()));
+            s.child_lifetime = Some(lifetime);
             self.children.insert(cky_i, child);
             return Ok(ServerEvent::ChildSaEstablished { cky_i });
         }
@@ -253,7 +283,7 @@ impl<E: Entropy> Server<E> {
             // An exchange already over: never taken again.
             return Ok(ServerEvent::Ignored);
         }
-        let (msg2, responder) = respond_quick(st, &data, &mut self.entropy)?;
+        let (msg2, responder) = respond_quick_capped(st, &data, &mut self.entropy, self.child_volume_limit)?;
         self.transport.send_to(&msg2, from)?;
         s.quick_ids.insert(hdr.message_id);
         s.quick = Some(Quick { message_id: hdr.message_id, msg1: data, msg2, responder: Some(responder) });
@@ -288,6 +318,7 @@ impl<E: Entropy> Server<E> {
                     }
                     Some((protocol::ESP, spi)) if s.child_spis.is_some_and(|(_, theirs)| spi == theirs.to_be_bytes()) => {
                         s.child_spis = None;
+                        s.child_lifetime = None;
                         self.children.remove(&cky_i);
                         return Ok(ServerEvent::ChildDeleted { cky_i });
                     }
@@ -423,13 +454,18 @@ mod tests {
 
         /// A whole Quick Mode; returns the peer's CHILD SA.
         fn quick(&mut self, server: &mut Server<SeedEntropy>, st: &Phase1State) -> ChildSa {
+            self.quick_with_lifetime(server, st).0
+        }
+
+        /// [`Self::quick`], with the lifetime the peer was left holding.
+        fn quick_with_lifetime(&mut self, server: &mut Server<SeedEntropy>, st: &Phase1State) -> (ChildSa, SaLifetime) {
             let (msg1, init) = self.quick_message_1(st);
             let (event, msg2) = self.send(server, &msg1);
             assert_eq!(event.unwrap(), ServerEvent::QuickSaInit);
-            let (msg3, child, _) = init.complete(&msg2.unwrap()).unwrap();
+            let (msg3, child, lifetime) = init.complete_with_lifetime(&msg2.unwrap()).unwrap();
             let (event, _) = self.send(server, &msg3);
             assert!(matches!(event.unwrap(), ServerEvent::ChildSaEstablished { .. }));
-            child
+            (child, lifetime)
         }
 
         /// The R-U-THERE-ACK sequence number in a reply of the server's.
@@ -703,6 +739,38 @@ mod tests {
         assert_eq!(peer.send(&mut server, &delete).0.unwrap(), ServerEvent::Ignored);
         let probe = build_r_u_there(&st, &mut peer.entropy, 1).unwrap();
         assert_eq!(peer.send(&mut server, &probe).0.unwrap(), ServerEvent::DpdAnswered { cky_i });
+    }
+
+    /// The lifetime the server grants a CHILD SA is what it says: the peer is
+    /// left holding the same, [`Server::child_lifetime`] reports it for as long as
+    /// the CHILD SA lasts -- taken by the caller or not -- and not once an ESP
+    /// Delete has closed it. A limit set with [`Server::set_child_volume_limit`]
+    /// applies to the exchanges after it, not to one already over.
+    #[test]
+    fn the_server_says_what_it_granted_and_forgets_it_with_the_child_sa() {
+        let (mut server, addr) = server();
+        let mut peer = Peer::new(addr);
+        let st = peer.aggressive(&mut server);
+        let cky_i = st.cky_i;
+        assert_eq!(server.child_lifetime(cky_i), None, "no CHILD SA yet");
+
+        server.set_child_volume_limit(Some(100_000));
+        let (child, held) = peer.quick_with_lifetime(&mut server, &st);
+        let limited = SaLifetime { seconds: 3600, kilobytes: Some(100_000) };
+        assert_eq!((held, server.child_lifetime(cky_i)), (limited, Some(limited)));
+        server.take_child(cky_i).unwrap();
+        assert_eq!(server.child_lifetime(cky_i), Some(limited), "taking the CHILD SA does not end its lifetime");
+
+        server.set_child_volume_limit(None);
+        assert_eq!(server.child_lifetime(cky_i), Some(limited), "a new limit is not applied to an SA already granted");
+        let delete = build_esp_delete(&st, &mut peer.entropy, child.inbound.spi()).unwrap();
+        assert_eq!(peer.send(&mut server, &delete).0.unwrap(), ServerEvent::ChildDeleted { cky_i });
+        assert_eq!(server.child_lifetime(cky_i), None);
+
+        let (_child, held) = peer.quick_with_lifetime(&mut server, &st);
+        let unlimited = SaLifetime { seconds: 3600, kilobytes: None };
+        assert_eq!((held, server.child_lifetime(cky_i)), (unlimited, Some(unlimited)));
+        assert_eq!(server.child_lifetime([0xEE; 8]), None, "another ISAKMP SA's");
     }
 
     /// An ISAKMP Delete closes the ISAKMP SA with its CHILD SA; nothing is

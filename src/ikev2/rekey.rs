@@ -410,8 +410,10 @@ pub fn responder_process_rekey(
 /// rekey is refused (`MissingPayload("KE")` without a KE,
 /// `NoProposalChosen` for a group not offered or not known). `None` runs
 /// without PFS: a proposal that lists no group, or NONE among its groups
-/// (PFS left optional), is answered without one; one that insists on a group
-/// is refused with `NoProposalChosen`. This mirrors
+/// (PFS left optional), is answered without one, and its KE is not run;
+/// one that insists on a group is refused with `NoProposalChosen`. A KE
+/// whose group no proposal names is malformed (RFC 7296 §3.4) and refused
+/// the same way with or without a key. This mirrors
 /// [`crate::ikev2::ike_rekey::responder_process_ike_rekey`]'s `dh_private`
 /// parameter for the IKE-SA-rekey analog. `cipher` is the ESP
 /// cipher already running on the tunnel being rekeyed -- see
@@ -433,6 +435,11 @@ pub fn responder_process_rekey_with_pfs(
     let peer_sa = ReceivedSa::parse(&sa_bytes)?;
     let peer_ke = find_ke(first, &inner)?;
 
+    // A KE's group is one of the request's own proposals' (RFC 7296 §3.4), whether or not we run the
+    // KE: one that is not is a malformed request, and no KE to ignore.
+    if peer_ke.as_ref().is_some_and(|ke| !proposals_name_dh(&peer_sa, ke.dh_group)) {
+        return Err(IkeError::NoProposalChosen);
+    }
     // The proposal to answer is one the peer offered (RFC 7296 §2.7, §3.3.6), chosen as the
     // session's responder chooses it: our cipher exactly, and the PFS our policy asks -- a key
     // is PFS on any group IKEv2 may run, none is no PFS, whatever KE the peer sent.
@@ -440,9 +447,6 @@ pub fn responder_process_rekey_with_pfs(
         Some(_) => (PfsPolicy { groups: Vec::new(), optional: false }, peer_ke.as_ref().map(|ke| ke.dh_group)),
         None => (PfsPolicy::none(), None),
     };
-    if ke_group.is_some_and(|g| !proposals_name_dh(&peer_sa, g)) {
-        return Err(IkeError::NoProposalChosen);
-    }
     // Refusals only (as this function documents): a group we would take on a KE of another is
     // not INVALID_KE_PAYLOAD's retry here, and one with no KE to run it on is the KE missing.
     let (proposal, peer_spi, pfs_group) = choose_child_proposal(&peer_sa, cipher, new_spi, ke_group, &pfs_policy).map_err(|e| match e {
@@ -599,11 +603,13 @@ pub(crate) fn select_child_proposal(
             .filter(|t| t.key_length.is_none() && t.transform_id != transform_id::UNUSABLE)
             .map(|t| t.transform_id)
             .collect();
-        let group = match ke_group {
-            Some(g) if dh_takeable.contains(&g) && pfs.allows_group(g) => match negotiate::ikev2_dh_group(g) {
-                Some(group) => Some(group),
-                None => continue,
-            },
+        // The KE's group, when this proposal lists it readable, our PFS policy allows it and IKEv2 may run it. One
+        // that is listed and not runnable (a group of the registry we do not implement, MODP-768) is no reason to
+        // stop weighing the proposal: it may offer NONE where PFS is optional, or a group we can run to ask for
+        // (RFC 7296 §1.3) -- the same as when the KE names a group this proposal lacks.
+        let ke_runnable = ke_group.filter(|g| dh_takeable.contains(g) && pfs.allows_group(*g)).and_then(negotiate::ikev2_dh_group);
+        let group = match ke_runnable {
+            Some(group) => Some(group),
             // A proposal with no DH of its own answers a rekey without PFS: the KE is
             // there for the proposals that do list its group (strongSwan sends
             // both kinds side by side, so a peer that can't do PFS still fits).
@@ -2243,6 +2249,127 @@ mod tests {
         }
     }
 
+    /// The peer's rekey request for the ESP proposal(s) `dh_per_proposal` (AES-GCM-256, no ESN, one DH
+    /// transform per ID listed -- 0 is NONE) and a KE of `ke_group`, and the tests' side of it.
+    fn ke_rekey_request(peer_sa: &CompletedSaInit, dh_per_proposal: &[&[u16]], ke_group: u16) -> Vec<u8> {
+        use crate::ikev2::payload::test_wire::{proposal, sa, transform, KEY_LENGTH_256};
+        let spi = 0x2222_2222u32.to_be_bytes();
+        let proposals: Vec<Vec<u8>> = dh_per_proposal
+            .iter()
+            .enumerate()
+            .map(|(n, dh)| {
+                let mut transforms =
+                    vec![transform(transform_type::ENCR, transform_id::AES_GCM_16, &KEY_LENGTH_256), transform(transform_type::ESN, transform_id::ESN_NONE, &[])];
+                transforms.extend(dh.iter().map(|&id| transform(transform_type::DH, id, &[])));
+                proposal(n as u8 + 1, protocol_id::ESP, &spi, &transforms)
+            })
+            .collect();
+        // What a group's public value looks like matters only to the groups we run; the others get filler.
+        let data = match ke_group {
+            transform_id::MODP_2048 => DhGroup::Modp2048.public(&[5u8; 32]),
+            transform_id::X25519 => DhGroup::X25519.public(&[5u8; 32]),
+            _ => vec![7u8; 64],
+        };
+        peer_rekey_request_wire(peer_sa, &sa(&proposals), Some(KeyExchange { dh_group: ke_group, data }))
+    }
+
+    /// RFC 7296 §3.4: a KE's group "MUST match a Diffie-Hellman group specified in a proposal in the
+    /// SA payload that is sent in the same message". The rekey responder that runs without PFS
+    /// ([`responder_process_rekey`], and [`responder_process_rekey_with_pfs`] with no key) ignored the
+    /// KE altogether, so a request whose KE named a group no proposal did was answered as if it had
+    /// been well formed -- where the responder that runs the KE says otherwise. Ignoring a KE is for
+    /// one that the proposal it settles on leaves unused (§3.3.6), not for one that is malformed.
+    #[test]
+    fn the_rekey_responder_without_pfs_refuses_a_ke_of_a_group_no_proposal_names() {
+        use crate::ikev2::payload::test_wire::{proposal, sa, transform, KEY_LENGTH_256, UNKNOWN_ATTRIBUTE};
+        let (our_sa, peer_sa) = sa_pair();
+        let (modp, x25519) = (transform_id::MODP_2048, transform_id::X25519);
+        let legacy = |req: &[u8]| responder_process_rekey(&our_sa, req, 0x1111_1111, &[0x44u8; 32], &[2u8; 8], None).map(|_| ());
+        let no_key = |req: &[u8]| {
+            responder_process_rekey_with_pfs(&our_sa, req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, None, &[2u8; 8], None).map(|_| ())
+        };
+        let with_key = |req: &[u8]| {
+            responder_process_rekey_with_pfs(&our_sa, req, 0x1111_1111, &[0x44u8; 32], SkCipher::Aes256Gcm, Some(&[6u8; 32]), &[2u8; 8], None).map(|_| ())
+        };
+        for (name, entry) in [("responder_process_rekey", &legacy as &dyn Fn(&[u8]) -> Result<(), IkeError>), ("... with no key", &no_key)] {
+            // Control: a KE the proposals do name, with PFS optional, is not run and does not matter.
+            assert_eq!(entry(&ke_rekey_request(&peer_sa, &[&[modp, 0]], modp)), Ok(()), "{name}: the KE names MODP-2048, and PFS is optional");
+            // The defect: a KE for a group in no proposal -- X25519, MODP-2048 with no DH transform at all, a group we do not run.
+            assert_eq!(entry(&ke_rekey_request(&peer_sa, &[&[]], modp)), Err(IkeError::NoProposalChosen), "{name}: no group in the proposal but a KE for one");
+            assert_eq!(entry(&ke_rekey_request(&peer_sa, &[&[modp, 0]], x25519)), Err(IkeError::NoProposalChosen), "{name}: a KE of a group no proposal names");
+            assert_eq!(entry(&ke_rekey_request(&peer_sa, &[&[modp], &[0]], x25519)), Err(IkeError::NoProposalChosen), "{name}: ... in a proposal of its own");
+            assert_eq!(entry(&ke_rekey_request(&peer_sa, &[&[transform_id::ECP256, 0]], 28)), Err(IkeError::NoProposalChosen), "{name}: a group we do not run");
+        }
+        // The same request is refused with the key (what the two share is the check).
+        assert_eq!(with_key(&ke_rekey_request(&peer_sa, &[&[modp, 0]], x25519)), Err(IkeError::NoProposalChosen), "with a key");
+
+        // A transform we cannot read still names the group it was sent with, as ever.
+        let esp = |dh: &[(u16, bool)]| {
+            let mut transforms =
+                vec![transform(transform_type::ENCR, transform_id::AES_GCM_16, &KEY_LENGTH_256), transform(transform_type::ESN, transform_id::ESN_NONE, &[])];
+            transforms.extend(dh.iter().map(|&(id, readable)| transform(transform_type::DH, id, if readable { &[] } else { &UNKNOWN_ATTRIBUTE })));
+            proposal(1, protocol_id::ESP, &0x2222_2222u32.to_be_bytes(), &transforms)
+        };
+        let ke = |group: u16| KeyExchange { dh_group: group, data: vec![7u8; 64] };
+        let named = peer_rekey_request_wire(&peer_sa, &sa(&[esp(&[(modp, false), (0, true)])]), Some(ke(modp)));
+        assert_eq!(legacy(&named), Ok(()), "MODP-2048 unreadable is still the KE's group");
+        let other = peer_rekey_request_wire(&peer_sa, &sa(&[esp(&[(modp, false), (0, true)])]), Some(ke(x25519)));
+        assert_eq!(legacy(&other), Err(IkeError::NoProposalChosen), "and no other group's");
+    }
+
+    /// RFC 7296 §1.3: "If the responder selects a proposal using a different Diffie-Hellman group
+    /// (other than NONE), the message MUST be rejected with a Notify payload of type
+    /// INVALID_KE_PAYLOAD" naming the group, for the initiator to retry with. A peer whose KE is
+    /// for a group we cannot run (it lists it first, as strongSwan lists its preferred one) next to
+    /// one we can, in the same proposal, was refused `NO_PROPOSAL_CHOSEN` instead -- the rekey failed
+    /// where the same proposals split in two got the retry. The group we cannot run is no reason to
+    /// stop weighing what else the proposal offers: NONE where PFS is optional, else the group to ask for.
+    #[test]
+    fn a_ke_of_a_readable_group_we_cannot_run_is_answered_with_the_group_we_can() {
+        let (our_sa, peer_sa) = sa_pair();
+        let (modp, x25519, brainpool) = (transform_id::MODP_2048, transform_id::X25519, 28u16);
+        let (nr, iv, resp_dh) = ([0x44u8; 32], [2u8; 8], [6u8; 32]);
+        let answered = |response: Vec<u8>| {
+            let (proposal, _, _, has_ke) = read_rekey_response(&response, &peer_sa);
+            (proposal.num, proposal.transforms.iter().filter(|t| t.transform_type == transform_type::DH).map(|t| t.transform_id).collect::<Vec<_>>(), has_ke)
+        };
+        type Answer = Result<(u8, Vec<u16>, bool), IkeError>;
+        let policy = |policy: &PfsPolicy, req: &[u8]| -> Answer {
+            responder_answer_child_rekey(&our_sa, req, 0x1111_1111, &nr, SkCipher::Aes256Gcm, policy, &resp_dh, &iv).map(|(r, _)| answered(r))
+        };
+        let optional = PfsPolicy::none();
+        let required = PfsPolicy::from_offer(&SecurityAssociation {
+            proposals: vec![esp_proposal(1, 0, (transform_id::AES_GCM_16, Some(256)), None, &[modp, x25519])],
+        })
+        .unwrap();
+
+        for (name, p) in [("PFS optional", &optional), ("PFS required on MODP-2048 or X25519", &required)] {
+            // The group to ask for: the one we can run, in the KE's own proposal or in another.
+            let retry = Err(IkeError::InvalidKeGroup(modp));
+            assert_eq!(policy(p, &ke_rekey_request(&peer_sa, &[&[brainpool, modp]], brainpool)), retry, "{name}: in the same proposal");
+            assert_eq!(policy(p, &ke_rekey_request(&peer_sa, &[&[brainpool], &[modp]], brainpool)), retry, "{name}: in another proposal (as before)");
+            assert_eq!(policy(p, &ke_rekey_request(&peer_sa, &[&[modp, brainpool]], brainpool)), retry, "{name}: listed the other way round");
+            // ... and the retry is taken.
+            assert_eq!(policy(p, &ke_rekey_request(&peer_sa, &[&[brainpool, modp]], modp)), Ok((1, vec![modp], true)), "{name}: the retry");
+            // Nothing else in the proposal that we can run: nothing to ask for.
+            assert_eq!(policy(p, &ke_rekey_request(&peer_sa, &[&[brainpool]], brainpool)), Err(IkeError::NoProposalChosen), "{name}: only the group we cannot run");
+            assert_eq!(
+                policy(p, &ke_rekey_request(&peer_sa, &[&[brainpool, 29]], brainpool)),
+                Err(IkeError::NoProposalChosen),
+                "{name}: only groups we cannot run"
+            );
+        }
+        // Where PFS is optional, the NONE the proposal offers is the way out, whichever group the KE is.
+        assert_eq!(policy(&optional, &ke_rekey_request(&peer_sa, &[&[brainpool, 0]], brainpool)), Ok((1, vec![0], false)), "NONE next to the group we cannot run");
+        assert_eq!(policy(&required, &ke_rekey_request(&peer_sa, &[&[brainpool, 0]], brainpool)), Err(IkeError::NoProposalChosen), "PFS is not optional here");
+
+        // The responder that runs the KE with a key it was given only refuses (its documented contract): no retry hint.
+        let with_key = |req: &[u8]| {
+            responder_process_rekey_with_pfs(&our_sa, req, 0x1111_1111, &nr, SkCipher::Aes256Gcm, Some(&resp_dh), &iv, None).map(|_| ())
+        };
+        assert_eq!(with_key(&ke_rekey_request(&peer_sa, &[&[brainpool, modp]], brainpool)), Err(IkeError::NoProposalChosen), "with a key");
+    }
+
     /// RFC 7296 §2.7, §3.3.6: [`responder_process_rekey_with_pfs`] answers with
     /// a proposal the peer offered -- the first that has the cipher running on
     /// the tunnel, exactly, and the PFS its own policy asks -- and with the
@@ -2314,8 +2441,9 @@ mod tests {
         let no_pfs = |proposals: &[Proposal]| answer(proposals, true, None);
         let (answered, ke, _) = no_pfs(&[esp_proposal(1, spi_a, gcm256, None, &[modp, 0])]).unwrap();
         assert_eq!((dh_of(&answered), ke), (vec![0], false), "a group or NONE");
-        let (answered, ke, _) = no_pfs(&[esp_proposal(1, spi_a, gcm256, None, &[])]).unwrap();
-        assert_eq!((dh_of(&answered), ke), (vec![], false), "no DH");
+        let (answered, ke, _) = answer(&[esp_proposal(1, spi_a, gcm256, None, &[])], false, None).unwrap();
+        assert_eq!((dh_of(&answered), ke), (vec![], false), "no DH, and no KE to go with it");
+        assert_eq!(no_pfs(&[esp_proposal(1, spi_a, gcm256, None, &[])]).err(), Some(IkeError::NoProposalChosen), "a KE and no group to name it");
         let (answered, ..) = no_pfs(&[esp_proposal(1, spi_a, gcm256, None, &[modp]), esp_proposal(2, spi_b, gcm256, None, &[])]).unwrap();
         assert_eq!(answered.num, 2, "the one that leaves PFS out, after one that insists on it");
         assert_eq!(no_pfs(&[esp_proposal(1, spi_a, gcm256, None, &[modp])]).err(), Some(IkeError::NoProposalChosen), "a group and no key");

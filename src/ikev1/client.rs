@@ -38,8 +38,12 @@
 //! What this does not do: recognise a repeat that the gateway re-encrypted
 //! (only identical bytes count); measure the round-trip time the retransmission
 //! interval should follow (RFC 2408 §5.1 asks for it); answer a Quick Mode or a
-//! Phase 1 that the gateway starts (this is an initiator only); or rekey the
-//! ISAKMP SA. Quick Mode's third message, sent by `connect` or by a rekey, is
+//! Phase 1 that the gateway starts (this is an initiator only); rekey the
+//! ISAKMP SA; or hold a lifetime in kilobytes (a volume limit is accepted and
+//! left to the gateway, see `quick`'s "SA lifetimes"). The look at port 500
+//! after a floated Aggressive Mode third message is `connect`'s own, made only
+//! while it waits: once `connect` has returned nothing looks there. Quick
+//! Mode's third message, sent by `connect` or by a rekey, is
 //! sent again only when the caller next reads the socket
 //! (`informational::peek`, `probe`, the next rekey), since nothing runs in the
 //! background: a gateway whose Quick Mode message 2 is answered by nothing waits

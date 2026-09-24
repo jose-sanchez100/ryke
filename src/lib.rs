@@ -58,26 +58,41 @@
 //! caller's. Neither runs in the background: the peer's requests are
 //! answered only while the caller is inside one of these calls.
 //!
-//! IKEv1's retransmissions are the same bytes each time, but at a fixed
-//! interval (the read timeout), where RFC 2408 §5.1 says "MUST NOT use a
-//! fixed timer" and asks for a growing one. The messages that nothing
-//! answers -- Aggressive Mode's third, the XAUTH ACK, Quick Mode's third --
-//! are kept, and sent again untouched when the gateway repeats the message
-//! before them (RFC 2408 §3.1, Commit Bit NOTE; RFC 2409 §5: no IV or state
-//! moves for a retransmission), and a gateway's repeat of a message the
-//! handshake already took is never read as the next one. That last-message
-//! recovery has limits: it recognises only a repeat identical to what the
-//! gateway sent first (one that is re-encrypted is not recognised); Quick
-//! Mode's third, sent by [`ikev1::Client::connect`] or a rekey, is sent again
-//! only when the caller next reads the socket ([`ikev1::informational::peek`],
-//! [`ikev1::informational::probe`], the next rekey), not in the background;
-//! and an Aggressive Mode third message lost after NAT-T floated is not
-//! recovered, since the gateway repeats its second message to port 500 while
-//! the client listens on 4500. Not done in IKEv1: a Quick Mode or a Phase 1
-//! the gateway starts goes unanswered (the client is an initiator only;
-//! answering one would be a Quick Mode responder driven from the caller's
-//! loop, which nothing here does yet), and the ISAKMP SA is never rekeyed --
-//! once its lifetime is up, a new `connect` is the way on.
+//! IKEv1's retransmissions are the same bytes each time, and the waits
+//! between them grow (RFC 2408 §5.1: "MUST NOT use a fixed timer"): for a
+//! read timeout `T`, a request goes out at 0, 3T/7 and 9T/7 (waits of 3T/7,
+//! 6T/7 and 12T/7, 1 : 2 : 4) and is given up on at 3T, which is what a
+//! silent gateway was already waited for. They follow no measured round-trip
+//! time, which §5.1 also asks for: the split is the same on every path. The
+//! messages that nothing answers -- Aggressive Mode's third, the XAUTH ACK,
+//! Quick Mode's third -- are kept, and sent again untouched when the gateway
+//! repeats the message before them (RFC 2408 §3.1, Commit Bit NOTE; RFC 2409
+//! §5: no IV or state moves for a retransmission), and a gateway's repeat of
+//! a message the handshake already took is never read as the next one. An
+//! Aggressive Mode third message lost after NAT-T floated is recovered too,
+//! within [`ikev1::Client::connect`]: the gateway that never saw it has not
+//! floated and repeats its second message to port 500 (RFC 3947 §5.3), so
+//! while the handshake waits on the floated port it also looks at port 500
+//! every 100 ms, at most eight datagrams at a look, and answers that repeat
+//! with the third message again, floated. That last-message recovery has
+//! limits: it recognises only a repeat identical to what the gateway sent
+//! first (one that is re-encrypted is not recognised) and keeps only the
+//! last eight such pairs; the look at port 500 is the handshake's own, so
+//! nothing looks there once `connect` has returned; and Quick Mode's third,
+//! sent by `connect` or a rekey, is sent again only when the caller next
+//! reads the socket ([`ikev1::informational::peek`],
+//! [`ikev1::informational::probe`], the next rekey), not in the background --
+//! until then a gateway whose Quick Mode second message was answered by
+//! nothing has no Quick Mode SA, and nothing here notices. What that
+//! recovery is worth is therefore how soon the caller reads: it is not a
+//! promise of service between the reads. Not done in IKEv1: a Quick Mode or
+//! a Phase 1 the gateway starts goes unanswered (the client is an initiator
+//! only; answering one would be a Quick Mode responder driven from the
+//! caller's loop, which nothing here does yet); the ISAKMP SA is never
+//! rekeyed -- once its lifetime is up, a new `connect` is the way on; and a
+//! lifetime in kilobytes, in Phase 1 or Phase 2, is accepted but neither
+//! held, counted nor applied (a volume limit is the gateway's to enforce),
+//! only the seconds are.
 //!
 //! IKEv2 fragmentation (RFC 7383), which every `IKE_SA_INIT` advertises:
 //! [`Ikev2Session`] and [`LivenessSession`] reassemble each fragmented

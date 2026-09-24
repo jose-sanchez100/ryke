@@ -565,6 +565,9 @@ pub struct LivenessSession {
     /// (a `peer_child.superseded` entry gone, say), and leave the peer
     /// without the Delete it waits for.
     peer_requests: PeerRequests,
+    /// The datagram size our requests and answers are fragmented to, when
+    /// the peer negotiated it -- see [`Ikev2Session::with_datagram_limit`].
+    datagram_limit: DatagramLimit,
 }
 
 /// Result of one [`LivenessSession::probe`] call.
@@ -663,7 +666,7 @@ impl LivenessSession {
         let mut iv = [0u8; 8];
         OsEntropy::new()?.fill(&mut iv);
         let req = dpd_request(&self.sa, mid, &iv)?;
-        let request = Outgoing::whole(wrap(&req, self.float));
+        let request = self.outgoing(OnIkeSa::Current, req)?;
         self.send_and_await(&request, mid, timeout)
     }
 
@@ -715,7 +718,7 @@ impl LivenessSession {
         let del = Delete::ike_sa();
         let req = build_informational(&self.sa, mid, false, &[(PayloadType::Delete, del.to_bytes())], &iv)?;
         ike_debug!("INFORMATIONAL: sending IKE_SA Delete to {} ({why})", self.dest);
-        let request = Outgoing::whole(wrap(&req, self.float));
+        let request = self.outgoing(OnIkeSa::Current, req)?;
         // Best-effort ack wait -- RFC 7296 says the requester may consider
         // the SA closed immediately, it doesn't need to wait for this.
         self.ike.closing = true;
@@ -1096,12 +1099,17 @@ impl LivenessSession {
         // request or response is retransmitted, the same bytes every time
         // (§2.1): the peer answers a retransmission with the answer it already
         // gave, so no second SA is made.
-        let response = match self.request_response(&Outgoing::whole(wrap(&req, self.float)), mid, timeout)? {
+        let request = self.outgoing(OnIkeSa::Current, req)?;
+        let response = match self.request_response(&request, mid, timeout)? {
             Reply::Response(response) => response,
             Reply::PeerTornDown => return Err(IkeError::PeerTornDown.into()),
             Reply::Unanswered => {
                 ike_debug!("CREATE_CHILD_SA ({what}): no answer to message id {mid}, retransmissions included");
-                return Err(io::Error::from(io::ErrorKind::TimedOut).into());
+                return Err(match request.oversize {
+                    Some(_) => io::Error::new(io::ErrorKind::TimedOut, request.unanswered(&format!("no answer to CREATE_CHILD_SA request {mid}"))),
+                    None => io::Error::from(io::ErrorKind::TimedOut),
+                }
+                .into());
             }
         };
         let (child, tsr) = match rekey::initiator_complete_child(&self.sa, &ni, new_local_spi, self.cipher, pfs, ts, &response) {
@@ -1176,7 +1184,7 @@ impl LivenessSession {
         let del = Delete::esp(vec![child.local]);
         let req = build_informational(&self.sa, mid, false, &[(PayloadType::Delete, del.to_bytes())], &iv)?;
         ike_debug!("INFORMATIONAL: sending ESP Delete for CHILD SA spi_in={:08x} to {}", child.local, self.dest);
-        let request = Outgoing::whole(wrap(&req, self.float));
+        let request = self.outgoing(OnIkeSa::Current, req)?;
         // Until it's answered, the peer's requests about this SA collide
         // with it (RFC 7296 §2.25.1).
         let outer = self.peer_child.in_flight.replace(OwnChildOp { op: ChildOp::Close(child), crossed: None, old_deleted: false });
@@ -1384,6 +1392,12 @@ impl LivenessSession {
         }
     }
 
+    /// `message`, ours and sealed on the IKE SA `on`, ready for the wire:
+    /// whole or in fragments within the datagram limit (see [`prepare`]).
+    fn outgoing(&self, on: OnIkeSa, message: Vec<u8>) -> Result<Outgoing, DriverError> {
+        prepare(self.ike_sa(on), message, self.dest, self.float, self.datagram_limit, &mut OsEntropy::new()?)
+    }
+
     fn peer_requests(&self, on: OnIkeSa) -> &PeerRequests {
         match (on, &self.ike.retired) {
             (OnIkeSa::Retired, Some(retired)) => &retired.requests,
@@ -1504,7 +1518,7 @@ impl LivenessSession {
     /// nothing but a retransmission of this request is answered on it again.
     fn answer_malformed_request(&mut self, on: OnIkeSa, header: &IkeHeader, msg: &[u8], error: &IkeError, iv: &[u8; 8]) -> Result<bool, DriverError> {
         let notify = request_error_notify(error);
-        let answer = build_error_response(self.ike_sa(on), header, &notify, iv)?;
+        let answer = self.outgoing(on, build_error_response(self.ike_sa(on), header, &notify, iv)?)?;
         let fatal = notify.notify_type == notify_type::INVALID_SYNTAX;
         let tears_down = fatal && on == OnIkeSa::Current;
         ike_debug!(
@@ -1517,7 +1531,7 @@ impl LivenessSession {
         if fatal {
             self.peer_requests_on(on).gone = true;
         }
-        self.respond(on, header, msg, Outgoing::whole(wrap(&answer, self.float)), tears_down);
+        self.respond(on, header, msg, answer, tears_down);
         Ok(tears_down)
     }
 
@@ -1559,7 +1573,7 @@ impl LivenessSession {
         let named: Vec<u32> = deletes.iter().filter(|d| d.protocol_id == protocol_id::ESP).flat_map(|d| d.spis.iter().copied()).collect();
 
         if on == OnIkeSa::Retired || ike_deleted {
-            let ack = build_informational(self.ike_sa(on), header.message_id, true, &[], iv)?;
+            let ack = self.outgoing(on, build_informational(self.ike_sa(on), header.message_id, true, &[], iv)?)?;
             let tears_down = on == OnIkeSa::Current && self.peer_deleted_ike_sa();
             if on == OnIkeSa::Retired && ike_deleted {
                 ike_debug!("INFORMATIONAL: peer deleted the IKE SA we moved on from");
@@ -1567,7 +1581,7 @@ impl LivenessSession {
             if (on == OnIkeSa::Retired && ike_deleted) || tears_down {
                 self.peer_requests_on(on).gone = true;
             }
-            self.respond(on, header, msg, Outgoing::whole(wrap(&ack, self.float)), tears_down);
+            self.respond(on, header, msg, ack, tears_down);
             if tears_down {
                 ike_debug!("INFORMATIONAL: peer deleted the IKE SA -- tunnel torn down by the gateway");
             }
@@ -1598,7 +1612,7 @@ impl LivenessSession {
             }
         }
         let payloads: Vec<_> = if ours.is_empty() { Vec::new() } else { vec![(PayloadType::Delete, Delete::esp(ours).to_bytes())] };
-        let ack = build_informational(&self.sa, header.message_id, true, &payloads, iv)?;
+        let ack = self.outgoing(on, build_informational(&self.sa, header.message_id, true, &payloads, iv)?)?;
 
         if !superseded.is_empty() {
             ike_debug!("INFORMATIONAL: peer deleted the CHILD SA its rekey replaced (spi_in={superseded:08x?})");
@@ -1640,7 +1654,7 @@ impl LivenessSession {
                 self.peer_child.deleted.push(ChildKind::Ipv6);
             }
         }
-        self.respond(on, header, msg, Outgoing::whole(wrap(&ack, self.float)), tears_down);
+        self.respond(on, header, msg, ack, tears_down);
         if tears_down {
             ike_debug!("INFORMATIONAL: peer deleted the tunnel's CHILD SAs -- tunnel torn down by the gateway");
         }
@@ -1723,7 +1737,7 @@ impl LivenessSession {
         };
         // Recorded in the window of the IKE SA it came on before this session
         // leaves that IKE SA.
-        let answer = Outgoing::whole(wrap(&response, self.float));
+        let answer = self.outgoing(OnIkeSa::Current, response)?;
         self.respond(OnIkeSa::Current, header, msg, answer.clone(), false);
         self.ike.answered_rekey = Some((msg.to_vec(), answer));
         match self.ike.rekeying.as_mut() {
@@ -1833,7 +1847,8 @@ impl LivenessSession {
         };
         match rekey::responder_answer_child_rekey(&self.sa, msg, new_spi, &nr, self.cipher, &self.pfs, &dh_private, iv) {
             Ok((response, child)) => {
-                self.respond(current, header, msg, Outgoing::whole(wrap(&response, self.float)), false);
+                let response = self.outgoing(current, response)?;
+                self.respond(current, header, msg, response, false);
                 let rekeyed = rekeyed_child(&child);
                 ike_debug!(
                     "CREATE_CHILD_SA: the peer rekeyed the {kind:?} CHILD SA (message id {}) -- new spi_in={:08x} spi_out={:08x}",
@@ -1890,7 +1905,7 @@ impl LivenessSession {
         data: Vec<u8>,
         why: &str,
     ) -> Result<(), DriverError> {
-        let refusal = rekey::build_child_error_with_data(self.ike_sa(on), header.message_id, reason, data, iv)?;
+        let refusal = self.outgoing(on, rekey::build_child_error_with_data(self.ike_sa(on), header.message_id, reason, data, iv)?)?;
         let fatal = reason == notify_type::INVALID_SYNTAX;
         ike_debug!(
             "CREATE_CHILD_SA request from the peer (message id {}) -- refusing with {}{}: {why}",
@@ -1901,7 +1916,7 @@ impl LivenessSession {
         if fatal {
             self.peer_requests_on(on).gone = true;
         }
-        self.respond(on, header, msg, Outgoing::whole(wrap(&refusal, self.float)), fatal && on == OnIkeSa::Current);
+        self.respond(on, header, msg, refusal, fatal && on == OnIkeSa::Current);
         Ok(())
     }
 
@@ -1998,8 +2013,9 @@ impl LivenessSession {
         let mid = self.alloc_ending_message_id()?;
         ike_debug!("CREATE_CHILD_SA (IKE SA rekey): initiating -- new_spi_i={new_spi_i:016x}");
         let req = ike_rekey::build_ike_rekey_request(&self.sa, mid, new_spi_i, &ni, &dh_private, &iv)?;
+        let request = self.outgoing(OnIkeSa::Current, req)?;
         self.ike.rekeying = Some(OwnIkeRekey::default());
-        let reply = self.request_response(&Outgoing::whole(wrap(&req, self.float)), mid, timeout);
+        let reply = self.request_response(&request, mid, timeout);
         let own = self.ike.rekeying.take().unwrap_or_default();
         let ours = match reply {
             // `INVALID_SYNTAX`, in either direction, ended the IKE SA this rekey
@@ -2630,10 +2646,11 @@ impl<E: Entropy> Ikev2Session<E> {
     }
 
     /// Keep every IP datagram our messages travel in within `limit`, from
-    /// `IKE_AUTH` on, rather than [`DatagramLimit::DEFAULT`]: a larger
-    /// message goes in RFC 7383 fragments when the peer negotiated them,
-    /// and whole otherwise. `IKE_SA_INIT` is never fragmented. The limit is
-    /// not discovered from the path.
+    /// `IKE_AUTH` on, rather than [`DatagramLimit::DEFAULT`]: our requests
+    /// and our answers, those of the tunnel's [`LivenessSession`] included.
+    /// A larger message goes in RFC 7383 fragments when the peer negotiated
+    /// them, and whole otherwise. `IKE_SA_INIT` is never fragmented. The
+    /// limit is not discovered from the path.
     pub fn with_datagram_limit(mut self, limit: DatagramLimit) -> Self {
         self.datagram_limit = limit;
         self
@@ -2880,7 +2897,7 @@ impl<E: Entropy> Ikev2Session<E> {
             child_carries_ipv6: false,
             child_ts: ChildScopes::default(),
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
+            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: self.datagram_limit,
         };
         if want_cfg && assigned_ip4.is_none() {
             ike_debug!("IKE_AUTH: CHILD SA refused ({rejection}) and no CFG_REPLY came with it -- no inner address to build on, closing");
@@ -3089,7 +3106,7 @@ impl<E: Entropy> Ikev2Session<E> {
             child_carries_ipv6: !child_subnets6.is_empty(),
             child_ts,
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
+            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: self.datagram_limit,
         };
         Ok(ConnectedTunnel {
             local_spi,
@@ -3391,7 +3408,7 @@ impl<E: Entropy> Ikev2Session<E> {
             child_carries_ipv6: !child_subnets6.is_empty(),
             child_ts,
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
+            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: self.datagram_limit,
         };
 
         Ok(ConnectedTunnel {
@@ -3551,7 +3568,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
@@ -3589,7 +3606,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT };
         // Must NOT report Alive on the forged datagram -- with no genuine
         // reply arriving, the probe times out instead.
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::NoReply);
@@ -3620,7 +3637,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT };
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::Alive);
         responder.join().unwrap();
     }
@@ -3650,7 +3667,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT };
         assert_eq!(liveness.probe(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -3677,7 +3694,7 @@ mod tests {
 
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT };
         liveness.close().unwrap();
         responder.join().unwrap();
     }
@@ -3691,7 +3708,7 @@ mod tests {
         let (init_sa, _resp_sa) = liveness_sa_pair();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT };
         liveness.close().unwrap();
     }
 
@@ -3706,7 +3723,7 @@ mod tests {
         let unreachable: SocketAddr = silent_peer.local_addr().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT };
         assert_eq!(liveness.probe(Duration::from_millis(300)).unwrap(), Liveness::NoReply);
     }
 
@@ -3716,7 +3733,7 @@ mod tests {
         let unreachable: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let probe_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: unreachable, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT };
         // Unlike probe(), silence on a peek is Alive (nothing new to
         // report), not NoReply -- peek never asked anything.
         assert_eq!(liveness.peek(Duration::from_millis(50)).unwrap(), Liveness::Alive);
@@ -3750,7 +3767,7 @@ mod tests {
         probe_sock.send_to(b"hello", bind).unwrap();
 
         let mut liveness =
-            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() };
+            LivenessSession { sock: probe_sock, sa: init_sa, dest: bind, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx: None, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
     }
@@ -3817,7 +3834,7 @@ mod tests {
             child_carries_ipv6: false,
             child_ts: ChildScopes::default(),
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
+            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT,
         };
         // Whatever the answer, the request is not a teardown: the IKE SA stands.
         assert_eq!(liveness.peek(Duration::from_millis(1500)).unwrap(), Liveness::Alive);
@@ -4220,7 +4237,7 @@ mod tests {
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(),
             primary_child_alive: true,
-            peer_requests: PeerRequests::default(),
+            peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT,
         };
         let err = liveness.rekey_child(Duration::from_secs(2)).err().expect("the answer without PFS is refused");
         assert!(matches!(err, DriverError::Ike(IkeError::NoProposalChosen)), "got {err:?}");
@@ -4371,7 +4388,7 @@ mod tests {
             child_carries_ipv6: false,
             child_ts: ChildScopes::default(),
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
+            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT,
         };
         // The stale Delete is ignored and the wait times out -- silence
         // (nothing new to report) is Alive, exactly as if nothing had
@@ -4416,7 +4433,7 @@ mod tests {
             child_carries_ipv6: false,
             child_ts: ChildScopes::default(),
             ike: IkeSaState::new(),
-            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(),
+            peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT,
         };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::PeerTornDown);
         responder.join().unwrap();
@@ -4467,7 +4484,7 @@ mod tests {
             child_ts: ChildScopes::default(),
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(),
-            primary_child_alive: true, peer_requests: PeerRequests::default(),
+            primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT,
         };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::Alive, "the IKE SA and the IPv6 CHILD SA are still good");
         assert_eq!(liveness.take_peer_deleted_children(), vec![ChildKind::Primary]);
@@ -4518,7 +4535,7 @@ mod tests {
             child_ts: ChildScopes::default(),
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(),
-            primary_child_alive: true, peer_requests: PeerRequests::default(),
+            primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT,
         };
         assert_eq!(liveness.peek(Duration::from_secs(5)).unwrap(), Liveness::Alive, "the IKE SA and the primary CHILD SA are still good");
         assert_eq!(liveness.take_peer_deleted_children(), vec![ChildKind::Ipv6]);
@@ -4633,7 +4650,7 @@ mod tests {
                 ..Default::default()
             },
             primary_child_alive: true,
-            peer_requests: PeerRequests::default(),
+            peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT,
         };
         assert_eq!(liveness.peek(Duration::from_millis(600)).unwrap(), Liveness::Alive);
         assert!(liveness.peer_child.superseded.is_empty(), "drained exactly once, not once per retransmission");
@@ -4663,7 +4680,7 @@ mod tests {
             ike: IkeSaState::new(),
             peer_child: PeerChildState::default(),
             primary_child_alive: true,
-            peer_requests: PeerRequests::default(),
+            peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT,
         }
     }
 
@@ -6639,7 +6656,7 @@ mod tests {
         (sock, sa)
     }
 
-    /// The client's request that `fragments` carry, on the gateway's `sa`,
+    /// The client's message that `fragments` carry, on the gateway's `sa`,
     /// sealed again as one `SK` message.
     fn request_from_fragments(sa: &CompletedSaInit, fragments: &[Vec<u8>]) -> Vec<u8> {
         let cipher = sa.suite.sk_cipher();
@@ -6882,6 +6899,213 @@ mod tests {
         let again = tunnel.liveness.peek(Duration::from_secs(4)).unwrap();
         assert!(gateway.join().unwrap(), "the Delete is answered");
         assert_eq!((first, again), (Liveness::PeerTornDown, Liveness::PeerTornDown));
+    }
+
+    /// [`session_facing`], keeping datagrams within [`small_limit`]: an IKE
+    /// message of 132 bytes at most.
+    fn small_session_facing(gateway: &UdpSocket, sa: CompletedSaInit) -> LivenessSession {
+        let mut liveness = session_facing(gateway, sa, None);
+        liveness.datagram_limit = small_limit();
+        liveness
+    }
+
+    /// Every datagram the session sent the gateway, until it goes quiet.
+    fn all_sent_to(gateway: &UdpSocket) -> Vec<Vec<u8>> {
+        std::iter::from_fn(|| sent_to(gateway)).collect()
+    }
+
+    /// The gateway's rekey of the session's primary CHILD SA, its request 0.
+    fn gateway_rekey_of_the_primary(sa: &CompletedSaInit) -> Vec<u8> {
+        gateway_child_rekey(sa, 0, 0xAAAA, PEER_NEW_SPI, &PEER_NI)
+    }
+
+    /// Whether `answer`, sealed again as one message, is the session's answer
+    /// taking on [`gateway_rekey_of_the_primary`].
+    fn answers_the_rekey_of_the_primary(resp_sa: &CompletedSaInit, answer: &[u8]) -> bool {
+        let ts = TrafficSelectors::ipv4_full_tunnel();
+        rekey::initiator_complete_child(resp_sa, &PEER_NI, PEER_NEW_SPI, SkCipher::Aes256Gcm, None, &ts, answer).is_ok()
+    }
+
+    /// RFC 7383 §2.5, for an answer: the gateway's CHILD SA rekey came
+    /// whole, and the answer, beyond the limit, goes in fragments within it.
+    /// RFC 7296 §2.1: the request again gets those same datagrams, byte for
+    /// byte, and is not acted on again.
+    #[test]
+    fn an_answer_beyond_the_limit_goes_in_fragments_and_a_retransmission_gets_the_same_ones_without_acting_again() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        assert!(init_sa.peer_supports_fragmentation, "test setup: the gateway negotiated fragmentation");
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = small_session_facing(&gateway, init_sa);
+        let request = gateway_rekey_of_the_primary(&resp_sa);
+
+        assert_eq!(deliver(&mut liveness, &gateway, &request), Liveness::Alive);
+        let answer = all_sent_to(&gateway);
+        assert!(answer.len() > 1, "the answer must be split");
+        assert!(answer.iter().all(|d| d.len() <= 132), "a fragment beyond the limit");
+        assert!(answers_the_rekey_of_the_primary(&resp_sa, &request_from_fragments(&resp_sa, &answer)));
+        assert_eq!(liveness.take_peer_rekeys().len(), 1);
+        let spis = (liveness.child_local_spi, liveness.child_peer_spi);
+        assert_eq!(spis.1, PEER_NEW_SPI);
+
+        assert_eq!(deliver(&mut liveness, &gateway, &request), Liveness::Alive);
+        assert_eq!(all_sent_to(&gateway), answer, "the request again gets the same datagrams");
+        assert!(liveness.take_peer_rekeys().is_empty(), "a retransmission is not a second rekey");
+        assert_eq!((liveness.child_local_spi, liveness.child_peer_spi), spis);
+        assert_eq!(liveness.peer_child.superseded.len(), 1, "the replaced SA is noted once");
+    }
+
+    /// RFC 7383 §2.6 and §2.6.1, a request whose fragments are lost,
+    /// duplicated, reordered or altered: nothing is answered or acted on
+    /// until the authentic set is whole, then it is answered once, in
+    /// fragments. Of the request again, only an authentic fragment 1 gets
+    /// the same datagrams, and nothing is acted on again.
+    #[test]
+    fn a_request_whose_fragments_are_lost_duplicated_reordered_or_altered_is_answered_once_in_fragments() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = small_session_facing(&gateway, init_sa);
+        let fragments = gateway_fragments(&resp_sa, &gateway_rekey_of_the_primary(&resp_sa), 3, 700);
+        let to = liveness.sock.local_addr().unwrap();
+        let send = |liveness: &mut LivenessSession, datagrams: &[&Vec<u8>]| {
+            for datagram in datagrams {
+                gateway.send_to(datagram, to).unwrap();
+            }
+            assert_eq!(liveness.peek(Duration::from_millis(100)).unwrap(), Liveness::Alive);
+        };
+
+        // Fragment 2 lost, 3 duplicated, 1 altered before its genuine copy.
+        let altered = flip_last_byte(fragments[0].clone());
+        send(&mut liveness, &[&fragments[2], &fragments[2], &altered, &fragments[0]]);
+        assert_eq!(all_sent_to(&gateway), Vec::<Vec<u8>>::new(), "nothing is answered before the request is whole");
+        assert!(liveness.take_peer_rekeys().is_empty());
+
+        // The peer's retransmission, reordered: fragment 2 completes it.
+        send(&mut liveness, &[&fragments[2], &fragments[1]]);
+        let answer = all_sent_to(&gateway);
+        assert!(answer.len() > 1, "the answer must be split");
+        assert!(answer.iter().all(|d| d.len() <= 132), "a fragment beyond the limit");
+        assert!(answers_the_rekey_of_the_primary(&resp_sa, &request_from_fragments(&resp_sa, &answer)));
+        assert_eq!(liveness.take_peer_rekeys().len(), 1);
+
+        send(&mut liveness, &[&fragments[1], &fragments[2], &altered]);
+        assert_eq!(all_sent_to(&gateway), Vec::<Vec<u8>>::new(), "only an authentic fragment 1 repeats the answer");
+        send(&mut liveness, &[&fragments[0]]);
+        assert_eq!(all_sent_to(&gateway), answer, "fragment 1 again gets the same datagrams");
+        assert!(liveness.take_peer_rekeys().is_empty(), "a retransmission is not a second rekey");
+        assert_eq!(liveness.peer_child.superseded.len(), 1);
+    }
+
+    /// RFC 7383: no SKF to a peer that did not negotiate fragmentation. The
+    /// answer goes whole, beyond the limit.
+    #[test]
+    fn an_answer_to_a_peer_without_fragmentation_goes_whole() {
+        let (mut init_sa, resp_sa) = liveness_sa_pair();
+        init_sa.peer_supports_fragmentation = false;
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = small_session_facing(&gateway, init_sa);
+
+        assert_eq!(deliver(&mut liveness, &gateway, &gateway_rekey_of_the_primary(&resp_sa)), Liveness::Alive);
+        let answer = all_sent_to(&gateway);
+        assert_eq!(answer.len(), 1);
+        assert!(answer[0].len() > 132, "test setup: the answer must be beyond the limit");
+        assert!(answers_the_rekey_of_the_primary(&resp_sa, &answer[0]));
+    }
+
+    /// The gateway's IKE SA rekey, answered in fragments. The request again,
+    /// once the session moved to the new IKE SA, gets the same datagrams
+    /// (RFC 7296 §2.1), and the session stays on that IKE SA.
+    #[test]
+    fn an_ike_sa_rekey_answered_in_fragments_is_answered_again_with_the_same_ones() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = small_session_facing(&gateway, init_sa);
+        let (ni, dh, new_spi_i) = (vec![0x55u8; 32], [3u8; 32], 0x1122_3344_5566_7788u64);
+        let request = ike_rekey::build_ike_rekey_request(&resp_sa, 0, new_spi_i, &ni, &dh, &[1u8; 8]).unwrap();
+
+        assert_eq!(deliver(&mut liveness, &gateway, &request), Liveness::Alive);
+        let answer = all_sent_to(&gateway);
+        assert!(answer.len() > 1, "the answer must be split");
+        assert!(answer.iter().all(|d| d.len() <= 132), "a fragment beyond the limit");
+        let new_sa = ike_rekey::initiator_complete_ike_rekey(&resp_sa, &ni, new_spi_i, &dh, &request_from_fragments(&resp_sa, &answer)).unwrap();
+        let on_new_sa = |liveness: &LivenessSession| (liveness.sa.spi_i, liveness.sa.spi_r) == (new_sa.spi_i, new_sa.spi_r);
+        assert!(on_new_sa(&liveness));
+
+        assert_eq!(deliver(&mut liveness, &gateway, &request), Liveness::Alive);
+        assert_eq!(all_sent_to(&gateway), answer, "the request again gets the same datagrams");
+        assert!(on_new_sa(&liveness));
+        assert!(liveness.ike.retired.as_ref().is_some_and(|r| r.sa.spi_r == resp_sa.spi_r), "retired once, not twice");
+    }
+
+    /// RFC 7383 §2.5, for a request of ours after `IKE_AUTH`: a CHILD SA
+    /// rekey beyond the limit goes in fragments within it. RFC 7296 §2.1:
+    /// each retransmission is the same datagrams, byte for byte.
+    #[test]
+    fn a_request_beyond_the_limit_goes_in_fragments_and_is_retransmitted_byte_for_byte() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = small_session_facing(&gateway, init_sa);
+
+        let err = liveness.rekey_child(Duration::from_millis(100)).unwrap_err();
+        assert!(matches!(&err, DriverError::Io(e) if e.kind() == io::ErrorKind::TimedOut), "{err}");
+        let sent = all_sent_to(&gateway);
+        let per = sent.len() / 3;
+        assert_eq!(sent.len(), 3 * per, "three attempts of as many datagrams each");
+        assert!(per > 1, "the request must be split");
+        assert!(sent.iter().all(|d| d.len() <= 132), "a fragment beyond the limit");
+        assert_eq!(sent[..per], sent[per..2 * per], "a retransmission is the same datagrams");
+        assert_eq!(sent[..per], sent[2 * per..]);
+        let header = IkeHeader::parse(&request_from_fragments(&resp_sa, &sent[..per])).unwrap();
+        assert_eq!((header.exchange_type, header.message_id, header.flags.response), (ExchangeType::CreateChildSa, 2, false));
+    }
+
+    /// RFC 7383: to a peer that did not negotiate fragmentation our request
+    /// goes whole, beyond the limit, and when it goes unanswered the error
+    /// says why that may be.
+    #[test]
+    fn a_request_to_a_peer_without_fragmentation_goes_whole_and_its_timeout_says_so() {
+        let (mut init_sa, _) = liveness_sa_pair();
+        init_sa.peer_supports_fragmentation = false;
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = small_session_facing(&gateway, init_sa);
+
+        let err = liveness.rekey_child(Duration::from_millis(100)).unwrap_err();
+        let DriverError::Io(e) = &err else { panic!("expected a timeout, got {err}") };
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            e.to_string(),
+            "no answer to CREATE_CHILD_SA request 2; the CREATE_CHILD_SA request 2 went whole, 189 bytes, above the 132 bytes an IKE message may take within the datagram limit, as the peer did not negotiate IKE fragmentation (RFC 7383): it may be fragmented at the IP layer or dropped"
+        );
+        let sent = all_sent_to(&gateway);
+        assert_eq!(sent.len(), 3, "three attempts, whole");
+        assert!(sent[0].len() > 132);
+        assert!(sent.iter().all(|d| *d == sent[0]), "a retransmission is the same bytes");
+    }
+
+    /// A CHILD SA rekey of ours in fragments, end to end: the gateway
+    /// reassembles and answers it, and the Delete of the replaced SA follows.
+    #[test]
+    fn a_child_rekey_requested_in_fragments_completes() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, _) = responder_through_auth_spis(bind, psk);
+                let (request, _, datagrams) = recv_request_whole(&sock, &sa);
+                let split = datagrams.len() > 1 && datagrams.iter().all(|d| d.len() <= 132);
+                let (answer, _) = gateway_answers_rekey(&sa, &request, &[0x77; 32]);
+                sock.send_to(&answer, from).unwrap();
+                let (delete, _, _) = recv_request_whole(&sock, &sa);
+                sock.send_to(&informational_answer(&sa, &delete, &[RESPONDER_CHILD_SPI]), from).unwrap();
+                split
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        tunnel.liveness.datagram_limit = small_limit();
+        let rekeyed = tunnel.liveness.rekey_child(Duration::from_secs(1)).unwrap();
+        assert!(gateway.join().unwrap(), "the request must go in fragments within the limit");
+        assert_eq!(rekeyed.peer_spi, PEER_L_SPI);
     }
 
     #[test]
@@ -8522,7 +8746,7 @@ mod tests {
         let (init_sa, _resp_sa) = liveness_sa_pair();
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let dest = sock.local_addr().unwrap();
-        LivenessSession { sock, sa: init_sa, dest, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default() }
+        LivenessSession { sock, sa: init_sa, dest, float: false, next_message_id: 2, cipher: SkCipher::Aes256Gcm, pfs: PfsPolicy::none(), child_local_spi: 0, child_peer_spi: 0, external_rx, child6: None, cfg_subnets6: Vec::new(), child_carries_ipv6: false, child_ts: ChildScopes::default(), ike: IkeSaState::new(), peer_child: PeerChildState::default(), primary_child_alive: true, peer_requests: PeerRequests::default(), datagram_limit: DatagramLimit::DEFAULT }
     }
 
     #[test]

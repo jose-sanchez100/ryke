@@ -87,12 +87,16 @@ pub struct Established {
     pub assigned_ip6: Option<(Ipv6Addr, u8)>,
     pub dns6: Vec<Ipv6Addr>,
     pub subnets6: Vec<(Ipv6Addr, u8)>,
-    /// The CHILD SA's negotiated ESP lifetime, in seconds (RFC 2407 §4.5 --
-    /// the responder's own chosen value if it echoed one, else whatever we
-    /// offered; see `quick::negotiated_p2_lifetime`) -- a caller scheduling a
+    /// The CHILD SA's negotiated ESP lifetime, in seconds (RFC 2407 §4.5): the
+    /// responder's own seconds limit when its answer states one (the DOI default,
+    /// 28800 s, when it states none), never beyond what we offered -- see
+    /// `quick::negotiated_p2_lifetime`. A caller scheduling a
     /// [`crate::ikev1::quick::rekey_child`] call ahead of expiry reads this
     /// rather than assuming `InitiatorConfig::p2_lifetime_secs` was actually
-    /// honored.
+    /// honored. It is a time limit only: a volume (kilobytes) limit the gateway
+    /// stated is neither held here nor anywhere else in this crate (see
+    /// `quick`'s "SA lifetimes" section), so nothing tells the caller when the
+    /// gateway's volume limit is near.
     pub p2_lifetime_secs: u32,
     /// The traffic selectors this CHILD SA was actually established with --
     /// `ts_local` may differ from `InitiatorConfig::ts_local` when
@@ -378,6 +382,8 @@ impl<E: Entropy> Client<E> {
     /// The socket is read without blocking beyond a poll (at most
     /// [`Self::PORT_500_LOOK_MAX`] datagrams), and its read timeout is left as found.
     fn answer_repeats_on_port_500(&self, want: &Awaiting) -> Result<(), DriverError> {
+        #[cfg(test)]
+        tests::port_500_look_starts();
         let Some((st, server)) = want.resend else { return Ok(()) };
         let bound = self.transport.read_timeout()?;
         self.transport.set_read_timeout(Some(Duration::from_millis(1)))?;
@@ -399,13 +405,24 @@ impl<E: Entropy> Client<E> {
 
     /// [`Self::recv_matching`]'s loop, giving up at `deadline` (`None`: never).
     /// While the exchange is floated and final messages of ours are retained
-    /// (`want.resend`), the wait is cut into slices of [`Self::PORT_500_SLICE`],
-    /// between which port 500 is looked at ([`Self::answer_repeats_on_port_500`]):
-    /// one thread, one socket read at a time, and the deadline is still absolute.
+    /// (`want.resend`), port 500 is looked at ([`Self::answer_repeats_on_port_500`])
+    /// every [`Self::PORT_500_SLICE`] by the clock -- the wait is cut into reads no
+    /// longer than what is left of that interval, so neither silence nor a
+    /// stream of unrelated datagrams on this socket puts the look off: one
+    /// thread, one socket read at a time, and the deadline is still absolute.
     fn recv_matching_until(&self, transport: &UdpTransport, want: &Awaiting, deadline: Option<Instant>) -> Result<Vec<u8>, DriverError> {
         let Awaiting { cky_i, cky_r, exchange_type, floated, .. } = *want;
         let also_port_500 = floated && want.resend.is_some();
+        let mut next_look = Instant::now() + Self::PORT_500_SLICE;
         loop {
+            // The look is due by the clock, not by the port going quiet: datagrams
+            // for someone else arriving on this socket without a pause must not keep
+            // a repeat on port 500 from being answered.
+            let now = Instant::now();
+            if also_port_500 && now >= next_look {
+                self.answer_repeats_on_port_500(want)?;
+                next_look = Instant::now() + Self::PORT_500_SLICE;
+            }
             let mut slice = None;
             if let Some(deadline) = deadline {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -415,17 +432,17 @@ impl<E: Entropy> Client<E> {
                 slice = Some(remaining);
             }
             if also_port_500 {
-                slice = Some(slice.map_or(Self::PORT_500_SLICE, |s| s.min(Self::PORT_500_SLICE)));
+                // Never zero, which a socket refuses as a timeout: `next_look` is
+                // either after `now` or was just set a slice past it.
+                let until_look = next_look.saturating_duration_since(now);
+                slice = Some(slice.map_or(until_look, |s| s.min(until_look)));
             }
             if slice.is_some() {
                 transport.set_read_timeout(slice)?;
             }
             let (raw, from) = match transport.recv_from() {
                 Ok(read) => read,
-                Err(e) if also_port_500 && matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                    self.answer_repeats_on_port_500(want)?;
-                    continue;
-                }
+                Err(e) if also_port_500 && matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => continue,
                 Err(e) => return Err(e.into()),
             };
             let msg = if floated {
@@ -734,6 +751,37 @@ mod tests {
     use super::*;
     use crate::entropy::SeedEntropy;
     use std::net::UdpSocket;
+
+    thread_local! {
+        static ON_PORT_500_LOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Called as [`Client::answer_repeats_on_port_500`] is entered, before it
+    /// decides whether there is anything to do: what a test hooked in with
+    /// [`OnPort500Look`] sees, on the thread that is waiting.
+    pub(super) fn port_500_look_starts() {
+        ON_PORT_500_LOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+
+    /// Runs a hook each time this thread starts a look at port 500, until dropped.
+    struct OnPort500Look;
+
+    impl OnPort500Look {
+        fn install(hook: impl FnMut() + 'static) -> Self {
+            ON_PORT_500_LOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+            Self
+        }
+    }
+
+    impl Drop for OnPort500Look {
+        fn drop(&mut self) {
+            ON_PORT_500_LOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
 
     /// A minimal (no payloads) but wire-valid ISAKMP header buffer --
     /// version and length set correctly, since `IsakmpHeader::parse` now
@@ -1261,6 +1309,106 @@ mod tests {
         assert!(matches!(&err, DriverError::Io(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)), "{err:?}");
         let still_there = f.client.recv_matching(&Awaiting::new(cky_i, Some(cky_r), exchange::AGGRESSIVE)).unwrap();
         assert_eq!(still_there, waiting);
+    }
+
+    /// Which waits look at port 500: one on the floated socket that has a final
+    /// message of ours retained to answer with -- not one on port 500 itself (it
+    /// is reading that port for its own answer), and not one with nothing to send.
+    /// Every wait is longer than a slice, so a look that is meant cannot be missed;
+    /// where none is meant, none may even start.
+    #[test]
+    fn only_a_floated_wait_with_a_final_message_retained_looks_at_port_500() {
+        for (floated, retained) in [(false, false), (false, true), (true, false), (true, true)] {
+            let f = floated_client([127, 78, 1, 4]);
+            f.client.set_read_timeout(Some(Duration::from_millis(350))).unwrap();
+            let (cky_i, cky_r) = ([0xAA; 8], [0xBB; 8]);
+            let st = phase1_with_cookies(cky_i, cky_r);
+            st.finals.retain(&message(cky_i, cky_r, exchange::AGGRESSIVE, 0), b"our final message");
+            let looks = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let counted = looks.clone();
+            let _hook = OnPort500Look::install(move || counted.set(counted.get() + 1));
+
+            let want = if retained { Awaiting::in_sa(&st, exchange::TRANSACTION, f.server) } else { Awaiting::new(cky_i, Some(cky_r), exchange::TRANSACTION) };
+            let err = f.client.recv_matching(&want.floated(floated)).unwrap_err();
+            assert!(matches!(&err, DriverError::Io(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)), "{err:?}");
+            assert_eq!(looks.get() > 0, floated && retained, "floated={floated}, retained={retained}: {} looks", looks.get());
+            // One look a slice, not one at every turn of the loop: 350 ms hold no
+            // more than three slices of 100 ms.
+            assert!(looks.get() <= 3, "floated={floated}, retained={retained}: {} looks in 350 ms", looks.get());
+        }
+    }
+
+    /// A stream of datagrams for someone else on the floated socket keeps it from
+    /// ever going quiet for a slice, so the look at port 500 cannot wait for
+    /// quiet: a repeat of message 2 there is answered while the stream goes on,
+    /// and the wait still ends at its deadline.
+    #[test]
+    fn a_floated_wait_still_looks_at_port_500_while_datagrams_keep_arriving_on_port_4500() {
+        let f = floated_client([127, 78, 1, 5]);
+        f.client.set_read_timeout(Some(Duration::from_millis(700))).unwrap();
+        let (cky_i, cky_r) = ([0xAA; 8], [0xBB; 8]);
+        let st = phase1_with_cookies(cky_i, cky_r);
+        let repeated = message(cky_i, cky_r, exchange::AGGRESSIVE, 0);
+        let mut our_final = message(cky_i, cky_r, exchange::AGGRESSIVE, 0);
+        our_final.extend_from_slice(b"our final message");
+        st.finals.retain(&repeated, &our_final);
+        f.gateway_500.send_to(&repeated, f.port_500()).unwrap();
+
+        let (stop, gateway_4500, to) = (std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), f.gateway_4500.try_clone().unwrap(), f.port_4500());
+        let flag = stop.clone();
+        let flood = std::thread::spawn(move || {
+            let mut stray = blank_header(exchange::MAIN);
+            stray[..16].copy_from_slice(&[0x11; 16]);
+            let stray = wrap_ike_4500(&stray);
+            let end = std::time::Instant::now() + Duration::from_millis(2500);
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) && std::time::Instant::now() < end {
+                let _ = gateway_4500.send_to(&stray, to);
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let err = f.client.recv_matching(&Awaiting::in_sa(&st, exchange::TRANSACTION, f.server).floated(true)).unwrap_err();
+        let waited = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        flood.join().unwrap();
+        assert!(matches!(&err, DriverError::Io(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)), "{err:?}");
+        assert!(waited < Duration::from_millis(1200), "waited {waited:?} for a 700 ms timeout");
+        assert_eq!(f.received_on_4500(Duration::from_millis(200)), Some(our_final), "the retained final message, sent while the stream went on");
+    }
+
+    /// A wait on port 500 itself reads that port for the answer it is waiting
+    /// for, so a look at it would take that answer and drop it as no repeat of
+    /// anything. Here the answer is put on the port the moment a look starts
+    /// (were one to start) and, if none does, by the gateway some time into the
+    /// wait: the wait must return it either way.
+    #[test]
+    fn an_unfloated_wait_does_not_lose_its_answer_to_a_look_at_port_500() {
+        let client = Client { transport: UdpTransport::bind("127.0.0.1:0").unwrap(), natt_transport: None, entropy: SeedEntropy::new(1) };
+        client.set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (cky_i, cky_r) = ([0xAA; 8], [0xBB; 8]);
+        let st = phase1_with_cookies(cky_i, cky_r);
+        st.finals.retain(&message(cky_i, cky_r, exchange::AGGRESSIVE, 0), b"our final message");
+        let answer = message(cky_i, cky_r, exchange::TRANSACTION, 12);
+
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (to, from_hook, answer_hook, sent_hook) = (client.local_addr().unwrap(), gateway.try_clone().unwrap(), answer.clone(), sent.clone());
+        let _hook = OnPort500Look::install(move || {
+            if !sent_hook.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                from_hook.send_to(&answer_hook, to).unwrap();
+            }
+        });
+        let (from_late, answer_late, sent_late) = (gateway.try_clone().unwrap(), answer.clone(), sent.clone());
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            if !sent_late.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                from_late.send_to(&answer_late, to).unwrap();
+            }
+        });
+
+        let got = client.recv_matching(&Awaiting::in_sa(&st, exchange::TRANSACTION, gateway.local_addr().unwrap()));
+        late.join().unwrap();
+        assert!(matches!(&got, Ok(m) if *m == answer), "{got:?}");
     }
 
     /// The times at which each of the sends of one request reaches a listener that

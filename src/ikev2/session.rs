@@ -2276,7 +2276,7 @@ fn prepare(
 }
 
 /// An exchange's name as RFC 7296 writes it, for diagnostics.
-fn exchange_name(exchange: ExchangeType) -> String {
+pub(crate) fn exchange_name(exchange: ExchangeType) -> String {
     match exchange {
         ExchangeType::IkeSaInit => "IKE_SA_INIT".to_string(),
         ExchangeType::IkeAuth => "IKE_AUTH".to_string(),

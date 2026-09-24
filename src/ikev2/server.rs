@@ -37,12 +37,15 @@
 //! - IKE fragmentation (RFC 7383), which `IKE_SA_INIT` always advertises:
 //!   a fragmented request is reassembled, each fragment authenticated
 //!   before it is kept ([`crate::ikev2::fragment::Reassembly`]), and one
-//!   left incomplete for [`FRAGMENT_REASSEMBLY_TIMEOUT`] is dropped. Its
-//!   response goes out in fragments no larger than the largest fragment
-//!   of the request, unless it fits in one of those whole (§2.4); a
-//!   retransmitted fragment 1 of the request gets them again, any other
-//!   fragment of it nothing (§2.6.1). A request that came whole is
-//!   answered whole. There is no path MTU discovery;
+//!   left incomplete for [`FRAGMENT_REASSEMBLY_TIMEOUT`] is dropped. A
+//!   response -- to a request that came whole or in fragments -- that does
+//!   not fit the [`DatagramLimit`] ([`Server::with_datagram_limit`]), nor
+//!   the largest fragment of a fragmented request (§2.4), goes out in
+//!   fragments that each do, when the peer negotiated fragmentation, and
+//!   whole otherwise. A retransmission of the request gets the same
+//!   datagrams again; of a fragmented one, only an authentic fragment 1
+//!   does, any other fragment nothing (§2.6.1). There is no path MTU
+//!   discovery;
 //! - it never starts an exchange (no liveness checks, rekeys or Deletes of
 //!   its own). The SAs last until the peer deletes them or reconnects with
 //!   `INITIAL_CONTACT`; the ESP data plane is the caller's
@@ -53,16 +56,18 @@ use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
+use crate::debug::ike_debug;
 use crate::entropy::Entropy;
 use crate::error::IkeError;
 use crate::esp::ChildSa;
 use crate::ikev2::exchange::{responder_respond, CompletedSaInit, LocalSecret};
-use crate::ikev2::fragment::{self, Accepted, MessageKey, Reassembly};
+use crate::ikev2::fragment::{self, Accepted, DatagramLimit, MessageKey, Reassembly};
 use crate::ikev2::ike_auth::{self, AuthConfig};
 use crate::ikev2::informational::{build_error_response, build_informational, deletes_in, open_from_peer, payload_list, request_error_notify};
 use crate::ikev2::message::{ExchangeType, IkeHeader, PayloadType};
 use crate::ikev2::payload::{notify_type, protocol_id, Delete, Identification};
 use crate::ikev2::rekey::build_child_refusal;
+use crate::ikev2::session::exchange_name;
 use crate::ikev2::sk;
 use crate::role::Role;
 use crate::transport::{DriverError, UdpTransport};
@@ -134,6 +139,9 @@ pub struct Server<E> {
     auth: AuthConfig,
     sessions: HashMap<(u64, u64), IkeSa>,
     children: HashMap<(u64, u64), ChildSa>,
+    /// The datagram size our answers are fragmented to -- see
+    /// [`Server::with_datagram_limit`].
+    datagram_limit: DatagramLimit,
 }
 
 impl<E: Entropy> Server<E> {
@@ -144,7 +152,19 @@ impl<E: Entropy> Server<E> {
             auth,
             sessions: HashMap::new(),
             children: HashMap::new(),
+            datagram_limit: DatagramLimit::DEFAULT,
         })
+    }
+
+    /// Fit our answers to `limit` rather than [`DatagramLimit::DEFAULT`]:
+    /// one that would not fit goes in RFC 7383 fragments, each in a datagram
+    /// within it, when the peer negotiated fragmentation -- whether its
+    /// request came whole or in fragments. `IKE_SA_INIT` is never
+    /// fragmented. The limit is a fixed figure; there is no path MTU
+    /// discovery.
+    pub fn with_datagram_limit(mut self, limit: DatagramLimit) -> Self {
+        self.datagram_limit = limit;
+        self
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -203,19 +223,22 @@ impl<E: Entropy> Server<E> {
         self.answer(key, &header, data, from, None)
     }
 
-    /// Answer the request `data` with the next Message ID -- in fragments no
-    /// larger than `fragment_size` when it came in fragments that large.
+    /// Answer the request `data` with the next Message ID: whole when the
+    /// response fits the [`DatagramLimit`] -- and, when the request came in
+    /// fragments, the largest of them, `request_fragment` -- otherwise in
+    /// fragments that each do, if the peer negotiated them. The datagrams
+    /// sent are kept, and a retransmission of the request gets them again.
     fn answer(
         &mut self,
         key: (u64, u64),
         header: &IkeHeader,
         data: Vec<u8>,
         from: SocketAddr,
-        fragment_size: Option<usize>,
+        request_fragment: Option<usize>,
     ) -> Result<ServerEvent, DriverError> {
         let ike = &self.sessions[&key];
         // The keys to fragment the response with, before a Delete takes them.
-        let sa = fragment_size.map(|_| ike.sa.clone());
+        let sa = ike.sa.clone();
         let (response, event) = match (header.exchange_type, ike.peer_id.is_some()) {
             (ExchangeType::IkeAuth, false) => self.answer_ike_auth(key, &data)?,
             (ExchangeType::Informational | ExchangeType::CreateChildSa, true) => {
@@ -232,14 +255,24 @@ impl<E: Entropy> Server<E> {
             }
             _ => return Ok(ServerEvent::Ignored),
         };
-        let response = match (sa, fragment_size) {
-            // RFC 7383 §2.4: in the form of the request, unless it fits whole.
-            (Some(sa), Some(size)) if response.len() > size => {
-                let keys = &sa.keys;
-                let iv_base = self.entropy.next_u64();
-                fragment::fragment_message(sa.suite.sk_cipher(), &response, &keys.sk_er, &keys.sk_ar, iv_base, size)?
-            }
-            _ => vec![response],
+        // No NAT traversal here, so no non-ESP marker in front. RFC 7383
+        // §2.4: no fragment larger than those of the request either.
+        let limit = self.datagram_limit.max_message_len(from.ip(), false);
+        let size = request_fragment.map_or(limit, |largest| largest.min(limit));
+        let response = if response.len() <= size {
+            vec![response]
+        } else if !sa.peer_supports_fragmentation {
+            ike_debug!(
+                "IKEv2 server: the {} response {} to {from} went whole, {} bytes, above the {size} bytes an IKE message may take within the datagram limit, as the peer did not negotiate IKE fragmentation (RFC 7383): it may be fragmented at the IP layer or dropped",
+                exchange_name(header.exchange_type),
+                header.message_id,
+                response.len()
+            );
+            vec![response]
+        } else {
+            let keys = &sa.keys;
+            let iv_base = self.entropy.next_u64();
+            fragment::fragment_message(sa.suite.sk_cipher(), &response, &keys.sk_er, &keys.sk_ar, iv_base, size)?
         };
         for datagram in &response {
             self.transport.send_to(datagram, from)?;
@@ -259,7 +292,7 @@ impl<E: Entropy> Server<E> {
     /// checked, authenticated, and only then kept -- and one of another
     /// request is ignored. The request it completes is sealed again as one
     /// `SK` message under the peer's keys and answered as if it had come
-    /// whole, but in fragments.
+    /// whole, but in fragments no larger than its own.
     fn take_fragment(&mut self, key: (u64, u64), header: &IkeHeader, data: Vec<u8>, from: SocketAddr) -> Result<ServerEvent, DriverError> {
         let (spi_i, spi_r) = key;
         let ike = self.sessions.get_mut(&key).expect("looked up by the caller");
@@ -1085,5 +1118,139 @@ mod tests {
         let (event, reply) = peer.send(&mut server, &peer_fragments(&peer.sa, &ahead, 2, 30)[0]);
         assert_eq!((event.unwrap(), reply), (ServerEvent::Ignored, None));
         assert!(server.sessions[&peer.key()].fragments.is_none());
+    }
+
+    /// A limit under which an IKE message to IPv4 loopback takes at most
+    /// 160 - 20 - 8 = 132 bytes: less than an `IKE_AUTH` response.
+    fn small_limit() -> DatagramLimit {
+        DatagramLimit::new(160, 1280).unwrap()
+    }
+
+    /// Run `IKE_SA_INIT` against `server` from a fresh socket, leaving the
+    /// IKE SA half-open: the socket, and the IKE SA as the peer sees it.
+    fn half_open(server: &mut Server<SeedEntropy>, addr: SocketAddr) -> (UdpSocket, CompletedSaInit) {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let local = LocalSecret::generate(&mut SeedEntropy::new(0xC11E), NONCE_LEN);
+        let init_request = initiator_request(&local, &default_offer());
+        sock.send_to(&init_request, addr).unwrap();
+        assert!(matches!(server.handle_one().unwrap(), ServerEvent::SaInit { .. }));
+        let sa = initiator_complete(&local, &init_request, &recv_all(&sock).remove(0)).unwrap();
+        assert!(sa.peer_supports_fragmentation, "test setup: the server negotiated fragmentation");
+        (sock, sa)
+    }
+
+    /// The peer's `IKE_AUTH` request on `sa`, whole.
+    fn auth_request(sa: &CompletedSaInit) -> Vec<u8> {
+        let cfg = AuthConfig::psk(Identification::fqdn("client.test"), PSK.to_vec());
+        initiator_auth_request(sa, &cfg, PEER_CHILD_SPI, &esp_offer(0), &[1u8; 8]).unwrap()
+    }
+
+    /// The CHILD SA SPI the server's `IKE_AUTH` response on `sa` gives,
+    /// once it verifies.
+    fn verified_auth(sa: &CompletedSaInit, response: &[u8]) -> u32 {
+        let cfg = AuthConfig::psk(Identification::fqdn("client.test"), PSK.to_vec());
+        initiator_verify_auth(sa, response, &cfg, &esp_offer(0), ike_auth::ChildTsOffer::Ipv4).unwrap().1
+    }
+
+    /// RFC 7383 §2.5: a response beyond the datagram limit to a request
+    /// that came whole goes in fragments, each in a datagram within the
+    /// limit, when the peer negotiated fragmentation. A retransmission of
+    /// the request gets those same datagrams (RFC 7296 §2.1), not a
+    /// response fragmented again, and is not acted on again: the CHILD SA
+    /// stays the one negotiated. Such a response used to go whole.
+    #[test]
+    fn a_whole_request_whose_answer_is_beyond_the_limit_is_answered_in_fragments_and_again_with_the_same_ones() {
+        let (server, addr) = server();
+        let mut server = server.with_datagram_limit(small_limit());
+        let (sock, sa) = half_open(&mut server, addr);
+        let (spi_i, spi_r) = (sa.spi_i, sa.spi_r);
+        let request = auth_request(&sa);
+
+        sock.send_to(&request, addr).unwrap();
+        assert!(matches!(server.handle_one().unwrap(), ServerEvent::Established { .. }));
+        let answer = recv_all(&sock);
+        assert!(answer.len() > 1, "the response comes in fragments");
+        for f in &answer {
+            assert!(f.len() <= 132, "a fragment of {} bytes, beyond the limit", f.len());
+            assert_eq!(IkeHeader::parse(f).unwrap().next_payload, PayloadType::EncryptedFragment);
+        }
+        let child_spi = verified_auth(&sa, &reassembled(&sa, &answer));
+        assert_eq!(server.child(spi_i, spi_r).unwrap().inbound.spi(), child_spi);
+
+        for _ in 0..2 {
+            sock.send_to(&request, addr).unwrap();
+            assert_eq!(server.handle_one().unwrap(), ServerEvent::Retransmitted { spi_i, spi_r });
+            assert_eq!(recv_all(&sock), answer, "the same datagrams, byte for byte");
+        }
+        assert_eq!(server.child(spi_i, spi_r).unwrap().inbound.spi(), child_spi, "nothing is negotiated again");
+        assert_eq!(server.sessions.len(), 1);
+    }
+
+    /// RFC 7383 §2.4, §2.6: the fragments of a request may come lost,
+    /// duplicated, out of order or altered. An altered one is dropped, a
+    /// duplicate kept once, and the request is taken once it is whole
+    /// whatever the order -- and answered once, in fragments no larger than
+    /// the request's nor beyond the datagram limit. Its fragment 1 again
+    /// gets the same answer, and nothing is acted on again.
+    #[test]
+    fn a_request_whose_fragments_are_lost_duplicated_reordered_or_altered_is_answered_once_in_fragments() {
+        let (server, addr) = server();
+        let mut server = server.with_datagram_limit(small_limit());
+        let (sock, sa) = half_open(&mut server, addr);
+        let (spi_i, spi_r) = (sa.spi_i, sa.spi_r);
+        let fragments = peer_fragments(&sa, &auth_request(&sa), 2, 10);
+        assert!(fragments.iter().all(|f| f.len() > 132), "test setup: the request's fragments are larger than the limit");
+
+        // Fragment 1 lost at first; fragment 2 twice; fragment 1 altered.
+        let stored = ServerEvent::FragmentStored { spi_i, spi_r };
+        for (datagram, event) in [
+            (fragments[1].clone(), stored.clone()),
+            (fragments[1].clone(), ServerEvent::Ignored),
+            (forged(fragments[0].clone()), ServerEvent::Ignored),
+        ] {
+            sock.send_to(&datagram, addr).unwrap();
+            assert_eq!(server.handle_one().unwrap(), event);
+        }
+        assert!(recv_all(&sock).is_empty(), "nothing is answered before the request is whole");
+        sock.send_to(&fragments[0], addr).unwrap();
+        assert!(matches!(server.handle_one().unwrap(), ServerEvent::Established { .. }));
+        let answer = recv_all(&sock);
+        assert!(answer.len() > 1);
+        assert!(answer.iter().all(|f| f.len() <= 132), "the limit, not the request's fragments, bounds the answer's");
+        let child_spi = verified_auth(&sa, &reassembled(&sa, &answer));
+
+        sock.send_to(&fragments[1], addr).unwrap();
+        assert_eq!(server.handle_one().unwrap(), ServerEvent::Ignored);
+        sock.send_to(&fragments[0], addr).unwrap();
+        assert_eq!(server.handle_one().unwrap(), ServerEvent::Retransmitted { spi_i, spi_r });
+        assert_eq!(recv_all(&sock), answer);
+        assert_eq!(server.child(spi_i, spi_r).unwrap().inbound.spi(), child_spi, "nothing is negotiated again");
+    }
+
+    /// RFC 7383 §2.3: a peer that did not negotiate fragmentation gets no
+    /// fragment, the response beyond the limit going whole all the same
+    /// (it may then be fragmented at the IP layer, or dropped), and its
+    /// retransmission gets it again.
+    #[test]
+    fn a_peer_without_fragmentation_is_answered_whole_beyond_the_limit() {
+        let (server, addr) = server();
+        let mut server = server.with_datagram_limit(small_limit());
+        let (sock, sa) = half_open(&mut server, addr);
+        let (spi_i, spi_r) = (sa.spi_i, sa.spi_r);
+        server.sessions.get_mut(&(spi_i, spi_r)).unwrap().sa.peer_supports_fragmentation = false;
+        let request = auth_request(&sa);
+
+        sock.send_to(&request, addr).unwrap();
+        assert!(matches!(server.handle_one().unwrap(), ServerEvent::Established { .. }));
+        let answer = recv_all(&sock);
+        assert_eq!(answer.len(), 1, "whole");
+        assert!(answer[0].len() > 132, "test setup: the response is beyond the limit");
+        assert_eq!(IkeHeader::parse(&answer[0]).unwrap().next_payload, PayloadType::Encrypted);
+        verified_auth(&sa, &answer[0]);
+
+        sock.send_to(&request, addr).unwrap();
+        assert_eq!(server.handle_one().unwrap(), ServerEvent::Retransmitted { spi_i, spi_r });
+        assert_eq!(recv_all(&sock), answer);
     }
 }

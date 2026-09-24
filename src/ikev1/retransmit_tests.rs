@@ -41,6 +41,9 @@ struct Script {
     /// After the handshake the gateway serves one more Quick Mode exchange (the
     /// client's rekey), and never sees its message 3 either.
     lose_rekey_msg3: bool,
+    /// The gateway never sees the client's first Phase 1 message: the client
+    /// answers its own timer with the same bytes, and only that reaches the gateway.
+    lose_msg1: bool,
     /// Ahead of Quick Mode message 2 the gateway sends a datagram of the same
     /// ISAKMP SA and exchange type under another Message ID: not its reply, and
     /// not a message that would pass for it (its last byte differs).
@@ -208,8 +211,22 @@ impl Gateway {
         Ok(Report { resent: self.resent, child, rekeyed })
     }
 
+    /// The client's first message of `exchange_type`; with `lose_msg1`, the first
+    /// delivery is dropped and the message is the client's retransmission of it.
+    fn msg1(&mut self, exchange_type: u8) -> Result<Vec<u8>, String> {
+        let msg1 = self.recv(exchange_type)?;
+        if !self.script.lose_msg1 {
+            return Ok(msg1);
+        }
+        let again = self.recv(exchange_type)?;
+        if again != msg1 {
+            return Err("gateway: the client's retransmission of message 1 is not the same bytes".into());
+        }
+        Ok(again)
+    }
+
     fn aggressive_mode(&mut self, cfg: &Phase1Config, our_addr: SocketAddr) -> Result<Phase1State, String> {
-        let msg1 = self.recv(exchange::AGGRESSIVE)?;
+        let msg1 = self.msg1(exchange::AGGRESSIVE)?;
         let (msg2, st) = respond_aggressive(cfg, &msg1, &mut self.entropy, our_addr, self.peer.unwrap()).map_err(|e| format!("gateway: msg1: {e:?}"))?;
         self.send(&msg2);
         self.on_4500 = self.natt.is_some();
@@ -224,7 +241,7 @@ impl Gateway {
     }
 
     fn main_mode(&mut self, cfg: &Phase1Config, our_addr: SocketAddr) -> Result<Phase1State, String> {
-        let msg1 = self.recv(exchange::MAIN)?;
+        let msg1 = self.msg1(exchange::MAIN)?;
         let (msg2, sa) = respond_main(cfg, &msg1, &mut self.entropy, our_addr, self.peer.unwrap()).map_err(|e| format!("gateway: msg1: {e:?}"))?;
         self.send(&msg2);
         let msg3 = self.recv_answering(exchange::MAIN, &msg1, &msg2)?;
@@ -311,6 +328,12 @@ struct Run {
 /// `connect` against a gateway following `script`, with a short read timeout so
 /// that a failure shows quickly.
 fn connect(script: Script) -> Run {
+    connect_with_timeout(script, Duration::from_millis(400))
+}
+
+/// [`connect`] with the client's read timeout `timeout`: the patience for each
+/// message, which the retransmission schedule spreads over its sends.
+fn connect_with_timeout(script: Script, timeout: Duration) -> Run {
     // A floating client sends to port 4500 of the gateway's address, whatever
     // port the gateway's first socket has: each such run takes an address of its
     // own, so that runs in parallel never share the port.
@@ -344,7 +367,7 @@ fn connect(script: Script) -> Run {
     } else {
         Client::from_socket(client_sock.try_clone().unwrap(), SeedEntropy::new(0x1111))
     };
-    client.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+    client.set_read_timeout(Some(timeout)).unwrap();
     let established = client.connect(gateway_addr, &initiator_config(script));
     Run { established, client_sock, gateway_addr, gateway }
 }
@@ -537,5 +560,45 @@ fn control_without_faults_every_handshake_shape_completes() {
         let report = run.gateway.join().unwrap().expect("gateway");
         assert_resent_identically(&report, 0);
         assert_eq!(est.child.inbound.spi(), report.child.outbound.spi());
+    }
+}
+
+/// RFC 2408 §5.1: what the handshake measures of the path. Each exchange whose reply
+/// depends on nothing but the path -- Phase 1's messages (Main Mode's three, Aggressive
+/// Mode's one) and Quick Mode's -- is a sample of the estimate the ISAKMP SA keeps, and
+/// XAUTH's and Mode-Config's, which wait on a backend, are not. The read timeout is long
+/// enough that no exchange of a loopback handshake is ever sent twice, which would take
+/// no sample (Karn's rule).
+#[test]
+fn the_handshake_measures_the_path_in_phase_1_and_quick_mode_but_not_in_xauth_or_mode_config() {
+    for (main_mode, xauth, mode_cfg, samples) in [
+        (false, false, false, 2), // Aggressive Mode message 2, Quick Mode message 2
+        (true, false, false, 4),  // Main Mode messages 2, 4 and 6, Quick Mode message 2
+        (false, true, true, 2),   // the same: XAUTH and Mode-Config add none
+        (true, true, true, 4),
+    ] {
+        let run = connect_with_timeout(Script { main_mode, xauth, mode_cfg, ..Script::default() }, Duration::from_secs(3));
+        let est = run.established.unwrap_or_else(|e| panic!("main_mode={main_mode} xauth={xauth} mode_cfg={mode_cfg}: {e:?}"));
+        run.gateway.join().unwrap().expect("gateway");
+        assert_eq!(est.phase1.rtt.samples(), samples, "main_mode={main_mode} xauth={xauth} mode_cfg={mode_cfg}");
+        let smoothed = est.phase1.rtt.smoothed().expect("measured");
+        assert!(smoothed < Duration::from_secs(2), "a loopback gateway measured as {smoothed:?}");
+        assert_eq!(est.phase1.rtt.backoff(), 0);
+    }
+}
+
+/// Karn's rule end to end: the reply that follows a retransmission is not a sample. The
+/// gateway never sees the client's first message; the client sends it again after its
+/// timer (0.64 s for this 1.5 s read timeout, which nothing measured yet can shorten) and
+/// the gateway's answer to that is used but not measured, so the handshake ends with one
+/// sample fewer than `the_handshake_measures_the_path_...` counts, whichever mode it ran.
+#[test]
+fn a_reply_that_followed_a_retransmission_is_used_but_not_measured() {
+    for (main_mode, samples) in [(false, 1), (true, 3)] {
+        let run = connect_with_timeout(Script { main_mode, lose_msg1: true, ..Script::default() }, Duration::from_millis(1500));
+        let est = run.established.unwrap_or_else(|e| panic!("main_mode={main_mode}: {e:?}"));
+        run.gateway.join().unwrap().expect("gateway");
+        assert_eq!(est.phase1.rtt.samples(), samples, "main_mode={main_mode}: message 1 went out twice, so its answer is no sample");
+        assert_eq!(est.phase1.rtt.backoff(), 0, "the samples that came after ended the backoff");
     }
 }

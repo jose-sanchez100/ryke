@@ -21,10 +21,18 @@
 //!
 //! Retransmissions and duplicates (RFC 2408 §3.1, §5.1, RFC 2409 §5): every
 //! request is sent again, the same bytes, when its answer does not come
-//! (`Client::send_and_await`), at longer and longer intervals
-//! ([`crate::ikev1::retransmit_waits`]; the read timeout, once per send, is the
-//! whole time a caller waits for a silent gateway) and never more than
-//! `MAX_RETRANSMITS` times. The messages nothing answers -- Aggressive Mode's
+//! (`Client::send_and_await`), at longer and longer intervals and never more
+//! than `MAX_RETRANSMITS` times -- more, up to seven, once the intervals follow a
+//! measurement. The read timeout, once per send, is the whole time a caller waits
+//! for a silent gateway however that time is cut: into
+//! [`crate::ikev1::retransmit_waits`]' 1 : 2 : 4 until a round trip has been
+//! measured, and from then on into a first wait that follows it, doubling
+//! (RFC 2408 §5.1, "adjusted dynamically based on measured round trip times"; see
+//! `crate::ikev1::rtt` for the estimator and its bounds). What is measured is
+//! the exchanges whose reply depends on nothing but the path -- Phase 1's messages
+//! and Quick Mode's -- and only a reply to a request sent once; the XAUTH reply and
+//! Mode-Config wait on a backend, and keep the schedule that follows no measurement.
+//! The messages nothing answers -- Aggressive Mode's
 //! third, the XAUTH ACK, Quick Mode's third -- are kept with the message they
 //! answered ([`crate::ikev1::phase1::Phase1State`]'s retained finals) and sent
 //! again, untouched, when the gateway repeats that message -- on the port the
@@ -39,8 +47,7 @@
 //! however many other datagrams come in meanwhile.
 //!
 //! What this does not do: recognise a repeat that the gateway re-encrypted
-//! (only identical bytes count); measure the round-trip time the retransmission
-//! interval should follow (RFC 2408 §5.1 asks for it); answer a Quick Mode or a
+//! (only identical bytes count); answer a Quick Mode or a
 //! Phase 1 that the gateway starts (this is an initiator only); rekey the
 //! ISAKMP SA; or count what an SA protects (a Phase-2 lifetime in kilobytes the
 //! gateway states is handed over as [`Established::p2_lifetime_kilobytes`] for
@@ -69,7 +76,7 @@ use crate::ikev1::phase1::{
     initiate_aggressive, initiate_main, Ikev1ExchangeMode, Ikev1LocalAuth, InitiatorConfig, Phase1State,
 };
 use crate::ikev1::quick::initiate_quick_with_pfs;
-use crate::ikev1::retransmit_waits;
+use crate::ikev1::rtt::{self, RoundTrips};
 use crate::ikev1::xauth;
 use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
 use crate::transport::{DriverError, UdpTransport};
@@ -169,12 +176,17 @@ struct Awaiting<'a> {
     /// gateway to send them to. A repeat of the peer message one of them
     /// answered gets it sent again (RFC 2408 §3.1, Commit Bit NOTE).
     resend: Option<(&'a Phase1State, SocketAddr)>,
+    /// What measures this exchange's round trip, and what its retransmission timer
+    /// follows (RFC 2408 §5.1), when its answer depends on nothing but the path:
+    /// `None` for one that waits on more (the XAUTH reply on a backend or a person,
+    /// Mode-Config), which keeps the schedule that follows no measurement.
+    rtt: Option<&'a RoundTrips>,
 }
 
 impl<'a> Awaiting<'a> {
     /// A Phase 1 message, before there is a [`Phase1State`].
     fn new(cky_i: [u8; 8], cky_r: Option<[u8; 8]>, exchange_type: u8) -> Self {
-        Self { cky_i, cky_r, exchange_type, msg_id: None, floated: false, handled: &[], resend: None }
+        Self { cky_i, cky_r, exchange_type, msg_id: None, floated: false, handled: &[], resend: None, rtt: None }
     }
 
     /// A message of `exchange_type` under the established ISAKMP SA `st`, whose
@@ -195,6 +207,12 @@ impl<'a> Awaiting<'a> {
 
     fn handled(mut self, handled: &'a [Vec<u8>]) -> Self {
         self.handled = handled;
+        self
+    }
+
+    /// Measure this exchange's round trip in `rtt`, and set its timer by it.
+    fn measured(mut self, rtt: &'a RoundTrips) -> Self {
+        self.rtt = Some(rtt);
         self
     }
 }
@@ -375,7 +393,8 @@ impl<E: Entropy> Client<E> {
     /// up), on `transport`, whose read timeout is left as it was found.
     fn recv_matching_for(&self, transport: &UdpTransport, want: &Awaiting, wait: Option<Duration>) -> Result<Vec<u8>, DriverError> {
         let bound = transport.read_timeout()?;
-        let result = self.recv_matching_until(transport, want, wait.map(|w| Instant::now() + w));
+        // A wait too long for the clock to reach is a wait for ever.
+        let result = self.recv_matching_until(transport, want, wait.and_then(|w| Instant::now().checked_add(w)));
         transport.set_read_timeout(bound)?;
         result
     }
@@ -519,52 +538,56 @@ impl<E: Entropy> Client<E> {
     /// a retry counter, then RETRY LIMIT REACHED).
     ///
     /// The waits between the sends are not equal (RFC 2408 §5.1: "MUST NOT use a
-    /// fixed timer"): they grow as 1 : 2 : 4 ([`retransmit_waits`]) and add up
-    /// to the read timeout once for the first send and once for each
-    /// retransmission -- exactly what the caller's read timeout already asked a
-    /// dead gateway to be waited for, so that policy is unchanged. They do not
-    /// follow a measured round-trip time, which §5.1 also asks for.
+    /// fixed timer"): they grow, each twice the one before, and add up to the
+    /// read timeout once for the first send and once for each retransmission --
+    /// exactly what the caller's read timeout already asked a dead gateway to be
+    /// waited for, so that policy is unchanged, however the time is cut. With no
+    /// measurement of the path (the exchange is not measured, or nothing has been
+    /// yet) the cut is 1 : 2 : 4 ([`crate::ikev1::retransmit_waits`]) and this many
+    /// resends. With one ([`Awaiting::measured`]) the first wait follows the round
+    /// trip measured (`crate::ikev1::rtt`): never longer than the unmeasured
+    /// schedule's first, never under a second, and there may be more resends,
+    /// though never more than seven, in the same total time.
     const MAX_RETRANSMITS: u32 = 2;
 
     /// Send `msg` and wait for its matching reply via [`Self::recv_matching_for`],
-    /// resending `msg` up to [`Self::MAX_RETRANSMITS`] more times if a wait
-    /// times out before a match arrives, each wait longer than the one before it
-    /// (see [`Self::MAX_RETRANSMITS`]). Every request/response round trip in
+    /// resending `msg` if a wait times out before a match arrives, each wait
+    /// longer than the one before it, until the read timeout, once per send
+    /// ([`Self::MAX_RETRANSMITS`] resends at least), has been waited (see
+    /// [`Self::MAX_RETRANSMITS`]). Every request/response round trip in
     /// [`Self::connect`] used to be a bare `send_step` + `recv_matching`: a
     /// single, unacknowledged UDP send with no recovery if that one datagram
     /// (or its reply) is dropped -- the whole handshake just times out. This
     /// covers exactly that case. Each resend is the same bytes (nothing is
     /// rebuilt, no IV advances: RFC 2409 §5), and each wait is absolute (see
     /// [`Self::recv_matching`]), so stray datagrams cannot hold the
-    /// retransmission off. A socket with no read timeout waits for ever, as
-    /// before, and so never retransmits.
+    /// retransmission off, nor stretch the total. A socket with no read timeout
+    /// waits for ever, as before, and so never retransmits.
+    ///
+    /// The exchange is [`rtt::exchange`]: what it measures -- only the reply to a
+    /// request sent once (Karn's rule) -- goes to `want`'s [`Awaiting::measured`]
+    /// estimate, when it has one, and the timer of the next exchange follows it.
     fn send_and_await(&self, msg: &[u8], server: SocketAddr, want: &Awaiting) -> Result<Vec<u8>, DriverError> {
-        self.send_step(msg, server, want.floated)?;
         let transport = self.transport_for(want)?;
         let sends = Self::MAX_RETRANSMITS + 1;
-        let waits: Vec<Option<Duration>> = match transport.read_timeout()? {
-            Some(timeout) => retransmit_waits(timeout.saturating_mul(sends), sends).into_iter().map(Some).collect(),
-            None => vec![None],
-        };
-        let mut waits = waits.into_iter();
-        let mut wait = waits.next().flatten();
-        let mut retransmits_left = Self::MAX_RETRANSMITS;
-        loop {
-            match self.recv_matching_for(transport, want, wait) {
-                Ok(reply) => return Ok(reply),
-                Err(DriverError::Io(e)) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                    let Some(next) = waits.next() else { return Err(DriverError::Io(e)) };
-                    wait = next;
-                    retransmits_left -= 1;
-                    ike_debug!(
-                        "retransmitting exchange={}, now waiting {wait:?} for the answer ({retransmits_left} retransmit(s) left)",
-                        want.exchange_type
-                    );
-                    self.send_step(msg, server, want.floated)?;
+        let patience = transport.read_timeout()?.map(|timeout| (timeout, sends));
+        let reply = rtt::exchange(
+            want.rtt,
+            patience,
+            &Instant::now,
+            |sent| {
+                if sent > 0 {
+                    ike_debug!("retransmitting exchange={} (send {} of the request)", want.exchange_type, sent + 1);
                 }
-                Err(e) => return Err(e),
-            }
-        }
+                self.send_step(msg, server, want.floated)
+            },
+            |wait| match self.recv_matching_for(transport, want, wait) {
+                Ok(reply) => Ok(Some(reply)),
+                Err(DriverError::Io(e)) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => Ok(None),
+                Err(e) => Err(e),
+            },
+        )?;
+        reply.ok_or_else(|| DriverError::Io(io::Error::from(io::ErrorKind::TimedOut)))
     }
 
     /// Run the full handshake — Phase 1 (Aggressive or Main Mode, see
@@ -583,12 +606,14 @@ impl<E: Entropy> Client<E> {
         // The gateway's messages this handshake has already taken, so a bit-for-bit
         // repeat of one is not read as the next (see `Awaiting::handled`).
         let mut handled: Vec<Vec<u8>> = Vec::new();
-        let phase1 = match cfg.mode {
+        // What the Phase 1 exchanges measure before there is a `Phase1State` to hold it.
+        let rtt = RoundTrips::default();
+        let mut phase1 = match cfg.mode {
             Ikev1ExchangeMode::Aggressive => {
                 ike_debug!("Aggressive Mode: sending msg1 to {server}");
                 let (msg1, ai) = initiate_aggressive(cfg, &mut self.entropy, our_addr, server);
                 let cky_i: [u8; 8] = msg1[..8].try_into().unwrap();
-                let msg2 = self.send_and_await(&msg1, server, &Awaiting::new(cky_i, None, exchange::AGGRESSIVE))?;
+                let msg2 = self.send_and_await(&msg1, server, &Awaiting::new(cky_i, None, exchange::AGGRESSIVE).measured(&rtt))?;
                 let (msg3, phase1) = ai.complete(&msg2, our_addr, server)?;
                 ike_debug!("Aggressive Mode: complete, sending msg3 (floated={})", phase1.floated);
                 self.enable_natt_encap(phase1.floated)?;
@@ -608,13 +633,13 @@ impl<E: Entropy> Client<E> {
                 ike_debug!("Main Mode: sending msg1 to {server}");
                 let (msg1, sa_sent) = initiate_main(cfg, &mut self.entropy);
                 let cky_i: [u8; 8] = msg1[..8].try_into().unwrap();
-                let msg2 = self.send_and_await(&msg1, server, &Awaiting::new(cky_i, None, exchange::MAIN))?;
+                let msg2 = self.send_and_await(&msg1, server, &Awaiting::new(cky_i, None, exchange::MAIN).measured(&rtt))?;
                 let cky_r: [u8; 8] = msg2[8..16].try_into().unwrap();
                 let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut self.entropy, our_addr, server)?;
                 handled.push(msg2);
                 // Still unfloated: NAT-D isn't verified until message 4
                 // arrives (below), so whether to float is still unknown.
-                let msg4 = self.send_and_await(&msg3, server, &Awaiting::new(cky_i, Some(cky_r), exchange::MAIN).handled(&handled))?;
+                let msg4 = self.send_and_await(&msg3, server, &Awaiting::new(cky_i, Some(cky_r), exchange::MAIN).handled(&handled).measured(&rtt))?;
                 let (msg5, id_sent) = ke_sent.complete_ke(&msg4)?;
                 handled.push(msg4);
                 ike_debug!("Main Mode: NAT-T floated={}", id_sent.floated);
@@ -622,7 +647,7 @@ impl<E: Entropy> Client<E> {
                 let msg6 = self.send_and_await(
                     &msg5,
                     server,
-                    &Awaiting::new(cky_i, Some(cky_r), exchange::MAIN).floated(id_sent.floated).handled(&handled),
+                    &Awaiting::new(cky_i, Some(cky_r), exchange::MAIN).floated(id_sent.floated).handled(&handled).measured(&rtt),
                 )?;
                 let msg6_len = msg6.len();
                 let floated = id_sent.floated;
@@ -652,6 +677,7 @@ impl<E: Entropy> Client<E> {
                 phase1
             }
         };
+        phase1.rtt = rtt;
 
         ike_debug!(
             "Phase 1: established -- prf={:?} group={:?} lifetime={}s floated={} peer DPD support={}",
@@ -737,7 +763,7 @@ impl<E: Entropy> Client<E> {
         let (qm1, qi) =
             initiate_quick_with_pfs(&phase1, &mut self.entropy, cfg.esp_cipher, ts_local, cfg.ts_remote, cfg.pfs_group, cfg.p2_lifetime_secs)?;
         let qm1_msgid = IsakmpHeader::parse(&qm1)?.message_id;
-        let qm2 = self.send_and_await(&qm1, server, &Awaiting::in_sa(&phase1, exchange::QUICK, server).msg_id(qm1_msgid).handled(&handled))?;
+        let qm2 = self.send_and_await(&qm1, server, &Awaiting::in_sa(&phase1, exchange::QUICK, server).msg_id(qm1_msgid).handled(&handled).measured(&phase1.rtt))?;
         let (qm3, child, p2_lifetime) = qi.complete_with_lifetime(&qm2)?;
         let (p2_lifetime_secs, p2_lifetime_kilobytes) = (p2_lifetime.seconds, p2_lifetime.kilobytes);
         // Quick Mode message 3 is the last of the exchange and nothing answers it:
@@ -1150,6 +1176,19 @@ mod tests {
         assert_eq!(got, waiting, "an expired deadline must leave the datagram on the socket");
     }
 
+    /// A wait too long for the clock to count is a wait for ever, not a panic on adding it
+    /// to the time now: the socket's own read timeout, the caller's, still ends it.
+    #[test]
+    fn a_wait_beyond_what_the_clock_can_count_is_no_panic_and_ends_at_the_sockets_timeout() {
+        let client = Client { transport: UdpTransport::bind("127.0.0.1:0").unwrap(), natt_transport: None, entropy: SeedEntropy::new(1) };
+        client.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+        let want = Awaiting::new([0xAA; 8], Some([0xBB; 8]), exchange::MAIN);
+        let started = std::time::Instant::now();
+        let err = client.recv_matching_for(&client.transport, &want, Some(Duration::MAX)).unwrap_err();
+        assert!(matches!(&err, DriverError::Io(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     /// The retransmission timer runs on that same bound: strays must not
     /// starve the resends of the request.
     #[test]
@@ -1176,6 +1215,133 @@ mod tests {
         assert!(matches!(&err, DriverError::Io(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)), "{err:?}");
         assert!(waited < Duration::from_millis(1500), "gave up after {waited:?}");
         assert_eq!(counter.join().unwrap(), Client::<SeedEntropy>::MAX_RETRANSMITS + 1);
+    }
+
+    /// A request whose first delivery the gateway drops, sent to a client with a 1 s
+    /// read timeout (a schedule of 3/7, 6/7 and 12/7 s without a measurement); how long
+    /// after the first delivery the retransmission comes, and what the exchange left in
+    /// `rtt`. The gateway answers the retransmission.
+    fn gap_before_the_retransmission(rtt: Option<&RoundTrips>) -> Duration {
+        let client = Client { transport: UdpTransport::bind("127.0.0.1:0").unwrap(), natt_transport: None, entropy: SeedEntropy::new(1) };
+        client.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let responder_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        responder_sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let responder_addr = responder_sock.local_addr().unwrap();
+
+        let (cky_i, cky_r) = ([0xAA; 8], [0xBB; 8]);
+        let mut req = blank_header(exchange::MAIN);
+        req[..8].copy_from_slice(&cky_i);
+        let mut reply = blank_header(exchange::MAIN);
+        reply[..8].copy_from_slice(&cky_i);
+        reply[8..16].copy_from_slice(&cky_r);
+
+        let responder = std::thread::spawn(move || {
+            let mut buf = [0u8; 128];
+            responder_sock.recv_from(&mut buf).unwrap();
+            let first = std::time::Instant::now();
+            let (_, from) = responder_sock.recv_from(&mut buf).unwrap();
+            let gap = first.elapsed();
+            responder_sock.send_to(&reply, from).unwrap();
+            gap
+        });
+        let mut want = Awaiting::new(cky_i, Some(cky_r), exchange::MAIN);
+        if let Some(rtt) = rtt {
+            want = want.measured(rtt);
+        }
+        client.send_and_await(&req, responder_addr, &want).unwrap();
+        responder.join().unwrap()
+    }
+
+    /// RFC 2408 §5.1: the timer follows the measured round trip. 30 ms measured is a
+    /// timer of 90 ms, held up to the 100 ms floor this test sets -- where the schedule
+    /// with nothing measured waits 3/7 s for the same 1 s read timeout
+    /// (`send_and_await_without_a_measurement_keeps_the_fixed_first_wait`). And the
+    /// reply that followed a retransmission is no sample, but backs the timer off.
+    #[test]
+    fn send_and_await_retransmits_after_the_measured_timer() {
+        let rtt = RoundTrips::with_floor(Duration::from_millis(100));
+        rtt.sampled(Duration::from_millis(30));
+        let gap = gap_before_the_retransmission(Some(&rtt));
+        assert!(gap >= Duration::from_millis(95) && gap < Duration::from_millis(300), "retransmitted after {gap:?}, not after the 100 ms the measurement sets");
+        assert_eq!(rtt.samples(), 1, "the reply followed a retransmission: only the seeded sample");
+        assert_eq!(rtt.backoff(), 1);
+    }
+
+    /// The control of the above: the same exchange with nothing to follow.
+    #[test]
+    fn send_and_await_without_a_measurement_keeps_the_fixed_first_wait() {
+        let gap = gap_before_the_retransmission(None);
+        assert!(gap >= Duration::from_millis(400) && gap < Duration::from_millis(900), "retransmitted after {gap:?}, the fixed schedule's first wait is 3/7 s");
+        // An exchange that is measured, but has no sample yet, follows the same schedule.
+        let rtt = RoundTrips::default();
+        let gap = gap_before_the_retransmission(Some(&rtt));
+        assert!(gap >= Duration::from_millis(400) && gap < Duration::from_millis(900), "retransmitted after {gap:?} with no sample yet");
+        assert_eq!(rtt.samples(), 0);
+    }
+
+    /// The reply to a request sent once is a sample of what it took.
+    #[test]
+    fn send_and_await_measures_the_reply_to_a_request_sent_once() {
+        let client = Client { transport: UdpTransport::bind("127.0.0.1:0").unwrap(), natt_transport: None, entropy: SeedEntropy::new(1) };
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let responder_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let responder_addr = responder_sock.local_addr().unwrap();
+        let (cky_i, cky_r) = ([0xAA; 8], [0xBB; 8]);
+        let mut req = blank_header(exchange::MAIN);
+        req[..8].copy_from_slice(&cky_i);
+        let mut reply = blank_header(exchange::MAIN);
+        reply[..8].copy_from_slice(&cky_i);
+        reply[8..16].copy_from_slice(&cky_r);
+        let responder = std::thread::spawn(move || {
+            let mut buf = [0u8; 128];
+            let (_, from) = responder_sock.recv_from(&mut buf).unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+            responder_sock.send_to(&reply, from).unwrap();
+        });
+
+        let rtt = RoundTrips::default();
+        client.send_and_await(&req, responder_addr, &Awaiting::new(cky_i, Some(cky_r), exchange::MAIN).measured(&rtt)).unwrap();
+        responder.join().unwrap();
+        assert_eq!(rtt.samples(), 1);
+        let measured = rtt.smoothed().unwrap();
+        assert!(measured >= Duration::from_millis(60) && measured < Duration::from_millis(600), "measured {measured:?} for a gateway that took 60 ms");
+        assert_eq!(rtt.backoff(), 0);
+    }
+
+    /// The timer that follows a measurement is bound by the caller's patience just as the
+    /// fixed one is: a stream of stray datagrams, one every 40 ms, neither keeps the
+    /// retransmissions off nor stretches the wait past three read timeouts. 20 ms measured is
+    /// a timer of 60 ms, so four sends fit in the 900 ms (waits of 60, 120, 240 and 480 ms),
+    /// where the fixed schedule makes three.
+    #[test]
+    fn a_measured_timer_still_ends_at_the_callers_deadline_while_stray_datagrams_arrive() {
+        let client = Client { transport: UdpTransport::bind("127.0.0.1:0").unwrap(), natt_transport: None, entropy: SeedEntropy::new(1) };
+        client.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        listener.set_read_timeout(Some(Duration::from_millis(1800))).unwrap();
+        let counter = std::thread::spawn(move || {
+            let mut buf = [0u8; 128];
+            let (mut sends, deadline) = (0u32, std::time::Instant::now() + Duration::from_millis(1800));
+            while std::time::Instant::now() < deadline && listener.recv_from(&mut buf).is_ok() {
+                sends += 1;
+            }
+            sends
+        });
+        let strays = StrayStream::start(client.local_addr().unwrap(), Duration::from_secs(2));
+        let rtt = RoundTrips::with_floor(Duration::from_millis(50));
+        rtt.sampled(Duration::from_millis(20));
+
+        let started = std::time::Instant::now();
+        let err = client
+            .send_and_await(&blank_header(exchange::MAIN), listener_addr, &Awaiting::new([0xAA; 8], None, exchange::AGGRESSIVE).measured(&rtt))
+            .unwrap_err();
+        let waited = started.elapsed();
+        strays.stop();
+        assert!(matches!(&err, DriverError::Io(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)), "{err:?}");
+        assert!(waited >= Duration::from_millis(850) && waited < Duration::from_millis(1300), "gave up after {waited:?}, for a patience of 900 ms");
+        assert_eq!(counter.join().unwrap(), 4, "the measured timer fits four sends where the fixed schedule makes three");
+        assert_eq!(rtt.backoff(), 4, "four timers ran out");
     }
 
     /// Datagrams with someone else's cookies, one every 40 ms until stopped

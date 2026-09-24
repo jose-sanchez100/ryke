@@ -18,6 +18,7 @@
 use super::crypto1::{self, Prf, AES_BLOCK};
 use super::isakmp::{self, exchange, payload, IsakmpHeader};
 use super::phase2;
+use super::rtt::RoundTrips;
 use super::payloads::{
     attr, auth, cert_payload_body, enc, hash, id_type, life, life_duration_value, protocol, AttrValue, Attribute, Id,
     Proposal, SaPayload, Transform, IPSEC_DOI, SIT_IDENTITY_ONLY,
@@ -306,6 +307,14 @@ pub struct Phase1State {
     /// and empty after [`Phase1State::resume`].
     #[zeroize(skip)]
     pub(crate) finals: RetainedFinals,
+    /// What has been measured of the round trip to the peer -- the exchanges of
+    /// this ISAKMP SA's own handshake, and of the Quick Modes that follow it -- and
+    /// what the retransmission timer of the next one follows (RFC 2408 §5.1, see
+    /// [`RoundTrips`]). Shared by every clone of this state, so the rekeys a caller
+    /// runs on a copy learn from `connect` and from each other, and empty after
+    /// [`Phase1State::resume`], which has measured nothing.
+    #[zeroize(skip)]
+    pub(crate) rtt: RoundTrips,
 }
 
 /// The final message of an exchange -- Aggressive Mode message 3, the XAUTH
@@ -797,6 +806,7 @@ pub fn respond_aggressive(
         floated,
         negotiated_lifetime_secs: initiator_offered_lifetime,
         finals: RetainedFinals::default(),
+        rtt: RoundTrips::default(),
     };
     Ok((msg2, state))
 }
@@ -842,6 +852,7 @@ impl Phase1State {
             floated: false,
             negotiated_lifetime_secs: 0,
             finals: RetainedFinals::default(),
+            rtt: RoundTrips::default(),
         }
     }
 
@@ -1191,6 +1202,7 @@ impl AggressiveInitiator {
             floated,
             negotiated_lifetime_secs,
             finals: RetainedFinals::default(),
+            rtt: RoundTrips::default(),
         };
         Ok((msg3, state))
     }
@@ -1646,6 +1658,7 @@ impl MainIdSent {
             floated: self.floated,
             negotiated_lifetime_secs: self.negotiated_p1_lifetime_secs,
             finals: RetainedFinals::default(),
+            rtt: RoundTrips::default(),
         };
         match verify {
             Ok(()) => Ok(state),
@@ -1933,6 +1946,7 @@ impl MainRespKeSent {
             floated: self.floated,
             negotiated_lifetime_secs: self.initiator_offered_lifetime,
             finals: RetainedFinals::default(),
+            rtt: RoundTrips::default(),
         };
         Ok((msg6, state))
     }
@@ -1969,6 +1983,7 @@ mod tests {
             floated: false,
             negotiated_lifetime_secs: 28800,
             finals: RetainedFinals::default(),
+            rtt: RoundTrips::default(),
         };
         zeroize::Zeroize::zeroize(&mut state);
         assert!(state.skeyid.is_empty());
@@ -1980,6 +1995,19 @@ mod tests {
         assert_eq!(state.cky_i, [1u8; 8]);
         assert_eq!(state.gxi, vec![4u8; 16]);
         assert_eq!(state.negotiated_lifetime_secs, 28800);
+    }
+
+    /// What was measured of the path belongs to the ISAKMP SA, not to one copy of it: a
+    /// caller that keeps a copy for its rekeys and liveness checks must see what `connect`
+    /// measured (RFC 2408 §5.1), and a state rebuilt from stored keys has measured nothing.
+    #[test]
+    fn the_round_trips_are_shared_by_clones_and_empty_after_resume() {
+        let st = Phase1State::resume(Prf::Sha256, DhGroup::Modp2048, [1; 8], [2; 8], vec![], vec![], vec![], vec![], AES_BLOCK, vec![]);
+        assert_eq!(st.rtt.samples(), 0, "a resumed state has measured nothing");
+        let copy = st.clone();
+        copy.rtt.sampled(Duration::from_millis(80));
+        assert_eq!(st.rtt.samples(), 1, "a clone's measurement is the SA's");
+        assert_eq!(st.rtt.smoothed(), Some(Duration::from_millis(80)));
     }
 
     #[test]

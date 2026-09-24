@@ -585,7 +585,7 @@ fn responder_respond_inner(
         }
     }
 
-    let suite = negotiate::select(&payloads.sa).ok_or(IkeError::NoProposalChosen)?;
+    let (offered, suite) = negotiate::select_with_proposal(&payloads.sa).ok_or(IkeError::NoProposalChosen)?;
     Nonce::parse_for_prf(&payloads.nonce.data, suite.prf_algorithm())?;
     let group = DhGroup::from_transform_id(suite.dh_id).ok_or(IkeError::NoProposalChosen)?;
 
@@ -635,7 +635,7 @@ fn responder_respond_inner(
     }
 
     let response_header = base_header(spi_i, spi_r, Flags { initiator: false, version: false, response: true });
-    let sar1 = SecurityAssociation { proposals: vec![suite.to_proposal()] };
+    let sar1 = SecurityAssociation { proposals: vec![suite.answer_to(offered)] };
     let response = build_sa_init(response_header, &sar1, suite.dh_id, &our_public, &local.nonce, &extra_notifies);
 
     let completed = CompletedSaInit {
@@ -1134,6 +1134,82 @@ mod tests {
         let answer = SecurityAssociation { proposals: vec![ours] };
         let response = build_sa_init(header, &answer, group.transform_id(), &public, &resp.nonce, &[]);
         initiator_complete(&init, &request, &response).expect("our own proposal, echoed back, completes");
+    }
+
+    /// An IKE proposal of AES-GCM-256, PRF-SHA256, `integ` and X25519.
+    fn gcm_offer(integ: &[u16]) -> Proposal {
+        let mut transforms = vec![
+            Transform { transform_type: transform_type::ENCR, transform_id: transform_id::AES_GCM_16, key_length: Some(256) },
+            Transform { transform_type: transform_type::PRF, transform_id: transform_id::PRF_HMAC_SHA2_256, key_length: None },
+        ];
+        transforms.extend(integ.iter().map(|&id| Transform { transform_type: transform_type::INTEG, transform_id: id, key_length: None }));
+        transforms.push(Transform { transform_type: transform_type::DH, transform_id: transform_id::X25519, key_length: None });
+        Proposal { num: 1, protocol_id: protocol_id::IKE, spi: Vec::new(), transforms }
+    }
+
+    fn integ_of(proposal: &Proposal) -> Vec<u16> {
+        proposal.transforms.iter().filter(|t| t.transform_type == transform_type::INTEG).map(|t| t.transform_id).collect()
+    }
+
+    /// RFC 7296 §3.3: a combined-mode cipher is offered with no integrity
+    /// algorithm or with a single INTEG NONE, and either is taken; §2.7: the
+    /// answer has one transform of each type offered, so an INTEG NONE offered
+    /// is one answered. Full exchange, both sides deriving the same keys.
+    #[test]
+    fn an_aead_offer_is_answered_and_completed_with_or_without_an_integ_none() {
+        const NONE: u16 = transform_id::INTEG_NONE;
+        const SHA256: u16 = transform_id::AUTH_HMAC_SHA2_256_128;
+        let (init, resp) = (init_secret(), resp_secret());
+        for (what, integ, answered) in [
+            ("no INTEG", vec![], vec![]),
+            ("INTEG NONE", vec![NONE], vec![NONE]),
+            ("INTEG SHA256 and NONE", vec![SHA256, NONE], vec![NONE]),
+        ] {
+            let offer = SecurityAssociation { proposals: vec![gcm_offer(&integ)] };
+            let request = initiator_request(&init, &offer);
+            let (response, resp_sa) = responder_respond(&request, &resp).unwrap_or_else(|e| panic!("{what}: the responder refused it: {e:?}"));
+            let header = IkeHeader::parse(&response).unwrap();
+            let answer = parse_sa_init(&header, &response[IkeHeader::LEN..]).unwrap().sa;
+            assert_eq!(answer.proposals.len(), 1, "{what}");
+            assert_eq!(integ_of(&answer.proposals[0]), answered, "{what}: the INTEG transforms answered");
+            let init_sa = initiator_complete(&init, &request, &response).unwrap_or_else(|e| panic!("{what}: the initiator refused the answer: {e:?}"));
+            assert_eq!(init_sa.suite, resp_sa.suite, "{what}");
+            assert_eq!((init_sa.suite.encr_id, init_sa.suite.integ_id), (transform_id::AES_GCM_16, None), "{what}");
+            assert_eq!(init_sa.keys.sk_ei, resp_sa.keys.sk_ei, "{what}");
+            assert_eq!(init_sa.keys.sk_er, resp_sa.keys.sk_er, "{what}");
+        }
+        // Not taken: a combined-mode cipher whose only integrity is a real algorithm.
+        let offer = SecurityAssociation { proposals: vec![gcm_offer(&[SHA256])] };
+        let request = initiator_request(&init, &offer);
+        assert_eq!(responder_respond(&request, &resp).unwrap_err(), IkeError::NoProposalChosen, "GCM with INTEG SHA256 only");
+    }
+
+    /// RFC 7296 §3.3.6: the initiator "MUST check that the accepted offer is
+    /// consistent with one of its proposals" -- with an INTEG NONE exactly where
+    /// it offered one, and never a real algorithm on an AEAD suite.
+    #[test]
+    fn the_initiator_takes_an_aead_answer_only_with_the_integ_none_it_offered() {
+        const NONE: u16 = transform_id::INTEG_NONE;
+        const SHA256: u16 = transform_id::AUTH_HMAC_SHA2_256_128;
+        let (init, resp) = (init_secret(), resp_secret());
+        let group = DhGroup::X25519;
+        let public = group.public(&resp.dh_private);
+        let header = base_header(init.spi, resp.spi, Flags { initiator: false, version: false, response: true });
+        let complete = |offered: &[u16], answered: &[u16]| {
+            let request = initiator_request(&init, &SecurityAssociation { proposals: vec![gcm_offer(offered)] });
+            let answer = SecurityAssociation { proposals: vec![gcm_offer(answered)] };
+            let response = build_sa_init(header, &answer, group.transform_id(), &public, &resp.nonce, &[]);
+            initiator_complete(&init, &request, &response).map(|_| ())
+        };
+        assert_eq!(complete(&[NONE], &[NONE]), Ok(()), "NONE offered, NONE answered");
+        assert_eq!(complete(&[], &[]), Ok(()), "nothing offered, nothing answered");
+        assert_eq!(complete(&[SHA256, NONE], &[NONE]), Ok(()), "SHA256 and NONE offered, NONE answered");
+        let refused = Err(IkeError::NoProposalChosen);
+        assert_eq!(complete(&[], &[NONE]), refused, "NONE answered, none offered");
+        assert_eq!(complete(&[NONE], &[]), refused, "NONE offered, INTEG left out");
+        assert_eq!(complete(&[NONE], &[NONE, NONE]), refused, "NONE answered twice");
+        assert_eq!(complete(&[SHA256, NONE], &[SHA256]), refused, "SHA256 answered to a GCM offer");
+        assert_eq!(complete(&[SHA256, NONE], &[SHA256, NONE]), refused, "SHA256 and NONE answered");
     }
 
     /// An `IKE_SA_INIT` whose SA payload body is `sa_body`, as it went on the

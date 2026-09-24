@@ -256,7 +256,7 @@ pub fn responder_process_ike_rekey(
     );
 
     // Response inner: SA(new IKE proposal carrying our new SPI) | Nr | KEr.
-    let mut prop = suite.to_proposal();
+    let mut prop = suite.answer_to(proposal);
     prop.protocol_id = protocol_id::IKE;
     prop.spi = new_spi_r.to_be_bytes().to_vec();
     let sar = SecurityAssociation { proposals: vec![prop] };
@@ -309,9 +309,14 @@ mod tests {
     use crate::ikev2::sk::{build_encrypted_gcm, open_encrypted_gcm};
 
     fn sa_pair() -> (CompletedSaInit, CompletedSaInit) {
+        sa_pair_with_offer(&default_offer())
+    }
+
+    /// The two ends of an `IKE_SA_INIT` whose offer is `offer`.
+    fn sa_pair_with_offer(offer: &SecurityAssociation) -> (CompletedSaInit, CompletedSaInit) {
         let init = LocalSecret { dh_private: [7u8; 32], nonce: vec![0x11; 32], spi: 0xA1 };
         let resp = LocalSecret { dh_private: [9u8; 32], nonce: vec![0x22; 32], spi: 0xB2 };
-        let request = initiator_request(&init, &default_offer());
+        let request = initiator_request(&init, offer);
         let (response, resp_done) = responder_respond(&request, &resp).unwrap();
         let init_done = initiator_complete(&init, &request, &response).unwrap();
         (init_done, resp_done)
@@ -638,6 +643,82 @@ mod tests {
         for (what, proposals) in cases {
             assert_eq!(complete(&ike_rekey_message_with(&resp_sa, true, proposals, ke())), Err(IkeError::NoProposalChosen), "{what}");
         }
+    }
+
+    /// The IKE proposal `from`'s suite is, as a rekey offers it -- with an INTEG
+    /// NONE added when `integ_none`, the way a peer may offer a combined-mode cipher.
+    fn ike_rekey_proposal(from: &CompletedSaInit, integ_none: bool) -> Proposal {
+        use crate::ikev2::payload::{transform_id, transform_type, Transform};
+
+        let mut prop = from.suite.to_proposal();
+        prop.num = 1;
+        prop.protocol_id = protocol_id::IKE;
+        prop.spi = 7u64.to_be_bytes().to_vec();
+        if integ_none {
+            let at = prop.transforms.iter().position(|t| t.transform_type == transform_type::DH).unwrap();
+            prop.transforms.insert(at, Transform { transform_type: transform_type::INTEG, transform_id: transform_id::INTEG_NONE, key_length: None });
+        }
+        prop
+    }
+
+    /// RFC 7296 §3.3: a combined-mode cipher's rekey offered with a single INTEG
+    /// NONE is taken, and §2.7 has the answer carry that NONE: one transform of
+    /// each type the proposal included. Offered with no INTEG it is answered
+    /// with none, the RECOMMENDED form.
+    #[test]
+    fn an_ike_rekey_offered_with_an_integ_none_is_answered_with_it() {
+        use crate::ikev2::payload::{transform_id, transform_type};
+
+        let (init_sa, resp_sa) = sa_pair();
+        let group = DhGroup::from_transform_id(init_sa.suite.dh_id).unwrap();
+        let ke = || Some(KeyExchange { dh_group: group.transform_id(), data: group.public(&[3u8; 32]) });
+        for (integ_none, answered) in [(false, vec![]), (true, vec![transform_id::INTEG_NONE])] {
+            let offered = ike_rekey_proposal(&init_sa, integ_none);
+            let request = ike_rekey_message_with(&init_sa, false, vec![offered.clone()], ke());
+            let (response, new_sa) = responder_process_ike_rekey(&resp_sa, &request, 0x99, &[9u8; 32], &[0x66u8; 32], &[2u8; 8])
+                .unwrap_or_else(|e| panic!("INTEG NONE offered: {integ_none}: refused with {e:?}"));
+            assert_eq!(new_sa.suite.integ_id, None, "INTEG NONE offered: {integ_none}");
+            let (first, inner) = open_encrypted(init_sa.suite.sk_cipher(), &response, peer_sk_e(&init_sa), peer_sk_a(&init_sa)).unwrap();
+            let sa = payloads(first, &inner).map(Result::unwrap).find(|p| p.payload_type == PayloadType::SecurityAssociation).unwrap();
+            let answer = SecurityAssociation::parse(sa.data).unwrap();
+            let [proposal] = answer.proposals.as_slice() else { panic!("INTEG NONE offered: {integ_none}: {answer:?}") };
+            let integ: Vec<u16> = proposal.transforms.iter().filter(|t| t.transform_type == transform_type::INTEG).map(|t| t.transform_id).collect();
+            assert_eq!(integ, answered, "INTEG NONE offered: {integ_none}");
+            assert_eq!(negotiate::accepted_proposal(&answer, &SecurityAssociation { proposals: vec![offered] }).map(|_| ()), Ok(()), "INTEG NONE offered: {integ_none}");
+        }
+    }
+
+    /// The answer to a rekey we started has our proposal's INTEG transforms and
+    /// no others (RFC 7296 §3.3.6): an INTEG NONE we never offered is refused,
+    /// though the suite it names is ours. A suite the first exchange took with
+    /// an INTEG NONE on offer (it was the peer's) rekeys as any other.
+    #[test]
+    fn an_ike_rekey_answer_does_not_add_an_integ_none_and_a_suite_taken_with_one_rekeys() {
+        let (init_sa, resp_sa) = sa_pair();
+        let (ni, dh, new_spi_i) = ([0x55u8; 32], [3u8; 32], 0xAABB_CCDD_1122_3344);
+        let group = DhGroup::from_transform_id(init_sa.suite.dh_id).unwrap();
+        let ke = || Some(KeyExchange { dh_group: group.transform_id(), data: group.public(&[9u8; 32]) });
+        let complete = |resp: &[u8]| initiator_complete_ike_rekey(&init_sa, &ni, new_spi_i, &dh, resp).map(|_| ());
+        assert_eq!(complete(&ike_rekey_message_with(&resp_sa, true, vec![ike_rekey_proposal(&resp_sa, false)], ke())), Ok(()), "control");
+        assert_eq!(
+            complete(&ike_rekey_message_with(&resp_sa, true, vec![ike_rekey_proposal(&resp_sa, true)], ke())),
+            Err(IkeError::NoProposalChosen),
+            "an INTEG NONE we did not offer"
+        );
+
+        // Both ends of an exchange whose offer had an INTEG NONE, then rekeyed.
+        let mut offer = default_offer();
+        offer.proposals[0].transforms.insert(2, crate::ikev2::payload::Transform {
+            transform_type: crate::ikev2::payload::transform_type::INTEG,
+            transform_id: crate::ikev2::payload::transform_id::INTEG_NONE,
+            key_length: None,
+        });
+        let (init_none, resp_none) = sa_pair_with_offer(&offer);
+        assert_eq!(init_none.suite.integ_id, None);
+        let request = build_ike_rekey_request(&init_none, 5, new_spi_i, &ni, &dh, &[1u8; 8]).unwrap();
+        let (response, new_resp) = responder_process_ike_rekey(&resp_none, &request, 0x99, &[9u8; 32], &[0x66u8; 32], &[2u8; 8]).unwrap();
+        let new_init = initiator_complete_ike_rekey(&init_none, &ni, new_spi_i, &dh, &response).unwrap();
+        assert_eq!(new_init.keys.sk_d, new_resp.keys.sk_d);
     }
 
     /// RFC 7296 §3.3.1: each proposal of an IKE SA rekey carries the SPI the

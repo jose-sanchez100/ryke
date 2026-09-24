@@ -53,6 +53,9 @@ pub mod transform_id {
     pub const ECP384: u16 = 20;
     pub const ECP521: u16 = 21;
     pub const X25519: u16 = 31;
+    // INTEG: what a combined-mode cipher's proposal may carry as its one
+    // integrity transform (RFC 7296 §3.3).
+    pub const INTEG_NONE: u16 = 0;
     // ESN
     pub const ESN_NONE: u16 = 0;
     pub const ESN_ENABLED: u16 = 1;

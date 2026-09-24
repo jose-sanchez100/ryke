@@ -109,6 +109,21 @@ impl ChosenSuite {
         Proposal { num: self.proposal_num, protocol_id: protocol_id::IKE, spi: Vec::new(), transforms }
     }
 
+    /// [`Self::to_proposal`] as the answer to `offered`, the proposal this suite
+    /// was chosen from: it adds the INTEG NONE that a combined-mode cipher's
+    /// proposal carried, since the answer holds "exactly one transform of each
+    /// type included in the proposal" (RFC 7296 §2.7) and NONE is that type's
+    /// one for an AEAD suite. Left out where `offered` had no INTEG, as §3.3
+    /// recommends.
+    pub(crate) fn answer_to(&self, offered: &Proposal) -> Proposal {
+        let mut answer = self.to_proposal();
+        if self.integ_id.is_none() && has(offered, transform_type::INTEG, transform_id::INTEG_NONE, None) {
+            let at = answer.transforms.iter().position(|t| t.transform_type == transform_type::DH).unwrap_or(answer.transforms.len());
+            answer.transforms.insert(at, Transform { transform_type: transform_type::INTEG, transform_id: transform_id::INTEG_NONE, key_length: None });
+        }
+        answer
+    }
+
     /// Whether every transform this suite names was actually present in
     /// `offer`'s proposal of the matching number. RFC 7296 §2.7: the
     /// responder "MUST select a single suite... from the SA payload" the
@@ -282,10 +297,12 @@ fn select_from_proposal(proposal: &Proposal) -> Option<ChosenSuite> {
     }
     // §2.7: the accepted suite "MUST contain exactly one transform of each
     // type included in the proposal", so one that lists integrity algorithms
-    // needs one of them answered -- which a combined-mode cipher can't take
+    // needs one of them answered. A combined-mode cipher can only take NONE
     // (§3.3: those "MUST either offer no integrity algorithm or a single
-    // integrity algorithm of NONE").
+    // integrity algorithm of NONE"), so it goes with either of those and not
+    // with real algorithms alone.
     let offers_integ = proposal.transforms.iter().any(|t| t.transform_type == transform_type::INTEG);
+    let offers_integ_none = has(proposal, transform_type::INTEG, transform_id::INTEG_NONE, None);
     let dh_id = DH_CANDIDATES.iter().copied().find(|&g| has(proposal, transform_type::DH, g, None))?;
 
     for &(encr_id, key_bits, aead) in ENCR_CANDIDATES {
@@ -295,7 +312,7 @@ fn select_from_proposal(proposal: &Proposal) -> Option<ChosenSuite> {
         let encr_key_bits = key_bits.or_else(|| fixed_key_bits(encr_id)).expect("every candidate has a key size");
 
         if aead {
-            if offers_integ {
+            if offers_integ && !offers_integ_none {
                 continue;
             }
             let Some(&prf_id) = PRF_CANDIDATES.iter().find(|&&p| has(proposal, transform_type::PRF, p, None)) else {
@@ -770,6 +787,114 @@ mod tests {
             tf(transform_type::DH, transform_id::X25519, None),
         ]);
         assert_eq!(select(&aead_with_integ), None);
+    }
+
+    /// An IKE proposal of one ENCR of `encr`, PRF-SHA256, `integ` and X25519.
+    fn ike_proposal(encr: &[(u16, Option<u16>)], integ: &[Transform]) -> Proposal {
+        let mut transforms: Vec<Transform> = encr.iter().map(|&(id, kl)| tf(transform_type::ENCR, id, kl)).collect();
+        transforms.push(tf(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, None));
+        transforms.extend(integ.iter().cloned());
+        transforms.push(tf(transform_type::DH, transform_id::X25519, None));
+        Proposal { num: 1, protocol_id: protocol_id::IKE, spi: Vec::new(), transforms }
+    }
+
+    fn integ_none() -> Transform {
+        tf(transform_type::INTEG, transform_id::INTEG_NONE, None)
+    }
+
+    fn integ_sha256() -> Transform {
+        tf(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, None)
+    }
+
+    /// RFC 7296 §3.3: a combined-mode cipher "MUST either offer no integrity
+    /// algorithm or a single integrity algorithm of NONE, with no integrity
+    /// algorithm being the RECOMMENDED method" -- both are proposals to take.
+    /// §2.7 then has the answer carry one transform of each type the proposal
+    /// included, so an INTEG NONE offered is an INTEG NONE answered.
+    #[test]
+    fn an_aead_cipher_takes_an_integrity_of_none_as_well_as_none_at_all() {
+        let gcm = (transform_id::AES_GCM_16, Some(256));
+        let chacha = (transform_id::CHACHA20_POLY1305, None);
+        let cbc = (transform_id::AES_CBC, Some(256));
+        let unreadable = tf(transform_type::INTEG, transform_id::UNUSABLE, None);
+        let none_with_key_length = tf(transform_type::INTEG, transform_id::INTEG_NONE, Some(128));
+        let chosen = |encr: &[(u16, Option<u16>)], integ: &[Transform]| {
+            select(&SecurityAssociation { proposals: vec![ike_proposal(encr, integ)] }).map(|s| (s.encr_id, s.integ_id))
+        };
+        let gcm_no_integ = Some((transform_id::AES_GCM_16, None));
+        let sha256 = Some(transform_id::AUTH_HMAC_SHA2_256_128);
+
+        // Combined-mode: no INTEG at all, or a NONE.
+        assert_eq!(chosen(&[gcm], &[]), gcm_no_integ, "GCM, no INTEG");
+        assert_eq!(chosen(&[gcm], &[integ_none()]), gcm_no_integ, "GCM, INTEG NONE");
+        assert_eq!(chosen(&[chacha], &[integ_none()]), Some((transform_id::CHACHA20_POLY1305, None)), "ChaCha20-Poly1305, INTEG NONE");
+        // A NONE among real algorithms is the one an AEAD cipher answers with (§2.7); a real algorithm alone is not.
+        assert_eq!(chosen(&[gcm], &[integ_sha256(), integ_none()]), gcm_no_integ, "GCM, INTEG SHA256 and NONE");
+        assert_eq!(chosen(&[gcm], &[integ_sha256()]), None, "GCM, INTEG SHA256 only");
+        // Not a NONE we can answer with: one carrying a Key Length (§3.3.5), or one we could not read (§3.3.6).
+        assert_eq!(chosen(&[gcm], &[none_with_key_length]), None, "GCM, INTEG NONE with a Key Length");
+        assert_eq!(chosen(&[gcm], std::slice::from_ref(&unreadable)), None, "GCM, INTEG we cannot read");
+        assert_eq!(chosen(&[gcm], &[unreadable, integ_none()]), gcm_no_integ, "GCM, INTEG we cannot read and NONE");
+        // A classic cipher still needs a real integrity algorithm; NONE is no answer for it.
+        assert_eq!(chosen(&[cbc], &[integ_none()]), None, "CBC, INTEG NONE only");
+        assert_eq!(chosen(&[cbc], &[]), None, "CBC, no INTEG");
+        assert_eq!(chosen(&[cbc], &[integ_none(), integ_sha256()]), Some((transform_id::AES_CBC, sha256)), "CBC, INTEG NONE and SHA256");
+        // Ranked as ever, strongest first: GCM over CBC once it can take a NONE.
+        assert_eq!(chosen(&[cbc, gcm], &[integ_none(), integ_sha256()]), gcm_no_integ, "GCM and CBC, INTEG NONE and SHA256");
+        assert_eq!(chosen(&[cbc, gcm], &[integ_sha256()]), Some((transform_id::AES_CBC, sha256)), "GCM and CBC, INTEG SHA256 only");
+    }
+
+    /// What a responder answers with, per RFC 7296 §2.7 and §3.3.6: the one
+    /// suite, and an INTEG NONE only where the proposal it chose had one.
+    #[test]
+    fn the_answer_to_an_aead_proposal_has_an_integ_none_when_the_offer_had_one() {
+        let gcm = [(transform_id::AES_GCM_16, Some(256))];
+        let answer = |offer: &Proposal| {
+            let sa = SecurityAssociation { proposals: vec![offer.clone()] };
+            let (offered, suite) = select_with_proposal(&sa).unwrap();
+            let answered = suite.answer_to(offered);
+            // Whatever it is, the initiator that made the offer takes it back.
+            let answer = SecurityAssociation { proposals: vec![answered.clone()] };
+            assert!(accepted_proposal(&answer, &sa).is_ok(), "{answered:?}");
+            assert!(select(&answer).unwrap().matches_offer(&sa), "{answered:?}");
+            // Transforms in the order of their types, as the rest of what we send has them.
+            assert!(answered.transforms.windows(2).all(|w| w[0].transform_type <= w[1].transform_type), "{answered:?}");
+            answered.transforms.iter().filter(|t| t.transform_type == transform_type::INTEG).cloned().collect::<Vec<_>>()
+        };
+        assert_eq!(answer(&ike_proposal(&gcm, &[integ_none()])), vec![integ_none()], "offered a NONE");
+        assert_eq!(answer(&ike_proposal(&gcm, &[integ_sha256(), integ_none()])), vec![integ_none()], "offered a NONE among real algorithms");
+        assert_eq!(answer(&ike_proposal(&gcm, &[])), Vec::<Transform>::new(), "offered no INTEG");
+        // A classic cipher's answer is its real algorithm, offered NONE or not.
+        let cbc = [(transform_id::AES_CBC, Some(256))];
+        assert_eq!(answer(&ike_proposal(&cbc, &[integ_none(), integ_sha256()])), vec![integ_sha256()], "CBC offered NONE and SHA256");
+    }
+
+    /// RFC 7296 §3.3.6: the initiator "MUST check that the accepted offer is
+    /// consistent with one of its proposals". An INTEG transform it never
+    /// offered, or one it did offer and the answer leaves out, is not.
+    #[test]
+    fn an_answer_to_an_aead_offer_has_an_integ_none_exactly_when_the_offer_had_one() {
+        let gcm = [(transform_id::AES_GCM_16, Some(256))];
+        let offer = |integ: &[Transform]| SecurityAssociation { proposals: vec![ike_proposal(&gcm, integ)] };
+        let verdict = |answered: &Proposal, offered: &SecurityAssociation| {
+            let answer = SecurityAssociation { proposals: vec![answered.clone()] };
+            accepted_proposal(&answer, offered).is_ok() && select(&answer).is_some_and(|s| s.matches_offer(offered))
+        };
+        let with_none = ike_proposal(&gcm, &[integ_none()]);
+        let without = ike_proposal(&gcm, &[]);
+        assert!(verdict(&with_none, &offer(&[integ_none()])), "NONE offered, NONE answered");
+        assert!(verdict(&without, &offer(&[])), "nothing offered, nothing answered");
+        assert!(!verdict(&with_none, &offer(&[])), "NONE answered to an offer without INTEG");
+        assert!(!verdict(&without, &offer(&[integ_none()])), "NONE offered, INTEG left out of the answer");
+        // One transform of each type: a NONE and a real algorithm together are two.
+        let both = ike_proposal(&gcm, &[integ_none(), integ_sha256()]);
+        assert!(!verdict(&both, &offer(&[integ_none(), integ_sha256()])), "two INTEG transforms answered");
+        // A real algorithm is no answer for a combined-mode cipher, offered or not.
+        let real = ike_proposal(&gcm, &[integ_sha256()]);
+        assert!(!verdict(&real, &offer(&[integ_none(), integ_sha256()])), "SHA256 answered with GCM");
+        // And the answer's NONE must be the offered NONE: not one with a Key Length.
+        let with_key_length = ike_proposal(&gcm, &[tf(transform_type::INTEG, transform_id::INTEG_NONE, Some(128))]);
+        assert!(!verdict(&with_key_length, &offer(&[integ_none()])), "NONE with a Key Length answered");
     }
 
     #[test]

@@ -35,11 +35,11 @@ use crate::ikev2::exchange::{
     default_offer, initiator_complete_natt, initiator_request_natt_retry, CompletedSaInit, LocalSecret,
     NatStatus, SaInitRetry,
 };
-use crate::ikev2::fragment::{self, Accepted, MessageKey, Reassembly};
+use crate::ikev2::fragment::{self, Accepted, DatagramLimit, MessageKey, Reassembly};
 use crate::ikev2::ike_auth::{self, AuthConfig, ChildTsOffer};
 use crate::ikev2::ike_rekey;
 use crate::ikev2::informational::{
-    build_error_response, build_informational, deletes_in, dpd_request, open_from_peer, payload_list, peer_sk_a, peer_sk_e, request_error_notify,
+    build_error_response, build_informational, deletes_in, dpd_request, open_from_peer, our_sk_a, our_sk_e, payload_list, peer_sk_a, peer_sk_e, request_error_notify,
 };
 use crate::ikev2::message::{payloads, ExchangeType, IkeHeader, PayloadType};
 use crate::ikev1::quick::{ChildKeyMaterial, RekeyedChild};
@@ -2145,6 +2145,9 @@ pub struct Ikev2Session<E> {
     force_natt: bool,
     /// Offer IPv4 and IPv6 together in IKE_AUTH -- see [`Self::with_unified_ts`].
     unified_ts: bool,
+    /// The datagram size our messages are fragmented to -- see
+    /// [`Self::with_datagram_limit`].
+    datagram_limit: DatagramLimit,
 }
 
 /// The local IP our packets actually carry as their source when reaching
@@ -2172,15 +2175,28 @@ fn natt_local_port(local_port: u16) -> u16 {
 /// A message of ours as it goes on the wire: its datagrams, each ready to
 /// send (behind the non-ESP marker on a floated transport). Kept as sent,
 /// so that a retransmission sends the same bytes again (RFC 7296 §2.1).
+/// See [`prepare`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Outgoing {
     datagrams: Vec<Vec<u8>>,
+    /// Set when the message went whole beyond the [`DatagramLimit`], the
+    /// peer not taking fragments: what to say if it goes unanswered.
+    oversize: Option<String>,
 }
 
 impl Outgoing {
     /// `datagram`, the whole message in one.
     fn whole(datagram: Vec<u8>) -> Outgoing {
-        Outgoing { datagrams: vec![datagram] }
+        Outgoing { datagrams: vec![datagram], oversize: None }
+    }
+
+    /// `what`, with why the message may have gone unanswered when it went
+    /// whole beyond the limit.
+    fn unanswered(&self, what: &str) -> String {
+        match &self.oversize {
+            Some(oversize) => format!("{what}; {oversize}"),
+            None => what.to_string(),
+        }
     }
 
     /// Send every datagram to `dest`, in order, stopping at the first that
@@ -2199,6 +2215,58 @@ impl Outgoing {
     fn header(&self, float: bool) -> Result<IkeHeader, DriverError> {
         let first = self.datagrams.first().ok_or(IkeError::Truncated { need: IkeHeader::LEN, have: 0 })?;
         Ok(IkeHeader::parse(&unwrap(first, float)?)?)
+    }
+}
+
+/// `message`, one of ours sealed on `sa`, ready to go to `dest` (behind the
+/// non-ESP marker when `float`): whole when it fits the IKE message size
+/// `limit` leaves for that family, otherwise in RFC 7383 fragments that
+/// each fit, sealed under our keys with IVs from a fresh random base. A
+/// peer that did not negotiate fragmentation gets it whole all the same,
+/// and a diagnostic says so: it may then be fragmented at the IP layer or
+/// dropped. Not for `IKE_SA_INIT`, which is never fragmented.
+fn prepare(
+    sa: &CompletedSaInit,
+    message: Vec<u8>,
+    dest: SocketAddr,
+    float: bool,
+    limit: DatagramLimit,
+    entropy: &mut impl Entropy,
+) -> Result<Outgoing, DriverError> {
+    let max = limit.max_message_len(dest.ip(), float);
+    if message.len() <= max {
+        return Ok(Outgoing::whole(wrap(&message, float)));
+    }
+    let header = IkeHeader::parse(&message)?;
+    let kind = if header.flags.response { "response" } else { "request" };
+    let what = format!("{} {kind} {}", exchange_name(header.exchange_type), header.message_id);
+    if !sa.peer_supports_fragmentation {
+        let oversize = format!(
+            "the {what} went whole, {} bytes, above the {max} bytes an IKE message may take within the datagram limit, as the peer did not negotiate IKE fragmentation (RFC 7383): it may be fragmented at the IP layer or dropped",
+            message.len()
+        );
+        ike_debug!("{oversize}");
+        return Ok(Outgoing { datagrams: vec![wrap(&message, float)], oversize: Some(oversize) });
+    }
+    let fragments = fragment::fragment_message(sa.suite.sk_cipher(), &message, our_sk_e(sa), our_sk_a(sa), entropy.next_u64(), max)
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("the {what}, {} bytes, cannot go in fragments of at most {max} bytes: {e}", message.len()),
+            )
+        })?;
+    ike_debug!("{what}: {} bytes, sent in {} fragments of at most {max} bytes (RFC 7383)", message.len(), fragments.len());
+    Ok(Outgoing { datagrams: fragments.iter().map(|f| wrap(f, float)).collect(), oversize: None })
+}
+
+/// An exchange's name as RFC 7296 writes it, for diagnostics.
+fn exchange_name(exchange: ExchangeType) -> String {
+    match exchange {
+        ExchangeType::IkeSaInit => "IKE_SA_INIT".to_string(),
+        ExchangeType::IkeAuth => "IKE_AUTH".to_string(),
+        ExchangeType::CreateChildSa => "CREATE_CHILD_SA".to_string(),
+        ExchangeType::Informational => "INFORMATIONAL".to_string(),
+        ExchangeType::Other(n) => format!("exchange {n}"),
     }
 }
 
@@ -2360,7 +2428,8 @@ fn send_and_retry_reassembling(
         }
     }
     let what = if reassembly.is_empty() { "no response" } else { "the response came in part" };
-    Err(io::Error::new(io::ErrorKind::TimedOut, format!("{what} after {} attempts", RETRY_BACKOFFS.len())).into())
+    let what = outgoing.unanswered(&format!("{what} after {} attempts", RETRY_BACKOFFS.len()));
+    Err(io::Error::new(io::ErrorKind::TimedOut, what).into())
 }
 
 /// Whether `header` is that of a message from the peer on the IKE SA `sa`
@@ -2557,7 +2626,17 @@ fn reject_unusable_grant(sock: &UdpSocket, sa: &CompletedSaInit, dest: SocketAdd
 
 impl<E: Entropy> Ikev2Session<E> {
     pub fn new(entropy: E) -> Self {
-        Self { entropy, force_natt: false, unified_ts: false }
+        Self { entropy, force_natt: false, unified_ts: false, datagram_limit: DatagramLimit::DEFAULT }
+    }
+
+    /// Keep every IP datagram our messages travel in within `limit`, from
+    /// `IKE_AUTH` on, rather than [`DatagramLimit::DEFAULT`]: a larger
+    /// message goes in RFC 7383 fragments when the peer negotiated them,
+    /// and whole otherwise. `IKE_SA_INIT` is never fragmented. The limit is
+    /// not discovered from the path.
+    pub fn with_datagram_limit(mut self, limit: DatagramLimit) -> Self {
+        self.datagram_limit = limit;
+        self
     }
 
     /// Makes every `IKE_SA_INIT` this session runs **force** NAT-T (what strongSwan
@@ -2949,7 +3028,7 @@ impl<E: Entropy> Ikev2Session<E> {
         self.entropy.fill(&mut iv);
         let req = ike_auth::initiator_auth_request_with_cfg(&sa, cfg, local_spi, want_cfg, esp_offer, ts_offer, &iv)?;
         ike_debug!("IKE_AUTH: sending to {dest} (local_spi={local_spi:08x}, floated={float}, ts={ts_offer:?})");
-        let outgoing = Outgoing::whole(wrap(&req, float));
+        let outgoing = prepare(&sa, req, dest, float, self.datagram_limit, &mut self.entropy)?;
         let response =
             send_and_retry_reassembling(&sock, dest, &outgoing, float, sa.suite.sk_cipher(), &sa.keys.sk_er, &sa.keys.sk_ar)?;
 
@@ -3220,8 +3299,8 @@ impl<E: Entropy> Ikev2Session<E> {
         let cipher = initiator.ike_sa().suite.sk_cipher();
         loop {
             round += 1;
-            let outgoing = Outgoing::whole(wrap(&msg, float));
             let sa = initiator.ike_sa();
+            let outgoing = prepare(sa, msg, dest, float, self.datagram_limit, &mut self.entropy)?;
             let ike_msg =
                 send_and_retry_reassembling(&sock, dest, &outgoing, float, cipher, &sa.keys.sk_er, &sa.keys.sk_ar)?;
             last_message = ike_msg.clone();
@@ -3259,7 +3338,7 @@ impl<E: Entropy> Ikev2Session<E> {
                 EapEvent::Established(final_msg) => {
                     ike_debug!("IKE_AUTH (EAP-MSCHAPv2): authentication succeeded after {round} round(s)");
                     if let Some(fm) = final_msg {
-                        Outgoing::whole(wrap(&fm, float)).send(&sock, dest)?;
+                        prepare(initiator.ike_sa(), fm, dest, float, self.datagram_limit, &mut self.entropy)?.send(&sock, dest)?;
                     }
                     break;
                 }
@@ -5547,7 +5626,7 @@ mod tests {
             length: IkeHeader::LEN as u32,
         };
         let first = wrap(&header.to_bytes(), true);
-        let out = Outgoing { datagrams: vec![first, vec![2; 20], vec![3; 5]] };
+        let out = Outgoing { datagrams: vec![first, vec![2; 20], vec![3; 5]], oversize: None };
         assert_eq!(out.header(true).unwrap().message_id, 7);
         out.send(&sender, receiver.local_addr().unwrap()).unwrap();
         out.send(&sender, receiver.local_addr().unwrap()).unwrap();
@@ -5556,7 +5635,86 @@ mod tests {
             let n = receiver.recv(&mut buf).unwrap();
             assert_eq!(&buf[..n], expected.as_slice());
         }
-        assert!(Outgoing { datagrams: Vec::new() }.header(false).is_err());
+        assert!(Outgoing { datagrams: Vec::new(), oversize: None }.header(false).is_err());
+    }
+
+    /// An INFORMATIONAL request of ours on `sa` carrying a Delete of
+    /// `spis` CHILD SAs: 4 bytes each, for a message of any size wanted.
+    fn delete_request_of(sa: &CompletedSaInit, spis: u32) -> Vec<u8> {
+        let del = Delete::esp((1..=spis).collect());
+        build_informational(sa, 3, false, &[(PayloadType::Delete, del.to_bytes())], &[2u8; 8]).unwrap()
+    }
+
+    const V4_PEER: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 4500);
+    const V6_PEER: SocketAddr =
+        SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), 4500);
+
+    /// A message that fits the limit goes whole, behind the marker when
+    /// floated.
+    #[test]
+    fn prepare_sends_a_message_that_fits_whole() {
+        let (ours, _) = liveness_sa_pair();
+        let msg = delete_request_of(&ours, 1);
+        for float in [false, true] {
+            let out = prepare(&ours, msg.clone(), V4_PEER, float, DatagramLimit::DEFAULT, &mut OsEntropy::new().unwrap()).unwrap();
+            assert_eq!(out, Outgoing::whole(wrap(&msg, float)));
+        }
+    }
+
+    /// RFC 7383: a message beyond the limit goes in fragments, each in a
+    /// datagram within the limit of the outer family, the marker counted
+    /// when floated; the peer reassembles them into the message.
+    #[test]
+    fn prepare_splits_a_message_beyond_the_limit_into_fragments_within_it() {
+        let (ours, theirs) = liveness_sa_pair();
+        assert!(ours.peer_supports_fragmentation);
+        let msg = delete_request_of(&ours, 300);
+        let (_, inner) = open_from_peer(&theirs, &msg).unwrap();
+        let limit = DatagramLimit::new(300, 400).unwrap();
+        for (peer, float, ip_header) in [(V4_PEER, false, 20), (V4_PEER, true, 20), (V6_PEER, false, 40), (V6_PEER, true, 40)] {
+            let out = prepare(&ours, msg.clone(), peer, float, limit, &mut OsEntropy::new().unwrap()).unwrap();
+            let total = if peer.is_ipv4() { 300 } else { 400 };
+            assert!(out.datagrams.len() > 1, "{peer} {float}");
+            assert!(out.datagrams.iter().all(|d| ip_header + 8 + d.len() <= total), "{peer} {float}: a datagram beyond the limit");
+            assert_eq!(out.oversize, None);
+            let fragments: Vec<Vec<u8>> = out.datagrams.iter().map(|d| unwrap(d, float).unwrap()).collect();
+            let (_, got) = fragment::reassemble(ours.suite.sk_cipher(), &fragments, peer_sk_e(&theirs), peer_sk_a(&theirs)).unwrap();
+            assert_eq!(got, inner, "{peer} {float}");
+        }
+    }
+
+    /// A peer that did not negotiate fragmentation gets no SKF: the
+    /// message goes whole, and why it may go unanswered is said, with
+    /// sizes, exchange and Message ID only.
+    #[test]
+    fn prepare_sends_whole_to_a_peer_without_fragmentation_and_says_so() {
+        let (mut ours, _) = liveness_sa_pair();
+        ours.peer_supports_fragmentation = false;
+        let msg = delete_request_of(&ours, 300);
+        let out = prepare(&ours, msg.clone(), V4_PEER, true, DatagramLimit::DEFAULT, &mut OsEntropy::new().unwrap()).unwrap();
+        assert_eq!(out.datagrams, vec![wrap(&msg, true)]);
+        let expected = format!(
+            "the INFORMATIONAL request 3 went whole, {} bytes, above the 544 bytes an IKE message may take within the datagram limit, as the peer did not negotiate IKE fragmentation (RFC 7383): it may be fragmented at the IP layer or dropped",
+            msg.len()
+        );
+        assert_eq!(out.oversize.as_deref(), Some(expected.as_str()));
+        assert_eq!(out.unanswered("no response after 5 attempts"), format!("no response after 5 attempts; {expected}"));
+        assert_eq!(Outgoing::whole(msg).unanswered("no response"), "no response");
+    }
+
+    /// A message that would need more fragments than RFC 7383 allows at
+    /// the limit is refused, with its sizes, and nothing is sent.
+    #[test]
+    fn prepare_refuses_a_message_the_fragments_allowed_cannot_carry() {
+        let (ours, _) = liveness_sa_pair();
+        let msg = delete_request_of(&ours, 3000);
+        let limit = DatagramLimit::new(132, 1280).unwrap();
+        let err = prepare(&ours, msg.clone(), V4_PEER, false, limit, &mut OsEntropy::new().unwrap()).unwrap_err();
+        let DriverError::Io(err) = err else { panic!("expected an I/O error, got {err:?}") };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let text = err.to_string();
+        assert!(text.starts_with(&format!("the INFORMATIONAL request 3, {} bytes, cannot go in fragments of at most 104 bytes", msg.len())), "{text}");
+        assert!(text.contains("too many fragments"), "{text}");
     }
 
     /// [`next_addr`]'s IPv6-loopback twin, `None` on a host with no IPv6
@@ -6440,6 +6598,150 @@ mod tests {
             let wrong_a = vec![0u8; r.sa.keys.sk_ar.len()];
             r.send(&sk::build_encrypted(cipher, r.header, r.first_inner, &r.inner, &wrong_e, &wrong_a, &[3u8; 8]).unwrap());
             r.send_all();
+        });
+        assert_eq!(got.unwrap(), 0xC0FFEE);
+    }
+
+    /// `response`, a gateway's `IKE_SA_INIT` answer, without its
+    /// `IKEV2_FRAGMENTATION_SUPPORTED`: a gateway that takes no fragments.
+    fn without_fragmentation_support(response: &[u8]) -> Vec<u8> {
+        let header = IkeHeader::parse(response).unwrap();
+        let mut rebuilt = crate::ikev2::message::MessageBuilder::new(header);
+        for payload in payloads(header.next_payload, &response[IkeHeader::LEN..]) {
+            let payload = payload.unwrap();
+            let fragmentation = payload.payload_type == PayloadType::Notify
+                && Notify::parse(payload.data).unwrap().notify_type == notify_type::IKEV2_FRAGMENTATION_SUPPORTED;
+            if !fragmentation {
+                rebuilt = rebuilt.push(payload.payload_type, payload.data.to_vec());
+            }
+        }
+        rebuilt.build()
+    }
+
+    /// A gateway on `bind` through `IKE_SA_INIT`, advertising fragmentation
+    /// or not.
+    fn gateway_through_sa_init(bind: SocketAddr, fragmentation: bool) -> (UdpSocket, CompletedSaInit) {
+        let sock = UdpSocket::bind(bind).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut buf = [0u8; 4096];
+        let (n, from) = sock.recv_from(&mut buf).unwrap();
+        let secret = LocalSecret::generate(&mut OsEntropy::new().unwrap(), 32);
+        let (mut response, mut sa) = match responder_respond_natt(&buf[..n], &secret, bind, from, None).unwrap() {
+            SaInitResult::Established { response, sa } => (response, sa),
+            _ => panic!("expected Established"),
+        };
+        if !fragmentation {
+            response = without_fragmentation_support(&response);
+            sa.resp_message = response.clone();
+        }
+        assert!(sa.peer_supports_fragmentation, "ryke always offers fragmentation");
+        sock.send_to(&response, from).unwrap();
+        (sock, sa)
+    }
+
+    /// The client's request that `fragments` carry, on the gateway's `sa`,
+    /// sealed again as one `SK` message.
+    fn request_from_fragments(sa: &CompletedSaInit, fragments: &[Vec<u8>]) -> Vec<u8> {
+        let cipher = sa.suite.sk_cipher();
+        let (first, inner) = fragment::reassemble(cipher, fragments, peer_sk_e(sa), peer_sk_a(sa)).unwrap();
+        let header = IkeHeader::parse(&fragments[0]).unwrap();
+        sk::build_encrypted(cipher, header, first, &inner, peer_sk_e(sa), peer_sk_a(sa), &[5u8; 8]).unwrap()
+    }
+
+    /// The client's next request to the gateway on `sa`, as one `SK`
+    /// message, with where it came from and the datagrams it came in: one,
+    /// or its RFC 7383 fragments.
+    fn recv_request_whole(sock: &UdpSocket, sa: &CompletedSaInit) -> (Vec<u8>, SocketAddr, Vec<Vec<u8>>) {
+        let mut buf = [0u8; 4096];
+        let (n, from) = sock.recv_from(&mut buf).unwrap();
+        let first = buf[..n].to_vec();
+        if IkeHeader::parse(&first).unwrap().next_payload != PayloadType::EncryptedFragment {
+            return (first.clone(), from, vec![first]);
+        }
+        let (_, total) = fragment::peek_fragment_header(&first).unwrap();
+        let mut datagrams = vec![first];
+        while datagrams.len() < usize::from(total) {
+            let (n, _) = sock.recv_from(&mut buf).unwrap();
+            datagrams.push(buf[..n].to_vec());
+        }
+        (request_from_fragments(sa, &datagrams), from, datagrams)
+    }
+
+    /// The gateway's answer to the client's `IKE_AUTH` `request`, sent whole.
+    fn answer_auth(sock: &UdpSocket, sa: &CompletedSaInit, request: &[u8], to: SocketAddr, psk: Vec<u8>) {
+        let rcfg = AuthConfig::psk(Identification::fqdn("responder.test"), psk);
+        let (resp, _peer_id, _spi, _ic) = responder_process_auth(sa, request, &rcfg, 0xC0FFEE, &[9u8; 8], None).unwrap();
+        sock.send_to(&resp, to).unwrap();
+    }
+
+    /// Runs `gateway` and connects to it with PSK, keeping datagrams within
+    /// `limit`: `Ok` with the CHILD SA's peer SPI, or the error the connect
+    /// ended with.
+    fn connect_within(
+        limit: DatagramLimit,
+        gateway: impl FnOnce(SocketAddr, Vec<u8>) + Send + 'static,
+    ) -> Result<u32, DriverError> {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || gateway(bind, psk)
+        });
+        thread::sleep(Duration::from_millis(50));
+        let mut session = Ikev2Session::new(OsEntropy::new().unwrap()).with_datagram_limit(limit);
+        let cfg = AuthConfig::psk(Identification::fqdn("client.test"), psk);
+        let result = session
+            .connect_direct_on_port(bind, &default_ike_offer(), &cfg, false, &default_esp_offer(), next_addr().port())
+            .map(|tunnel| tunnel.peer_spi);
+        gateway.join().unwrap();
+        result
+    }
+
+    /// 160 bytes for an IPv4 datagram: an IKE message of 132 at most, on
+    /// loopback, which does not float.
+    fn small_limit() -> DatagramLimit {
+        DatagramLimit::new(160, 1280).unwrap()
+    }
+
+    /// RFC 7383 §2.5: an `IKE_AUTH` request beyond the datagram limit goes
+    /// in fragments, each within it, and the gateway reassembles it.
+    #[test]
+    fn an_ike_auth_request_beyond_the_limit_goes_in_fragments_within_it() {
+        let got = connect_within(small_limit(), |bind, psk| {
+            let (sock, sa) = gateway_through_sa_init(bind, true);
+            let (request, from, datagrams) = recv_request_whole(&sock, &sa);
+            assert!(datagrams.len() > 1, "a {}-byte request must be split", request.len());
+            assert!(datagrams.iter().all(|d| d.len() <= 132), "a fragment beyond the limit");
+            answer_auth(&sock, &sa, &request, from, psk);
+        });
+        assert_eq!(got.unwrap(), 0xC0FFEE);
+    }
+
+    /// RFC 7296 §2.1: a fragment of the request lost, the retransmission is
+    /// the same datagrams, byte for byte, not a new split.
+    #[test]
+    fn a_fragmented_ike_auth_request_is_retransmitted_byte_for_byte() {
+        let got = connect_within(small_limit(), |bind, psk| {
+            let (sock, sa) = gateway_through_sa_init(bind, true);
+            // Fragment 2 never arrives: nothing is answered.
+            let (_, _, first) = recv_request_whole(&sock, &sa);
+            let (request, from, again) = recv_request_whole(&sock, &sa);
+            assert_eq!(again, first, "the retransmission is the same datagrams");
+            answer_auth(&sock, &sa, &request, from, psk);
+        });
+        assert_eq!(got.unwrap(), 0xC0FFEE);
+    }
+
+    /// RFC 7383: no SKF to a peer that did not negotiate fragmentation.
+    /// The request goes whole, beyond the limit.
+    #[test]
+    fn an_ike_auth_request_to_a_peer_without_fragmentation_goes_whole() {
+        let got = connect_within(small_limit(), |bind, psk| {
+            let (sock, sa) = gateway_through_sa_init(bind, false);
+            let (request, from, datagrams) = recv_request_whole(&sock, &sa);
+            assert_eq!(datagrams, vec![request.clone()]);
+            assert!(request.len() > 132, "test setup: the request must be beyond the limit");
+            answer_auth(&sock, &sa, &request, from, psk);
         });
         assert_eq!(got.unwrap(), 0xC0FFEE);
     }
@@ -9146,7 +9448,7 @@ mod tests {
         sock.send_to(&response, from).unwrap();
 
         let mut responder = EapResponder::new(
-            sa,
+            sa.clone(),
             Identification::fqdn("gw.test"),
             ServerAuth::Psk(group_psk),
             user,
@@ -9154,8 +9456,11 @@ mod tests {
             0xBEEF,
         );
         loop {
-            let (n, from) = sock.recv_from(&mut buf).unwrap();
-            match responder.handle(&buf[..n], &mut entropy).unwrap() {
+            // A request beyond the default limit (a client certificate's)
+            // comes in fragments that each keep within it.
+            let (request, from, datagrams) = recv_request_whole(&sock, &sa);
+            assert!(datagrams.iter().all(|d| d.len() <= 576 - 20 - 8), "a datagram beyond the default limit");
+            match responder.handle(&request, &mut entropy).unwrap() {
                 EapEvent::Reply(m) => sock.send_to(&m, from).unwrap(),
                 EapEvent::Established(Some(m)) => {
                     sock.send_to(&m, from).unwrap();

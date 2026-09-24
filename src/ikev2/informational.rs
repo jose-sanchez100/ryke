@@ -14,14 +14,14 @@ use crate::ikev2::payload::{notify_type, Delete, Notify};
 use crate::role::Role;
 use crate::ikev2::sk::{build_encrypted, open_encrypted};
 
-fn our_sk_e(sa: &CompletedSaInit) -> &[u8] {
+pub(crate) fn our_sk_e(sa: &CompletedSaInit) -> &[u8] {
     match sa.role {
         Role::Initiator => &sa.keys.sk_ei,
         Role::Responder => &sa.keys.sk_er,
     }
 }
 
-fn our_sk_a(sa: &CompletedSaInit) -> &[u8] {
+pub(crate) fn our_sk_a(sa: &CompletedSaInit) -> &[u8] {
     match sa.role {
         Role::Initiator => &sa.keys.sk_ai,
         Role::Responder => &sa.keys.sk_ar,

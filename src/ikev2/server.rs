@@ -40,7 +40,7 @@
 //!   left incomplete for [`FRAGMENT_REASSEMBLY_TIMEOUT`] is dropped. A
 //!   response -- to a request that came whole or in fragments -- that does
 //!   not fit the [`DatagramLimit`] ([`Server::with_datagram_limit`]), nor
-//!   the largest fragment of a fragmented request (§2.4), goes out in
+//!   the largest fragment of a fragmented request (§2.5.1), goes out in
 //!   fragments that each do, when the peer negotiated fragmentation, and
 //!   whole otherwise. A retransmission of the request gets the same
 //!   datagrams again; of a fragmented one, only an authentic fragment 1
@@ -256,7 +256,7 @@ impl<E: Entropy> Server<E> {
             _ => return Ok(ServerEvent::Ignored),
         };
         // No NAT traversal here, so no non-ESP marker in front. RFC 7383
-        // §2.4: no fragment larger than those of the request either.
+        // §2.5.1: no fragment larger than those of the request either.
         let limit = self.datagram_limit.max_message_len(from.ip(), false);
         let size = request_fragment.map_or(limit, |largest| largest.min(limit));
         let response = if response.len() <= size {
@@ -1032,7 +1032,7 @@ mod tests {
         unreachable!()
     }
 
-    /// RFC 7383 §2.6 and §2.4: the server advertises IKE fragmentation in
+    /// RFC 7383 §2.3, §2.6 and §2.5.1: the server advertises IKE fragmentation in
     /// `IKE_SA_INIT`, so an `IKE_AUTH` request in fragments is reassembled
     /// -- a forged fragment ahead of the real ones changes nothing -- and
     /// answered in fragments no larger than the request's. Of a
@@ -1085,7 +1085,7 @@ mod tests {
         assert_eq!(server.child(spi_i, spi_r).unwrap().inbound.spi(), server_child_spi, "and nothing is negotiated again");
     }
 
-    /// RFC 7383 §2.4: a response to a fragmented request that fits in one of
+    /// RFC 7383 §2.5.1: a response to a fragmented request that fits in one of
     /// the request's fragments goes out whole.
     #[test]
     fn a_fragmented_request_whose_answer_fits_whole_is_answered_whole() {
@@ -1187,7 +1187,7 @@ mod tests {
         assert_eq!(server.sessions.len(), 1);
     }
 
-    /// RFC 7383 §2.4, §2.6: the fragments of a request may come lost,
+    /// RFC 7383 §2.6, §2.5.1: the fragments of a request may come lost,
     /// duplicated, out of order or altered. An altered one is dropped, a
     /// duplicate kept once, and the request is taken once it is whole
     /// whatever the order -- and answered once, in fragments no larger than
@@ -1228,7 +1228,7 @@ mod tests {
         assert_eq!(server.child(spi_i, spi_r).unwrap().inbound.spi(), child_spi, "nothing is negotiated again");
     }
 
-    /// RFC 7383 §2.3: a peer that did not negotiate fragmentation gets no
+    /// RFC 7383 §2.4: a peer that did not negotiate fragmentation gets no
     /// fragment, the response beyond the limit going whole all the same
     /// (it may then be fragmented at the IP layer, or dropped), and its
     /// retransmission gets it again.

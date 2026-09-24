@@ -2384,7 +2384,7 @@ fn send_and_retry<T>(
 ///   message under the same peer keys, so the callers, which open `SK`
 ///   messages, need not know fragments exist.
 /// - The request is retransmitted on the [`RETRY_BACKOFFS`] schedule until
-///   the whole response is in (RFC 7296 §2.1, RFC 7383 §2.6: a responder
+///   the whole response is in (RFC 7296 §2.1, RFC 7383 §2.6 and §2.6.1: a responder
 ///   answers a retransmission with its whole response again). Fragments in
 ///   hand are kept across retransmissions, since the peer resends the same
 ///   ones, and dropped when the last attempt times out.
@@ -6783,7 +6783,7 @@ mod tests {
         }
     }
 
-    /// RFC 7383 §2.6: once IKE fragmentation is negotiated -- ryke always
+    /// RFC 7383 §2.4, §2.6: once IKE fragmentation is negotiated -- ryke always
     /// advertises it -- any later exchange of the IKE SA may come
     /// fragmented, not only `IKE_AUTH`. A DPD probe answered in fragments
     /// used to go unrecognised, three times over, and read as a dead peer.

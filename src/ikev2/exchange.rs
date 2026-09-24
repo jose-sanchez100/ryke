@@ -85,8 +85,8 @@ pub struct CompletedSaInit {
     /// means the peer forbids Digital Signature auth.
     pub peer_signature_hashes: Vec<u16>,
     /// Whether the peer's `IKE_SA_INIT` advertised `IKEV2_FRAGMENTATION_SUPPORTED`
-    /// (RFC 7383 §2.4). A caller MUST NOT send it SKF fragments unless this is
-    /// true.
+    /// (RFC 7383 §2.3). A caller MUST NOT send it SKF fragments unless this is
+    /// true (§2.4).
     pub peer_supports_fragmentation: bool,
 }
 
@@ -136,7 +136,7 @@ struct SaInitPayloads {
     /// The peer's `NAT_DETECTION_SOURCE_IP` notify data, if it sent one.
     nat_source: Option<Vec<u8>>,
     /// Whether the sender advertised `IKEV2_FRAGMENTATION_SUPPORTED` (RFC 7383
-    /// §2.4): a message MUST NOT be fragmented to a peer unless it announced
+    /// §2.3); by §2.4 a message MUST NOT be fragmented to a peer unless it announced
     /// support for reassembling fragments here.
     fragmentation_supported: bool,
 }
@@ -251,7 +251,7 @@ fn sighash_notify() -> Notify {
     Notify::status(notify_type::SIGNATURE_HASH_ALGORITHMS, data)
 }
 
-/// The `IKEV2_FRAGMENTATION_SUPPORTED` notify (RFC 7383 §2.4, empty payload),
+/// The `IKEV2_FRAGMENTATION_SUPPORTED` notify (RFC 7383 §2.3, empty payload),
 /// which every `IKE_SA_INIT` built here carries. The routes that use it
 /// ([`crate::Ikev2Session`] and its [`crate::LivenessSession`],
 /// [`crate::ikev2::client::Client`], [`crate::ikev2::server::Server`])
@@ -938,7 +938,7 @@ mod tests {
 
     #[test]
     fn sa_init_advertises_and_captures_fragmentation_support() {
-        // RFC 7383 §2.4: both sides always advertise
+        // RFC 7383 §2.3: both sides always advertise
         // IKEV2_FRAGMENTATION_SUPPORTED, and each records the other's.
         let request = initiator_request(&init_secret(), &default_offer());
         let (response, resp_done) = responder_respond(&request, &resp_secret()).unwrap();

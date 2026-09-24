@@ -298,7 +298,7 @@ mod tests {
         assert!(client.enable_natt_encap(true).is_err(), "floated with no port-4500 socket must error, not silently no-op");
     }
 
-    /// RFC 7383 §2.6: the client advertises IKE fragmentation in
+    /// RFC 7383 §2.3, §2.6: the client advertises IKE fragmentation in
     /// `IKE_SA_INIT`, so an `IKE_AUTH` response in fragments must be
     /// reassembled -- a forged fragment ahead of the real ones changing
     /// nothing. It used to be handed whole to `initiator_verify_auth`,

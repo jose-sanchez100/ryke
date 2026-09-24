@@ -1375,6 +1375,57 @@ mod tests {
         }
     }
 
+    /// RFC 7296 §3.3.2, §3.3.3: Transform Type 5 (ESN) is used in AH and ESP, not in IKE, whose
+    /// mandatory types are ENCR, PRF, INTEG and D-H. Some initiators add one to an IKE proposal all
+    /// the same; that was always taken as noise, and it is decided to stay so: the responder weighs
+    /// the proposal on the four types IKE negotiates, whatever the ESN transform is or carries (a
+    /// Key Length §3.3.5 forbids on it, an attribute we cannot read, ESN turned on), and answers
+    /// without it -- there is no ESN to choose in an IKE SA, so nothing to return "unmodified"
+    /// (§3.3.6). The initiator, which never offers one, takes back no answer that names one.
+    #[test]
+    fn an_esn_transform_in_an_ike_proposal_is_left_out_whatever_it_carries() {
+        use crate::ikev2::payload::test_wire::{proposal, sa, transform, KEY_LENGTH_128, KEY_LENGTH_256, UNKNOWN_ATTRIBUTE};
+        let gcm = || transform(transform_type::ENCR, transform_id::AES_GCM_16, &KEY_LENGTH_256);
+        let prf = || transform(transform_type::PRF, transform_id::PRF_HMAC_SHA2_256, &[]);
+        let dh = || transform(transform_type::DH, transform_id::X25519, &[]);
+        let esn = |id: u16, attributes: &[u8]| transform(transform_type::ESN, id, attributes);
+        let ike = |num: u8, transforms: &[Vec<u8>]| proposal(num, protocol_id::IKE, &[], transforms);
+        let with = |extra: &[Vec<u8>]| [&[gcm(), prf(), dh()][..], extra].concat();
+        let respond = |proposals: &[Vec<u8>]| responder_respond(&raw_sa_init(&sa(proposals), false), &resp_secret());
+        let answered_esn = |response: &[u8]| {
+            let header = IkeHeader::parse(response).unwrap();
+            let answer = parse_sa_init(&header, &response[IkeHeader::LEN..]).unwrap().sa;
+            answer.proposals[0].transforms.iter().filter(|t| t.transform_type == transform_type::ESN).count()
+        };
+
+        let cases = [
+            ("ESN NONE", vec![esn(transform_id::ESN_NONE, &[])]),
+            ("ESN turned on", vec![esn(transform_id::ESN_ENABLED, &[])]),
+            ("both ESN values", vec![esn(transform_id::ESN_NONE, &[]), esn(transform_id::ESN_ENABLED, &[])]),
+            ("an ESN with a Key Length", vec![esn(transform_id::ESN_NONE, &KEY_LENGTH_128)]),
+            ("an ESN we cannot read", vec![esn(transform_id::ESN_NONE, &UNKNOWN_ATTRIBUTE)]),
+        ];
+        for (what, extra) in &cases {
+            let (response, chosen) = respond(&[ike(1, &with(extra))]).unwrap_or_else(|e| panic!("responder: {what}: {e:?}"));
+            assert_eq!((chosen.suite.proposal_num, answered_esn(&response)), (1, 0), "responder: {what}, answered without it");
+        }
+        // It rescues nothing: the proposal is judged on the types IKE negotiates.
+        let no_dh = [gcm(), prf(), esn(transform_id::ESN_NONE, &[])];
+        assert_eq!(respond(&[ike(1, &no_dh)]).map(|_| ()), Err(IkeError::NoProposalChosen), "responder: an ESN does not stand for the missing D-H");
+        // And it does not sink the proposal either, next to the one that is refused.
+        let (_, next) = respond(&[ike(1, &no_dh), ike(2, &with(&[esn(transform_id::ESN_NONE, &KEY_LENGTH_128)]))]).unwrap();
+        assert_eq!(next.suite.proposal_num, 2);
+
+        // The initiator's side: an answer that names an ESN is not the proposal we offered.
+        let init = init_secret();
+        let request = initiator_request(&init, &default_offer());
+        let complete = |transforms: &[Vec<u8>]| initiator_complete(&init, &request, &raw_sa_init(&sa(&[ike(1, transforms)]), true)).map(|_| ());
+        assert_eq!(complete(&with(&[])), Ok(()), "initiator: control");
+        for (what, extra) in &cases {
+            assert_eq!(complete(&with(extra)), Err(IkeError::NoProposalChosen), "initiator: {what} in the answer");
+        }
+    }
+
     #[test]
     fn responder_rejects_wrong_ke_group() {
         // SA offers X25519 (accepted) but the KE payload claims MODP-2048.

@@ -787,6 +787,50 @@ mod tests {
         }
     }
 
+    /// RFC 7296 §3.3.2, §3.3.3: ESN (Transform Type 5) is not an IKE transform, and an IKE SA
+    /// rekey is judged as `IKE_SA_INIT` is (`exchange.rs`): an ESN transform in the proposal, with
+    /// whatever it carries, is left out of the answer and decides nothing; the initiator takes back
+    /// no answer that names one, as it never offers one.
+    #[test]
+    fn an_esn_transform_in_an_ike_rekey_proposal_is_left_out_whatever_it_carries() {
+        use crate::ikev2::payload::{transform_id, transform_type, Transform};
+
+        let (init_sa, resp_sa) = sa_pair();
+        let group = DhGroup::from_transform_id(init_sa.suite.dh_id).unwrap();
+        let ke = || Some(KeyExchange { dh_group: group.transform_id(), data: group.public(&[3u8; 32]) });
+        let plain = ike_rekey_proposal(&init_sa, false);
+        let esn = |id: u16, key_length: Option<u16>| Transform { transform_type: transform_type::ESN, transform_id: id, key_length };
+        let with = |extra: &[Transform]| Proposal { transforms: [plain.transforms.clone(), extra.to_vec()].concat(), ..plain.clone() };
+        let cases = [
+            ("ESN NONE", vec![esn(transform_id::ESN_NONE, None)]),
+            ("ESN turned on", vec![esn(transform_id::ESN_ENABLED, None)]),
+            ("both ESN values", vec![esn(transform_id::ESN_NONE, None), esn(transform_id::ESN_ENABLED, None)]),
+            ("an ESN with a Key Length", vec![esn(transform_id::ESN_NONE, Some(128))]),
+            ("an ESN we cannot read", vec![esn(transform_id::UNUSABLE, None)]),
+        ];
+
+        let answer = |proposal: Proposal| responder_process_ike_rekey(&resp_sa, &ike_rekey_message_with(&init_sa, false, vec![proposal], ke()), 0x99, &[9u8; 32], &[0x66u8; 32], &[2u8; 8]);
+        assert!(answer(plain.clone()).is_ok(), "control");
+        for (what, extra) in &cases {
+            let (response, new_sa) = answer(with(extra)).unwrap_or_else(|e| panic!("responder: {what}: {e:?}"));
+            let (first, inner) = open_encrypted(init_sa.suite.sk_cipher(), &response, peer_sk_e(&init_sa), peer_sk_a(&init_sa)).unwrap();
+            let sa = payloads(first, &inner).map(Result::unwrap).find(|p| p.payload_type == PayloadType::SecurityAssociation).unwrap();
+            let answered = SecurityAssociation::parse(sa.data).unwrap().proposals.remove(0);
+            assert!(answered.transforms.iter().all(|t| t.transform_type != transform_type::ESN), "responder: {what}, answered without it");
+            assert_eq!(new_sa.suite.proposal_num, plain.num, "responder: {what}");
+        }
+
+        let (ni, dh, new_spi_i) = ([0x55u8; 32], [3u8; 32], 0xAABB_CCDD_1122_3344);
+        let ke = || Some(KeyExchange { dh_group: group.transform_id(), data: group.public(&[9u8; 32]) });
+        let complete = |proposal: Proposal| initiator_complete_ike_rekey(&init_sa, &ni, new_spi_i, &dh, &ike_rekey_message_with(&resp_sa, true, vec![proposal], ke())).map(|_| ());
+        let ours = ike_rekey_proposal(&resp_sa, false);
+        assert_eq!(complete(ours.clone()), Ok(()), "initiator: control");
+        for (what, extra) in &cases {
+            let named = Proposal { transforms: [ours.transforms.clone(), extra.clone()].concat(), ..ours.clone() };
+            assert_eq!(complete(named), Err(IkeError::NoProposalChosen), "initiator: {what} in the answer");
+        }
+    }
+
     /// RFC 7296 §3.3.1: each proposal of an IKE SA rekey carries the SPI the
     /// initiator wants for the new SA *if that proposal is the one chosen*, so
     /// the responder keys the new SA on the SPI of the proposal it picked -- not

@@ -1451,10 +1451,15 @@ pub(crate) mod tests {
     /// attribute we cannot read (ENCR, INTEG, ESN) is unacceptable, so a
     /// proposal that has it -- and no other of its type -- is passed over for
     /// the next one, and one that has it next to a plain one is answered with
-    /// the plain one. Only DH is passed over whatever it carries, because a DH
-    /// group has no place in SAi2 to begin with (§1.2: "cannot contain ... any
-    /// value other than NONE"): a leniency this crate always had, not a rule.
-    /// And the forged SAr2 that names them is not our proposal.
+    /// the plain one. A DH *group* is passed over whatever it carries, because it
+    /// has no place in SAi2 to begin with (§1.2: "cannot contain ... any value
+    /// other than NONE"): a leniency this crate always had, not a rule -- and so
+    /// is a DH transform we cannot read, whatever ID it named (the parsed
+    /// `SecurityAssociation` keeps only [`transform_id::UNUSABLE`] of it, which is
+    /// no NONE). A DH NONE that carries a Key Length is the exception: NONE is
+    /// the one value SAi2 may hold, and with the attribute §3.3.5 forbids it is
+    /// unacceptable like the other NONEs. And the forged SAr2 that names them is
+    /// not our proposal.
     #[test]
     fn the_ike_auth_sa_payloads_take_no_transform_with_a_key_length_it_must_not_have_or_an_attribute_it_cannot_read() {
         use crate::ikev2::payload::test_wire::{proposal, sa, transform, KEY_LENGTH_128, KEY_LENGTH_256, UNKNOWN_ATTRIBUTE};
@@ -1483,6 +1488,7 @@ pub(crate) mod tests {
             ("an ENCR we cannot read", esp(1, &[transform(transform_type::ENCR, transform_id::AES_GCM_16, &UNKNOWN_ATTRIBUTE), esn_none()])),
             ("an INTEG we cannot read", esp(1, &[gcm(), transform(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, &UNKNOWN_ATTRIBUTE), esn_none()])),
             ("an ESN we cannot read", esp(1, &[gcm(), transform(transform_type::ESN, transform_id::ESN_NONE, &UNKNOWN_ATTRIBUTE)])),
+            ("a DH NONE with a Key Length", esp(1, &[gcm(), transform(transform_type::DH, 0, &KEY_LENGTH_128), esn_none()])),
         ];
         for (what, bad) in &refused {
             let (resp, sar2, peer_spi) = answer(std::slice::from_ref(bad));
@@ -1496,6 +1502,7 @@ pub(crate) mod tests {
             ("an ESN NONE", vec![gcm(), transform(transform_type::ESN, transform_id::ESN_NONE, &KEY_LENGTH_128), esn_none()], vec![GCM256, ESN_NONE]),
             ("an ESN we cannot read", vec![gcm(), transform(transform_type::ESN, transform_id::ESN_NONE, &UNKNOWN_ATTRIBUTE), esn_none()], vec![GCM256, ESN_NONE]),
             ("an INTEG we cannot read", vec![gcm(), transform(transform_type::INTEG, transform_id::AUTH_HMAC_SHA2_256_128, &UNKNOWN_ATTRIBUTE), transform(transform_type::INTEG, transform_id::INTEG_NONE, &[]), esn_none()], vec![GCM256, (transform_type::INTEG, transform_id::INTEG_NONE, None), ESN_NONE]),
+            ("a DH NONE", vec![gcm(), transform(transform_type::DH, 0, &KEY_LENGTH_128), transform(transform_type::DH, 0, &[]), esn_none()], vec![GCM256, (transform_type::DH, 0, None), ESN_NONE]),
         ] {
             // The order of the transforms in a proposal is not significant (§3.3), so it is not compared.
             let (_, sar2, peer_spi) = answer(&[esp(1, &transforms)]);
@@ -1531,6 +1538,7 @@ pub(crate) mod tests {
             ("an ESN we cannot read added", answered(&[gcm(), esn_none(), transform(transform_type::ESN, transform_id::ESN_NONE, &UNKNOWN_ATTRIBUTE)])),
             ("an ENCR we cannot read added", answered(&[gcm(), transform(transform_type::ENCR, transform_id::AES_GCM_16, &UNKNOWN_ATTRIBUTE), esn_none()])),
             ("an INTEG NONE with a Key Length added", answered(&[gcm(), transform(transform_type::INTEG, transform_id::INTEG_NONE, &KEY_LENGTH_128), esn_none()])),
+            ("a DH NONE with a Key Length added", answered(&[gcm(), transform(transform_type::DH, 0, &KEY_LENGTH_128), esn_none()])),
         ];
         for (what, sar2) in cases {
             assert_eq!(verify(sar2), Err(IkeError::NoProposalChosen), "{what}");

@@ -37,12 +37,14 @@
 //! - IKE fragmentation (RFC 7383), which `IKE_SA_INIT` always advertises:
 //!   a fragmented request is reassembled, each fragment authenticated
 //!   before it is kept ([`crate::ikev2::fragment::Reassembly`]), and one
-//!   left incomplete for [`FRAGMENT_REASSEMBLY_TIMEOUT`] is dropped. A
-//!   response -- to a request that came whole or in fragments -- that does
-//!   not fit the [`DatagramLimit`] ([`Server::with_datagram_limit`]), nor
-//!   the largest fragment of a fragmented request (§2.5.1), goes out in
-//!   fragments that each do, when the peer negotiated fragmentation, and
-//!   whole otherwise. A retransmission of the request gets the same
+//!   left incomplete for [`FRAGMENT_REASSEMBLY_TIMEOUT`] is dropped. When
+//!   the peer negotiated fragmentation, the response to a fragmented
+//!   request goes in fragments too, a single one if it fits (§2.4), none
+//!   larger than the request's largest (§2.5.1) nor the [`DatagramLimit`]
+//!   ([`Server::with_datagram_limit`]); the response to a request that
+//!   came whole goes in fragments only if it does not fit the limit. To a
+//!   peer that did not negotiate fragmentation, every response goes whole.
+//!   A retransmission of the request gets the same
 //!   datagrams again; of a fragmented one, only an authentic fragment 1
 //!   does, any other fragment nothing (§2.6.1). There is no path MTU
 //!   discovery;
@@ -159,7 +161,8 @@ impl<E: Entropy> Server<E> {
     /// Fit our answers to `limit` rather than [`DatagramLimit::DEFAULT`]:
     /// one that would not fit goes in RFC 7383 fragments, each in a datagram
     /// within it, when the peer negotiated fragmentation -- whether its
-    /// request came whole or in fragments. `IKE_SA_INIT` is never
+    /// request came whole or in fragments (the answer to a fragmented
+    /// request goes in fragments whatever its size). `IKE_SA_INIT` is never
     /// fragmented. The limit is a fixed figure; there is no path MTU
     /// discovery.
     pub fn with_datagram_limit(mut self, limit: DatagramLimit) -> Self {
@@ -223,11 +226,15 @@ impl<E: Entropy> Server<E> {
         self.answer(key, &header, data, from, None)
     }
 
-    /// Answer the request `data` with the next Message ID: whole when the
-    /// response fits the [`DatagramLimit`] -- and, when the request came in
-    /// fragments, the largest of them, `request_fragment` -- otherwise in
-    /// fragments that each do, if the peer negotiated them. The datagrams
-    /// sent are kept, and a retransmission of the request gets them again.
+    /// Answer the request `data` with the next Message ID. A request that
+    /// came whole gets its response whole when it fits the
+    /// [`DatagramLimit`], otherwise in fragments that each do, if the peer
+    /// negotiated them. A request that came in fragments, the largest of
+    /// them `request_fragment`, gets its response in fragments no larger
+    /// than that nor the limit -- a single one if it fits (RFC 7383 §2.4,
+    /// §2.5.1) -- if the peer negotiated them, and whole otherwise. The
+    /// datagrams sent are kept, and a retransmission of the request gets
+    /// them again.
     fn answer(
         &mut self,
         key: (u64, u64),
@@ -258,8 +265,17 @@ impl<E: Entropy> Server<E> {
         // No NAT traversal here, so no non-ESP marker in front. RFC 7383
         // §2.5.1: no fragment larger than those of the request either.
         let limit = self.datagram_limit.max_message_len(from.ip(), false);
-        let size = request_fragment.map_or(limit, |largest| largest.min(limit));
-        let response = if response.len() <= size {
+        // A fragment of the request smaller than any of ours could be (one
+        // with next to no content) sets no bound below that.
+        let floor = fragment::min_fragment_message_len(sa.suite.sk_cipher());
+        let size = request_fragment.map_or(limit, |largest| largest.max(floor).min(limit));
+        // §2.4: the answer to a fragmented request goes in the same form --
+        // one SKF 1 of 1 if it fits -- since no other guideline there applies
+        // to it: the peer fragmented the request, so fragmentation at the IP
+        // layer was not unlikely. Never to a peer that did not advertise
+        // support, even if it sent fragments.
+        let same_form = request_fragment.is_some() && sa.peer_supports_fragmentation;
+        let response = if response.len() <= size && !same_form {
             vec![response]
         } else if !sa.peer_supports_fragmentation {
             ike_debug!(
@@ -1085,13 +1101,56 @@ mod tests {
         assert_eq!(server.child(spi_i, spi_r).unwrap().inbound.spi(), server_child_spi, "and nothing is negotiated again");
     }
 
-    /// RFC 7383 §2.5.1: a response to a fragmented request that fits in one of
-    /// the request's fragments goes out whole.
+    /// RFC 7383 §2.4: a response to a fragmented request goes in the same
+    /// form, a single SKF, Fragment Number 1 of 1, when it fits in one no
+    /// larger than the request's (§2.5.1). Of a retransmission of the
+    /// request, only an authentic fragment 1 gets that same datagram again,
+    /// and nothing is done twice (§2.6.1, RFC 7296 §2.1).
     #[test]
-    fn a_fragmented_request_whose_answer_fits_whole_is_answered_whole() {
+    fn a_fragmented_request_whose_answer_fits_one_fragment_is_answered_in_one() {
         let (mut server, addr) = server();
         let peer = establish(&mut server, addr);
         let (spi_i, spi_r) = peer.key();
+        let note = Notify::status(40_000, vec![0x5a; 300]);
+        let request = build_informational(&peer.sa, 2, false, &[(PayloadType::Notify, note.to_bytes())], &[2u8; 8]).unwrap();
+        let fragments = peer_fragments(&peer.sa, &request, 3, 20);
+        let largest = fragments.iter().map(Vec::len).max().unwrap();
+        for f in &fragments[..2] {
+            peer.sock.send_to(f, addr).unwrap();
+            assert_eq!(server.handle_one().unwrap(), ServerEvent::FragmentStored { spi_i, spi_r });
+        }
+        peer.sock.send_to(&fragments[2], addr).unwrap();
+        assert_eq!(server.handle_one().unwrap(), ServerEvent::Informational { spi_i, spi_r });
+        let answer = recv_all(&peer.sock);
+        assert_eq!(answer.len(), 1, "one fragment");
+        assert!(answer[0].len() <= largest, "no larger than those of the request");
+        let header = IkeHeader::parse(&answer[0]).unwrap();
+        assert_eq!((header.exchange_type, header.message_id, header.next_payload), (ExchangeType::Informational, 2, PayloadType::EncryptedFragment));
+        let cipher = peer.sa.suite.sk_cipher();
+        assert_eq!(fragment::verify_fragment(cipher, &answer[0], &peer.sa.keys.sk_er, &peer.sa.keys.sk_ar).unwrap(), (1, 1));
+        let (_, payloads) = peer.open(&reassembled(&peer.sa, &answer));
+        assert!(payloads.is_empty());
+        assert_eq!(server.sessions[&(spi_i, spi_r)].next_request_id, 3);
+
+        for other in [fragments[1].clone(), fragments[2].clone(), forged(fragments[0].clone())] {
+            peer.sock.send_to(&other, addr).unwrap();
+            assert_eq!(server.handle_one().unwrap(), ServerEvent::Ignored);
+        }
+        assert!(recv_all(&peer.sock).is_empty(), "only fragment 1 of a request answered gets the answer again");
+        peer.sock.send_to(&fragments[0], addr).unwrap();
+        assert_eq!(server.handle_one().unwrap(), ServerEvent::Retransmitted { spi_i, spi_r });
+        assert_eq!(recv_all(&peer.sock), answer, "the very same datagram");
+        assert_eq!(server.sessions[&(spi_i, spi_r)].next_request_id, 3, "and the request is not taken again");
+    }
+
+    /// RFC 7383 §2.4: a peer that did not negotiate fragmentation gets its
+    /// answer whole even when it sent the request in fragments.
+    #[test]
+    fn a_fragmented_request_from_a_peer_without_fragmentation_is_answered_whole() {
+        let (mut server, addr) = server();
+        let peer = establish(&mut server, addr);
+        let (spi_i, spi_r) = peer.key();
+        server.sessions.get_mut(&(spi_i, spi_r)).unwrap().sa.peer_supports_fragmentation = false;
         let note = Notify::status(40_000, vec![0x5a; 300]);
         let request = build_informational(&peer.sa, 2, false, &[(PayloadType::Notify, note.to_bytes())], &[2u8; 8]).unwrap();
         let fragments = peer_fragments(&peer.sa, &request, 3, 20);
@@ -1099,10 +1158,12 @@ mod tests {
             peer.sock.send_to(f, addr).unwrap();
             assert_eq!(server.handle_one().unwrap(), ServerEvent::FragmentStored { spi_i, spi_r });
         }
-        let (event, reply) = peer.send(&mut server, &fragments[2]);
-        assert_eq!(event.unwrap(), ServerEvent::Informational { spi_i, spi_r });
-        let (header, payloads) = peer.open(&reply.expect("the request is answered"));
-        assert_eq!((header.exchange_type, header.message_id, header.next_payload), (ExchangeType::Informational, 2, PayloadType::Encrypted));
+        peer.sock.send_to(&fragments[2], addr).unwrap();
+        assert_eq!(server.handle_one().unwrap(), ServerEvent::Informational { spi_i, spi_r });
+        let answer = recv_all(&peer.sock);
+        assert_eq!(answer.len(), 1);
+        let (header, payloads) = peer.open(&answer[0]);
+        assert_eq!((header.message_id, header.next_payload), (2, PayloadType::Encrypted));
         assert!(payloads.is_empty());
     }
 

@@ -124,8 +124,10 @@
 //! (in IKEv1, Main Mode only), one CHILD SA at a time, no EAP or XAUTH, no
 //! NAT-T, and never an exchange of their own. Their module docs list what
 //! they do. The IKEv2 one reassembles a request that comes in fragments,
-//! and answers beyond its [`DatagramLimit`] in fragments -- no larger than
-//! the request's, when it came in fragments -- if the peer negotiated them.
+//! and, if the peer negotiated fragmentation, answers it in fragments no
+//! larger than the request's -- a single one if it fits (RFC 7383 §2.4) --
+//! and a request that came whole in fragments only beyond its
+//! [`DatagramLimit`].
 //!
 //! [`ikev2::client::Client`] is the matching minimal IKEv2 initiator: the
 //! handshake, nothing after it. It reassembles a fragmented `IKE_AUTH`

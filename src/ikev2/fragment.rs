@@ -535,6 +535,14 @@ pub fn fragment_message(cipher: SkCipher, message: &[u8], sk_e: &[u8], sk_a: &[u
 /// (SKF header) + 16 (IV) + 32 (ICV) and a whole 16-byte block.
 const MIN_FRAGMENT_MESSAGE_LEN: usize = 100;
 
+/// The smallest IKE message [`fragment_message`] can put content in under
+/// `cipher`: the IKE header, the SKF payload with its IV and ICV, and one
+/// byte of content with the Pad Length (for CBC, a whole block).
+pub(crate) fn min_fragment_message_len(cipher: SkCipher) -> usize {
+    let (iv_len, content) = if cipher.is_aead() { (IV_LEN, 2) } else { (cipher.block_len(), cipher.block_len()) };
+    IkeHeader::LEN + 4 + SKF_EXTRA + iv_len + cipher.icv_len() + content
+}
+
 const IPV4_HEADER_LEN: usize = 20; // without options
 const IPV6_HEADER_LEN: usize = 40; // without extension headers
 const UDP_HEADER_LEN: usize = 8;
@@ -951,6 +959,29 @@ mod tests {
                 assert_eq!(reassemble(cipher, &frags, &sk_e, &sk_a).unwrap(), (PayloadType::IdInitiator, inner.clone()));
             }
             assert!(fragment_message(cipher, &whole, &sk_e, &sk_a, 7, 60).is_err(), "no room for any content");
+        }
+    }
+
+    /// [`min_fragment_message_len`] is, for every cipher, the size at which
+    /// [`fragment_message`] first carries content, and never above
+    /// [`MIN_FRAGMENT_MESSAGE_LEN`].
+    #[test]
+    fn min_fragment_message_len_is_the_smallest_that_carries_content() {
+        use IntegAlgorithm::*;
+        let integs = [HmacMd5_96, HmacSha1_96, HmacSha2_256_128, HmacSha2_384_192, HmacSha2_512_256];
+        let ciphers = aead_ciphers().into_iter().chain(integs.iter().flat_map(|&i| {
+            [SkCipher::Aes128Cbc(i), SkCipher::Aes192Cbc(i), SkCipher::Aes256Cbc(i), SkCipher::TripleDesCbc(i)]
+        }));
+        for cipher in ciphers {
+            let (sk_e, sk_a) = keys_for(cipher);
+            let inner = vec![9u8; 40];
+            let whole = crate::ikev2::sk::build_encrypted(cipher, header(), PayloadType::IdInitiator, &inner, &sk_e, &sk_a, &[1u8; 8]).unwrap();
+            let min = min_fragment_message_len(cipher);
+            assert!(min <= MIN_FRAGMENT_MESSAGE_LEN, "{cipher:?}");
+            let frags = fragment_message(cipher, &whole, &sk_e, &sk_a, 7, min).unwrap();
+            assert!(frags.iter().all(|f| f.len() <= min), "{cipher:?}");
+            assert_eq!(reassemble(cipher, &frags, &sk_e, &sk_a).unwrap().1, inner, "{cipher:?}");
+            assert!(fragment_message(cipher, &whole, &sk_e, &sk_a, 7, min - 1).is_err(), "{cipher:?}");
         }
     }
 

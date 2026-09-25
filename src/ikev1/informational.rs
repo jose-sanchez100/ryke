@@ -289,6 +289,7 @@ pub enum Liveness {
 }
 
 /// Outcome [`watch`] classifies an incoming datagram into.
+#[derive(Debug, PartialEq, Eq)]
 enum Seen {
     /// Nothing decisive arrived before the deadline (possibly after
     /// auto-acking one or more incoming R-U-THERE probes along the way).
@@ -299,6 +300,35 @@ enum Seen {
     /// An R-U-THERE-ACK matching the sequence number `watch` was told to
     /// expect (only possible when called from [`probe`]).
     AckMatched,
+}
+
+/// What an authenticated ESP Delete from the peer naming `spi` means for the
+/// CHILD SAs in use, and the trace line that says so. The peer names its own
+/// inbound SPI (the convention `build_delete` follows for ours), which is the
+/// SPI we send ESP to: `current_peer_spi` and
+/// `current_peer_spi_ipv6` are those, so the line calls them `spi_out`, as the
+/// "complete" lines of Quick Mode do, never `spi_in` (our own inbound SPI).
+fn peer_esp_delete(spi: &[u8], current_peer_spi: u32, current_peer_spi_ipv6: Option<u32>) -> (Option<Seen>, String) {
+    let named = <[u8; 4]>::try_from(spi).ok().map(u32::from_be_bytes);
+    if named == Some(current_peer_spi) {
+        if current_peer_spi_ipv6.is_some() {
+            let note = format!("INFORMATIONAL: peer deleted the primary CHILD SA (spi_out={current_peer_spi:08x}) while the IPv6 one is still up -- renegotiating it instead of tearing down");
+            (Some(Seen::ChildDeleted(ChildFamily::Primary)), note)
+        } else {
+            let note = format!("INFORMATIONAL: peer sent an ESP Delete for the CHILD SA in use (spi_out={current_peer_spi:08x}) -- tunnel torn down by the gateway");
+            (Some(Seen::PeerTornDown), note)
+        }
+    } else if let Some(v6) = current_peer_spi_ipv6.filter(|v6| named == Some(*v6)) {
+        let note = format!("INFORMATIONAL: peer deleted the IPv6 CHILD SA (spi_out={v6:08x}) while the primary is still up -- renegotiating it instead of tearing down");
+        (Some(Seen::ChildDeleted(ChildFamily::Ipv6)), note)
+    } else {
+        let note = format!(
+            "INFORMATIONAL: ignoring peer ESP Delete for spi={} (the CHILD SA(s) in use are spi_out={current_peer_spi:08x}{})",
+            named.map_or_else(|| "<malformed>".to_string(), |v| format!("{v:08x}")),
+            current_peer_spi_ipv6.map_or_else(String::new, |v| format!("/{v:08x}"))
+        );
+        (None, note)
+    }
 }
 
 /// Bounded (by `timeout`) watch of `sock` for encrypted Informational
@@ -391,26 +421,9 @@ fn watch(
                     Some(Seen::PeerTornDown)
                 }
                 Some((proto, spi)) if proto == protocol::ESP => {
-                    let named = <[u8; 4]>::try_from(spi).ok().map(u32::from_be_bytes);
-                    if named == Some(current_peer_spi) {
-                        if current_peer_spi_ipv6.is_some() {
-                            ike_debug!("INFORMATIONAL: peer deleted the primary CHILD SA (spi_in={current_peer_spi:08x}) while the IPv6 one is still up -- renegotiating it instead of tearing down");
-                            Some(Seen::ChildDeleted(ChildFamily::Primary))
-                        } else {
-                            ike_debug!("INFORMATIONAL: peer sent an ESP Delete for the CHILD SA in use (spi_in={current_peer_spi:08x}) -- tunnel torn down by the gateway");
-                            Some(Seen::PeerTornDown)
-                        }
-                    } else if current_peer_spi_ipv6.is_some() && named == current_peer_spi_ipv6 {
-                        ike_debug!("INFORMATIONAL: peer deleted the IPv6 CHILD SA (spi_in={:08x}) while the primary is still up -- renegotiating it instead of tearing down", named.unwrap());
-                        Some(Seen::ChildDeleted(ChildFamily::Ipv6))
-                    } else {
-                        ike_debug!(
-                            "INFORMATIONAL: ignoring peer ESP Delete for spi={} (the CHILD SA(s) in use are spi_in={current_peer_spi:08x}{})",
-                            named.map_or_else(|| "<malformed>".to_string(), |v| format!("{v:08x}")),
-                            current_peer_spi_ipv6.map_or_else(String::new, |v| format!("/{v:08x}"))
-                        );
-                        None
-                    }
+                    let (seen, note) = peer_esp_delete(spi, current_peer_spi, current_peer_spi_ipv6);
+                    ike_debug!("{note}");
+                    seen
                 }
                 _ => None,
             };
@@ -591,6 +604,29 @@ mod tests {
         initiate_aggressive, respond_aggressive, Ikev1ExchangeMode, Ikev1LocalAuth, InitiatorConfig, Phase1Config,
     };
     use crate::ikev2::sk::SkCipher;
+
+    /// A peer's ESP Delete names the peer's inbound SPI -- the one we send to --
+    /// and the trace line calls it that (`spi_out`), whichever SA it names; the
+    /// classification is unchanged.
+    #[test]
+    fn a_peer_esp_delete_is_traced_by_the_spi_we_send_to() {
+        let (primary, v6, ours) = (0x1111_1111u32, 0x2222_2222u32, 0x3333_3333u32);
+        let cases: [(u32, Option<u32>, Option<Seen>, &str); 4] = [
+            (primary, None, Some(Seen::PeerTornDown), "spi_out=11111111"),
+            (primary, Some(v6), Some(Seen::ChildDeleted(ChildFamily::Primary)), "spi_out=11111111"),
+            (v6, Some(v6), Some(Seen::ChildDeleted(ChildFamily::Ipv6)), "spi_out=22222222"),
+            (ours, Some(v6), None, "spi_out=11111111/22222222"),
+        ];
+        for (named, ipv6, want, label) in cases {
+            let (seen, note) = peer_esp_delete(&named.to_be_bytes(), primary, ipv6);
+            assert_eq!(seen, want, "{note}");
+            assert!(note.contains(label), "{note}");
+            assert!(!note.contains("spi_in"), "the SPI a peer's Delete names is not ours: {note}");
+        }
+        let (seen, note) = peer_esp_delete(&[1, 2, 3], primary, None);
+        assert_eq!(seen, None);
+        assert!(note.contains("<malformed>") && !note.contains("spi_in"), "{note}");
+    }
 
     fn phase1_pair() -> (Phase1State, Phase1State) {
         let psk = b"correct horse battery staple".to_vec();

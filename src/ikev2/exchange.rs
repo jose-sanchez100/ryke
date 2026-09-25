@@ -947,6 +947,30 @@ mod tests {
         assert!(init_done.peer_supports_fragmentation, "initiator must see the responder's notify");
     }
 
+    /// RFC 7296 §3.10, as the rfc-editor's rendering with its Verified
+    /// errata reads: "For a notification concerning the IKE SA, the SPI Size
+    /// MUST be zero and the SPI field must be empty." The
+    /// IKEV2_FRAGMENTATION_SUPPORTED notify (RFC 7383 §2.3) concerns the IKE
+    /// SA, so both sides send it that way: protocol ID 0, SPI Size 0, no SPI,
+    /// no data.
+    #[test]
+    fn the_fragmentation_notify_carries_no_spi() {
+        let request = initiator_request(&init_secret(), &default_offer());
+        let (response, _) = responder_respond(&request, &resp_secret()).unwrap();
+        for message in [&request, &response] {
+            let header = crate::ikev2::message::IkeHeader::parse(message).unwrap();
+            let bodies: Vec<&[u8]> = crate::ikev2::message::payloads(header.next_payload, &message[crate::ikev2::message::IkeHeader::LEN..])
+                .map(|p| p.unwrap())
+                .filter(|p| p.payload_type == crate::ikev2::message::PayloadType::Notify)
+                .map(|p| p.data)
+                .filter(|body| Notify::parse(body).unwrap().notify_type == notify_type::IKEV2_FRAGMENTATION_SUPPORTED)
+                .collect();
+            assert_eq!(bodies.len(), 1, "advertised once");
+            // Protocol ID 0, SPI Size 0, Notify Message Type 16430 -- and nothing after.
+            assert_eq!(bodies[0], [0, 0, 0x40, 0x2e]);
+        }
+    }
+
     #[test]
     fn responder_natt_emits_nat_detection_and_still_completes() {
         let request = initiator_request(&init_secret(), &default_offer());

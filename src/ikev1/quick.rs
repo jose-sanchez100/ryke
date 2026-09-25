@@ -1205,6 +1205,30 @@ pub fn rekey_child_with_lifetime(
     Ok(out)
 }
 
+/// Create an IPv4 CHILD SA under the live Phase-1 SA (`st`) to take the place
+/// of one the peer itself deleted: [`rekey_child_with_lifetime`] minus the
+/// trailing Delete, since the SA it would name is already gone on the peer's
+/// side -- sending one anyway only asks the peer about an SA it no longer has.
+/// Same transport, retransmission and lifetime handling as
+/// [`rekey_child_with_lifetime`]; whether the peer really deleted the SA
+/// (an authenticated Delete naming the SA in use) is for the caller to know.
+#[allow(clippy::too_many_arguments)]
+pub fn create_child_with_lifetime(
+    sock: &dyn IkeSocket,
+    st: &Phase1State,
+    entropy: &mut impl Entropy,
+    peer: SocketAddr,
+    cipher: SkCipher,
+    pfs_group: Option<DhGroup>,
+    ts_local: ([u8; 4], [u8; 4]),
+    ts_remote: ([u8; 4], [u8; 4]),
+    life_duration: u32,
+    timeout: Duration,
+) -> Result<(RekeyedChild, SaLifetime), DriverError> {
+    let (msg1, qi) = initiate_quick_with_pfs(st, entropy, cipher, ts_local, ts_remote, pfs_group, life_duration)?;
+    quick_exchange(sock, st, peer, timeout, msg1, qi, "IPv4 CHILD SA")
+}
+
 /// Create the tunnel's additional **IPv6** CHILD SA: one more Quick Mode
 /// exchange under the live Phase-1 SA (`st`), offering IPv6 selectors
 /// (`ts_local`/`ts_remote` as `(network, prefix length)`, see
@@ -3461,6 +3485,48 @@ mod tests {
                     assert_eq!(after, 0, "{name}: nothing may follow a message 2 whose RESPONDER-LIFETIME is malformed");
                 }
             }
+        }
+    }
+
+    /// An IPv4 CHILD SA created in place of one the peer deleted is a full Quick
+    /// Mode -- message 3 sent, the lifetime the answer stated handed back -- and
+    /// nothing after it: no Delete, where a rekey sends one for the SA it
+    /// replaces.
+    #[test]
+    fn an_ipv4_child_sa_created_in_place_of_a_deleted_one_sends_no_delete() {
+        type Run = Box<dyn Fn(&UdpSocket, &Phase1State, &mut SeedEntropy, SocketAddr) -> Result<(RekeyedChild, SaLifetime), DriverError>>;
+        let runs: Vec<(&str, usize, Run)> = vec![
+            ("create_child_with_lifetime", 1, Box::new(|sock, st, ie, peer| {
+                create_child_with_lifetime(sock, st, ie, peer, SkCipher::Aes256Gcm, None, QM_TS, QM_TS, 3600, Duration::from_millis(300))
+            })),
+            ("rekey_child_with_lifetime", 2, Box::new(|sock, st, ie, peer| {
+                rekey_child_with_lifetime(sock, st, ie, peer, SkCipher::Aes256Gcm, None, QM_TS, QM_TS, 3600, Duration::from_millis(300), 0x0102_0304)
+            })),
+        ];
+        for (name, datagrams_after_answer, run) in runs {
+            let (initiator, responder, _iaddr, raddr) = loopback_pair();
+            let (mut istate, mut rstate, mut ie, mut re) = phase1_pair(0x5511, 0x5512, QM_ADDRS.0.parse().unwrap(), QM_ADDRS.1.parse().unwrap());
+            istate.floated = false;
+            rstate.floated = false;
+            let iaddr = initiator.local_addr().unwrap();
+            let gateway = std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                let n = responder.recv(&mut buf).unwrap();
+                let msg2 = answer_with_notifies(&rstate, &buf[..n], &mut re, vec![life_type(1), life_dur(1800)], Vec::new());
+                responder.send_to(&msg2, iaddr).unwrap();
+                responder.set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+                let mut after = 0;
+                while responder.recv(&mut buf).is_ok() {
+                    after += 1;
+                }
+                after
+            });
+            let out = run(&initiator, &istate, &mut ie, raddr);
+            let after = gateway.join().unwrap();
+            let (child, held) = out.unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(child.peer_spi, ANSWER_SPI, "{name}");
+            assert_eq!(held, SaLifetime { seconds: 1800, kilobytes: None }, "{name}");
+            assert_eq!(after, datagrams_after_answer, "{name}: message 3, and a Delete only for a rekey");
         }
     }
 

@@ -2202,8 +2202,8 @@ fn natt_local_port(local_port: u16) -> u16 {
 /// so that a retransmission sends the same bytes again (RFC 7296 §2.1).
 /// See [`prepare`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Outgoing {
-    datagrams: Vec<Vec<u8>>,
+pub(crate) struct Outgoing {
+    pub(crate) datagrams: Vec<Vec<u8>>,
     /// Set when the message went whole beyond the [`DatagramLimit`], the
     /// peer not taking fragments: what to say if it goes unanswered.
     oversize: Option<String>,
@@ -2256,7 +2256,7 @@ impl Outgoing {
 /// it fits -- to a peer that negotiated them (RFC 7383 §2.4: none of the
 /// other guidelines there applies, the peer having fragmented the request,
 /// so the response takes the same form).
-fn prepare(
+pub(crate) fn prepare(
     sa: &CompletedSaInit,
     message: Vec<u8>,
     dest: SocketAddr,

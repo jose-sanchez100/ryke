@@ -17,8 +17,16 @@
 //! RFC 7383 IKE fragmentation, which `IKE_SA_INIT` always advertises: an
 //! `IKE_AUTH` response in fragments is reassembled, each fragment
 //! authenticated before it is kept ([`crate::ikev2::fragment::Reassembly`]).
-//! The request itself always goes out whole, and it is sent once: this
-//! client does not retransmit, so a lost request or fragment of the
+//! The `IKE_AUTH` request goes whole when it fits
+//! [`DatagramLimit::DEFAULT`] (576 bytes for an IPv4 datagram, 1280 for an
+//! IPv6 one, headers and non-ESP marker included), and otherwise in
+//! fragments that each fit, when the peer negotiated fragmentation; a peer
+//! that did not gets it whole all the same (it may then be fragmented at
+//! the IP layer or dropped), as from [`crate::Ikev2Session`]. The limit is
+//! fixed here -- the session's own is what
+//! [`crate::Ikev2Session::with_datagram_limit`] sets -- and `IKE_SA_INIT` is
+//! never fragmented. Each request is sent once: this client does not
+//! retransmit, so a lost request, fragment of it or fragment of the
 //! response fails the handshake with the socket's read timeout.
 
 use std::io;
@@ -31,11 +39,12 @@ use crate::esp::ChildSa;
 use crate::ikev2::exchange::{
     default_offer, initiator_complete_natt, initiator_request_natt, CompletedSaInit, LocalSecret, NatStatus,
 };
-use crate::ikev2::fragment::{Accepted, MessageKey, Reassembly, MAX_FRAGMENTS};
+use crate::ikev2::fragment::{Accepted, DatagramLimit, MessageKey, Reassembly, MAX_FRAGMENTS};
 use crate::ikev2::ike_auth::{self, AuthConfig};
 use crate::ikev2::message::{IkeHeader, PayloadType};
-use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
+use crate::ikev2::natt::unwrap_ike_4500;
 use crate::ikev2::payload::Identification;
+use crate::ikev2::session::prepare;
 use crate::role::Role;
 use crate::transport::{DriverError, UdpTransport};
 
@@ -46,7 +55,7 @@ pub struct Client<E> {
     transport: UdpTransport,
     /// Present only via [`Self::from_sockets`] -- a caller that never hands
     /// one in (`bind`/`from_socket`, both pre-dating NAT-T) simply can't
-    /// float; [`Self::send_step`]/[`Self::recv_step`] error out rather than
+    /// float; [`Self::send_datagram`]/[`Self::recv_step`] error out rather than
     /// silently staying on port 500 if `IKE_SA_INIT` ever decides floating
     /// is needed without one configured.
     natt_transport: Option<UdpTransport>,
@@ -113,18 +122,19 @@ impl<E: Entropy> Client<E> {
         Ok(())
     }
 
-    /// Send `msg` to `server`, floated (wrapped with the non-ESP marker, to
-    /// `server`'s IP on UDP 4500 instead of its own port) whenever `floated`
-    /// is `true`. Errors if `floated` is requested but this `Client` was
-    /// never given a port-4500 socket (see [`Self::from_sockets`]).
-    fn send_step(&self, msg: &[u8], server: SocketAddr, floated: bool) -> Result<(), DriverError> {
+    /// Send `datagram` to `server` -- already behind the non-ESP marker, and
+    /// to `server`'s IP on UDP 4500 instead of its own port, whenever
+    /// `floated` is `true`. Errors if `floated` is requested but this
+    /// `Client` was never given a port-4500 socket (see
+    /// [`Self::from_sockets`]).
+    fn send_datagram(&self, datagram: &[u8], server: SocketAddr, floated: bool) -> Result<(), DriverError> {
         if floated {
             let natt = self.natt_transport.as_ref().ok_or(IkeError::Crypto(
                 "NAT-T floating required but this Client has no port-4500 socket (use Client::from_sockets)",
             ))?;
-            natt.send_to(&wrap_ike_4500(msg), SocketAddr::new(server.ip(), crate::natt_port()))?;
+            natt.send_to(datagram, SocketAddr::new(server.ip(), crate::natt_port()))?;
         } else {
-            self.transport.send_to(msg, server)?;
+            self.transport.send_to(datagram, server)?;
         }
         Ok(())
     }
@@ -210,7 +220,11 @@ impl<E: Entropy> Client<E> {
         self.entropy.fill(&mut iv);
         let esp_offer = ike_auth::esp_offer(0);
         let request = ike_auth::initiator_auth_request(sa, cfg, child_spi, &esp_offer, &iv)?;
-        self.send_step(&request, server, floated)?;
+        // Whole, or in fragments beyond the limit (see this module's doc).
+        let outgoing = prepare(sa, request.clone(), server, floated, DatagramLimit::DEFAULT, false, &mut self.entropy)?;
+        for datagram in &outgoing.datagrams {
+            self.send_datagram(datagram, server, floated)?;
+        }
         let response = self.recv_response(sa, &request, floated)?;
         let (id, spi, _esp_suite, ip4, _tsr) = ike_auth::initiator_verify_auth(sa, &response, cfg, &esp_offer, ike_auth::ChildTsOffer::Ipv4)?;
         Ok((id, spi, ip4))
@@ -340,5 +354,63 @@ mod tests {
         responder.join().unwrap();
         assert_eq!(peer, Identification::fqdn("gw.test"));
         assert_eq!(child.outbound.spi(), 0xC0FFEE);
+    }
+
+    /// RFC 7383 §2.5: an `IKE_AUTH` request beyond the datagram limit goes
+    /// in fragments, each in an IPv4 datagram of at most 576 bytes (548 of
+    /// IKE message past the IP and UDP headers), which the gateway, having
+    /// negotiated fragmentation, reassembles into the request. A request
+    /// that fits goes whole, as before.
+    #[test]
+    fn connect_sends_an_ike_auth_request_beyond_the_limit_in_fragments() {
+        use crate::ikev2::exchange::{responder_respond_natt, SaInitResult};
+        use crate::ikev2::sk::build_encrypted;
+
+        for (name_len, fragmented) in [(16, false), (700, true)] {
+            let gateway = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            gateway.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let bind = gateway.local_addr().unwrap();
+            let responder = std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let (n, from) = gateway.recv_from(&mut buf).unwrap();
+                let (response, sa) = match responder_respond_natt(&buf[..n], &resp_secret(), bind, from, None).unwrap() {
+                    SaInitResult::Established { response, sa } => (response, sa),
+                    _ => panic!("expected Established"),
+                };
+                assert!(sa.peer_supports_fragmentation);
+                gateway.send_to(&response, from).unwrap();
+                let (cipher, sk_e, sk_a) = (sa.suite.sk_cipher(), &sa.keys.sk_ei, &sa.keys.sk_ai);
+                let mut sizes = Vec::new();
+                let mut reassembly: Option<Reassembly> = None;
+                let request = loop {
+                    let (n, from) = gateway.recv_from(&mut buf).unwrap();
+                    sizes.push(n);
+                    let header = IkeHeader::parse(&buf[..n]).unwrap();
+                    if header.next_payload != PayloadType::EncryptedFragment {
+                        break (buf[..n].to_vec(), from);
+                    }
+                    let key = MessageKey { initiator: true, response: false, ..MessageKey::of(&header) };
+                    let accepted = reassembly.get_or_insert_with(|| Reassembly::new(key)).accept(&buf[..n], cipher, sk_e, sk_a);
+                    if let Accepted::Complete(first, inner) = accepted {
+                        break (build_encrypted(cipher, header, first, &inner, sk_e, sk_a, &[3u8; 8]).unwrap(), from);
+                    }
+                };
+                let (request, from) = request;
+                let rcfg = AuthConfig::psk(Identification::fqdn("gw.test"), b"psk".to_vec());
+                let (resp, ..) = ike_auth::responder_process_auth(&sa, &request, &rcfg, 0xC0FFEE, &[9u8; 8], None).unwrap();
+                gateway.send_to(&resp, from).unwrap();
+                sizes
+            });
+            let mut client = Client::bind("127.0.0.1:0", SeedEntropy::new(1)).unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let name = format!("{}.test", "c".repeat(name_len));
+            let cfg = AuthConfig::psk(Identification::fqdn(&name), b"psk".to_vec());
+            let (_sa, peer, child, _) = client.connect(bind, &cfg, 0x1234).unwrap();
+            let sizes = responder.join().unwrap();
+            assert_eq!(peer, Identification::fqdn("gw.test"));
+            assert_eq!(child.outbound.spi(), 0xC0FFEE);
+            assert_eq!(sizes.len() > 1, fragmented, "{name_len}-byte name: datagrams of {sizes:?}");
+            assert!(sizes.iter().all(|&n| n <= 576 - 28), "every datagram within the limit: {sizes:?}");
+        }
     }
 }

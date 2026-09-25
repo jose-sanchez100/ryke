@@ -133,7 +133,10 @@
 //!
 //! [`ikev2::client::Client`] is the matching minimal IKEv2 initiator: the
 //! handshake, nothing after it. It reassembles a fragmented `IKE_AUTH`
-//! response, but sends each request once, with no retransmission.
+//! response, and sends its `IKE_AUTH` request in fragments beyond
+//! [`DatagramLimit::DEFAULT`] when the peer negotiated them (whole
+//! otherwise, as the sessions do); the limit is fixed, and each request is
+//! sent once, with no retransmission.
 //!
 //! ### What the consumer supplies
 //!

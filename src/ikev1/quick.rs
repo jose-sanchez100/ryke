@@ -69,6 +69,23 @@
 //! `quick_mode_initiator_holds_the_volume_limit_the_answer_states` and
 //! `a_rekey_or_a_new_ipv6_child_sa_hands_over_the_volume_limit_the_gateway_states`).
 //!
+//! The responder may state its limits in a **RESPONDER-LIFETIME** Notify
+//! instead (RFC 2407 §4.5.4 says it SHOULD when it shortens them, §4.6.3.1
+//! gives the format), and a FortiGate states its volume limit only that way,
+//! its transform stating seconds alone. Message 2's Notifies are read once
+//! HASH(2) has proved them the peer's, and before message 3 is built: each
+//! unit a well-formed one states shortens the one the transform left us with,
+//! or is added when there was none -- never lengthens it, and never counts as
+//! the other unit. One that is cut short, is outside the IPsec DOI, is for
+//! another protocol or names another SA than the one negotiated (by SPI, or by
+//! ISAKMP cookies), whose data is not lifetime pairs alone, or that disagrees
+//! with another, is `MalformedPayload` and ends the exchange: no message 3, no
+//! SA, and for a rekey no Delete of the SA in use.
+//! Only the authenticated peer can cause that. What this does not do: take a
+//! RESPONDER-LIFETIME sent outside message 2 (an Informational, say), or one
+//! for the ISAKMP SA (tests: `a_responder_lifetime_notify_..` and
+//! `a_rekey_or_a_new_ipv6_child_sa_takes_the_responder_lifetime_notify_..`).
+//!
 //! **Phase 2, as a responder**, grants the volume limit it is offered, as stated,
 //! and hands it over: the answer's transform carries its seconds pair (the
 //! offer's, or its own 3600 when the offer states none) followed by the
@@ -92,7 +109,7 @@ use super::crypto1::{self, Prf};
 use super::informational;
 use super::isakmp::{self, exchange, payload, IsakmpHeader, Payload};
 use super::payloads::{
-    id_type, life, life_duration_value, protocol, AttrValue, Attribute, Id, Proposal, SaPayload, Transform, IPSEC_DOI,
+    id_type, life, life_duration_value, parse_attributes, protocol, AttrValue, Attribute, Id, Proposal, SaPayload, Transform, IPSEC_DOI,
     SIT_IDENTITY_ONLY,
 };
 use super::phase1::Phase1State;
@@ -262,9 +279,15 @@ struct StatedLifetime {
 /// as the other, whatever their order -- see the module's "SA lifetimes"
 /// section.
 fn stated_lifetime(t: &Transform) -> Result<StatedLifetime, IkeError> {
+    stated_lifetime_in(&t.attributes)
+}
+
+/// [`stated_lifetime`] over a bare attribute list -- a transform's, or the data
+/// of a RESPONDER-LIFETIME Notify ([`responder_lifetime`]).
+fn stated_lifetime_in(attributes: &[Attribute]) -> Result<StatedLifetime, IkeError> {
     let (mut seconds, mut kilobytes): (Option<u32>, Option<u32>) = (None, None);
     let mut pending: Option<u16> = None;
-    for a in &t.attributes {
+    for a in attributes {
         if pending.is_some() && a.attr_type != esp_attr::LIFE_DURATION {
             return Err(IkeError::MalformedPayload("SA Life Type not immediately followed by its SA Life Duration"));
         }
@@ -315,6 +338,100 @@ fn negotiated_p2_lifetime(ps: &[Payload], offered: u32) -> SaLifetime {
     let Some(transform) = sa.proposals.first().and_then(|p| p.transforms.first()) else { return unread };
     let Ok(stated) = stated_lifetime(transform) else { return unread };
     SaLifetime { seconds: stated.seconds.unwrap_or(DEFAULT_LIFE_SECONDS).min(offered), kilobytes: stated.kilobytes }
+}
+
+/// RFC 2407 §4.6.3.1's RESPONDER-LIFETIME status Notify Message Type.
+const RESPONDER_LIFETIME: u16 = 24576;
+
+/// The lifetime the RESPONDER-LIFETIME Notifies of an authentic message 2
+/// (`ps`) state for the SA it answers, each unit `None` when none states it.
+/// RFC 2407 §4.5.4: a responder that shortens the lifetime "SHOULD" send one
+/// in the exchange carrying its SA payload, and a FortiGate states its volume
+/// limit this way only, its transform stating seconds alone. Per §4.6.3.1 the
+/// Notify's DOI is the IPsec DOI, its Protocol ID that of the chosen SA (ESP,
+/// the only one offered), its SPI "the sender's inbound IPSEC SPI" -- the
+/// `peer_spi` this answer chose -- "or the ISAKMP cookies" (16 octets, those
+/// of the ISAKMP SA the exchange runs under: in a Quick Mode that negotiates
+/// one SA they can name no other), and its data an attribute list of lifetime
+/// pairs, read by the rules of a transform's ([`stated_lifetime_in`]), with
+/// nothing else in it. Notifies of other types are left alone, as before.
+///
+/// Every departure from that is `MalformedPayload`: a Notify cut short, one in
+/// another DOI or for another protocol, one naming another SA (another SPI,
+/// our own inbound one included, or other cookies), an attribute list that
+/// does not parse, is empty, holds anything but lifetime pairs or breaks their
+/// rules, and two Notifies stating different values for one unit (§4.5.2:
+/// conflicting lifetimes are not taken). The caller has already verified
+/// HASH(2), which covers these payloads, so only the authenticated peer can
+/// cause this; it is not passed over, since that would leave the SA with no
+/// limit where the gateway holds one.
+fn responder_lifetime(ps: &[Payload], peer_spi: u32, cky_i: [u8; 8], cky_r: [u8; 8]) -> Result<StatedLifetime, IkeError> {
+    let malformed = |why: &'static str| {
+        ike_debug!("Quick Mode: RESPONDER-LIFETIME refused: {why}");
+        IkeError::MalformedPayload(why)
+    };
+    let mut held = StatedLifetime { seconds: None, kilobytes: None };
+    for body in ps.iter().filter(|p| p.payload_type == payload::NOTIFY).map(|p| p.data.as_slice()) {
+        let Some(fixed) = body.get(..8) else {
+            // Too short to carry a Notify Message Type, so not known to be a
+            // RESPONDER-LIFETIME -- but not a well-formed Notify of any type
+            // either, and one that may have been meant as one.
+            return Err(malformed("Notify shorter than its fixed fields"));
+        };
+        if u16::from_be_bytes([fixed[6], fixed[7]]) != RESPONDER_LIFETIME {
+            continue;
+        }
+        if u32::from_be_bytes([fixed[0], fixed[1], fixed[2], fixed[3]]) != IPSEC_DOI {
+            return Err(malformed("RESPONDER-LIFETIME outside the IPsec DOI"));
+        }
+        if fixed[4] != protocol::ESP {
+            return Err(malformed("RESPONDER-LIFETIME for a protocol this Quick Mode did not negotiate"));
+        }
+        let spi_size = usize::from(fixed[5]);
+        let Some(spi) = body.get(8..8 + spi_size) else {
+            return Err(malformed("RESPONDER-LIFETIME SPI runs past the Notify"));
+        };
+        let cookies: Vec<u8> = cky_i.iter().chain(&cky_r).copied().collect();
+        let names_this_sa = match spi_size {
+            4 => spi == peer_spi.to_be_bytes(),
+            16 => spi == cookies.as_slice(),
+            _ => return Err(malformed("RESPONDER-LIFETIME SPI neither four nor sixteen octets")),
+        };
+        if !names_this_sa {
+            return Err(malformed("RESPONDER-LIFETIME for an SA other than the one this Quick Mode negotiated"));
+        }
+        let attributes = parse_attributes(&body[8 + spi_size..]).map_err(|_| malformed("RESPONDER-LIFETIME attribute list cut short"))?;
+        if attributes.is_empty() {
+            return Err(malformed("RESPONDER-LIFETIME stating no lifetime"));
+        }
+        if attributes.iter().any(|a| !LIFETIME_ATTRS.contains(&a.attr_type)) {
+            return Err(malformed("RESPONDER-LIFETIME carrying an attribute that is not a lifetime"));
+        }
+        let stated = stated_lifetime_in(&attributes)?;
+        for (slot, value) in [(&mut held.seconds, stated.seconds), (&mut held.kilobytes, stated.kilobytes)] {
+            match (*slot, value) {
+                (Some(previous), Some(value)) if previous != value => return Err(malformed("RESPONDER-LIFETIME Notifies that disagree")),
+                (_, Some(value)) => *slot = Some(value),
+                (_, None) => {}
+            }
+        }
+    }
+    Ok(held)
+}
+
+/// `negotiated` shortened by what a RESPONDER-LIFETIME `stated`: each unit on
+/// its own, the lower of the two, and a limit `negotiated` lacks taken as
+/// stated -- never lengthened, and never one unit read as or added to the
+/// other.
+fn shortened(negotiated: SaLifetime, stated: StatedLifetime) -> SaLifetime {
+    let lower = |a: Option<u32>, b: Option<u32>| match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    SaLifetime {
+        seconds: stated.seconds.map_or(negotiated.seconds, |s| negotiated.seconds.min(s)),
+        kilobytes: lower(negotiated.kilobytes, stated.kilobytes),
+    }
 }
 
 /// The one SA payload of a Quick Mode message (RFC 2409 §5.5 carries exactly
@@ -851,6 +968,9 @@ impl QuickInitiator {
         if peer_ids.len() != 2 || peer_ids[0] != self.id_local || peer_ids[1] != self.id_remote {
             return Err(IkeError::NoProposalChosen);
         }
+        // Read only now that HASH(2) has proved them the peer's, and before
+        // anything is sent or derived: a malformed one ends the exchange here.
+        let responder_stated = responder_lifetime(&ps, peer_spi, self.cky_i, self.cky_r)?;
 
         let h3 = hash3(self.prf, &self.skeyid_a, self.msgid, &self.ni, &nr);
         let (msg3, _) = phase2::encrypt_payloads(qm_header(self.cky_i, self.cky_r, self.msgid), &self.enc_key, self.enc_block, &iv2, &[(payload::HASH, h3)])?;
@@ -862,7 +982,7 @@ impl QuickInitiator {
             }
             None => derive_child(self.prf, &self.skeyid_d, self.cipher, &self.ni, &nr, self.local_spi, peer_spi)?,
         };
-        let negotiated_lifetime = negotiated_p2_lifetime(&ps, self.life_duration);
+        let negotiated_lifetime = shortened(negotiated_p2_lifetime(&ps, self.life_duration), responder_stated);
         Ok((msg3, child, negotiated_lifetime))
     }
 }
@@ -1523,6 +1643,18 @@ mod tests {
     /// sent as its own payload, in order) -- for the answers that carry more
     /// than the one SA payload a Quick Mode message 2 has.
     fn forge_answer(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy, sas: &[&SaPayload], id_payloads: &[Vec<u8>]) -> Vec<u8> {
+        forge_answer_with(st, msg1, entropy, sas, id_payloads, &[])
+    }
+
+    /// [`forge_answer`] with `extra` payloads after the identities, where a
+    /// FortiGate puts its RESPONDER-LIFETIME Notify -- all of them under HASH(2).
+    fn forge_answer_with(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy, sas: &[&SaPayload], id_payloads: &[Vec<u8>], extra: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        forge_answer_hashed_by(st, st, msg1, entropy, sas, id_payloads, extra)
+    }
+
+    /// [`forge_answer_with`], message 1 being read with `st` and message 2's
+    /// HASH(2) computed with `hash_st`'s SKEYID_a.
+    fn forge_answer_hashed_by(st: &Phase1State, hash_st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy, sas: &[&SaPayload], id_payloads: &[Vec<u8>], extra: &[(u8, Vec<u8>)]) -> Vec<u8> {
         let hdr = IsakmpHeader::parse(msg1).unwrap();
         let msgid = hdr.message_id;
         let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
@@ -1535,7 +1667,8 @@ mod tests {
         for id in id_payloads {
             after.push((payload::ID, id.clone()));
         }
-        let (msg2, _iv2) = phase2::build_encrypted_prefixed(qm_header(st.cky_i, st.cky_r, msgid), st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv1, &ni, &after).unwrap();
+        after.extend(extra.iter().cloned());
+        let (msg2, _iv2) = phase2::build_encrypted_prefixed(qm_header(st.cky_i, st.cky_r, msgid), st.prf, &hash_st.skeyid_a, &st.enc_key, st.enc_block, &iv1, &ni, &after).unwrap();
         msg2
     }
 
@@ -3256,6 +3389,294 @@ mod tests {
         let mut sa = esp_sa(0xC0FF_EE00, SkCipher::Aes256Gcm, None, false, 3600);
         set_life(&mut sa, life);
         forge_answer(st, msg1, entropy, &[&sa], &ids)
+    }
+
+    // ---- RESPONDER-LIFETIME (RFC 2407 §4.6.3.1) in message 2 ----
+
+    /// [`answer_with_life`], with `notifies` (Notify bodies) after the
+    /// identities; the gateway's inbound SPI is [`ANSWER_SPI`].
+    fn answer_with_notifies(st: &Phase1State, msg1: &[u8], entropy: &mut impl Entropy, life: Vec<Attribute>, notifies: Vec<Vec<u8>>) -> Vec<u8> {
+        let hdr = IsakmpHeader::parse(msg1).unwrap();
+        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, hdr.message_id, st.enc_block);
+        let (_h, ps, _iv1) = phase2::parse_encrypted(msg1, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0).unwrap();
+        let ids: Vec<Vec<u8>> = ps.iter().filter(|p| p.payload_type == payload::ID).map(|p| p.data.clone()).collect();
+        let mut sa = esp_sa(ANSWER_SPI, SkCipher::Aes256Gcm, None, false, 3600);
+        set_life(&mut sa, life);
+        let extra: Vec<(u8, Vec<u8>)> = notifies.into_iter().map(|n| (payload::NOTIFY, n)).collect();
+        forge_answer_with(st, msg1, entropy, &[&sa], &ids, &extra)
+    }
+
+    /// The gateway's inbound SPI in [`answer_with_life`] and [`answer_with_notifies`].
+    const ANSWER_SPI: u32 = 0xC0FF_EE00;
+
+    /// A rekey, a new IPv6 CHILD SA and an IPv6 rekey all complete through
+    /// `quick_exchange`, so each hands over the volume limit a gateway states
+    /// in a RESPONDER-LIFETIME alone; and when that Notify is malformed, each
+    /// fails without sending message 3 -- and a rekey without the Delete of the
+    /// SA it would have replaced, which stays the one in use.
+    #[test]
+    fn a_rekey_or_a_new_ipv6_child_sa_takes_the_responder_lifetime_notify_and_fails_on_a_malformed_one() {
+        type Run = Box<dyn Fn(&UdpSocket, &Phase1State, &mut SeedEntropy, SocketAddr) -> Result<(RekeyedChild, SaLifetime), DriverError>>;
+        let runs = || -> Vec<(&'static str, usize, Run)> {
+            vec![
+                ("rekey_child_with_lifetime", 2, Box::new(|sock, st, ie, peer| {
+                    rekey_child_with_lifetime(sock, st, ie, peer, SkCipher::Aes256Gcm, None, QM_TS, QM_TS, 3600, Duration::from_millis(300), 0x0102_0304)
+                })),
+                ("rekey_child_ipv6_with_lifetime", 2, Box::new(|sock, st, ie, peer| {
+                    rekey_child_ipv6_with_lifetime(sock, st, ie, peer, SkCipher::Aes256Gcm, None, (v6("fd00::1"), 128), (v6("::"), 0), 3600, Duration::from_millis(300), 0x0102_0304)
+                })),
+                ("create_child_ipv6_with_lifetime", 1, Box::new(|sock, st, ie, peer| {
+                    create_child_ipv6_with_lifetime(sock, st, ie, peer, SkCipher::Aes256Gcm, None, (v6("fd00::1"), 128), (v6("::"), 0), 3600, Duration::from_millis(300))
+                })),
+            ]
+        };
+        for (kb, want) in [(5120u32, true), (0u32, false)] {
+            for (name, datagrams_after_answer, run) in runs() {
+                let (initiator, responder, _iaddr, raddr) = loopback_pair();
+                let (mut istate, mut rstate, mut ie, mut re) = phase1_pair(0x5501, 0x5502, QM_ADDRS.0.parse().unwrap(), QM_ADDRS.1.parse().unwrap());
+                istate.floated = false;
+                rstate.floated = false;
+                let iaddr = initiator.local_addr().unwrap();
+                let gateway = std::thread::spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    let n = responder.recv(&mut buf).unwrap();
+                    let notifies = vec![responder_lifetime(ANSWER_SPI, &[life_type(2), life_dur(kb)])];
+                    let msg2 = answer_with_notifies(&rstate, &buf[..n], &mut re, vec![life_type(1), life_dur(3600)], notifies);
+                    responder.send_to(&msg2, iaddr).unwrap();
+                    responder.set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+                    let mut after = 0;
+                    while responder.recv(&mut buf).is_ok() {
+                        after += 1;
+                    }
+                    after
+                });
+                let out = run(&initiator, &istate, &mut ie, raddr);
+                let after = gateway.join().unwrap();
+                if want {
+                    let (_child, held) = out.unwrap_or_else(|e| panic!("{name}: {e}"));
+                    assert_eq!(held, SaLifetime { seconds: 3600, kilobytes: Some(kb) }, "{name}");
+                    assert_eq!(after, datagrams_after_answer, "{name}: message 3 (and the Delete of a rekey) sent");
+                } else {
+                    assert!(matches!(out, Err(DriverError::Ike(IkeError::MalformedPayload(_)))), "{name}: {:?}", out.map(|(_, l)| l));
+                    assert_eq!(after, 0, "{name}: nothing may follow a message 2 whose RESPONDER-LIFETIME is malformed");
+                }
+            }
+        }
+    }
+
+    /// A Notify payload body (RFC 2408 §3.14): DOI, Protocol-ID, SPI Size,
+    /// Notify Message Type, SPI, Notification Data.
+    fn notify(doi: u32, protocol_id: u8, msg_type: u16, spi: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut out = doi.to_be_bytes().to_vec();
+        out.push(protocol_id);
+        out.push(spi.len() as u8);
+        out.extend_from_slice(&msg_type.to_be_bytes());
+        out.extend_from_slice(spi);
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// A well-formed RESPONDER-LIFETIME for the ESP SA whose inbound SPI (the
+    /// gateway's) is `spi`, stating the lifetime attributes `life`.
+    fn responder_lifetime(spi: u32, life: &[Attribute]) -> Vec<u8> {
+        notify(IPSEC_DOI, protocol::ESP, 24576, &spi.to_be_bytes(), &attr_bytes(life))
+    }
+
+    fn attr_bytes(list: &[Attribute]) -> Vec<u8> {
+        list.iter().flat_map(Attribute::to_bytes).collect()
+    }
+
+    /// Builds the Notify bodies of a message 2 from the [`Names`] it may use.
+    type Build = Box<dyn Fn(Names) -> Vec<Vec<u8>>>;
+
+    /// Who a Notify built by a test may name: the gateway's inbound SPI for the
+    /// SA being negotiated (`peer`), the ISAKMP SA's cookies, and our own inbound
+    /// SPI for it (`local`).
+    #[derive(Clone, Copy)]
+    struct Names {
+        peer: u32,
+        cookies: [u8; 16],
+        local: u32,
+    }
+
+    /// What the initiator is left with -- or the error -- from an authentic
+    /// message 2 that answers exactly what was offered (3600 s), its transform
+    /// stating the lifetime pairs `life`, followed by the Notify payloads
+    /// `notifies` builds.
+    fn held_with_notifies(life: Vec<Attribute>, notifies: impl FnOnce(Names) -> Vec<Vec<u8>>) -> Result<SaLifetime, IkeError> {
+        held_with_notifies_hashed_by(life, notifies, |_| {})
+    }
+
+    /// [`held_with_notifies`], message 2 being authenticated with the
+    /// responder's Phase-1 state as `edit` leaves it.
+    fn held_with_notifies_hashed_by(life: Vec<Attribute>, notifies: impl FnOnce(Names) -> Vec<Vec<u8>>, edit: impl FnOnce(&mut Phase1State)) -> Result<SaLifetime, IkeError> {
+        let (mut istate, mut rstate, mut ie, mut re) = phase1_pair(0x5401, 0x5402, QM_ADDRS.0.parse().unwrap(), QM_ADDRS.1.parse().unwrap());
+        istate.floated = false;
+        rstate.floated = false;
+        let (qm1, qi) = initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, QM_TS, QM_TS, 3600).unwrap();
+        let peer = 0xAAAA_BBBB;
+        let mut sa = esp_sa(peer, SkCipher::Aes256Gcm, None, false, 3600);
+        set_life(&mut sa, life);
+        let mut cookies = [0u8; 16];
+        cookies[..8].copy_from_slice(&istate.cky_i);
+        cookies[8..].copy_from_slice(&istate.cky_r);
+        let extra: Vec<(u8, Vec<u8>)> = notifies(Names { peer, cookies, local: qi.local_spi }).into_iter().map(|n| (payload::NOTIFY, n)).collect();
+        let id = ts_id(QM_TS.0, QM_TS.1);
+        let mut hash_st = rstate.clone();
+        edit(&mut hash_st);
+        let msg2 = forge_answer_hashed_by(&rstate, &hash_st, &qm1, &mut re, &[&sa], &[id.clone(), id], &extra);
+        qi.complete_with_lifetime(&msg2).map(|(_msg3, _child, lifetime)| lifetime)
+    }
+
+    /// What a FortiGate answers when its Phase 2 has a volume limit and the
+    /// offer has none: the SA's transform states seconds only, and the limit
+    /// comes in a RESPONDER-LIFETIME Notify after the identities -- these are
+    /// the Notify's bytes from a FortiGate's own debug log, but for its SPI,
+    /// which is the gateway's inbound one (0x6003972F there). RFC 2407 §4.5.4:
+    /// a responder that shortens the lifetime "SHOULD" say so this way, and
+    /// §4.6.3.1: the Notify's SPI is "the sender's inbound IPSEC SPI". The
+    /// limit is held beside the seconds, as when the transform states it.
+    #[test]
+    fn a_responder_lifetime_notify_hands_over_the_volume_limit_a_fortigate_states_outside_the_transform() {
+        let held = held_with_notifies(vec![life_type(1), life_dur(3600)], |n| {
+            let mut body = vec![0x00, 0x00, 0x00, 0x01, 0x03, 0x04, 0x60, 0x00];
+            body.extend_from_slice(&n.peer.to_be_bytes());
+            body.extend_from_slice(&[0x80, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x04, 0x00, 0x00, 0x14, 0x00]);
+            vec![body]
+        });
+        assert_eq!(held, Ok(SaLifetime { seconds: 3600, kilobytes: Some(5120) }));
+        assert_eq!(held_with_notifies(vec![life_type(1), life_dur(3600)], |_| vec![]), Ok(SaLifetime { seconds: 3600, kilobytes: None }), "without the Notify");
+    }
+
+    /// A RESPONDER-LIFETIME only ever shortens (RFC 2407 §4.5.4): each unit on
+    /// its own, the lower of what the transform leaves us with and what the
+    /// Notify states; a limit the transform has none of is added; seconds
+    /// beyond what was offered stay what was offered; a received RX and TX
+    /// count are never summed, for nothing is summed at all. Several Notifies
+    /// that agree, or state different units, are all taken; a Notify of
+    /// another type is not a lifetime.
+    #[test]
+    fn a_responder_lifetime_notify_shortens_each_limit_on_its_own_and_never_lengthens_one() {
+        let seconds = |n: u32| vec![life_type(1), life_dur(n)];
+        let kilobytes = |n: u32| vec![life_type(2), life_dur(n)];
+        let life = |s: u32, kb: Option<u32>| SaLifetime { seconds: s, kilobytes: kb };
+        let one = |attrs: Vec<Attribute>| -> Build { Box::new(move |n: Names| vec![responder_lifetime(n.peer, &attrs)]) };
+        // (name, the transform's pairs, the Notifies, the lifetime held)
+        let cases: Vec<(&str, Vec<Attribute>, Build, SaLifetime)> = vec![
+            ("seconds, shorter than the transform's", seconds(3600), one(seconds(600)), life(600, None)),
+            ("seconds, longer than what was offered", seconds(3600), one(seconds(99_999)), life(3600, None)),
+            ("seconds, when the transform states none (DOI default, then the offer)", vec![], one(seconds(900)), life(900, None)),
+            ("kilobytes, when the transform states none", vec![], one(kilobytes(1)), life(3600, Some(1))),
+            ("kilobytes below the transform's", [seconds(3600), kilobytes(6000)].concat(), one(kilobytes(5120)), life(3600, Some(5120))),
+            ("kilobytes above the transform's", [seconds(3600), kilobytes(4000)].concat(), one(kilobytes(5120)), life(3600, Some(4000))),
+            ("both units, kilobytes first", seconds(3600), one([kilobytes(5120), seconds(900)].concat()), life(900, Some(5120))),
+            ("the largest kilobytes a Duration of four octets holds", seconds(3600), one(kilobytes(u32::MAX)), life(3600, Some(u32::MAX))),
+            (
+                "a Duration of eight octets, beyond 32 bits (saturates, never wraps)",
+                seconds(3600),
+                one(vec![life_type(2), Attribute::long_bytes(esp_attr::LIFE_DURATION, vec![1, 0, 0, 0, 0, 0, 0, 5])]),
+                life(3600, Some(u32::MAX)),
+            ),
+            ("a Duration in the basic form", seconds(3600), one(vec![life_type(2), Attribute::short(esp_attr::LIFE_DURATION, 5120)]), life(3600, Some(5120))),
+            (
+                "the same Notify twice",
+                seconds(3600),
+                Box::new(move |n: Names| vec![responder_lifetime(n.peer, &kilobytes(5120)), responder_lifetime(n.peer, &kilobytes(5120))]),
+                life(3600, Some(5120)),
+            ),
+            (
+                "one Notify per unit",
+                seconds(3600),
+                Box::new(move |n: Names| vec![responder_lifetime(n.peer, &kilobytes(5120)), responder_lifetime(n.peer, &seconds(1200))]),
+                life(1200, Some(5120)),
+            ),
+            (
+                "the ISAKMP cookies as the SPI (RFC 2407 §4.6.3.1 allows them)",
+                seconds(3600),
+                Box::new(move |n: Names| vec![notify(IPSEC_DOI, protocol::ESP, 24576, &n.cookies, &attr_bytes(&kilobytes(5120)))]),
+                life(3600, Some(5120)),
+            ),
+            (
+                "a Notify of another type stating a lifetime (REPLAY-STATUS)",
+                seconds(3600),
+                Box::new(move |n: Names| vec![notify(IPSEC_DOI, protocol::ESP, 24577, &n.peer.to_be_bytes(), &attr_bytes(&kilobytes(1)))]),
+                life(3600, None),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (name, transform, build, wanted) in cases {
+            match held_with_notifies(transform, build) {
+                Ok(held) if held == wanted => {}
+                other => wrong.push(format!("{name}: {other:?}, wanted {wanted:?}")),
+            }
+        }
+        assert!(wrong.is_empty(), "RESPONDER-LIFETIME Notifies not applied as they must be:\n{}", wrong.join("\n"));
+    }
+
+    /// A RESPONDER-LIFETIME that can't be read, or that is not about the SA
+    /// this exchange negotiates, ends the exchange with `MalformedPayload`
+    /// before message 3 is built -- no SA comes out of it -- rather than being
+    /// passed over, which would leave the SA with no limit where the gateway
+    /// holds one. Its DOI must be the IPsec DOI, its protocol the one of the SA
+    /// (ESP), its SPI the gateway's inbound SPI for it (4 octets) or the ISAKMP
+    /// cookies (16); its data a list of lifetime pairs (RFC 2407 §4.5 and
+    /// §4.5.2: a Type followed by its Duration, no two values for one unit),
+    /// and nothing else.
+    #[test]
+    fn a_responder_lifetime_notify_that_is_malformed_or_names_another_sa_ends_the_exchange() {
+        let kb = |n: u32| vec![life_type(2), life_dur(n)];
+        let with_data = |data: Vec<u8>| -> Build { Box::new(move |n: Names| vec![notify(IPSEC_DOI, protocol::ESP, 24576, &n.peer.to_be_bytes(), &data)]) };
+        let with = |f: fn(Names) -> Vec<u8>| -> Build { Box::new(move |n: Names| vec![f(n)]) };
+        let cases: Vec<(&str, Build)> = vec![
+            ("an attribute cut short", with_data(vec![0x80, 0x01, 0x00])),
+            ("a Duration whose length runs past the data", with_data(vec![0x80, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x04, 0x00, 0x00])),
+            ("an unknown unit", with_data(attr_bytes(&[life_type(3), life_dur(5120)]))),
+            ("a Type sent as a variable-length attribute", with_data(attr_bytes(&[Attribute::long_u32(esp_attr::LIFE_TYPE, 2), life_dur(5120)]))),
+            ("a Type with no Duration", with_data(attr_bytes(&[life_type(2)]))),
+            ("a Duration with no Type", with_data(attr_bytes(&[life_dur(5120)]))),
+            ("a Duration of zero", with_data(attr_bytes(&kb(0)))),
+            ("a Duration of nine octets", with_data(attr_bytes(&[life_type(2), Attribute::long_bytes(esp_attr::LIFE_DURATION, vec![0; 9])]))),
+            ("an empty Duration", with_data(attr_bytes(&[life_type(2), Attribute::long_bytes(esp_attr::LIFE_DURATION, vec![])]))),
+            ("no attributes at all", with_data(vec![])),
+            ("an attribute that is not a lifetime", with_data(attr_bytes(&[kb(5120), vec![Attribute::short(esp_attr::ENCAP_MODE, 1)]].concat()))),
+            ("two kilobytes values in one Notify", with_data(attr_bytes(&[kb(5120), kb(4096)].concat()))),
+            ("two Notifies that disagree", Box::new(move |n: Names| vec![responder_lifetime(n.peer, &kb(5120)), responder_lifetime(n.peer, &kb(4096))])),
+            ("DOI 0 (ISAKMP)", with(|n| notify(0, protocol::ESP, 24576, &n.peer.to_be_bytes(), &attr_bytes(&[life_type(2), life_dur(5120)])))),
+            ("DOI 2", with(|n| notify(2, protocol::ESP, 24576, &n.peer.to_be_bytes(), &attr_bytes(&[life_type(2), life_dur(5120)])))),
+            ("protocol ISAKMP", with(|n| notify(IPSEC_DOI, protocol::ISAKMP, 24576, &n.peer.to_be_bytes(), &attr_bytes(&[life_type(2), life_dur(5120)])))),
+            ("protocol AH", with(|n| notify(IPSEC_DOI, 2, 24576, &n.peer.to_be_bytes(), &attr_bytes(&[life_type(2), life_dur(5120)])))),
+            ("our own inbound SPI (the other direction)", with(|n| responder_lifetime(n.local, &[life_type(2), life_dur(5120)]))),
+            ("another SA's SPI", with(|n| responder_lifetime(n.peer ^ 1, &[life_type(2), life_dur(5120)]))),
+            ("no SPI", with(|_| notify(IPSEC_DOI, protocol::ESP, 24576, &[], &attr_bytes(&[life_type(2), life_dur(5120)])))),
+            ("an SPI of eight octets", with(|n| notify(IPSEC_DOI, protocol::ESP, 24576, &n.cookies[..8], &attr_bytes(&[life_type(2), life_dur(5120)])))),
+            ("another ISAKMP SA's cookies", with(|n| {
+                let mut other = n.cookies;
+                other[15] ^= 1;
+                notify(IPSEC_DOI, protocol::ESP, 24576, &other, &attr_bytes(&[life_type(2), life_dur(5120)]))
+            })),
+            ("a body shorter than the Notify's fixed fields", with(|_| vec![0, 0, 0, 1, 3, 4, 0x60])),
+            ("an SPI Size running past the body", with(|n| notify(IPSEC_DOI, protocol::ESP, 24576, &n.peer.to_be_bytes(), &[])[..10].to_vec())),
+        ];
+        let mut wrong = Vec::new();
+        for (name, build) in cases {
+            match held_with_notifies(vec![life_type(1), life_dur(3600)], build) {
+                Err(IkeError::MalformedPayload(_)) => {}
+                other => wrong.push(format!("{name}: {other:?}")),
+            }
+        }
+        assert!(wrong.is_empty(), "RESPONDER-LIFETIME Notifies not refused as they must be:\n{}", wrong.join("\n"));
+    }
+
+    /// The Notify is read only once HASH(2) has proved message 2 authentic: one
+    /// a third party put in a message it could not authenticate is refused for
+    /// that (`AuthFailed`), as any such message is, and so decides nothing --
+    /// neither a lifetime nor the fate of the exchange by its own contents.
+    #[test]
+    fn a_responder_lifetime_notify_is_read_only_under_an_authentic_hash() {
+        let bad = |n: Names| vec![responder_lifetime(n.peer ^ 1, &[life_type(2), life_dur(0)])];
+        assert!(matches!(held_with_notifies(vec![life_type(1), life_dur(3600)], bad), Err(IkeError::MalformedPayload(_))));
+        let forged = held_with_notifies_hashed_by(vec![life_type(1), life_dur(3600)], bad, |st| st.skeyid_a[0] ^= 1);
+        assert_eq!(forged.map(|_| ()), Err(IkeError::AuthFailed));
     }
 
     /// The responder counterpart of the initiator's: an offer that includes a

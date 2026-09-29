@@ -321,6 +321,9 @@ struct Run {
     established: Result<Established, DriverError>,
     /// The client's socket, still open, for what the caller does after `connect`.
     client_sock: UdpSocket,
+    /// The port the client's NAT-T socket is bound to (a floated run only): an
+    /// ephemeral one, the way a caller that cannot hold port 4500 binds it.
+    client_natt_port: Option<u16>,
     gateway_addr: SocketAddr,
     gateway: std::thread::JoinHandle<Result<Report, String>>,
 }
@@ -362,14 +365,16 @@ fn connect_with_timeout(script: Script, timeout: Duration) -> Run {
     let gateway = std::thread::spawn(move || gateway.serve());
 
     let client_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let client_natt = script.floated.then(|| UdpSocket::bind("127.0.0.1:0").unwrap());
+    let client_natt_port = client_natt.as_ref().map(|s| s.local_addr().unwrap().port());
     let mut client = if script.floated {
-        Client::from_sockets(client_sock.try_clone().unwrap(), UdpSocket::bind("127.0.0.1:0").unwrap(), SeedEntropy::new(0x1111))
+        Client::from_sockets(client_sock.try_clone().unwrap(), client_natt.unwrap(), SeedEntropy::new(0x1111))
     } else {
         Client::from_socket(client_sock.try_clone().unwrap(), SeedEntropy::new(0x1111))
     };
     client.set_read_timeout(Some(timeout)).unwrap();
     let established = client.connect(gateway_addr, &initiator_config(script));
-    Run { established, client_sock, gateway_addr, gateway }
+    Run { established, client_sock, client_natt_port, gateway_addr, gateway }
 }
 
 /// How many messages the gateway saw sent again. Each one was identical to the
@@ -419,6 +424,20 @@ fn control_a_floated_aggressive_mode_handshake_completes_on_port_4500() {
     assert!(est.phase1.floated, "the handshake was to float");
     assert_resent_identically(&report, 0);
     assert_eq!(est.child.inbound.spi(), report.child.outbound.spi());
+}
+
+/// The address a floated handshake reports as ours carries the port the NAT-T
+/// socket is really bound to, not the well-known 4500: a caller that binds that
+/// socket elsewhere (Windows cannot hold 4500 for ESP, so the worker binds an
+/// ephemeral one) builds its UDP-encap ports from it, as IKEv2's tunnel does.
+#[test]
+fn a_floated_handshake_reports_the_port_its_nat_t_socket_is_really_bound_to() {
+    let run = connect(Script { floated: true, ..Script::default() });
+    let est = run.established.expect("the handshake must complete");
+    run.gateway.join().unwrap().expect("gateway");
+    let bound = run.client_natt_port.expect("a floated run binds a NAT-T socket");
+    assert_ne!(bound, crate::natt_port(), "the test's NAT-T socket is not on port 4500");
+    assert_eq!(est.local_addr.port(), bound, "reported {} but the NAT-T socket is on {bound}", est.local_addr);
 }
 
 /// RFC 2408 §3.1 with RFC 3947 §5.3: message 3 goes out on port 4500, the

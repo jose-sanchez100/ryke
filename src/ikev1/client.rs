@@ -128,7 +128,8 @@ pub struct Established {
     /// selectors, not `cfg.ts_local`/`cfg.ts_remote` verbatim.
     pub ts_local: ([u8; 4], [u8; 4]),
     pub ts_remote: ([u8; 4], [u8; 4]),
-    /// Our real local `(IP, port)` as seen reaching the peer -- resolved via
+    /// Our real local `(IP, port)` as seen reaching the peer (once floated, the
+    /// port is the NAT-T socket's own, which is not necessarily 4500) -- resolved via
     /// [`crate::transport::UdpTransport::local_addr_for`], **not**
     /// [`Client::local_addr`] (which reports the wildcard-bound socket's own
     /// address, `0.0.0.0`, when the socket was never itself `connect()`-ed).
@@ -778,15 +779,25 @@ impl<E: Entropy> Client<E> {
             p2_lifetime_kilobytes.map(|kb| format!(" / {kb} KB")).unwrap_or_default()
         );
 
-        // Post-float, our own reported address's port must be 4500 too, not
-        // just the peer's -- a caller deciding whether to install a
+        // Post-float, our own reported address's port is the one the NAT-T
+        // socket is really bound to -- the port the tunnel's packets leave
+        // from and the gateway answers to -- the way IKEv2's tunnel reports
+        // it. Not the well-known 4500: a caller that cannot hold that port for
+        // itself (Windows drops the ESP that reaches a socket on it, so the
+        // worker binds an ephemeral one) would otherwise be told a port its
+        // tunnel does not use. A caller deciding whether to install a
         // UDP-encap kernel XFRM SA reads `phase1.floated` directly (see
-        // `Phase1State::floated`'s doc) and pairs it with this `local_addr`
-        // and its own already-known `server` address (bumped to port 4500
-        // the same way) -- the same IKE-version-agnostic, port-based signal
-        // an IKEv2 NAT-T path would use too.
-        let local_addr =
-            if phase1.floated { SocketAddr::new(our_addr.ip(), crate::natt_port()) } else { self.transport.local_addr_for(server)? };
+        // `Phase1State::floated`'s doc) and pairs this `local_addr` with its
+        // own already-known `server` address (bumped to port 4500, which is
+        // the peer's, the same way).
+        let local_addr = if phase1.floated {
+            let natt = self.natt_transport.as_ref().ok_or(IkeError::Crypto(
+                "NAT-T floating required but this Client has no port-4500 socket (use Client::from_sockets)",
+            ))?;
+            SocketAddr::new(our_addr.ip(), natt.local_addr()?.port())
+        } else {
+            self.transport.local_addr_for(server)?
+        };
         Ok(Established { phase1, child, assigned_ip4, netmask, dns, subnets, assigned_ip6, dns6, subnets6, local_addr, p2_lifetime_secs, p2_lifetime_kilobytes, ts_local, ts_remote: cfg.ts_remote })
     }
 }

@@ -653,6 +653,33 @@ fn select_offer(ps: &[Payload]) -> Result<Selection, IkeError> {
     Err(IkeError::NoProposalChosen)
 }
 
+/// Whether the identity a responder answered (`answered`, an ID payload body) names the selector this side
+/// offered (`offered`). RFC 2409 §5.5 has the responder echo the initiator's identities, and RFC 2407 §4.6.2.1
+/// gives one address two encodings: ID_IPV4_ADDR / ID_IPV6_ADDR, or a subnet whose mask covers only that
+/// address. This side offers its assigned address as a /32 (/128) subnet; a gateway that writes a single
+/// address in the first form answers it that way (strongSwan does, observed live 2026-09-29), which a byte
+/// comparison refused as an SA "not offered".
+///
+/// Accepted: the same bytes (as always), and the one host that was offered as a /32 (/128) subnet, answered as
+/// that same address in the single-address form with the same protocol and port. Nothing else is: another
+/// address, a subnet wider than a host, the other family, a body that does not parse or has the wrong length
+/// for its type, and the reverse (this side never offers a single address, so an answer in the subnet form for
+/// one is not looked for).
+fn selector_id_matches(offered: &[u8], answered: &[u8]) -> bool {
+    if offered == answered {
+        return true;
+    }
+    let (Ok(o), Ok(a)) = (Id::parse(offered), Id::parse(answered)) else { return false };
+    if o.protocol != a.protocol || o.port != a.port {
+        return false;
+    }
+    match (o.id_type, a.id_type) {
+        (id_type::IPV4_ADDR_SUBNET, id_type::IPV4_ADDR) => o.data.len() == 8 && o.data[4..] == [0xff; 4] && a.data[..] == o.data[..4],
+        (id_type::IPV6_ADDR_SUBNET, id_type::IPV6_ADDR) => o.data.len() == 32 && o.data[16..] == [0xff; 16] && a.data[..] == o.data[..16],
+        _ => false,
+    }
+}
+
 /// Check the SA payload of Quick Mode message 2 against the one we sent
 /// (`offered`) and return the SPI the responder chose for its inbound ESP SA.
 /// RFC 2408 §4.2: "The initiator MUST verify that the Security Association
@@ -794,10 +821,12 @@ pub struct QuickInitiator {
     /// see `negotiated_p2_lifetime`'s doc).
     life_duration: u32,
     /// The IDci/IDcr payload bodies we offered -- [`QuickInitiator::complete`]
-    /// checks the responder echoed exactly these back (RFC 2409 §5.5: when
+    /// checks the responder echoed these back (RFC 2409 §5.5: when
     /// the initiator sends client identities, the responder's message 2
-    /// carries them too). An authentic HASH(2) only proves the response
-    /// wasn't tampered with, not that it actually named what we offered.
+    /// carries them too), the same bytes or the same single host written
+    /// as a single address ([`selector_id_matches`]). An authentic HASH(2)
+    /// only proves the response wasn't tampered with, not that it actually
+    /// named what we offered.
     id_local: Vec<u8>,
     id_remote: Vec<u8>,
 }
@@ -965,7 +994,7 @@ impl QuickInitiator {
         // the one sent.
         let peer_spi = check_answer(&self.offer, &ps)?;
         let peer_ids: Vec<Vec<u8>> = ps.iter().filter(|p| p.payload_type == payload::ID).map(|p| p.data.clone()).collect();
-        if peer_ids.len() != 2 || peer_ids[0] != self.id_local || peer_ids[1] != self.id_remote {
+        if peer_ids.len() != 2 || !selector_id_matches(&self.id_local, &peer_ids[0]) || !selector_id_matches(&self.id_remote, &peer_ids[1]) {
             return Err(IkeError::NoProposalChosen);
         }
         // Read only now that HASH(2) has proved them the peer's, and before
@@ -1736,6 +1765,109 @@ mod tests {
             Err(IkeError::NoProposalChosen) => {}
             other => panic!("expected NoProposalChosen, got {:?}", other.map(|_| ())),
         }
+    }
+
+    /// An IPv4 host selector, the way a gateway that writes a single address as `ID_IPV4_ADDR` answers it
+    /// (strongSwan does; observed live against 6.0.4, 2026-09-29).
+    fn host_id_v4(addr: [u8; 4]) -> Vec<u8> {
+        Id::ipv4(addr).to_bytes()
+    }
+
+    #[test]
+    fn quick_mode_complete_accepts_a_host_offered_as_a_slash_32_and_answered_as_a_single_address() {
+        // RFC 2407 §4.6.2.1 writes one address either as ID_IPV4_ADDR or as a subnet covering only it. This side
+        // offers its assigned address as a /32 subnet; strongSwan answers it as ID_IPV4_ADDR. The exchange must
+        // complete, and the child SA must be the one that was negotiated.
+        let (istate, rstate, mut ie, mut re) = phase1_pair(0x5151, 0x5252, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let vip = ([10, 99, 0, 1], [255, 255, 255, 255]);
+        let any = ([0, 0, 0, 0], [0, 0, 0, 0]);
+        let (qm1, qi) = initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, vip, any, 3600).unwrap();
+
+        let sa = esp_sa(0xAAAA_BBBB, SkCipher::Aes256Gcm, None, rstate.floated, 3600);
+        let msg2 = respond_quick_forging_answer(&rstate, &qm1, &mut re, &sa, &[host_id_v4(vip.0), ts_id(any.0, any.1)]);
+
+        let (_msg3, child, seconds) = qi.complete(&msg2).unwrap_or_else(|e| panic!("a host answered as a single address must be accepted: {e:?}"));
+        assert_eq!(seconds, 3600);
+        assert_eq!(child.outbound.spi(), 0xAAAA_BBBB);
+    }
+
+    #[test]
+    fn quick_mode_complete_still_refuses_an_answer_that_is_not_the_selector_offered() {
+        // The single-address form is accepted for the one host that was offered, and for nothing else.
+        let vip = ([10, 99, 0, 1], [255, 255, 255, 255]);
+        let any = ([0, 0, 0, 0], [0, 0, 0, 0]);
+        let other_host = host_id_v4([10, 99, 0, 2]);
+        let with_port = Id { id_type: id_type::IPV4_ADDR, protocol: 17, port: 4500, data: vip.0.to_vec() }.to_bytes();
+        let with_protocol = Id { id_type: id_type::IPV4_ADDR, protocol: 17, port: 0, data: vip.0.to_vec() }.to_bytes();
+        let wider = ts_id([10, 99, 0, 0], [255, 255, 255, 0]);
+        let cases = [
+            ("another host", vip, other_host),
+            ("the host with a port", vip, with_port),
+            ("the host with a protocol", vip, with_protocol),
+            ("a subnet where a host was offered", vip, wider),
+            // A /24 offered is not a host: its network address written as a single address is another selector.
+            ("a single address for an offered /24", ([10, 99, 0, 0], [255, 255, 255, 0]), host_id_v4([10, 99, 0, 0])),
+        ];
+        for (n, (label, offered, answered)) in cases.into_iter().enumerate() {
+            let (istate, rstate, mut ie, mut re) = phase1_pair(0x6100 + n as u64, 0x6200 + n as u64, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+            let (qm1, qi) = initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, offered, any, 3600).unwrap();
+            let sa = esp_sa(0xAAAA_BBBB, SkCipher::Aes256Gcm, None, rstate.floated, 3600);
+            let msg2 = respond_quick_forging_answer(&rstate, &qm1, &mut re, &sa, &[answered, ts_id(any.0, any.1)]);
+            match qi.complete(&msg2) {
+                Err(IkeError::NoProposalChosen) => {}
+                other => panic!("{label}: expected NoProposalChosen, got {:?}", other.map(|_| ())),
+            }
+        }
+    }
+
+    #[test]
+    fn quick_mode_ipv6_complete_accepts_a_host_offered_as_a_slash_128_and_answered_as_a_single_address() {
+        let (istate, rstate, mut ie, mut re) = phase1_pair(0x7101, 0x7102, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let vip = v6("fd00::abcd");
+        let (qm1, qi) = initiate_quick_ipv6(&istate, &mut ie, SkCipher::Aes256Gcm, (vip, 128), (v6("::"), 0), None, 3600).unwrap();
+
+        let sa = esp_sa(0xAAAA_BBBB, SkCipher::Aes256Gcm, None, rstate.floated, 3600);
+        let host = Id { id_type: id_type::IPV6_ADDR, protocol: 0, port: 0, data: vip.octets().to_vec() }.to_bytes();
+        let msg2 = respond_quick_forging_answer(&rstate, &qm1, &mut re, &sa, &[host, ts_id_v6(v6("::"), 0)]);
+        qi.complete(&msg2).unwrap_or_else(|e| panic!("an IPv6 host answered as a single address must be accepted: {e:?}"));
+
+        // Another IPv6 address is not the one offered.
+        let (istate, rstate, mut ie, mut re) = phase1_pair(0x7201, 0x7202, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let (qm1, qi) = initiate_quick_ipv6(&istate, &mut ie, SkCipher::Aes256Gcm, (vip, 128), (v6("::"), 0), None, 3600).unwrap();
+        let sa = esp_sa(0xAAAA_BBBB, SkCipher::Aes256Gcm, None, rstate.floated, 3600);
+        let other = Id { id_type: id_type::IPV6_ADDR, protocol: 0, port: 0, data: v6("fd00::abce").octets().to_vec() }.to_bytes();
+        let msg2 = respond_quick_forging_answer(&rstate, &qm1, &mut re, &sa, &[other, ts_id_v6(v6("::"), 0)]);
+        match qi.complete(&msg2) {
+            Err(IkeError::NoProposalChosen) => {}
+            other => panic!("expected NoProposalChosen, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn selector_id_matches_only_the_same_bytes_or_the_same_single_host() {
+        let v4_host_subnet = ts_id([10, 99, 0, 1], [255, 255, 255, 255]);
+        let v4_single = host_id_v4([10, 99, 0, 1]);
+        let v4_slash24 = ts_id([10, 99, 0, 0], [255, 255, 255, 0]);
+        let v6_host_subnet = ts_id_v6(v6("fd00::1"), 128);
+        let v6_single = Id { id_type: id_type::IPV6_ADDR, protocol: 0, port: 0, data: v6("fd00::1").octets().to_vec() }.to_bytes();
+        let v6_slash64 = ts_id_v6(v6("fd00::"), 64);
+        // Equal bytes, as before.
+        assert!(selector_id_matches(&v4_host_subnet, &v4_host_subnet));
+        assert!(selector_id_matches(&v4_slash24, &v4_slash24));
+        // The offered host, answered as a single address.
+        assert!(selector_id_matches(&v4_host_subnet, &v4_single));
+        assert!(selector_id_matches(&v6_host_subnet, &v6_single));
+        // Not the other way round (this side never offers a single address), not across families, not for a wider subnet.
+        assert!(!selector_id_matches(&v4_single, &v4_host_subnet));
+        assert!(!selector_id_matches(&v6_single, &v6_host_subnet));
+        assert!(!selector_id_matches(&v4_host_subnet, &v6_single));
+        assert!(!selector_id_matches(&v6_host_subnet, &v4_single));
+        assert!(!selector_id_matches(&v4_slash24, &host_id_v4([10, 99, 0, 0])));
+        assert!(!selector_id_matches(&v6_slash64, &Id { id_type: id_type::IPV6_ADDR, protocol: 0, port: 0, data: v6("fd00::").octets().to_vec() }.to_bytes()));
+        // A body that cannot be read, or has the wrong length for its type, is never a match.
+        assert!(!selector_id_matches(&v4_host_subnet, &[]));
+        assert!(!selector_id_matches(&v4_host_subnet, &[id_type::IPV4_ADDR, 0, 0, 0, 10, 99, 0]));
+        assert!(!selector_id_matches(&[id_type::IPV4_ADDR_SUBNET, 0, 0, 0, 10, 99, 0, 1], &v4_single));
     }
 
     /// The specific cipher a real FortiGate demanded live (see this crate's

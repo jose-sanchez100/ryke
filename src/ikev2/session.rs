@@ -326,6 +326,54 @@ pub struct PeerRekeyedChild {
     pub child: RekeyedChild,
 }
 
+/// A CHILD SA rekey of our own that [`LivenessSession::negotiate_rekey`]
+/// negotiated and nothing has committed or abandoned yet: the SA replacing
+/// `kind`'s for the caller to install, before
+/// [`LivenessSession::commit_rekey`] deletes the one it replaces.
+pub struct NegotiatedRekey {
+    pub kind: ChildKind,
+    /// The SA to install: ours, or the peer's when it rekeyed the same SA at
+    /// the same time and its SA is the one kept (RFC 7296 §2.8.1).
+    pub child: RekeyedChild,
+    /// The (local, peer) SPIs of the SA it replaces.
+    pub replaces: (u32, u32),
+}
+
+/// What came of the Delete of one CHILD SA -- see [`DeleteReport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildDeleteOutcome {
+    /// Sent, and answered or not, retransmissions included.
+    Sent { acknowledged: bool },
+    /// Not sent: no Message ID left, or the request could not go out. The
+    /// caller may try it once more ([`LivenessSession::delete_child`]).
+    NotSent(String),
+    /// Nothing for us to send, and why: `"peer_deletes"` (the peer deletes
+    /// that SA itself), `"gateway_deleted"` (it already did), `"superseded"`
+    /// (the peer's rekey replaced it), `"ike_sa_gone"` (the IKE SA it was
+    /// under is over), `"not_asked"` (the caller asked for no Delete) or
+    /// `"in_use"` (the SA is still one the tunnel runs on).
+    NotOwed(&'static str),
+}
+
+/// What [`LivenessSession::commit_rekey`], [`LivenessSession::abandon_rekey`]
+/// and [`LivenessSession::delete_child`] did about a CHILD SA's Delete.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeleteReport {
+    pub outcome: ChildDeleteOutcome,
+    /// What waiting for the Delete's answer saw: [`Liveness::Alive`] (also
+    /// when nothing was sent), [`Liveness::NoReply`], or
+    /// [`Liveness::PeerTornDown`] -- the peer tore the tunnel down meanwhile
+    /// (a request of its answered during the wait), or the IKE SA is gone.
+    pub liveness: Liveness,
+}
+
+impl DeleteReport {
+    /// Nothing sent: the IKE SA the CHILD SA was under is over.
+    fn ike_sa_gone() -> Self {
+        DeleteReport { outcome: ChildDeleteOutcome::NotOwed("ike_sa_gone"), liveness: Liveness::PeerTornDown }
+    }
+}
+
 /// How long a CHILD SA the peer rekeyed away stays recognisable: the peer
 /// deletes it right after the exchange, and that Delete is answered with ours.
 const SUPERSEDED_CHILD_TTL: Duration = Duration::from_secs(60);
@@ -353,6 +401,40 @@ struct PeerChildState {
     /// The CHILD SA exchange of our own still waiting for its answer, which
     /// a request of the peer's can collide with (RFC 7296 §2.25.1).
     in_flight: Option<OwnChildOp>,
+    /// The rekeys of ours [`LivenessSession::negotiate_rekey`] negotiated
+    /// and nothing has committed or abandoned yet, by family (see
+    /// [`own_rekey_slot`]). Deliberately not `in_flight`: no request of ours
+    /// is waiting, and the peer's IKE SA rekeys are taken on meanwhile.
+    own_rekeys: [Option<OwnRekey>; 2],
+}
+
+/// Where a family's entry is in [`PeerChildState::own_rekeys`].
+fn own_rekey_slot(kind: ChildKind) -> usize {
+    match kind {
+        ChildKind::Primary => 0,
+        ChildKind::Ipv6 => 1,
+    }
+}
+
+/// A rekey of ours negotiated but not committed or abandoned: the SA it
+/// replaces and that SA's traffic selectors, the SA replacing it (the
+/// family's current one from the negotiation on), and who deletes the old one.
+struct OwnRekey {
+    old: ChildSpis,
+    old_ts: Option<ChildTs>,
+    new: ChildSpis,
+    fate: OldFate,
+}
+
+/// Who deletes the SA a rekey of ours replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OldFate {
+    /// We do, once the caller commits (RFC 7296 §2.8).
+    Ours,
+    /// The peer does: it rekeyed the same SA and its SA was kept (§2.8.1).
+    PeerDeletes,
+    /// The peer deleted it already.
+    Gone,
 }
 
 /// A CHILD SA exchange this session started and the peer has not answered yet.
@@ -873,6 +955,208 @@ impl LivenessSession {
         Ok(rekeyed)
     }
 
+    /// The current (local, peer) SPIs of `kind`'s CHILD SA, if it has one --
+    /// from [`Self::negotiate_rekey`] on, the SA it negotiated.
+    pub fn child_spis(&self, kind: ChildKind) -> Option<(u32, u32)> {
+        match kind {
+            ChildKind::Primary => self.primary_child_alive.then_some((self.child_local_spi, self.child_peer_spi)),
+            ChildKind::Ipv6 => self.child6.map(|c| (c.local, c.peer)),
+        }
+    }
+
+    /// The first half of a make-before-break rekey of `kind`'s CHILD SA:
+    /// the `CREATE_CHILD_SA` exchange of [`Self::rekey_child`] (`Primary`,
+    /// both families when the SA carries both) or [`Self::rekey_child_ipv6`]
+    /// (`Ipv6`), with the same errors, but without the Delete of the SA it
+    /// replaces. The caller installs [`NegotiatedRekey::child`], moves its
+    /// traffic to it, and then [`Self::commit_rekey`]s -- or
+    /// [`Self::abandon_rekey`]s if it cannot. Meanwhile [`Self::peek`]
+    /// answers the peer as usual, and `kind`'s current SA is the new one: the
+    /// peer may already send on it, and may rekey it.
+    ///
+    /// A crossed rekey of the same SA by the peer is settled here
+    /// (RFC 7296 §2.8.1), as in [`Self::rekey_child`]: `child` is the SA
+    /// kept, ours or the peer's. Refused with [`IkeError::Crypto`], sending
+    /// nothing, while a rekey of `kind` is already negotiated, when `kind`
+    /// has no CHILD SA, or when the IKE SA is over.
+    pub fn negotiate_rekey(&mut self, kind: ChildKind, timeout: Duration) -> Result<NegotiatedRekey, DriverError> {
+        let slot = own_rekey_slot(kind);
+        if self.peer_child.own_rekeys[slot].is_some() {
+            return Err(IkeError::Crypto("a rekey of this CHILD SA is already negotiated").into());
+        }
+        if self.ike.ended {
+            return Err(IkeError::Crypto("the IKE SA is over").into());
+        }
+        let (old, ts, what) = match kind {
+            ChildKind::Primary if !self.primary_child_alive => return Err(IkeError::Crypto("no primary CHILD SA to rekey").into()),
+            ChildKind::Primary => {
+                let old = ChildSpis { local: self.child_local_spi, peer: self.child_peer_spi };
+                // As in `rekey_child`: a unified SA keeps being proposed as one.
+                let ts = if self.child_carries_ipv6 { TrafficSelectors::unified_full_tunnel() } else { TrafficSelectors::ipv4_full_tunnel() };
+                (old, ts, "rekey")
+            }
+            ChildKind::Ipv6 => {
+                let old = self.child6.ok_or(IkeError::Crypto("no IPv6 CHILD SA to rekey"))?;
+                (old, TrafficSelectors::ipv6_full_tunnel(), "rekey IPv6")
+            }
+        };
+        let old_ts = self.child_ts.get(kind).cloned();
+        let (child, tsr, _, fate) = self.child_exchange_parts(kind, old, &ts, what, timeout)?;
+        if kind == ChildKind::Primary && self.child_carries_ipv6 && !tsr.as_ref().is_some_and(|t| t.has_ipv6()) {
+            ike_debug!("CREATE_CHILD_SA (rekey): the unified CHILD SA's rekey came back without IPv6 (TSr={tsr:?})");
+        }
+        ike_debug!(
+            "CREATE_CHILD_SA ({what}): negotiated spi_in={:08x}, replacing spi_in={:08x} ({fate:?} to delete) -- awaiting commit",
+            child.local_spi, old.local
+        );
+        self.peer_child.own_rekeys[slot] = Some(OwnRekey { old, old_ts, new: ChildSpis::of(&child), fate });
+        Ok(NegotiatedRekey { kind, child, replaces: (old.local, old.peer) })
+    }
+
+    /// The second half of [`Self::negotiate_rekey`], once the caller runs on
+    /// the SA it negotiated, named by `new_local_spi`: the SA it replaced is
+    /// deleted (RFC 7296 §2.8) if `delete_replaced` and that is ours to do.
+    /// It is not when the peer deletes it ([`ChildDeleteOutcome::NotOwed`]
+    /// `"peer_deletes"`, a crossed rekey kept the peer's SA), deleted it
+    /// already (`"gateway_deleted"`), or the IKE SA is over
+    /// (`"ike_sa_gone"`). The Delete's answer is waited for, a few attempts
+    /// of 500 ms, so that no other request of ours is outstanding meanwhile
+    /// (RFC 7296 §2.3); unanswered, it is not sent again. The negotiated
+    /// rekey is done with either way. With none of `kind` matching it is
+    /// refused with [`IkeError::Crypto`], changing nothing.
+    pub fn commit_rekey(&mut self, kind: ChildKind, new_local_spi: u32, delete_replaced: bool) -> Result<DeleteReport, DriverError> {
+        let rekey = self.take_own_rekey(kind, new_local_spi)?;
+        ike_debug!("CREATE_CHILD_SA: committing the rekey to spi_in={new_local_spi:08x} ({:?}, replaced spi_in={:08x})", rekey.fate, rekey.old.local);
+        if self.ike_sa_gone() {
+            return Ok(DeleteReport::ike_sa_gone());
+        }
+        let outcome = match rekey.fate {
+            OldFate::PeerDeletes => ChildDeleteOutcome::NotOwed("peer_deletes"),
+            OldFate::Gone => ChildDeleteOutcome::NotOwed("gateway_deleted"),
+            OldFate::Ours if !delete_replaced => ChildDeleteOutcome::NotOwed("not_asked"),
+            OldFate::Ours => return self.delete_child_sa_reporting(rekey.old),
+        };
+        Ok(DeleteReport { outcome, liveness: Liveness::Alive })
+    }
+
+    /// Give up the SA [`Self::negotiate_rekey`] negotiated, named by
+    /// `new_local_spi`, when the caller could not install it. While it is
+    /// still `kind`'s current SA:
+    /// - if the SA it replaced is ours to delete, that SA is `kind`'s again,
+    ///   traffic selectors and all, and the new one is deleted if
+    ///   `delete_new`;
+    /// - if the peer deletes the SA it replaced or did already, nothing is
+    ///   left to go back to: the new one is deleted if `delete_new`, and
+    ///   `kind` is lost as when the peer deletes its CHILD SA -- queued for
+    ///   [`Self::take_peer_deleted_children`] while the other family is up,
+    ///   the tunnel's end ([`Liveness::PeerTornDown`]) otherwise.
+    ///
+    /// When it no longer is -- the peer rekeyed it (and deletes it) or
+    /// deleted it -- there is nothing of it to delete, and the SA it replaced
+    /// is deleted as [`Self::commit_rekey`] would. The report is of the one
+    /// Delete sent, if any. The negotiated rekey is done with either way;
+    /// with none of `kind` matching it is refused with
+    /// [`IkeError::Crypto`], changing nothing.
+    pub fn abandon_rekey(&mut self, kind: ChildKind, new_local_spi: u32, delete_new: bool) -> Result<DeleteReport, DriverError> {
+        let rekey = self.take_own_rekey(kind, new_local_spi)?;
+        let still_current = self.child_spis(kind) == Some((rekey.new.local, rekey.new.peer));
+        ike_debug!(
+            "CREATE_CHILD_SA: abandoning the rekey to spi_in={new_local_spi:08x} ({:?}, replaced spi_in={:08x}, {})",
+            rekey.fate,
+            rekey.old.local,
+            if still_current { "still current" } else { "no longer current" }
+        );
+        if !still_current {
+            if self.ike_sa_gone() {
+                return Ok(DeleteReport::ike_sa_gone());
+            }
+            let outcome = match rekey.fate {
+                OldFate::Ours => return self.delete_child_sa_reporting(rekey.old),
+                OldFate::PeerDeletes => ChildDeleteOutcome::NotOwed("peer_deletes"),
+                OldFate::Gone => ChildDeleteOutcome::NotOwed("gateway_deleted"),
+            };
+            return Ok(DeleteReport { outcome, liveness: Liveness::Alive });
+        }
+        if rekey.fate == OldFate::Ours {
+            self.restore_child_spis(kind, rekey.old);
+            self.child_ts.set(kind, rekey.old_ts);
+            return self.delete_new_of_abandoned(rekey.new, delete_new);
+        }
+        let mut report = self.delete_new_of_abandoned(rekey.new, delete_new)?;
+        // The SA it replaced is (being) deleted by the peer: `kind` has none.
+        let other_up = match kind {
+            ChildKind::Primary => self.child6.is_some(),
+            ChildKind::Ipv6 => self.primary_child_alive,
+        };
+        if other_up {
+            ike_debug!("CREATE_CHILD_SA: the {kind:?} CHILD SA is lost with the abandoned rekey -- the other one and the IKE SA are still up, renegotiating it");
+            match kind {
+                ChildKind::Primary => self.primary_child_alive = false,
+                ChildKind::Ipv6 => self.child6 = None,
+            }
+            self.peer_child.deleted.push(kind);
+        } else {
+            ike_debug!("CREATE_CHILD_SA: the tunnel's last CHILD SA is lost with the abandoned rekey");
+            report.liveness = Liveness::PeerTornDown;
+        }
+        Ok(report)
+    }
+
+    /// Delete the CHILD SA `local_spi`/`peer_spi` once more: the one retry
+    /// of a Delete [`Self::commit_rekey`] or [`Self::abandon_rekey`]
+    /// reported [`ChildDeleteOutcome::NotSent`]. Refused as
+    /// [`ChildDeleteOutcome::NotOwed`] `"in_use"` for an SA the tunnel runs
+    /// on (a family's current SA, or one negotiated and not committed) and
+    /// `"peer_deletes"` for one the peer's rekey replaced, whose Delete is the
+    /// peer's.
+    pub fn delete_child(&mut self, local_spi: u32, peer_spi: u32) -> Result<DeleteReport, DriverError> {
+        let names = |local: u32, peer: u32| local == local_spi || peer == peer_spi;
+        let current = [ChildKind::Primary, ChildKind::Ipv6].into_iter().filter_map(|kind| self.child_spis(kind)).any(|(l, p)| names(l, p));
+        let negotiated = self.peer_child.own_rekeys.iter().flatten().any(|r| names(r.new.local, r.new.peer));
+        if current || negotiated {
+            return Ok(DeleteReport { outcome: ChildDeleteOutcome::NotOwed("in_use"), liveness: Liveness::Alive });
+        }
+        if self.peer_child.superseded.iter().any(|s| names(s.local_spi, s.peer_spi)) {
+            return Ok(DeleteReport { outcome: ChildDeleteOutcome::NotOwed("peer_deletes"), liveness: Liveness::Alive });
+        }
+        self.delete_child_sa_reporting(ChildSpis { local: local_spi, peer: peer_spi })
+    }
+
+    /// Take `kind`'s negotiated rekey whose new SA is `new_local_spi`, or
+    /// fail leaving everything as it was.
+    fn take_own_rekey(&mut self, kind: ChildKind, new_local_spi: u32) -> Result<OwnRekey, DriverError> {
+        self.peer_child.own_rekeys[own_rekey_slot(kind)]
+            .take_if(|rekey| rekey.new.local == new_local_spi)
+            .ok_or_else(|| IkeError::Crypto("no negotiated rekey of this CHILD SA").into())
+    }
+
+    /// Whether the IKE SA is over: nothing more is sent on it.
+    fn ike_sa_gone(&self) -> bool {
+        self.ike.ended || self.peer_requests.gone
+    }
+
+    /// Record `spis` as `kind`'s CHILD SA (see [`Self::set_child_spis`]).
+    fn restore_child_spis(&mut self, kind: ChildKind, spis: ChildSpis) {
+        match kind {
+            ChildKind::Primary => {
+                self.child_local_spi = spis.local;
+                self.child_peer_spi = spis.peer;
+            }
+            ChildKind::Ipv6 => self.child6 = Some(spis),
+        }
+    }
+
+    /// The Delete of an abandoned rekey's new SA `new`, if `delete_new`.
+    fn delete_new_of_abandoned(&mut self, new: ChildSpis, delete_new: bool) -> Result<DeleteReport, DriverError> {
+        if self.ike_sa_gone() {
+            return Ok(DeleteReport::ike_sa_gone());
+        }
+        if !delete_new {
+            return Ok(DeleteReport { outcome: ChildDeleteOutcome::NotOwed("not_asked"), liveness: Liveness::Alive });
+        }
+        self.delete_child_sa_reporting(new)
+    }
+
     /// One `CREATE_CHILD_SA` exchange creating a CHILD SA proposing `ts` as
     /// both TSi and TSr: a rekey of `kind`'s CHILD SA `old` when `replaces` is
     /// `Some((kind, old))`, a brand-new CHILD SA otherwise. Returns the new SA
@@ -901,6 +1185,30 @@ impl LivenessSession {
             (Some((kind, old)), Some(own)) => self.settle_rekey(kind, old, own, exchanged, what),
             _ => exchanged.map(|(child, tsr, _, granted)| (rekeyed_child(&child), tsr, granted)),
         }
+    }
+
+    /// [`Self::child_exchange`] for a rekey of `kind`'s CHILD SA `old`, for
+    /// [`Self::negotiate_rekey`]: settled by [`Self::settle_rekey_parts`],
+    /// which sends no Delete of `old` and says who deletes it.
+    fn child_exchange_parts(
+        &mut self,
+        kind: ChildKind,
+        old: ChildSpis,
+        ts: &TrafficSelectors,
+        what: &str,
+        timeout: Duration,
+    ) -> Result<(RekeyedChild, Option<TrafficSelectors>, Option<ChildTs>, OldFate), DriverError> {
+        if self.ike.ended {
+            return Err(IkeError::PeerTornDown.into());
+        }
+        let keep = self.child_ts.get(kind).cloned();
+        let op = OwnChildOp { op: ChildOp::Rekey(old), crossed: None, old_deleted: false };
+        self.peer_child.in_flight = Some(op);
+        let exchanged = self.child_request(Some(old), keep, ts, what, timeout);
+        // Always there: set just above, and a Delete sent meanwhile puts back
+        // what it found.
+        let own = self.peer_child.in_flight.take().unwrap_or(OwnChildOp { op: ChildOp::Rekey(old), crossed: None, old_deleted: false });
+        self.settle_rekey_parts(kind, old, own, exchanged, what)
     }
 
     /// Where a rekey of `kind`'s CHILD SA `old` leaves things, once our own
@@ -937,6 +1245,41 @@ impl LivenessSession {
         exchanged: Result<ChildExchanged, DriverError>,
         what: &str,
     ) -> Result<(RekeyedChild, Option<TrafficSelectors>, Option<ChildTs>), DriverError> {
+        let (rekeyed, tsr, granted, fate) = self.settle_rekey_parts(kind, old, own, exchanged, what)?;
+        // RFC 7296 §2.8's own worked example ends a rekey with the initiator
+        // explicitly deleting the SA it just replaced -- without this, a real
+        // gateway (confirmed live against a FortiGate) has no way to know the
+        // old CHILD SA is no longer wanted and keeps it (and its kernel
+        // state) around until its own lifetime eventually expires it, which
+        // with a short-lived P2 profile means old, unused SAs pile up.
+        // Best-effort: the new CHILD SA above is already valid and in use
+        // regardless of whether the peer sees or acks this.
+        if fate == OldFate::Ours {
+            if let Err(e) = self.delete_child_sa(old) {
+                ike_debug!(
+                    "CREATE_CHILD_SA ({what}): failed to send Delete for superseded CHILD SA spi_in={:08x} (new CHILD SA unaffected): {e}",
+                    old.local
+                );
+            }
+        }
+        Ok((rekeyed, tsr, granted))
+    }
+
+    /// [`Self::settle_rekey`] up to the Delete of `old`: records the SA
+    /// replacing `old`, and its traffic selectors, as `kind`'s, deletes our
+    /// redundant SA of a crossed rekey, and returns the SA the caller
+    /// installs with who deletes `old` -- [`OldFate::Ours`] when that is
+    /// still to be done by us, [`OldFate::PeerDeletes`] when the peer's SA
+    /// was kept, [`OldFate::Gone`] when the peer deleted `old` meanwhile.
+    fn settle_rekey_parts(
+        &mut self,
+        kind: ChildKind,
+        old: ChildSpis,
+        own: OwnChildOp,
+        exchanged: Result<ChildExchanged, DriverError>,
+        what: &str,
+    ) -> Result<(RekeyedChild, Option<TrafficSelectors>, Option<ChildTs>, OldFate), DriverError> {
+        let ours_to_delete = if own.old_deleted { OldFate::Gone } else { OldFate::Ours };
         // A peer rekey answered meanwhile has already recorded its SA, and
         // its traffic selectors, as `kind`'s.
         let (child, tsr, granted) = match (exchanged, own.crossed) {
@@ -951,7 +1294,7 @@ impl LivenessSession {
                     if let Err(e) = self.delete_child_sa(ChildSpis::of(&ours)) {
                         ike_debug!("CREATE_CHILD_SA ({what}): failed to send Delete for the redundant CHILD SA spi_in={:08x}: {e}", ours.local_spi);
                     }
-                    return Ok((crossed.child, tsr, self.child_ts.get(kind).cloned()));
+                    return Ok((crossed.child, tsr, self.child_ts.get(kind).cloned(), OldFate::PeerDeletes));
                 }
                 ike_debug!(
                     "CREATE_CHILD_SA ({what}): the peer rekeyed the same CHILD SA -- its SA (spi_in={:08x}) holds the lowest nonce, the peer deletes it; keeping ours (spi_in={:08x})",
@@ -970,7 +1313,7 @@ impl LivenessSession {
                     "CREATE_CHILD_SA ({what}): failed ({e}), but the peer rekeyed the same CHILD SA meanwhile -- keeping its SA (spi_in={:08x})",
                     crossed.child.local_spi
                 );
-                return Ok((crossed.child, None, self.child_ts.get(kind).cloned()));
+                return Ok((crossed.child, None, self.child_ts.get(kind).cloned(), OldFate::PeerDeletes));
             }
             (Err(e), None) if own.old_deleted => return Err(self.lost_child(kind, e)),
             (Err(e), None) => return Err(e),
@@ -980,23 +1323,7 @@ impl LivenessSession {
         if granted.is_some() {
             self.child_ts.set(kind, granted.clone());
         }
-        // RFC 7296 §2.8's own worked example ends a rekey with the initiator
-        // explicitly deleting the SA it just replaced -- without this, a real
-        // gateway (confirmed live against a FortiGate) has no way to know the
-        // old CHILD SA is no longer wanted and keeps it (and its kernel
-        // state) around until its own lifetime eventually expires it, which
-        // with a short-lived P2 profile means old, unused SAs pile up.
-        // Best-effort: the new CHILD SA above is already valid and in use
-        // regardless of whether the peer sees or acks this.
-        if !own.old_deleted {
-            if let Err(e) = self.delete_child_sa(old) {
-                ike_debug!(
-                    "CREATE_CHILD_SA ({what}): failed to send Delete for superseded CHILD SA spi_in={:08x} (new CHILD SA unaffected): {e}",
-                    old.local
-                );
-            }
-        }
-        Ok((rekeyed, tsr, granted))
+        Ok((rekeyed, tsr, granted, ours_to_delete))
     }
 
     /// Record `child` as `kind`'s CHILD SA.
@@ -1196,6 +1523,40 @@ impl LivenessSession {
         let _ = self.send_and_await(&request, mid, Duration::from_millis(500));
         self.peer_child.in_flight = outer;
         Ok(())
+    }
+
+    /// [`Self::delete_child_sa`], reporting what came of it instead of
+    /// dropping it: whether the Delete went out and was answered, and what
+    /// the wait for its answer saw ([`Liveness::PeerTornDown`] included).
+    /// Running out of Message IDs, and failing to send, is
+    /// [`ChildDeleteOutcome::NotSent`]; on an IKE SA that is over nothing is
+    /// sent (`"ike_sa_gone"`).
+    fn delete_child_sa_reporting(&mut self, child: ChildSpis) -> Result<DeleteReport, DriverError> {
+        if self.ike_sa_gone() {
+            return Ok(DeleteReport::ike_sa_gone());
+        }
+        let mid = match self.alloc_message_id() {
+            Ok(mid) => mid,
+            Err(e) => return Ok(DeleteReport { outcome: ChildDeleteOutcome::NotSent(e.to_string()), liveness: Liveness::Alive }),
+        };
+        let mut iv = [0u8; 8];
+        OsEntropy::new()?.fill(&mut iv);
+        let del = Delete::esp(vec![child.local]);
+        let req = build_informational(&self.sa, mid, false, &[(PayloadType::Delete, del.to_bytes())], &iv)?;
+        ike_debug!("INFORMATIONAL: sending ESP Delete for CHILD SA spi_in={:08x} to {}", child.local, self.dest);
+        let request = self.outgoing(OnIkeSa::Current, req)?;
+        // As in `delete_child_sa`: the peer's requests about this SA collide
+        // with it until it is answered (RFC 7296 §2.25.1).
+        let outer = self.peer_child.in_flight.replace(OwnChildOp { op: ChildOp::Close(child), crossed: None, old_deleted: false });
+        let waited = self.send_and_await(&request, mid, Duration::from_millis(500));
+        self.peer_child.in_flight = outer;
+        Ok(match waited {
+            Ok(liveness) => DeleteReport { outcome: ChildDeleteOutcome::Sent { acknowledged: liveness == Liveness::Alive }, liveness },
+            Err(e) => {
+                ike_debug!("INFORMATIONAL: the ESP Delete for CHILD SA spi_in={:08x} failed: {e}", child.local);
+                DeleteReport { outcome: ChildDeleteOutcome::NotSent(e.to_string()), liveness: Liveness::Alive }
+            }
+        })
     }
 
     /// Shared receive loop for `probe`/`peek`: reads until `timeout`
@@ -1613,9 +1974,20 @@ impl LivenessSession {
         let names = |spi: u32| named.contains(&spi) && Some(spi) != collided_peer;
         let primary = self.primary_child_alive && names(self.child_peer_spi);
         let child6 = self.child6.filter(|c| names(c.peer));
+        // The SA a rekey of ours negotiated (and not yet committed) replaced:
+        // ours to delete no more, and not one the tunnel runs on.
+        let negotiated_old: Vec<usize> = (0..self.peer_child.own_rekeys.len())
+            .filter(|&slot| self.peer_child.own_rekeys[slot].as_ref().is_some_and(|r| named.contains(&r.old.peer)))
+            .collect();
+        let negotiated_old_local = negotiated_old.iter().filter_map(|&slot| self.peer_child.own_rekeys[slot].as_ref().map(|r| r.old.local));
         // Ours for each pair, but for an SA we are deleting (RFC 7296 §2.25.1).
         let mut ours = superseded.clone();
-        for spi in rekeying.into_iter().chain(primary.then_some(self.child_local_spi)).chain(child6.map(|c| c.local)) {
+        for spi in rekeying
+            .into_iter()
+            .chain(primary.then_some(self.child_local_spi))
+            .chain(child6.map(|c| c.local))
+            .chain(negotiated_old_local)
+        {
             if !ours.contains(&spi) {
                 ours.push(spi);
             }
@@ -1638,6 +2010,12 @@ impl LivenessSession {
                 ike_debug!("INFORMATIONAL: peer deleted the CHILD SA we are deleting (spi_in={:08x}) -- ours is on its way", closing.local);
             }
             _ => {}
+        }
+        for slot in negotiated_old {
+            if let Some(rekey) = self.peer_child.own_rekeys[slot].as_mut() {
+                ike_debug!("INFORMATIONAL: peer deleted the CHILD SA our negotiated rekey replaces (spi_in={:08x}) -- the commit owes no Delete", rekey.old.local);
+                rekey.fate = OldFate::Gone;
+            }
         }
         // The tunnel ends when these Deletes leave it no CHILD SA, whatever
         // order they came in: one deleted earlier and still to be
@@ -1814,6 +2192,18 @@ impl LivenessSession {
             Some(OwnChildOp { op: ChildOp::Rekey(old), crossed: None, .. }) => old.peer == rekeyed_spi,
             _ => false,
         };
+        // The SA a rekey of ours negotiated replaced, which we delete once
+        // the caller commits: as for one we are deleting (§2.25.1).
+        if self.peer_child.own_rekeys.iter().flatten().any(|r| r.fate == OldFate::Ours && r.old.peer == rekeyed_spi) {
+            return self.refuse_peer_child_request(
+                current,
+                header,
+                msg,
+                iv,
+                notify_type::TEMPORARY_FAILURE,
+                &format!("we are deleting the CHILD SA with spi {rekeyed_spi:08x}, which a rekey of ours replaced"),
+            );
+        }
         let (kind, old) = if self.primary_child_alive && rekeyed_spi == self.child_peer_spi {
             (ChildKind::Primary, ChildSpis { local: self.child_local_spi, peer: self.child_peer_spi })
         } else if let Some(child6) = self.child6.filter(|c| c.peer == rekeyed_spi) {
@@ -8247,6 +8637,739 @@ mod tests {
         assert!(sent.iter().all(|m| *m == sent[0]), "a retransmission is the same bytes");
         assert!(quiet, "three attempts, and no Delete");
         assert_eq!((tunnel.liveness.child_local_spi, tunnel.liveness.child_peer_spi), (old_local_spi, RESPONDER_CHILD_SPI));
+    }
+
+    /// The exchange, Message ID and Response flag of a message from the client.
+    fn client_header(msg: &[u8]) -> (ExchangeType, u32, bool) {
+        let header = IkeHeader::parse(msg).unwrap();
+        (header.exchange_type, header.message_id, header.flags.response)
+    }
+
+    fn refused_crypto<T>(result: Result<T, DriverError>) -> bool {
+        matches!(result, Err(DriverError::Ike(IkeError::Crypto(_))))
+    }
+
+    /// Make-before-break: `negotiate_rekey` is one `CREATE_CHILD_SA` naming
+    /// the replaced SA in `REKEY_SA` (Message ID 2, the first after
+    /// `IKE_AUTH`) and nothing more -- no Delete before the caller commits --
+    /// and makes the new SA current. `commit_rekey` is then one Delete of the
+    /// replaced SA (Message ID 3), answered, and the rekey is done with: a
+    /// second commit is refused and sends nothing.
+    #[test]
+    fn negotiate_rekey_sends_no_delete_and_commit_rekey_deletes_the_replaced_sa_once() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let (quiet_tx, quiet_rx) = mpsc::channel();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let request = recv_from_client(&sock);
+                let (response, made) = gateway_answers_rekey(&sa, &request, &[0x80u8; 32]);
+                sock.send_to(&response, from).unwrap();
+                let quiet_before_commit = client_stays_quiet(&sock);
+                quiet_tx.send(()).unwrap();
+                let delete = recv_from_client(&sock);
+                sock.send_to(&informational_answer(&sa, &delete, &[RESPONDER_CHILD_SPI]), from).unwrap();
+                let quiet_after_commit = client_stays_quiet(&sock);
+                (
+                    client_spi,
+                    (client_header(&request), rekey::rekey_sa_spi(&sa, &request)),
+                    quiet_before_commit,
+                    (client_header(&delete), delete_in(&sa, &delete)),
+                    made.outbound.spi(),
+                    quiet_after_commit,
+                )
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let old = tunnel.liveness.child_spis(ChildKind::Primary).unwrap();
+        let negotiated = tunnel.liveness.negotiate_rekey(ChildKind::Primary, Duration::from_secs(5)).unwrap();
+        assert_eq!(negotiated.kind, ChildKind::Primary);
+        assert_eq!(negotiated.replaces, old);
+        assert_eq!(
+            tunnel.liveness.child_spis(ChildKind::Primary),
+            Some((negotiated.child.local_spi, PEER_L_SPI)),
+            "the new SA is current from the negotiation on"
+        );
+        quiet_rx.recv().unwrap();
+        let report = tunnel.liveness.commit_rekey(ChildKind::Primary, negotiated.child.local_spi, true).unwrap();
+        let again = tunnel.liveness.commit_rekey(ChildKind::Primary, negotiated.child.local_spi, true);
+        let (client_spi, (request, rekey_sa), quiet_before_commit, (delete, deleted), made_local, quiet_after_commit) = gateway.join().unwrap();
+
+        assert_eq!(old, (client_spi, RESPONDER_CHILD_SPI));
+        assert_eq!(request, (ExchangeType::CreateChildSa, 2, false));
+        assert_eq!(rekey_sa, Some(client_spi), "REKEY_SA names our inbound SPI of the replaced SA");
+        assert_eq!(negotiated.child.local_spi, made_local);
+        assert!(quiet_before_commit, "no Delete before the commit");
+        assert_eq!(delete, (ExchangeType::Informational, 3, false));
+        assert_eq!(deleted, Some(Delete::esp(vec![client_spi])), "the commit deletes the replaced SA, and only it");
+        assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::Sent { acknowledged: true }, liveness: Liveness::Alive });
+        assert!(refused_crypto(again), "the rekey is committed already");
+        assert!(quiet_after_commit, "one Delete, once");
+        assert_eq!(tunnel.liveness.child_spis(ChildKind::Primary), Some((made_local, PEER_L_SPI)));
+    }
+
+    /// RFC 7296 §1.4.1 between negotiation and commit: the gateway deleting the
+    /// SA our rekey replaced is answered with our Delete for the pair, is not
+    /// the tunnel losing a CHILD SA (it runs on the new one), and leaves the
+    /// commit nothing to send.
+    #[test]
+    fn a_gateway_delete_of_the_replaced_sa_before_the_commit_is_answered_with_ours_and_the_commit_owes_nothing() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let (negotiated_tx, negotiated_rx) = mpsc::channel();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let request = recv_from_client(&sock);
+                sock.send_to(&gateway_answers_rekey(&sa, &request, &[0x80u8; 32]).0, from).unwrap();
+                negotiated_rx.recv().unwrap();
+                sock.send_to(&esp_delete_request(&sa, 0, RESPONDER_CHILD_SPI), from).unwrap();
+                let answer = recv_from_client(&sock);
+                (client_spi, client_header(&answer), delete_in(&sa, &answer), client_stays_quiet(&sock))
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let negotiated = tunnel.liveness.negotiate_rekey(ChildKind::Primary, Duration::from_secs(5)).unwrap();
+        negotiated_tx.send(()).unwrap();
+        assert_eq!(tunnel.liveness.peek(Duration::from_millis(300)).unwrap(), Liveness::Alive, "not a teardown");
+        assert!(tunnel.liveness.take_peer_deleted_children().is_empty(), "the tunnel runs on the new SA");
+        assert_eq!(tunnel.liveness.child_spis(ChildKind::Primary), Some((negotiated.child.local_spi, PEER_L_SPI)));
+        let report = tunnel.liveness.commit_rekey(ChildKind::Primary, negotiated.child.local_spi, true).unwrap();
+        let (client_spi, answer, answered, quiet) = gateway.join().unwrap();
+
+        assert_eq!(answer, (ExchangeType::Informational, 0, true));
+        assert_eq!(answered, Some(Delete::esp(vec![client_spi])), "answered with ours for the pair");
+        assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::NotOwed("gateway_deleted"), liveness: Liveness::Alive });
+        assert!(quiet, "the commit sends nothing");
+    }
+
+    /// The gateway rekeys the SA our negotiation made before the commit: the
+    /// existing path takes it on (the new SA is current) and hands the
+    /// gateway's SA to the caller, and the commit still deletes the SA our
+    /// rekey replaced -- not the one the gateway's replaced, whose Delete is
+    /// the gateway's.
+    #[test]
+    fn a_gateway_rekey_of_the_new_sa_before_the_commit_is_taken_on_and_the_commit_still_deletes_the_replaced_one() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let (negotiated_tx, negotiated_rx) = mpsc::channel();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let request = recv_from_client(&sock);
+                sock.send_to(&gateway_answers_rekey(&sa, &request, &[0x80u8; 32]).0, from).unwrap();
+                negotiated_rx.recv().unwrap();
+                let ni = [0x55u8; 32];
+                sock.send_to(&gateway_child_rekey(&sa, 0, PEER_L_SPI, PEER_P_SPI, &ni), from).unwrap();
+                let answer = recv_from_client(&sock);
+                let (theirs, _) =
+                    rekey::initiator_complete_child(&sa, &ni, PEER_P_SPI, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), &answer)
+                        .expect("taken on");
+                let delete = recv_from_client(&sock);
+                sock.send_to(&informational_answer(&sa, &delete, &[RESPONDER_CHILD_SPI]), from).unwrap();
+                (client_spi, client_header(&answer), theirs.outbound.spi(), client_header(&delete), delete_in(&sa, &delete), client_stays_quiet(&sock))
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let negotiated = tunnel.liveness.negotiate_rekey(ChildKind::Primary, Duration::from_secs(5)).unwrap();
+        negotiated_tx.send(()).unwrap();
+        assert_eq!(tunnel.liveness.peek(Duration::from_millis(300)).unwrap(), Liveness::Alive);
+        let taken = tunnel.liveness.take_peer_rekeys();
+        let report = tunnel.liveness.commit_rekey(ChildKind::Primary, negotiated.child.local_spi, true).unwrap();
+        let (client_spi, answer, theirs_local, delete, deleted, quiet) = gateway.join().unwrap();
+
+        assert_eq!(answer, (ExchangeType::CreateChildSa, 0, true));
+        assert_eq!(taken.len(), 1);
+        assert_eq!((taken[0].kind, taken[0].child.local_spi, taken[0].child.peer_spi), (ChildKind::Primary, theirs_local, PEER_P_SPI));
+        assert_eq!(tunnel.liveness.child_spis(ChildKind::Primary), Some((theirs_local, PEER_P_SPI)));
+        assert_eq!(delete, (ExchangeType::Informational, 3, false));
+        assert_eq!(deleted, Some(Delete::esp(vec![client_spi])), "the SA our rekey replaced, not the new one");
+        assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::Sent { acknowledged: true }, liveness: Liveness::Alive });
+        assert!(quiet);
+    }
+
+    /// RFC 7296 §2.25.1: the SA our negotiated rekey replaced is ours to
+    /// delete at the commit, so a gateway's rekey of it meanwhile is refused
+    /// with `TEMPORARY_FAILURE`, as for an SA being deleted, and changes
+    /// nothing: the commit then deletes it as usual.
+    #[test]
+    fn a_gateway_rekey_of_the_replaced_sa_before_the_commit_is_refused_temporary_failure() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let (negotiated_tx, negotiated_rx) = mpsc::channel();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let request = recv_from_client(&sock);
+                sock.send_to(&gateway_answers_rekey(&sa, &request, &[0x80u8; 32]).0, from).unwrap();
+                negotiated_rx.recv().unwrap();
+                sock.send_to(&gateway_child_rekey(&sa, 0, RESPONDER_CHILD_SPI, PEER_P_SPI, &[0x55u8; 32]), from).unwrap();
+                let refusal = recv_from_client(&sock);
+                let delete = recv_from_client(&sock);
+                sock.send_to(&informational_answer(&sa, &delete, &[RESPONDER_CHILD_SPI]), from).unwrap();
+                (client_spi, client_header(&refusal), create_child_notify(&sa, &refusal), client_header(&delete), delete_in(&sa, &delete))
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let negotiated = tunnel.liveness.negotiate_rekey(ChildKind::Primary, Duration::from_secs(5)).unwrap();
+        negotiated_tx.send(()).unwrap();
+        assert_eq!(tunnel.liveness.peek(Duration::from_millis(300)).unwrap(), Liveness::Alive);
+        assert!(tunnel.liveness.take_peer_rekeys().is_empty(), "refused, nothing taken on");
+        assert_eq!(tunnel.liveness.child_spis(ChildKind::Primary), Some((negotiated.child.local_spi, PEER_L_SPI)));
+        let report = tunnel.liveness.commit_rekey(ChildKind::Primary, negotiated.child.local_spi, true).unwrap();
+        let (client_spi, refusal, refused_with, delete, deleted) = gateway.join().unwrap();
+
+        assert_eq!(refusal, (ExchangeType::CreateChildSa, 0, true));
+        assert_eq!(refused_with, Some(notify_type::TEMPORARY_FAILURE));
+        assert_eq!(delete, (ExchangeType::Informational, 3, false));
+        assert_eq!(deleted, Some(Delete::esp(vec![client_spi])));
+        assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::Sent { acknowledged: true }, liveness: Liveness::Alive });
+    }
+
+    /// RFC 7296 §2.8.1 inside `negotiate_rekey`, the gateway's nonce the
+    /// lowest: its SA is the redundant one, the gateway deletes it (answered
+    /// with ours for the pair), and ours is kept. Nothing is deleted at the
+    /// negotiation -- the first thing the client sends after answering the
+    /// gateway's rekey is the answer to that Delete -- and the commit deletes
+    /// the SA both rekeys replaced, ours to delete as the survivor's initiator.
+    #[test]
+    fn simultaneous_rekeys_negotiated_keep_ours_and_the_commit_deletes_the_replaced_sa() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let (negotiated_tx, negotiated_rx) = mpsc::channel();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let ours = recv_from_client(&sock);
+                let ni = [0x00u8; 32]; // the lowest a nonce can be
+                sock.send_to(&gateway_child_rekey(&sa, 0, RESPONDER_CHILD_SPI, PEER_P_SPI, &ni), from).unwrap();
+                let answer = recv_from_client(&sock);
+                let (theirs, _) =
+                    rekey::initiator_complete_child(&sa, &ni, PEER_P_SPI, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), &answer)
+                        .expect("answered as usual");
+                let (response, ours_sa) = gateway_answers_rekey(&sa, &ours, &[0x80u8; 32]);
+                sock.send_to(&response, from).unwrap();
+                negotiated_rx.recv().unwrap();
+                sock.send_to(&esp_delete_request(&sa, 1, PEER_P_SPI), from).unwrap();
+                let redundant_answer = recv_from_client(&sock);
+                let delete = recv_from_client(&sock);
+                sock.send_to(&informational_answer(&sa, &delete, &[RESPONDER_CHILD_SPI]), from).unwrap();
+                (
+                    client_spi,
+                    theirs.outbound.spi(),
+                    ours_sa.outbound.spi(),
+                    (client_header(&redundant_answer), delete_in(&sa, &redundant_answer)),
+                    (client_header(&delete), delete_in(&sa, &delete)),
+                    client_stays_quiet(&sock),
+                )
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let negotiated = tunnel.liveness.negotiate_rekey(ChildKind::Primary, Duration::from_secs(5)).unwrap();
+        negotiated_tx.send(()).unwrap();
+        assert_eq!(tunnel.liveness.peek(Duration::from_millis(300)).unwrap(), Liveness::Alive);
+        let report = tunnel.liveness.commit_rekey(ChildKind::Primary, negotiated.child.local_spi, true).unwrap();
+        let (client_spi, theirs_local, ours_local, (redundant, redundant_answered), (delete, deleted), quiet) = gateway.join().unwrap();
+
+        assert_eq!((negotiated.child.local_spi, negotiated.child.peer_spi), (ours_local, PEER_L_SPI), "ours survives");
+        assert_eq!(negotiated.replaces, (client_spi, RESPONDER_CHILD_SPI));
+        assert!(tunnel.liveness.take_peer_rekeys().is_empty(), "the redundant SA never reaches the caller");
+        assert_eq!(redundant, (ExchangeType::Informational, 1, true), "nothing of ours went out in between");
+        assert_eq!(redundant_answered, Some(Delete::esp(vec![theirs_local])));
+        assert_eq!(delete, (ExchangeType::Informational, 3, false));
+        assert_eq!(deleted, Some(Delete::esp(vec![client_spi])), "the survivor's initiator deletes the SA it replaced");
+        assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::Sent { acknowledged: true }, liveness: Liveness::Alive });
+        assert!(quiet);
+        assert_eq!(tunnel.liveness.child_spis(ChildKind::Primary), Some((ours_local, PEER_L_SPI)));
+    }
+
+    /// The same collision with our nonce the lowest: ours is the redundant SA
+    /// and is deleted at once inside the negotiation, as `rekey_child` does
+    /// (it was never installed), the gateway's is the one to install, and
+    /// the SA both replaced is the gateway's to delete: the commit sends
+    /// nothing, and the gateway's Delete of it is answered with ours.
+    #[test]
+    fn simultaneous_rekeys_negotiated_keep_the_gateways_and_the_commit_owes_nothing() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let (committed_tx, committed_rx) = mpsc::channel();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let ours = recv_from_client(&sock);
+                let ni = [0xFFu8; 32];
+                sock.send_to(&gateway_child_rekey(&sa, 0, RESPONDER_CHILD_SPI, PEER_P_SPI, &ni), from).unwrap();
+                let answer = recv_from_client(&sock);
+                let (theirs, _) =
+                    rekey::initiator_complete_child(&sa, &ni, PEER_P_SPI, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), &answer)
+                        .expect("answered as usual");
+                let (response, ours_sa) = gateway_answers_rekey(&sa, &ours, &[0x00u8; 32]);
+                sock.send_to(&response, from).unwrap();
+                let redundant = recv_from_client(&sock);
+                sock.send_to(&informational_answer(&sa, &redundant, &[PEER_L_SPI]), from).unwrap();
+                let quiet = client_stays_quiet(&sock);
+                committed_tx.send(()).unwrap();
+                sock.send_to(&esp_delete_request(&sa, 1, RESPONDER_CHILD_SPI), from).unwrap();
+                let old_answer = recv_from_client(&sock);
+                (
+                    client_spi,
+                    theirs.outbound.spi(),
+                    ours_sa.outbound.spi(),
+                    (client_header(&redundant), delete_in(&sa, &redundant)),
+                    quiet,
+                    (client_header(&old_answer), delete_in(&sa, &old_answer)),
+                )
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let negotiated = tunnel.liveness.negotiate_rekey(ChildKind::Primary, Duration::from_secs(5)).unwrap();
+        let report = tunnel.liveness.commit_rekey(ChildKind::Primary, negotiated.child.local_spi, true).unwrap();
+        committed_rx.recv().unwrap();
+        assert_eq!(tunnel.liveness.peek(Duration::from_millis(300)).unwrap(), Liveness::Alive, "the replaced SA's Delete is routine");
+        let (client_spi, theirs_local, ours_local, (redundant, redundant_deleted), quiet, (old_answer, old_answered)) = gateway.join().unwrap();
+
+        assert_eq!((negotiated.child.local_spi, negotiated.child.peer_spi), (theirs_local, PEER_P_SPI), "the gateway's SA survives");
+        assert_eq!(negotiated.replaces, (client_spi, RESPONDER_CHILD_SPI));
+        assert_eq!(redundant, (ExchangeType::Informational, 3, false));
+        assert_eq!(redundant_deleted, Some(Delete::esp(vec![ours_local])), "our redundant SA is deleted at once, not the replaced one");
+        assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::NotOwed("peer_deletes"), liveness: Liveness::Alive });
+        assert!(quiet, "the commit sends nothing");
+        assert_eq!(old_answer, (ExchangeType::Informational, 1, true));
+        assert_eq!(old_answered, Some(Delete::esp(vec![client_spi])), "the gateway's Delete of the replaced SA is answered with ours");
+        assert!(tunnel.liveness.take_peer_rekeys().is_empty(), "the survivor reaches the caller once, from negotiate_rekey");
+        assert!(tunnel.liveness.take_peer_deleted_children().is_empty());
+        assert_eq!(tunnel.liveness.child_spis(ChildKind::Primary), Some((theirs_local, PEER_P_SPI)));
+    }
+
+    /// The window between negotiation and commit is no CHILD SA exchange of
+    /// ours, so a gateway's IKE SA rekey in it is taken on (RFC 7296 §2.18),
+    /// and the CHILD SAs -- the negotiated rekey included -- move to the new
+    /// IKE SA: the commit's Delete goes on it, Message ID 0.
+    #[test]
+    fn a_negotiated_rekey_survives_a_gateway_ike_sa_rekey_and_its_commit_goes_on_the_new_ike_sa() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let (negotiated_tx, negotiated_rx) = mpsc::channel();
+        let (rekeyed_tx, rekeyed_rx) = mpsc::channel();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let request = recv_from_client(&sock);
+                sock.send_to(&gateway_answers_rekey(&sa, &request, &[0x80u8; 32]).0, from).unwrap();
+                negotiated_rx.recv().unwrap();
+                let ni = [0x55u8; 32];
+                sock.send_to(&gateway_ike_rekey(&sa, 0, &ni), from).unwrap();
+                let answer = recv_from_client(&sock);
+                let new_sa = gateway_ike_rekey_done(&sa, &ni, &answer);
+                rekeyed_tx.send(()).unwrap();
+                let delete = recv_from_client(&sock);
+                let on_new_sa = open_informational(&new_sa, &delete).is_ok();
+                let deleted = on_new_sa.then(|| delete_in(&new_sa, &delete)).flatten();
+                sock.send_to(&informational_answer(&new_sa, &delete, &[RESPONDER_CHILD_SPI]), from).unwrap();
+                (client_spi, client_header(&answer), on_new_sa, client_header(&delete), deleted)
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let negotiated = tunnel.liveness.negotiate_rekey(ChildKind::Primary, Duration::from_secs(5)).unwrap();
+        negotiated_tx.send(()).unwrap();
+        assert_eq!(tunnel.liveness.peek(Duration::from_millis(300)).unwrap(), Liveness::Alive);
+        rekeyed_rx.recv().unwrap();
+        let report = tunnel.liveness.commit_rekey(ChildKind::Primary, negotiated.child.local_spi, true).unwrap();
+        let (client_spi, answer, on_new_sa, delete, deleted) = gateway.join().unwrap();
+
+        assert_eq!(answer, (ExchangeType::CreateChildSa, 0, true), "the IKE SA rekey is answered, not refused (see gateway_ike_rekey_done)");
+        assert!(on_new_sa, "the commit's Delete goes on the new IKE SA");
+        assert_eq!(delete, (ExchangeType::Informational, 0, false), "Message IDs started over");
+        assert_eq!(deleted, Some(Delete::esp(vec![client_spi])));
+        assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::Sent { acknowledged: true }, liveness: Liveness::Alive });
+        assert_eq!(tunnel.liveness.child_spis(ChildKind::Primary), Some((negotiated.child.local_spi, PEER_L_SPI)));
+    }
+
+    /// The commit's Delete never answered: sent three times, the same bytes,
+    /// 500 ms apart, then reported unacknowledged -- no further retransmission
+    /// -- within about 1.5 s.
+    #[test]
+    fn a_commit_whose_delete_is_never_answered_reports_it_unacknowledged_within_its_bound() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let request = recv_from_client(&sock);
+                sock.send_to(&gateway_answers_rekey(&sa, &request, &[0x80u8; 32]).0, from).unwrap();
+                let sent: Vec<Vec<u8>> = (0..3).map(|_| recv_from_client(&sock)).collect();
+                (client_spi, client_header(&sent[0]), delete_in(&sa, &sent[0]), sent.iter().all(|m| *m == sent[0]), client_stays_quiet(&sock))
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let negotiated = tunnel.liveness.negotiate_rekey(ChildKind::Primary, Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        let report = tunnel.liveness.commit_rekey(ChildKind::Primary, negotiated.child.local_spi, true).unwrap();
+        let took = started.elapsed();
+        let (client_spi, delete, deleted, same_bytes, quiet) = gateway.join().unwrap();
+
+        assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::Sent { acknowledged: false }, liveness: Liveness::NoReply });
+        assert!(took >= Duration::from_millis(1400) && took < Duration::from_millis(2500), "three waits of 500 ms, took {took:?}");
+        assert_eq!(delete, (ExchangeType::Informational, 3, false));
+        assert_eq!(deleted, Some(Delete::esp(vec![client_spi])));
+        assert!(same_bytes, "a retransmission is the same bytes");
+        assert!(quiet, "three attempts, then nothing more");
+    }
+
+    /// The gateway deleting the IKE SA while the commit's Delete waits for its
+    /// answer: that Delete is answered, and the report says the tunnel is down.
+    /// Nothing more goes out, and a later Delete owes nothing.
+    #[test]
+    fn a_teardown_answered_while_a_commit_waits_is_in_its_report() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let request = recv_from_client(&sock);
+                sock.send_to(&gateway_answers_rekey(&sa, &request, &[0x80u8; 32]).0, from).unwrap();
+                let delete = recv_from_client(&sock); // never answered
+                sock.send_to(&ike_delete_request(&sa, 0), from).unwrap();
+                let ack = recv_response_from_client(&sock);
+                let ack_empty = open_informational(&sa, &ack).unwrap().is_empty();
+                (client_spi, delete_in(&sa, &delete), client_header(&ack), ack_empty, client_stays_quiet(&sock))
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let negotiated = tunnel.liveness.negotiate_rekey(ChildKind::Primary, Duration::from_secs(5)).unwrap();
+        let report = tunnel.liveness.commit_rekey(ChildKind::Primary, negotiated.child.local_spi, true).unwrap();
+        let later = tunnel.liveness.delete_child(negotiated.replaces.0, negotiated.replaces.1).unwrap();
+        let (client_spi, deleted, ack, ack_empty, quiet) = gateway.join().unwrap();
+
+        assert_eq!(deleted, Some(Delete::esp(vec![client_spi])));
+        assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::Sent { acknowledged: false }, liveness: Liveness::PeerTornDown });
+        assert_eq!(ack, (ExchangeType::Informational, 0, true));
+        assert!(ack_empty, "an IKE SA Delete is answered empty");
+        assert_eq!(later, DeleteReport { outcome: ChildDeleteOutcome::NotOwed("ike_sa_gone"), liveness: Liveness::PeerTornDown });
+        assert!(quiet, "nothing more on an IKE SA that is gone");
+    }
+
+    /// `abandon_rekey` while the new SA is current and the replaced one ours:
+    /// the replaced SA is the family's again, its traffic selectors with it,
+    /// and the new one is deleted -- the only thing sent.
+    #[test]
+    fn abandon_rekey_restores_the_replaced_sa_and_deletes_the_new_one_when_asked() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let request = recv_from_client(&sock);
+                let (response, made) = gateway_answers_rekey(&sa, &request, &[0x80u8; 32]);
+                sock.send_to(&response, from).unwrap();
+                let delete = recv_from_client(&sock);
+                sock.send_to(&informational_answer(&sa, &delete, &[PEER_L_SPI]), from).unwrap();
+                (client_spi, made.outbound.spi(), client_header(&delete), delete_in(&sa, &delete), client_stays_quiet(&sock))
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let old = tunnel.liveness.child_spis(ChildKind::Primary).unwrap();
+        // So that putting the replaced SA's selectors back is seen: the
+        // negotiation records the ones the gateway grants.
+        tunnel.liveness.child_ts.primary = None;
+        let negotiated = tunnel.liveness.negotiate_rekey(ChildKind::Primary, Duration::from_secs(5)).unwrap();
+        assert!(tunnel.liveness.child_ts.primary.is_some());
+        let report = tunnel.liveness.abandon_rekey(ChildKind::Primary, negotiated.child.local_spi, true).unwrap();
+        let (client_spi, made_local, delete, deleted, quiet) = gateway.join().unwrap();
+
+        assert_eq!(negotiated.child.local_spi, made_local);
+        assert_eq!(delete, (ExchangeType::Informational, 3, false));
+        assert_eq!(deleted, Some(Delete::esp(vec![made_local])), "the new SA, not the replaced one");
+        assert!(quiet);
+        assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::Sent { acknowledged: true }, liveness: Liveness::Alive });
+        assert_eq!(tunnel.liveness.child_spis(ChildKind::Primary), Some(old));
+        assert_eq!(old, (client_spi, RESPONDER_CHILD_SPI));
+        assert_eq!(tunnel.liveness.child_ts.primary, None, "the replaced SA's selectors are back");
+        assert!(tunnel.liveness.take_peer_deleted_children().is_empty());
+        assert!(refused_crypto(tunnel.liveness.commit_rekey(ChildKind::Primary, negotiated.child.local_spi, true)), "abandoned");
+    }
+
+    /// `abandon_rekey` after the gateway rekeyed the new SA: the new SA is no
+    /// longer current and is the gateway's to delete, so nothing of it is
+    /// sent; the SA our rekey replaced is still ours, and is deleted.
+    #[test]
+    fn abandon_rekey_after_the_gateway_rekeyed_the_new_sa_deletes_only_the_replaced_one() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let (negotiated_tx, negotiated_rx) = mpsc::channel();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, client_spi) = responder_through_auth_spis(bind, psk);
+                let request = recv_from_client(&sock);
+                sock.send_to(&gateway_answers_rekey(&sa, &request, &[0x80u8; 32]).0, from).unwrap();
+                negotiated_rx.recv().unwrap();
+                let ni = [0x55u8; 32];
+                sock.send_to(&gateway_child_rekey(&sa, 0, PEER_L_SPI, PEER_P_SPI, &ni), from).unwrap();
+                let answer = recv_from_client(&sock);
+                let (theirs, _) =
+                    rekey::initiator_complete_child(&sa, &ni, PEER_P_SPI, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), &answer)
+                        .expect("taken on");
+                let delete = recv_from_client(&sock);
+                sock.send_to(&informational_answer(&sa, &delete, &[RESPONDER_CHILD_SPI]), from).unwrap();
+                (client_spi, theirs.outbound.spi(), client_header(&delete), delete_in(&sa, &delete), client_stays_quiet(&sock))
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let negotiated = tunnel.liveness.negotiate_rekey(ChildKind::Primary, Duration::from_secs(5)).unwrap();
+        negotiated_tx.send(()).unwrap();
+        assert_eq!(tunnel.liveness.peek(Duration::from_millis(300)).unwrap(), Liveness::Alive);
+        assert_eq!(tunnel.liveness.take_peer_rekeys().len(), 1);
+        let report = tunnel.liveness.abandon_rekey(ChildKind::Primary, negotiated.child.local_spi, true).unwrap();
+        let (client_spi, theirs_local, delete, deleted, quiet) = gateway.join().unwrap();
+
+        assert_eq!(delete, (ExchangeType::Informational, 3, false));
+        assert_eq!(deleted, Some(Delete::esp(vec![client_spi])), "only the SA our rekey replaced");
+        assert!(quiet, "nothing for the new SA");
+        assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::Sent { acknowledged: true }, liveness: Liveness::Alive });
+        assert_eq!(tunnel.liveness.child_spis(ChildKind::Primary), Some((theirs_local, PEER_P_SPI)), "the gateway's SA stays");
+        assert!(tunnel.liveness.take_peer_deleted_children().is_empty());
+    }
+
+    /// `negotiate_rekey` refuses, sending nothing and using no Message ID: a
+    /// second rekey of a family with one negotiated, an IPv6 rekey with no
+    /// IPv6 CHILD SA, a primary rekey with the primary gone, and any rekey
+    /// once the IKE SA is over. (Abandoning without a Delete, which sends
+    /// nothing either, clears the first.)
+    #[test]
+    fn a_second_negotiation_of_a_family_with_one_pending_is_refused_and_sends_nothing() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, _client_spi) = responder_through_auth_spis(bind, psk);
+                let request = recv_from_client(&sock);
+                sock.send_to(&gateway_answers_rekey(&sa, &request, &[0x80u8; 32]).0, from).unwrap();
+                (client_header(&request), client_stays_quiet(&sock))
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let old = tunnel.liveness.child_spis(ChildKind::Primary).unwrap();
+        let negotiated = tunnel.liveness.negotiate_rekey(ChildKind::Primary, Duration::from_secs(5)).unwrap();
+        let mid = tunnel.liveness.next_message_id;
+        assert!(refused_crypto(tunnel.liveness.negotiate_rekey(ChildKind::Primary, Duration::from_millis(200))), "one negotiated already");
+        assert!(refused_crypto(tunnel.liveness.negotiate_rekey(ChildKind::Ipv6, Duration::from_millis(200))), "no IPv6 CHILD SA");
+        assert_eq!(tunnel.liveness.child_spis(ChildKind::Primary), Some((negotiated.child.local_spi, PEER_L_SPI)));
+
+        let abandoned = tunnel.liveness.abandon_rekey(ChildKind::Primary, negotiated.child.local_spi, false).unwrap();
+        assert_eq!(abandoned, DeleteReport { outcome: ChildDeleteOutcome::NotOwed("not_asked"), liveness: Liveness::Alive });
+        assert_eq!(tunnel.liveness.child_spis(ChildKind::Primary), Some(old));
+        tunnel.liveness.primary_child_alive = false;
+        assert!(refused_crypto(tunnel.liveness.negotiate_rekey(ChildKind::Primary, Duration::from_millis(200))), "no primary CHILD SA");
+        tunnel.liveness.primary_child_alive = true;
+        tunnel.liveness.ike.ended = true;
+        assert!(refused_crypto(tunnel.liveness.negotiate_rekey(ChildKind::Primary, Duration::from_millis(200))), "the IKE SA is over");
+        assert_eq!(tunnel.liveness.next_message_id, mid, "no Message ID used");
+
+        let (request, quiet) = gateway.join().unwrap();
+        assert_eq!(request, (ExchangeType::CreateChildSa, 2, false));
+        assert!(quiet, "only the first negotiation went out");
+    }
+
+    /// `commit_rekey` and `abandon_rekey` with nothing negotiated, or naming
+    /// another SA or family than the one negotiated, are refused, change
+    /// nothing and send nothing.
+    #[test]
+    fn commit_and_abandon_of_a_rekey_not_pending_are_refused_and_send_nothing() {
+        let (init_sa, _resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+
+        assert!(refused_crypto(liveness.commit_rekey(ChildKind::Primary, 0xBBBB, true)));
+        assert!(refused_crypto(liveness.abandon_rekey(ChildKind::Primary, 0xBBBB, true)));
+        assert!(refused_crypto(liveness.commit_rekey(ChildKind::Ipv6, 0xBBBB, true)));
+
+        // One negotiated (the primary's, 0x1111 -> 0xBBBB), but named otherwise.
+        liveness.peer_child.own_rekeys[0] = Some(OwnRekey {
+            old: ChildSpis { local: 0x1111, peer: 0x2222 },
+            old_ts: None,
+            new: ChildSpis { local: 0xBBBB, peer: 0xAAAA },
+            fate: OldFate::Ours,
+        });
+        assert!(refused_crypto(liveness.commit_rekey(ChildKind::Primary, 0xCCCC, true)), "another SA");
+        assert!(refused_crypto(liveness.abandon_rekey(ChildKind::Primary, 0xCCCC, true)), "another SA");
+        assert!(refused_crypto(liveness.commit_rekey(ChildKind::Ipv6, 0xBBBB, true)), "another family");
+        assert!(refused_crypto(liveness.abandon_rekey(ChildKind::Ipv6, 0xBBBB, true)), "another family");
+
+        assert!(liveness.peer_child.own_rekeys[0].as_ref().is_some_and(|r| r.new.local == 0xBBBB && r.fate == OldFate::Ours), "still negotiated");
+        assert!(liveness.peer_child.own_rekeys[1].is_none());
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some((0xBBBB, 0xAAAA)));
+        assert_eq!(liveness.next_message_id, 2, "no Message ID used");
+        assert_eq!(sent_to(&gateway), None, "nothing sent");
+    }
+
+    /// A unified IPv4+IPv6 CHILD SA is negotiated as one, proposing both
+    /// families (`rekey_child`'s rule), and keeps both (§2.9.2); the
+    /// negotiation sends no Delete after the exchange.
+    #[test]
+    fn negotiating_a_rekey_of_a_unified_child_sa_proposes_both_families() {
+        let (bind, responder) = spawn_unified_responder(UnifiedReply::GrantBothThenRekey, b"shared-secret");
+        let mut tunnel = connect_unified_direct(bind, b"shared-secret").unwrap();
+        let negotiated = tunnel.liveness.negotiate_rekey(ChildKind::Primary, Duration::from_secs(5)).unwrap();
+        let observed = responder.join().unwrap();
+
+        assert_eq!(observed.created_child_tsi, Some(TrafficSelectors::unified_full_tunnel()), "an IPv4-only rekey would silently drop IPv6");
+        assert!(!observed.client_deleted_ike_sa, "no Delete follows the negotiation");
+        assert_eq!(negotiated.replaces, (tunnel.local_spi, tunnel.peer_spi));
+        assert_ne!(negotiated.child.local_spi, tunnel.local_spi);
+        assert!(tunnel.liveness.child_carries_ipv6(), "still one SA for both families");
+        let both = TrafficSelectors::unified_full_tunnel();
+        assert_eq!(tunnel.liveness.child_ts.primary, Some(ChildTs { ours: both.clone(), theirs: both }));
+        assert_eq!(tunnel.liveness.child_spis(ChildKind::Ipv6), None, "no separate IPv6 CHILD SA");
+        // The gateway is gone: commit without a Delete.
+        let report = tunnel.liveness.commit_rekey(ChildKind::Primary, negotiated.child.local_spi, false).unwrap();
+        assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::NotOwed("not_asked"), liveness: Liveness::Alive });
+    }
+
+    /// The separate IPv6 CHILD SA negotiated and committed on its own: its
+    /// `REKEY_SA` and the commit's Delete name its SPI, and the primary CHILD
+    /// SA never moves.
+    #[test]
+    fn an_ipv6_rekey_negotiated_and_committed_leaves_the_primary_alone() {
+        let bind = next_addr();
+        let psk = b"shared-secret".to_vec();
+        let (quiet_tx, quiet_rx) = mpsc::channel();
+        let gateway = thread::spawn({
+            let psk = psk.clone();
+            move || {
+                let (sock, sa, from, _client_spi) = responder_through_auth_spis(bind, psk);
+                let create = recv_from_client(&sock);
+                let (response, _) =
+                    rekey::responder_process_rekey_with_pfs(&sa, &create, 0xFEED_FACE, &[0x77u8; 32], SkCipher::Aes256Gcm, None, &[8u8; 8], None).unwrap();
+                sock.send_to(&response, from).unwrap();
+                let request = recv_from_client(&sock);
+                let (response, made) =
+                    rekey::responder_process_rekey_with_pfs(&sa, &request, 0xFEED_F00D, &[0x78u8; 32], SkCipher::Aes256Gcm, None, &[7u8; 8], None).unwrap();
+                sock.send_to(&response, from).unwrap();
+                let quiet_before_commit = client_stays_quiet(&sock);
+                quiet_tx.send(()).unwrap();
+                let delete = recv_from_client(&sock);
+                sock.send_to(&informational_answer(&sa, &delete, &[0xFEED_FACE]), from).unwrap();
+                (
+                    (client_header(&request), rekey::rekey_sa_spi(&sa, &request)),
+                    made.outbound.spi(),
+                    quiet_before_commit,
+                    (client_header(&delete), delete_in(&sa, &delete)),
+                    client_stays_quiet(&sock),
+                )
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        let mut tunnel = connect_for_collision_test(bind, psk);
+        let v6 = tunnel.liveness.create_child_ipv6(Duration::from_secs(5)).unwrap();
+        let primary = tunnel.liveness.child_spis(ChildKind::Primary);
+        let negotiated = tunnel.liveness.negotiate_rekey(ChildKind::Ipv6, Duration::from_secs(5)).unwrap();
+        assert_eq!(negotiated.kind, ChildKind::Ipv6);
+        assert_eq!(negotiated.replaces, (v6.child.local_spi, 0xFEED_FACE));
+        assert_eq!(tunnel.liveness.child_spis(ChildKind::Ipv6), Some((negotiated.child.local_spi, 0xFEED_F00D)));
+        assert_eq!(tunnel.liveness.child_spis(ChildKind::Primary), primary);
+        quiet_rx.recv().unwrap();
+        let report = tunnel.liveness.commit_rekey(ChildKind::Ipv6, negotiated.child.local_spi, true).unwrap();
+        let ((request, rekey_sa), made_local, quiet_before_commit, (delete, deleted), quiet) = gateway.join().unwrap();
+
+        assert_eq!(request, (ExchangeType::CreateChildSa, 3, false));
+        assert_eq!(rekey_sa, Some(v6.child.local_spi), "the IPv6 SA's SPI, not the primary's");
+        assert_eq!(negotiated.child.local_spi, made_local);
+        assert!(quiet_before_commit, "no Delete before the commit");
+        assert_eq!(delete, (ExchangeType::Informational, 4, false));
+        assert_eq!(deleted, Some(Delete::esp(vec![v6.child.local_spi])), "the replaced IPv6 SA, only it");
+        assert!(quiet);
+        assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::Sent { acknowledged: true }, liveness: Liveness::Alive });
+        assert_eq!(tunnel.liveness.child_spis(ChildKind::Primary), primary, "the primary CHILD SA never moved");
+        assert!(tunnel.liveness.peer_child.own_rekeys.iter().all(Option::is_none));
+    }
+
+    /// `delete_child`, the retry of a Delete reported `NotSent`: here a
+    /// commit with no Message ID left, which sends nothing. Once there are
+    /// IDs again (as after the IKE SA rekey that gives them back) the retry
+    /// sends the Delete of the replaced SA. An SA in use -- a family's
+    /// current one, or one negotiated and not committed -- is refused, and so
+    /// is one the gateway's rekey replaced (its Delete is the gateway's);
+    /// neither sends anything.
+    #[test]
+    fn delete_child_retries_a_replaced_sa_and_refuses_one_in_use() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        // Our rekey of 0x1111 made 0x5555, which the gateway rekeyed in turn
+        // into the current 0xBBBB; the gateway's earlier rekey replaced 0x9999.
+        liveness.peer_child.superseded = vec![
+            SupersededChild { local_spi: 0x5555, peer_spi: 0x6666, since: Instant::now() },
+            SupersededChild { local_spi: 0x9999, peer_spi: 0x7777, since: Instant::now() },
+        ];
+        liveness.peer_child.own_rekeys[0] = Some(OwnRekey {
+            old: ChildSpis { local: 0x1111, peer: 0x2222 },
+            old_ts: None,
+            new: ChildSpis { local: 0x5555, peer: 0x6666 },
+            fate: OldFate::Ours,
+        });
+
+        let in_use = DeleteReport { outcome: ChildDeleteOutcome::NotOwed("in_use"), liveness: Liveness::Alive };
+        assert_eq!(liveness.delete_child(0xBBBB, 0xAAAA).unwrap(), in_use, "current");
+        assert_eq!(liveness.delete_child(0x5555, 0x6666).unwrap(), in_use, "negotiated, not committed");
+        assert_eq!(
+            liveness.delete_child(0x9999, 0x7777).unwrap(),
+            DeleteReport { outcome: ChildDeleteOutcome::NotOwed("peer_deletes"), liveness: Liveness::Alive }
+        );
+
+        liveness.next_message_id = u32::MAX - MESSAGE_IDS_KEPT_FOR_ENDING;
+        let report = liveness.commit_rekey(ChildKind::Primary, 0x5555, true).unwrap();
+        assert!(matches!(report.outcome, ChildDeleteOutcome::NotSent(_)), "{report:?}");
+        assert!(liveness.peer_child.own_rekeys[0].is_none(), "committed, its Delete still to retry");
+        assert_eq!(sent_to(&gateway), None, "nothing sent so far");
+
+        liveness.next_message_id = 2;
+        // The gateway's answer to the retry, waiting before the request goes out.
+        let answer = build_informational(&resp_sa, 2, true, &[], &[4u8; 8]).unwrap();
+        gateway.send_to(&answer, liveness.sock.local_addr().unwrap()).unwrap();
+        let retried = liveness.delete_child(0x1111, 0x2222).unwrap();
+        let sent = sent_to(&gateway).expect("the retry is sent");
+        assert_eq!(retried, DeleteReport { outcome: ChildDeleteOutcome::Sent { acknowledged: true }, liveness: Liveness::Alive });
+        assert_eq!(client_header(&sent), (ExchangeType::Informational, 2, false));
+        assert_eq!(delete_in(&resp_sa, &sent), Some(Delete::esp(vec![0x1111])));
+        assert_eq!(sent_to(&gateway), None, "once");
     }
 
     /// RFC 7296 §2.2: Message IDs never wrap. Once an IKE SA's have run out, a

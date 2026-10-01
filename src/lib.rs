@@ -119,6 +119,14 @@
 //! limit is a fixed figure; there is no path MTU discovery, and a path
 //! narrower than the limit still fragments at the IP layer.
 //!
+//! ### Session lifecycle
+//!
+//! [`session`] is arithmetic over figures and instants the caller supplies -- when an SA is to be
+//! renewed, and how far apart renewal attempts are kept -- and over nothing else: every figure of
+//! the policy is a parameter, no clock is read, and it enforces nothing, counts nothing and starts
+//! nothing. It is not a session object and drives no exchange; the schedule stays the consumer's
+//! (below), which can take its arithmetic from here.
+//!
 //! ### Bundled servers
 //!
 //! [`ikev2::server::Server`] and [`ikev1::server::Server`] are minimal
@@ -179,6 +187,7 @@ pub mod entropy;
 pub mod error;
 pub mod esp;
 pub mod role;
+pub mod session;
 pub mod transport;
 pub mod tunnel;
 

@@ -497,7 +497,7 @@ pub fn responder_process_rekey_with_pfs(
     let bytes = encode_payload_chain(&inner_out);
     if std::env::var_os("RYKE_REKEY_TRACE").is_some() {
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        eprintln!("[ryke/rekeyresp] first={first_out:?} inner ({} B) = {hex}", bytes.len());
+        crate::debug::emit_tagged(format_args!("[ryke/rekeyresp] first={first_out:?} inner ({} B) = {hex}", bytes.len()));
     }
     let response = build_encrypted(sa.suite.sk_cipher(), header, first_out, &bytes, our_sk_e(sa), our_sk_a(sa), iv)?;
     Ok((response, child))

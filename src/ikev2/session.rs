@@ -810,7 +810,12 @@ impl LivenessSession {
     /// already pending -- unlike `probe`, it does not need to "wait long
     /// enough" for a reply that was never asked for. A plain timeout here
     /// (nothing pending) is [`Liveness::Alive`], not [`Liveness::NoReply`]:
-    /// silence is completely normal when nothing was just sent.
+    /// silence is completely normal when nothing was just sent. With
+    /// [`Self::hold_peer_rekeys`] on, it returns [`Liveness::Alive`] as soon
+    /// as it has taken a rekey of the peer's and held its answer, without
+    /// waiting out `timeout`, so the caller can hand it over without delay
+    /// ([`Self::peer_rekey_held`]); a call made while one is already held
+    /// reads on as usual.
     pub fn peek(&mut self, timeout: Duration) -> Result<Liveness, DriverError> {
         if self.ike.ended {
             return Ok(Liveness::PeerTornDown);
@@ -1626,7 +1631,9 @@ impl LivenessSession {
     /// passed over; `peek` passes `None` since it never sent anything. A
     /// request from the peer is answered, or not, by
     /// [`Self::answer_peer_request`], and the wait goes on unless it ended
-    /// the tunnel ([`Liveness::PeerTornDown`]). A datagram that isn't an
+    /// the tunnel ([`Liveness::PeerTornDown`]) or, for `peek` only, it newly
+    /// held the answer to a rekey ([`Self::hold_peer_rekeys`]): that is
+    /// [`Liveness::Alive`] at once. A datagram that isn't an
     /// IKEv2 message at all is dropped: anyone can send one.
     fn recv_and_classify(&mut self, timeout: Duration, mut awaited: Option<&mut Reassembly>) -> Result<Liveness, DriverError> {
         let quiet = if awaited.is_some() { Liveness::NoReply } else { Liveness::Alive };
@@ -1668,8 +1675,15 @@ impl LivenessSession {
                 }
                 continue;
             }
+            let held_before = self.peer_child.held.is_some();
             if self.answer_peer_request(&header, &msg, fragmented)? {
                 return Ok(Liveness::PeerTornDown);
+            }
+            // A rekey this request newly holds ([`Self::hold_peer_rekeys`]) is for the caller to
+            // hand over at once, not after the rest of a `peek`'s wait: the peer's traffic only
+            // moves to the new SA once it has the answer, which is held until then.
+            if awaited.is_none() && !held_before && self.peer_child.held.is_some() {
+                return Ok(Liveness::Alive);
             }
         }
     }
@@ -2441,7 +2455,9 @@ impl LivenessSession {
     /// of the IKE SA are refused with [`IkeError::Crypto`], sending nothing,
     /// and every other exchange of ours goes on. Nothing here bounds how long
     /// it is held: that is the caller's (the peer retransmits meanwhile, and
-    /// gives up in the end). [`Self::close`] drops it.
+    /// gives up in the end). [`Self::close`] drops it. A [`Self::peek`] that
+    /// takes the request returns at once, so that the caller learns of the
+    /// held rekey ([`Self::peer_rekey_held`]) without waiting out its timeout.
     ///
     /// Not held, ever: a rekey that crosses one of ours (§2.8.1), one of the
     /// SA a negotiated rekey of ours made current ([`Self::negotiate_rekey`]),
@@ -6324,6 +6340,57 @@ mod tests {
         assert_eq!(gateway_takes_the_answer(&resp_sa, PEER_NEW_SPI, &answer).outbound.spi(), held_spi);
         deliver(&mut liveness, &gateway, &build_informational(&resp_sa, 1, false, &[], &[9u8; 8]).unwrap());
         assert_eq!(sent_to(&gateway).map(|a| client_header(&a)), Some((ExchangeType::Informational, 1, true)), "the next request is answered");
+    }
+
+    /// A `peek` that takes a rekey of the gateway's and holds its answer returns
+    /// at once, not at its timeout: the caller hands the SA over without the
+    /// rest of the wait. One made while that rekey is held reads on as it
+    /// always did -- to its timeout, taking a retransmission of the request off
+    /// the socket without answering it -- since returning at once there would
+    /// leave the socket unread. Without the hold nothing returns early.
+    #[test]
+    fn a_peek_returns_at_once_when_it_newly_holds_a_gateway_rekey_and_not_when_one_is_already_held() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        liveness.hold_peer_rekeys(true);
+        let request = gateway_rekey_of(&resp_sa, 0, 0xAAAA, PEER_NEW_SPI);
+        gateway.send_to(&request, liveness.sock.local_addr().unwrap()).unwrap();
+        let started = Instant::now();
+        assert_eq!(liveness.peek(Duration::from_secs(2)).unwrap(), Liveness::Alive);
+        assert!(started.elapsed() < Duration::from_millis(500), "returned at once, not at its timeout: {:?}", started.elapsed());
+        let (_, held_spi, since) = liveness.peer_rekey_held().expect("held on return");
+        assert_eq!(sent_to(&gateway), None, "and still unanswered");
+
+        // Already held: a retransmission is read and dropped, and the wait runs out.
+        gateway.send_to(&request, liveness.sock.local_addr().unwrap()).unwrap();
+        let started = Instant::now();
+        assert_eq!(liveness.peek(Duration::from_millis(200)).unwrap(), Liveness::Alive);
+        assert!(started.elapsed() >= Duration::from_millis(150), "ran to its timeout: {:?}", started.elapsed());
+        liveness.sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        assert!(liveness.sock.recv_from(&mut [0u8; 4096]).is_err(), "the retransmission was taken off the socket");
+        assert_eq!(sent_to(&gateway), None, "and not answered");
+        assert_eq!(liveness.peer_rekey_held(), Some((ChildKind::Primary, held_spi, since)), "the same rekey, still held");
+
+        // Nothing held and nothing coming: it waits out its timeout as ever.
+        liveness.release_peer_rekey(ChildKind::Primary, held_spi).unwrap();
+        let started = Instant::now();
+        assert_eq!(liveness.peek(Duration::from_millis(200)).unwrap(), Liveness::Alive);
+        assert!(started.elapsed() >= Duration::from_millis(150));
+    }
+
+    /// With the hold off, a `peek` that takes a rekey of the gateway's answers
+    /// it and, as ever, reads on to its timeout.
+    #[test]
+    fn without_the_hold_a_peek_that_answers_a_gateway_rekey_still_waits_out_its_timeout() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        gateway.send_to(&gateway_rekey_of(&resp_sa, 0, 0xAAAA, PEER_NEW_SPI), liveness.sock.local_addr().unwrap()).unwrap();
+        let started = Instant::now();
+        assert_eq!(liveness.peek(Duration::from_millis(200)).unwrap(), Liveness::Alive);
+        assert!(started.elapsed() >= Duration::from_millis(150), "ran to its timeout: {:?}", started.elapsed());
+        assert!(sent_to(&gateway).is_some(), "answered on arrival");
     }
 
     /// Refused, the held rekey is answered `TEMPORARY_FAILURE` -- and that

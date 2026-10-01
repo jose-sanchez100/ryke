@@ -326,6 +326,21 @@ pub struct PeerRekeyedChild {
     pub child: RekeyedChild,
 }
 
+/// A CHILD SA rekey the *peer* started that this session derived and holds
+/// unanswered ([`LivenessSession::hold_peer_rekeys`]): the new SA, for the
+/// caller to install next to the one it replaces before
+/// [`LivenessSession::release_peer_rekey`] sends the answer -- or
+/// [`LivenessSession::refuse_peer_rekey`] refuses the request instead.
+pub struct HeldPeerRekey {
+    pub kind: ChildKind,
+    pub child: RekeyedChild,
+    /// The (local, peer) SPIs of the SA it replaces: `kind`'s current one,
+    /// which stays current until the release.
+    pub replaces: (u32, u32),
+    /// When the request was held.
+    pub since: Instant,
+}
+
 /// A CHILD SA rekey of our own that [`LivenessSession::negotiate_rekey`]
 /// negotiated and nothing has committed or abandoned yet: the SA replacing
 /// `kind`'s for the caller to install, before
@@ -406,6 +421,36 @@ struct PeerChildState {
     /// [`own_rekey_slot`]). Deliberately not `in_flight`: no request of ours
     /// is waiting, and the peer's IKE SA rekeys are taken on meanwhile.
     own_rekeys: [Option<OwnRekey>; 2],
+    /// Whether a rekey that would go to `pending` is held unanswered instead
+    /// ([`LivenessSession::hold_peer_rekeys`]).
+    hold: bool,
+    /// The rekey held unanswered, if any: at most one, the peer's window
+    /// being one request wide.
+    held: Option<HeldRekey>,
+}
+
+/// A rekey of the peer's held unanswered ([`LivenessSession::hold_peer_rekeys`]):
+/// what [`LivenessSession::answer_peer_child_request`] would have sent, and
+/// what it would have done once it had, kept for the release.
+struct HeldRekey {
+    kind: ChildKind,
+    /// The SA it replaces, `kind`'s current one until the release.
+    old: ChildSpis,
+    new: ChildSpis,
+    /// The traffic selectors the new SA carries, if known.
+    proposed: Option<ChildTs>,
+    /// The request, as it came, and the answer built for it.
+    header: IkeHeader,
+    request: Vec<u8>,
+    response: Outgoing,
+    /// Whether the request came in fragments: a refusal goes in fragments too.
+    fragmented: bool,
+    /// The SPIs of the IKE SA it came on.
+    ike_spis: (u64, u64),
+    since: Instant,
+    /// The new SA's keys, until the caller takes them
+    /// ([`LivenessSession::take_held_peer_rekey`]).
+    child: Option<RekeyedChild>,
 }
 
 /// Where a family's entry is in [`PeerChildState::own_rekeys`].
@@ -784,8 +829,13 @@ impl LivenessSession {
     /// I/O error past the initial send) is not surfaced as a hard failure.
     /// It may use the Message IDs kept back for ending the IKE SA (see
     /// [`Self::message_ids_exhausted`]); with none left at all it fails with
-    /// [`IkeError::MessageIdsExhausted`], having sent nothing.
+    /// [`IkeError::MessageIdsExhausted`], having sent nothing. A rekey of the
+    /// peer's held unanswered ([`Self::hold_peer_rekeys`]) is dropped as it is:
+    /// the Delete of the IKE SA ends it too.
     pub fn close(&mut self) -> Result<(), DriverError> {
+        if self.peer_child.held.take().is_some() {
+            ike_debug!("CREATE_CHILD_SA: closing with a rekey of the peer's held -- dropped unanswered");
+        }
         if self.ike.ended {
             // RFC 7296 §2.21.3: an `INVALID_SYNTAX` answer deleted it already,
             // "without needing an explicit Delete payload".
@@ -977,12 +1027,16 @@ impl LivenessSession {
     /// A crossed rekey of the same SA by the peer is settled here
     /// (RFC 7296 §2.8.1), as in [`Self::rekey_child`]: `child` is the SA
     /// kept, ours or the peer's. Refused with [`IkeError::Crypto`], sending
-    /// nothing, while a rekey of `kind` is already negotiated, when `kind`
-    /// has no CHILD SA, or when the IKE SA is over.
+    /// nothing, while a rekey of `kind` is already negotiated, while the
+    /// peer's rekey of `kind` is held unanswered ([`Self::hold_peer_rekeys`]),
+    /// when `kind` has no CHILD SA, or when the IKE SA is over.
     pub fn negotiate_rekey(&mut self, kind: ChildKind, timeout: Duration) -> Result<NegotiatedRekey, DriverError> {
         let slot = own_rekey_slot(kind);
         if self.peer_child.own_rekeys[slot].is_some() {
             return Err(IkeError::Crypto("a rekey of this CHILD SA is already negotiated").into());
+        }
+        if self.held_kind() == Some(kind) {
+            return Err(IkeError::Crypto("the peer's rekey of this CHILD SA is held unanswered").into());
         }
         if self.ike.ended {
             return Err(IkeError::Crypto("the IKE SA is over").into());
@@ -1165,7 +1219,9 @@ impl LivenessSession {
     /// [`Self::settle_rekey`], which records the SA that ends up replacing
     /// `old` as `kind`'s, and is refused if it narrows what `old` carries
     /// (RFC 7296 §2.9.2); a brand-new CHILD SA isn't recorded anywhere -- the
-    /// callers own which SA that is.
+    /// callers own which SA that is. A rekey of a CHILD SA whose rekey by the
+    /// peer is held unanswered ([`Self::hold_peer_rekeys`]) is refused with
+    /// [`IkeError::Crypto`], sending nothing: it would collide with our own.
     fn child_exchange(
         &mut self,
         replaces: Option<(ChildKind, ChildSpis)>,
@@ -1175,6 +1231,9 @@ impl LivenessSession {
     ) -> Result<(RekeyedChild, Option<TrafficSelectors>, Option<ChildTs>), DriverError> {
         if self.ike.ended {
             return Err(IkeError::PeerTornDown.into());
+        }
+        if replaces.is_some_and(|(kind, _)| self.held_kind() == Some(kind)) {
+            return Err(IkeError::Crypto("the peer's rekey of this CHILD SA is held unanswered").into());
         }
         let op = replaces.map_or(ChildOp::Create, |(_, old)| ChildOp::Rekey(old));
         let keep = replaces.and_then(|(kind, _)| self.child_ts.get(kind).cloned());
@@ -1833,6 +1892,14 @@ impl LivenessSession {
             let _ = last.response.send(&self.sock, self.dest);
             return Ok(last.tears_down);
         }
+        // The request whose answer is held ([`Self::hold_peer_rekeys`]), sent
+        // again -- or another under its Message ID: neither answered nor taken
+        // on again until the caller releases or refuses it. Its answer then
+        // goes out, and is resent to a retransmission like any other.
+        if on == OnIkeSa::Current && self.peer_child.held.as_ref().is_some_and(|held| held.header.message_id == mid) {
+            ike_debug!("request {mid} from the peer: its answer is held -- nothing sent");
+            return Ok(false);
+        }
         if requests.next != u64::from(mid) {
             ike_debug!("request {mid} from the peer: outside the receive window (expecting {}) -- dropped", requests.next);
             return Ok(false);
@@ -2169,6 +2236,12 @@ impl LivenessSession {
     /// as usual, but the new SA is only noted for [`Self::settle_rekey`] to
     /// weigh against ours, not handed to the caller. While we rekey or delete
     /// the IKE SA, any of these is refused with `TEMPORARY_FAILURE` (§2.25.2).
+    ///
+    /// With [`Self::hold_peer_rekeys`] on, a rekey that would be handed to the
+    /// caller is derived and its answer built, but neither sent nor acted on:
+    /// it is held ([`HeldRekey`]). A crossed rekey, one of the SA a negotiated
+    /// rekey of ours made current, and every refusal are answered at once,
+    /// held or not.
     fn answer_peer_child_request(&mut self, header: &IkeHeader, msg: &[u8], iv: &[u8; 8]) -> Result<(), DriverError> {
         let current = OnIkeSa::Current;
         if self.ike.rekeying.is_some() || self.ike.closing {
@@ -2247,8 +2320,29 @@ impl LivenessSession {
         match rekey::responder_answer_child_rekey(&self.sa, msg, new_spi, &nr, self.cipher, &self.pfs, &dh_private, iv) {
             Ok((response, child)) => {
                 let response = self.outgoing(current, response)?;
-                self.respond(current, header, msg, response, false);
                 let rekeyed = rekeyed_child(&child);
+                let ours_on_it = self.peer_child.own_rekeys[own_rekey_slot(kind)].is_some();
+                if self.peer_child.hold && !crossed && !ours_on_it && self.peer_child.held.is_none() {
+                    ike_debug!(
+                        "CREATE_CHILD_SA: the peer rekeyed the {kind:?} CHILD SA (message id {}) -- new spi_in={:08x} spi_out={:08x}, its answer held for the caller",
+                        header.message_id, rekeyed.local_spi, rekeyed.peer_spi
+                    );
+                    self.peer_child.held = Some(HeldRekey {
+                        kind,
+                        old,
+                        new: ChildSpis::of(&rekeyed),
+                        proposed,
+                        header: *header,
+                        request: msg.to_vec(),
+                        response,
+                        fragmented: self.peer_requests.answering_fragmented,
+                        ike_spis: (self.sa.spi_i, self.sa.spi_r),
+                        since: Instant::now(),
+                        child: Some(rekeyed),
+                    });
+                    return Ok(());
+                }
+                self.respond(current, header, msg, response, false);
                 ike_debug!(
                     "CREATE_CHILD_SA: the peer rekeyed the {kind:?} CHILD SA (message id {}) -- new spi_in={:08x} spi_out={:08x}",
                     header.message_id, rekeyed.local_spi, rekeyed.peer_spi
@@ -2324,9 +2418,126 @@ impl LivenessSession {
     /// installs each new SA (and drops the one it replaced) promptly, since the
     /// peer moves its own traffic to the new SA as soon as it has the answer.
     /// The session's SPIs and the peer's deletion of the replaced SA are
-    /// tracked here; only the data plane is the caller's.
+    /// tracked here; only the data plane is the caller's. A rekey held
+    /// unanswered ([`Self::hold_peer_rekeys`]) is not among them.
     pub fn take_peer_rekeys(&mut self) -> Vec<PeerRekeyedChild> {
         std::mem::take(&mut self.peer_child.pending)
+    }
+
+    /// Hold the answer to a CHILD SA rekey the peer starts, instead of sending
+    /// it at once: off unless asked for, and then only for a rekey that would
+    /// be handed to [`Self::take_peer_rekeys`]. The request is checked and the
+    /// new SA derived exactly as they are without this, but the answer is not
+    /// sent and the session does not move to the new SA: the caller takes
+    /// it ([`Self::take_held_peer_rekey`]), installs it next to the one it
+    /// replaces, and then [`Self::release_peer_rekey`]s it -- or, if it cannot,
+    /// [`Self::refuse_peer_rekey`]s it. RFC 7296 §2.8 has the responder able
+    /// to receive on the new SA by the time its answer is out; this is how a
+    /// caller whose data plane is not the session's makes that so.
+    ///
+    /// While one is held, a retransmission of its request is neither answered
+    /// nor taken on again, the peer sends no other request (its window is one
+    /// request wide, §2.3), our own rekey of the same CHILD SA and our rekey
+    /// of the IKE SA are refused with [`IkeError::Crypto`], sending nothing,
+    /// and every other exchange of ours goes on. Nothing here bounds how long
+    /// it is held: that is the caller's (the peer retransmits meanwhile, and
+    /// gives up in the end). [`Self::close`] drops it.
+    ///
+    /// Not held, ever: a rekey that crosses one of ours (§2.8.1), one of the
+    /// SA a negotiated rekey of ours made current ([`Self::negotiate_rekey`]),
+    /// and every refusal -- answered at once, as without this.
+    pub fn hold_peer_rekeys(&mut self, hold: bool) {
+        self.peer_child.hold = hold;
+    }
+
+    /// The rekey held unanswered, if any ([`Self::hold_peer_rekeys`]): which
+    /// CHILD SA, the new SA's inbound SPI, and since when.
+    pub fn peer_rekey_held(&self) -> Option<(ChildKind, u32, Instant)> {
+        self.peer_child.held.as_ref().map(|held| (held.kind, held.new.local, held.since))
+    }
+
+    /// The new SA of the rekey held unanswered, once: it stays held until
+    /// [`Self::release_peer_rekey`] or [`Self::refuse_peer_rekey`].
+    pub fn take_held_peer_rekey(&mut self) -> Option<HeldPeerRekey> {
+        let held = self.peer_child.held.as_mut()?;
+        let child = held.child.take()?;
+        Some(HeldPeerRekey { kind: held.kind, child, replaces: (held.old.local, held.old.peer), since: held.since })
+    }
+
+    /// Send the answer held for the peer's rekey of `kind`'s CHILD SA whose
+    /// new SA is `new_local_spi`, and only then move to that SA, as
+    /// [`Self::answer_peer_child_request`] does at once without the hold: it
+    /// becomes `kind`'s current SA, with the traffic selectors the peer
+    /// proposed, and the SA it replaced is the one the peer deletes -- that
+    /// Delete is routine. Refused with [`IkeError::Crypto`], changing
+    /// nothing, with none held of `kind` matching; with
+    /// [`IkeError::PeerTornDown`], sending nothing, when the IKE SA it came on
+    /// is over (the rekey is dropped).
+    pub fn release_peer_rekey(&mut self, kind: ChildKind, new_local_spi: u32) -> Result<(), DriverError> {
+        let held = self.take_held(kind, new_local_spi)?;
+        if self.ike_sa_gone() || held.ike_spis != (self.sa.spi_i, self.sa.spi_r) {
+            ike_debug!("CREATE_CHILD_SA: the IKE SA of the held rekey of the {kind:?} CHILD SA is over -- dropped unanswered");
+            return Err(IkeError::PeerTornDown.into());
+        }
+        // Nothing moves `kind`'s SA while its rekey is held: none of our own
+        // rekeys of it is let through, and the peer sends nothing more first.
+        if self.child_spis(kind) != Some((held.old.local, held.old.peer)) {
+            self.refuse_held(held, "the CHILD SA it rekeys is no longer current")?;
+            return Err(IkeError::Crypto("the CHILD SA the held rekey replaces is no longer current").into());
+        }
+        let HeldRekey { old, new, proposed, header, request, response, .. } = held;
+        self.respond(OnIkeSa::Current, &header, &request, response, false);
+        ike_debug!(
+            "CREATE_CHILD_SA: the held answer to the peer's rekey of the {kind:?} CHILD SA (message id {}) sent -- now on spi_in={:08x} spi_out={:08x}",
+            header.message_id, new.local, new.peer
+        );
+        self.restore_child_spis(kind, new);
+        if proposed.is_some() {
+            self.child_ts.set(kind, proposed);
+        }
+        self.peer_child.superseded.push(SupersededChild { local_spi: old.local, peer_spi: old.peer, since: Instant::now() });
+        Ok(())
+    }
+
+    /// Refuse the peer's rekey held unanswered of `kind`'s CHILD SA whose new
+    /// SA is `new_local_spi`, with `TEMPORARY_FAILURE`: the caller could not
+    /// take the new SA on, and the peer may try again later (RFC 7296 §2.25
+    /// gives it that meaning; no other error says "not now" of a request the
+    /// responder could otherwise take). The session stays on the SA the
+    /// request rekeyed, and a retransmission of the request gets the same
+    /// refusal. Refused with [`IkeError::Crypto`], changing nothing, with
+    /// none held of `kind` matching; with [`IkeError::PeerTornDown`], sending
+    /// nothing, when the IKE SA it came on is over (the rekey is dropped).
+    pub fn refuse_peer_rekey(&mut self, kind: ChildKind, new_local_spi: u32) -> Result<(), DriverError> {
+        let held = self.take_held(kind, new_local_spi)?;
+        if self.ike_sa_gone() || held.ike_spis != (self.sa.spi_i, self.sa.spi_r) {
+            ike_debug!("CREATE_CHILD_SA: the IKE SA of the held rekey of the {kind:?} CHILD SA is over -- dropped unanswered");
+            return Err(IkeError::PeerTornDown.into());
+        }
+        self.refuse_held(held, "the new CHILD SA could not be taken on")
+    }
+
+    /// The `TEMPORARY_FAILURE` answer to the request of `held`, sent and kept
+    /// as its answer.
+    fn refuse_held(&mut self, held: HeldRekey, why: &str) -> Result<(), DriverError> {
+        let mut iv = [0u8; 8];
+        OsEntropy::new()?.fill(&mut iv);
+        self.peer_requests.answering_fragmented = held.fragmented;
+        self.refuse_peer_child_request(OnIkeSa::Current, &held.header, &held.request, &iv, notify_type::TEMPORARY_FAILURE, why)
+    }
+
+    /// Take the rekey held of `kind` whose new SA is `new_local_spi`, or fail
+    /// leaving everything as it was.
+    fn take_held(&mut self, kind: ChildKind, new_local_spi: u32) -> Result<HeldRekey, DriverError> {
+        self.peer_child
+            .held
+            .take_if(|held| held.kind == kind && held.new.local == new_local_spi)
+            .ok_or_else(|| IkeError::Crypto("no held rekey of this CHILD SA").into())
+    }
+
+    /// Which CHILD SA the rekey held unanswered is of, if one is.
+    fn held_kind(&self) -> Option<ChildKind> {
+        self.peer_child.held.as_ref().map(|held| held.kind)
     }
 
     /// Which families the peer deleted outright (an unsolicited ESP Delete,
@@ -2392,9 +2603,17 @@ impl LivenessSession {
     /// IKE SA without ever answering it -- the peer's IKE SA stands. Either
     /// way the tunnel carries on under the survivor, and this is
     /// [`Liveness::Alive`].
+    ///
+    /// While a rekey of the peer's is held unanswered
+    /// ([`Self::hold_peer_rekeys`]) it is refused with [`IkeError::Crypto`],
+    /// sending nothing: the held answer belongs to this IKE SA, and the peer,
+    /// waiting on it, would refuse ours (§2.25.2).
     pub fn rekey_ike(&mut self, timeout: Duration) -> Result<Liveness, DriverError> {
         if self.ike.ended {
             return Ok(Liveness::PeerTornDown);
+        }
+        if self.peer_child.held.is_some() {
+            return Err(IkeError::Crypto("a CHILD SA rekey of the peer's is held unanswered").into());
         }
         let mut entropy = OsEntropy::new()?;
         let mut ni = vec![0u8; NONCE_LEN];
@@ -6000,6 +6219,256 @@ mod tests {
         assert_eq!(refusal_reason(&resp_sa, &refusal), notify_type::NO_ADDITIONAL_SAS);
         deliver(&mut liveness, &gateway, &request);
         assert_eq!(sent_to(&gateway), Some(refusal), "the same refusal, byte for byte");
+    }
+
+    /// The gateway's rekey (Message ID `mid`) of the CHILD SA it knows by
+    /// `rekeyed` (our outbound SPI), its new SA on `new_spi`.
+    fn gateway_rekey_of(sa: &CompletedSaInit, mid: u32, rekeyed: u32, new_spi: u32) -> Vec<u8> {
+        rekey::build_child_request(sa, mid, Some(rekeyed), new_spi, &PEER_NI, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), &[7u8; 8]).unwrap()
+    }
+
+    /// The SA the gateway derives from our answer to its rekey with `new_spi`.
+    fn gateway_takes_the_answer(sa: &CompletedSaInit, new_spi: u32, answer: &[u8]) -> crate::esp::ChildSa {
+        rekey::initiator_complete_child(sa, &PEER_NI, new_spi, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), answer).expect("a rekey answer, not a refusal").0
+    }
+
+    /// Whatever the session sent the gateway that has not been read yet.
+    fn drain(gateway: &UdpSocket) {
+        while sent_to(gateway).is_some() {}
+    }
+
+    /// Off by default: a rekey of the gateway's is answered on arrival and
+    /// handed over, as it always was, and nothing is held.
+    #[test]
+    fn without_the_hold_a_gateway_rekey_is_answered_on_arrival_as_ever() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        deliver(&mut liveness, &gateway, &gateway_rekey_of(&resp_sa, 0, 0xAAAA, PEER_NEW_SPI));
+        let answer = sent_to(&gateway).expect("answered on arrival");
+        let made = gateway_takes_the_answer(&resp_sa, PEER_NEW_SPI, &answer);
+        assert!(liveness.peer_rekey_held().is_none() && liveness.take_held_peer_rekey().is_none(), "nothing held");
+        let taken = liveness.take_peer_rekeys();
+        assert_eq!(taken.iter().map(|t| (t.kind, t.child.local_spi)).collect::<Vec<_>>(), [(ChildKind::Primary, made.outbound.spi())]);
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some((made.outbound.spi(), PEER_NEW_SPI)));
+    }
+
+    /// With the hold on, the gateway's rekey is derived but nothing goes on the
+    /// wire and the session stays on the SA it rekeys, until the release: the
+    /// answer is sent then -- the SA it carries is the one handed over -- and
+    /// the session moves to the new SA. The gateway's Delete of the SA it
+    /// replaced is then routine: answered with ours for the pair, no teardown.
+    #[test]
+    fn a_held_gateway_rekey_is_answered_only_on_release_and_the_session_moves_then() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, Some(ChildSpis { local: 0x6666, peer: 0x7777 }));
+        liveness.hold_peer_rekeys(true);
+        let request = gateway_rekey_of(&resp_sa, 0, 0xAAAA, PEER_NEW_SPI);
+        assert_eq!(deliver(&mut liveness, &gateway, &request), Liveness::Alive);
+        assert_eq!(sent_to(&gateway), None, "nothing on the wire until the release");
+        assert!(liveness.take_peer_rekeys().is_empty(), "not handed over as a rekey already answered");
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some((0xBBBB, 0xAAAA)), "the session stays on the SA it rekeys");
+        let held = liveness.take_held_peer_rekey().expect("held");
+        assert_eq!((held.kind, held.replaces, held.child.peer_spi), (ChildKind::Primary, (0xBBBB, 0xAAAA), PEER_NEW_SPI));
+        assert!(liveness.take_held_peer_rekey().is_none(), "its keys are handed over once");
+        assert_eq!(liveness.peer_rekey_held().map(|(kind, spi, _)| (kind, spi)), Some((ChildKind::Primary, held.child.local_spi)), "and it stays held");
+
+        assert!(refused_crypto(liveness.release_peer_rekey(ChildKind::Ipv6, held.child.local_spi)), "not the family held");
+        assert!(refused_crypto(liveness.release_peer_rekey(ChildKind::Primary, held.child.local_spi ^ 1)), "not the SA held");
+        assert_eq!(sent_to(&gateway), None);
+        liveness.release_peer_rekey(ChildKind::Primary, held.child.local_spi).unwrap();
+        let answer = sent_to(&gateway).expect("the answer, on release");
+        assert_eq!(client_header(&answer), (ExchangeType::CreateChildSa, 0, true));
+        let made = gateway_takes_the_answer(&resp_sa, PEER_NEW_SPI, &answer);
+        assert_eq!(held.child.local_spi, made.outbound.spi(), "the SA answered is the one handed over");
+        assert_eq!(held.child.key_in.enc, made.outbound.enc_material(), "what the gateway sends, we open");
+        assert_eq!(held.child.key_out.enc, made.inbound.enc_material(), "what we send, the gateway opens");
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some((held.child.local_spi, PEER_NEW_SPI)), "on the new SA from the release on");
+        assert_eq!(liveness.child_spis(ChildKind::Ipv6), Some((0x6666, 0x7777)), "the IPv6 SA is untouched");
+        assert!(liveness.peer_rekey_held().is_none());
+        assert!(refused_crypto(liveness.release_peer_rekey(ChildKind::Primary, held.child.local_spi)), "released once");
+        assert!(liveness.take_peer_rekeys().is_empty(), "and never handed over a second time");
+
+        deliver(&mut liveness, &gateway, &request);
+        assert_eq!(sent_to(&gateway), Some(answer), "a retransmission now gets the same answer");
+        assert_eq!(deliver(&mut liveness, &gateway, &esp_delete_request(&resp_sa, 1, 0xAAAA)), Liveness::Alive, "the replaced SA's Delete ends nothing");
+        let ack = sent_to(&gateway).expect("answered");
+        assert_eq!(esp_spis_deleted(&resp_sa, &ack), vec![0xBBBB], "with ours for the pair");
+        assert!(liveness.take_peer_deleted_children().is_empty(), "nothing to renegotiate");
+    }
+
+    /// While its answer is held, the gateway's retransmission of the request
+    /// gets nothing and is not taken on again -- no second SA, the one held
+    /// unchanged -- and neither is another request under its Message ID; the
+    /// next one is outside the window. Released, the request is answered once,
+    /// and the window moves on.
+    #[test]
+    fn a_retransmission_of_a_held_rekey_is_neither_answered_nor_taken_on_again() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        liveness.hold_peer_rekeys(true);
+        let request = gateway_rekey_of(&resp_sa, 0, 0xAAAA, PEER_NEW_SPI);
+        deliver(&mut liveness, &gateway, &request);
+        let (_, held_spi, since) = liveness.peer_rekey_held().expect("held");
+        for again in [request.clone(), gateway_rekey_of(&resp_sa, 0, 0xAAAA, PEER_NEW_SPI + 1), build_informational(&resp_sa, 1, false, &[], &[8u8; 8]).unwrap()] {
+            assert_eq!(deliver(&mut liveness, &gateway, &again), Liveness::Alive);
+            assert_eq!(sent_to(&gateway), None, "nothing answered while the answer is held");
+        }
+        assert_eq!(liveness.peer_rekey_held(), Some((ChildKind::Primary, held_spi, since)), "the same rekey, held since it came");
+        assert_eq!(liveness.take_held_peer_rekey().map(|h| h.child.peer_spi), Some(PEER_NEW_SPI), "derived once, from the first request");
+        liveness.release_peer_rekey(ChildKind::Primary, held_spi).unwrap();
+        let answer = sent_to(&gateway).expect("answered once released");
+        assert_eq!(sent_to(&gateway), None, "once");
+        assert_eq!(gateway_takes_the_answer(&resp_sa, PEER_NEW_SPI, &answer).outbound.spi(), held_spi);
+        deliver(&mut liveness, &gateway, &build_informational(&resp_sa, 1, false, &[], &[9u8; 8]).unwrap());
+        assert_eq!(sent_to(&gateway).map(|a| client_header(&a)), Some((ExchangeType::Informational, 1, true)), "the next request is answered");
+    }
+
+    /// Refused, the held rekey is answered `TEMPORARY_FAILURE` -- and that
+    /// refusal again to a retransmission -- and the session stays on the SA it
+    /// rekeyed. The gateway's next rekey of it is taken on as usual.
+    #[test]
+    fn a_refused_held_rekey_is_answered_temporary_failure_and_the_next_rekey_is_taken_on() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        liveness.hold_peer_rekeys(true);
+        let request = gateway_rekey_of(&resp_sa, 0, 0xAAAA, PEER_NEW_SPI);
+        deliver(&mut liveness, &gateway, &request);
+        let (_, held_spi, _) = liveness.peer_rekey_held().expect("held");
+        assert!(refused_crypto(liveness.refuse_peer_rekey(ChildKind::Primary, held_spi ^ 1)), "not the SA held");
+        liveness.refuse_peer_rekey(ChildKind::Primary, held_spi).unwrap();
+        let refusal = sent_to(&gateway).expect("refused");
+        assert_eq!(create_child_notify(&resp_sa, &refusal), Some(notify_type::TEMPORARY_FAILURE));
+        assert_eq!(client_header(&refusal), (ExchangeType::CreateChildSa, 0, true));
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some((0xBBBB, 0xAAAA)), "still on the SA it rekeyed");
+        assert!(liveness.peer_rekey_held().is_none() && liveness.take_held_peer_rekey().is_none(), "nothing held any more");
+        assert!(liveness.take_peer_rekeys().is_empty());
+        deliver(&mut liveness, &gateway, &request);
+        assert_eq!(sent_to(&gateway), Some(refusal), "a retransmission gets the same refusal");
+
+        deliver(&mut liveness, &gateway, &gateway_rekey_of(&resp_sa, 1, 0xAAAA, PEER_NEW_SPI + 1));
+        assert_eq!(sent_to(&gateway), None, "the next rekey is held in its turn");
+        let held = liveness.take_held_peer_rekey().expect("held");
+        assert_eq!(held.replaces, (0xBBBB, 0xAAAA));
+        liveness.release_peer_rekey(ChildKind::Primary, held.child.local_spi).unwrap();
+        let answer = sent_to(&gateway).expect("answered");
+        assert_eq!(client_header(&answer), (ExchangeType::CreateChildSa, 1, true));
+        assert_eq!(gateway_takes_the_answer(&resp_sa, PEER_NEW_SPI + 1, &answer).outbound.spi(), held.child.local_spi);
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some((held.child.local_spi, PEER_NEW_SPI + 1)));
+    }
+
+    /// The IPv6 CHILD SA's rekey is held and released on its own: the primary
+    /// SA is untouched throughout.
+    #[test]
+    fn a_held_rekey_of_the_ipv6_child_sa_moves_only_that_one() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, Some(ChildSpis { local: 0x6666, peer: 0x7777 }));
+        liveness.hold_peer_rekeys(true);
+        deliver(&mut liveness, &gateway, &gateway_rekey_of(&resp_sa, 0, 0x7777, PEER_NEW_SPI));
+        assert_eq!(sent_to(&gateway), None);
+        let held = liveness.take_held_peer_rekey().expect("held");
+        assert_eq!((held.kind, held.replaces), (ChildKind::Ipv6, (0x6666, 0x7777)));
+        liveness.release_peer_rekey(ChildKind::Ipv6, held.child.local_spi).unwrap();
+        assert!(sent_to(&gateway).is_some());
+        assert_eq!(liveness.child_spis(ChildKind::Ipv6), Some((held.child.local_spi, PEER_NEW_SPI)));
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some((0xBBBB, 0xAAAA)));
+    }
+
+    /// Never held, the hold on: a refusal (a rekey of an SA we do not know), a
+    /// rekey that crosses ours (RFC 7296 §2.8.1, settled by our exchange), and
+    /// one of the SA a negotiated rekey of ours made current -- each answered
+    /// at once, exactly as without the hold.
+    #[test]
+    fn refusals_and_rekeys_that_meet_one_of_ours_are_never_held() {
+        let session = |gateway: &UdpSocket, sa: CompletedSaInit| {
+            let mut liveness = session_facing(gateway, sa, None);
+            liveness.hold_peer_rekeys(true);
+            liveness
+        };
+
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session(&gateway, init_sa);
+        deliver(&mut liveness, &gateway, &gateway_rekey_of(&resp_sa, 0, 0x1111_1111, PEER_NEW_SPI));
+        assert_eq!(create_child_notify(&resp_sa, &sent_to(&gateway).expect("refused at once")), Some(notify_type::CHILD_SA_NOT_FOUND));
+        assert!(liveness.peer_rekey_held().is_none());
+
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session(&gateway, init_sa);
+        let old = ChildSpis { local: 0xBBBB, peer: 0xAAAA };
+        liveness.peer_child.in_flight = Some(OwnChildOp { op: ChildOp::Rekey(old), crossed: None, old_deleted: false });
+        deliver(&mut liveness, &gateway, &gateway_rekey_of(&resp_sa, 0, 0xAAAA, PEER_NEW_SPI));
+        let answer = sent_to(&gateway).expect("a crossed rekey is answered at once");
+        gateway_takes_the_answer(&resp_sa, PEER_NEW_SPI, &answer);
+        assert!(liveness.peer_rekey_held().is_none());
+        assert!(liveness.peer_child.in_flight.as_ref().is_some_and(|own| own.crossed.is_some()), "kept for our exchange to settle");
+
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session(&gateway, init_sa);
+        liveness.peer_child.own_rekeys[own_rekey_slot(ChildKind::Primary)] =
+            Some(OwnRekey { old: ChildSpis { local: 0x9998, peer: 0x9999 }, old_ts: None, new: old, fate: OldFate::Ours });
+        deliver(&mut liveness, &gateway, &gateway_rekey_of(&resp_sa, 0, 0xAAAA, PEER_NEW_SPI));
+        let answer = sent_to(&gateway).expect("answered at once");
+        let made = gateway_takes_the_answer(&resp_sa, PEER_NEW_SPI, &answer);
+        assert!(liveness.peer_rekey_held().is_none());
+        assert_eq!(liveness.take_peer_rekeys().iter().map(|t| t.child.local_spi).collect::<Vec<_>>(), [made.outbound.spi()], "handed over as it always was");
+    }
+
+    /// While the gateway's rekey of the primary SA is held, our own rekey of
+    /// that SA -- early or not -- and our rekey of the IKE SA are refused,
+    /// sending nothing; our rekey of the IPv6 SA goes out as usual. The held
+    /// rekey is released afterwards all the same.
+    #[test]
+    fn our_rekey_of_a_child_sa_whose_rekey_is_held_is_refused_and_the_other_family_goes_on() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, Some(ChildSpis { local: 0x6666, peer: 0x7777 }));
+        liveness.hold_peer_rekeys(true);
+        deliver(&mut liveness, &gateway, &gateway_rekey_of(&resp_sa, 0, 0xAAAA, PEER_NEW_SPI));
+        let (_, held_spi, _) = liveness.peer_rekey_held().expect("held");
+        let timeout = Duration::from_millis(50);
+        assert!(refused_crypto(liveness.negotiate_rekey(ChildKind::Primary, timeout)));
+        assert!(refused_crypto(liveness.rekey_child(timeout)));
+        assert!(refused_crypto(liveness.rekey_ike(timeout)));
+        assert_eq!(sent_to(&gateway), None, "nothing sent for any of them");
+
+        let ipv6 = liveness.negotiate_rekey(ChildKind::Ipv6, timeout).map(|_| ()).expect_err("never answered here");
+        assert!(matches!(&ipv6, DriverError::Io(e) if e.kind() == io::ErrorKind::TimedOut), "{ipv6}");
+        let request = sent_to(&gateway).expect("the IPv6 rekey went out");
+        assert_eq!(client_header(&request), (ExchangeType::CreateChildSa, 2, false));
+        assert_eq!(rekey::rekey_sa_spi(&resp_sa, &request), Some(0x6666), "naming the IPv6 SA");
+        drain(&gateway);
+
+        liveness.release_peer_rekey(ChildKind::Primary, held_spi).unwrap();
+        assert_eq!(sent_to(&gateway).map(|a| client_header(&a)), Some((ExchangeType::CreateChildSa, 0, true)));
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some((held_spi, PEER_NEW_SPI)));
+    }
+
+    /// Closing the session with a rekey held drops it: the IKE SA's Delete
+    /// goes, the rekey's answer never does, and nothing is held any more.
+    #[test]
+    fn closing_with_a_rekey_held_drops_it_unanswered() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        liveness.hold_peer_rekeys(true);
+        deliver(&mut liveness, &gateway, &gateway_rekey_of(&resp_sa, 0, 0xAAAA, PEER_NEW_SPI));
+        let (_, held_spi, _) = liveness.peer_rekey_held().expect("held");
+        liveness.close().unwrap();
+        let mut sent = Vec::new();
+        while let Some(msg) = sent_to(&gateway) {
+            sent.push(msg);
+        }
+        assert!(!sent.is_empty() && sent.iter().all(|m| client_header(m) == (ExchangeType::Informational, 2, false)), "the IKE SA's Delete, and nothing else");
+        assert!(deletes_ike_sa(&resp_sa, &sent[0]));
+        assert!(liveness.peer_rekey_held().is_none() && liveness.take_held_peer_rekey().is_none());
+        assert!(refused_crypto(liveness.release_peer_rekey(ChildKind::Primary, held_spi)));
     }
 
     /// RFC 7296 §2.2: two counters, one for our requests and one for the

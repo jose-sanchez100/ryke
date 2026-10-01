@@ -9,15 +9,19 @@
 //!
 //! What it holds today:
 //!
+//! - [`limits`]: the volume figures of an SA by where each comes from, which of them is a hard
+//!   limit under the consumer's policy, and the renewal one may ask for.
 //! - [`spacing`]: how far apart renewal attempts of one SA are kept, and when the next one may
 //!   start.
 //! - [`timing`]: when an SA is to be renewed by its age and by its volume, where it stands against
 //!   its limits, and how soon a failed attempt is tried again.
 //!
-//! Every figure a policy is made of -- a share of a lifetime, a spacing, a reference rate -- is the
-//! consumer's: it is passed in as a parameter, and no type here has a default for one. What is here
-//! is the arithmetic those figures go through, the same for every consumer.
+//! Every figure a policy is made of -- a share of a lifetime, a spacing, a reference rate, which
+//! origins of a volume figure are hard limits -- is the consumer's: it is passed in as a parameter,
+//! and no type here has a default for one. What is here is the arithmetic those figures go through,
+//! the same for every consumer.
 
+pub mod limits;
 pub mod spacing;
 pub mod timing;
 

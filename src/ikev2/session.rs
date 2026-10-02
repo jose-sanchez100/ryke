@@ -324,6 +324,36 @@ pub enum ChildKind {
 pub struct PeerRekeyedChild {
     pub kind: ChildKind,
     pub child: RekeyedChild,
+    /// The (local, peer) SPIs of the SA it replaces: `kind`'s current one, or,
+    /// with [`LivenessSession::keep_redundant_children`] on, a redundant SA of
+    /// `kind` ([`RedundantChild`]) -- the new SA then takes that one's place
+    /// as a redundant SA, and `kind`'s current SA stays as it is.
+    pub replaces: (u32, u32),
+}
+
+/// The peer's SA of a crossed rekey (RFC 7296 §2.8.1) that is not kept as its
+/// family's SA -- ours is -- but that the peer may still send on until it
+/// deletes it, kept by a session that was asked to
+/// ([`LivenessSession::keep_redundant_children`]): its SPIs and keys, for the
+/// caller to accept inbound traffic on, next to `kind`'s current SA, and never
+/// to send on unless the session moves `kind` to it
+/// ([`PeerChildEvent::MovedToRedundant`]).
+pub struct RedundantChild {
+    pub kind: ChildKind,
+    pub child: RekeyedChild,
+}
+
+/// What became of a redundant SA ([`RedundantChild`]) as the session answered
+/// the peer -- see [`LivenessSession::take_peer_child_events`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerChildEvent {
+    /// The peer deleted a redundant CHILD SA of a crossed rekey (or the bound,
+    /// [`REDUNDANT_CHILDREN_KEPT`], closed it): the caller stops accepting it.
+    RedundantClosed { kind: ChildKind, local_spi: u32 },
+    /// The peer deleted `kind`'s current CHILD SA, `replaced` (local, peer),
+    /// and the redundant one named here is `kind`'s now: the caller moves its
+    /// outbound traffic to it.
+    MovedToRedundant { kind: ChildKind, local_spi: u32, peer_spi: u32, replaced: (u32, u32) },
 }
 
 /// A CHILD SA rekey the *peer* started that this session derived and holds
@@ -335,7 +365,10 @@ pub struct HeldPeerRekey {
     pub kind: ChildKind,
     pub child: RekeyedChild,
     /// The (local, peer) SPIs of the SA it replaces: `kind`'s current one,
-    /// which stays current until the release.
+    /// which stays current until the release -- or, with
+    /// [`LivenessSession::keep_redundant_children`] on, a redundant SA of
+    /// `kind` ([`RedundantChild`]), whose place the new SA takes at the
+    /// release, `kind`'s current SA staying as it is.
     pub replaces: (u32, u32),
     /// When the request was held.
     pub since: Instant,
@@ -348,7 +381,10 @@ pub struct HeldPeerRekey {
 pub struct NegotiatedRekey {
     pub kind: ChildKind,
     /// The SA to install: ours, or the peer's when it rekeyed the same SA at
-    /// the same time and its SA is the one kept (RFC 7296 §2.8.1).
+    /// the same time and its SA is the one kept (RFC 7296 §2.8.1). When ours
+    /// is kept, the peer's is redundant: with
+    /// [`LivenessSession::keep_redundant_children`] on it is handed over too,
+    /// apart ([`LivenessSession::take_redundant_children`]); without it, never.
     pub child: RekeyedChild,
     /// The (local, peer) SPIs of the SA it replaces.
     pub replaces: (u32, u32),
@@ -400,6 +436,30 @@ struct SupersededChild {
     since: Instant,
 }
 
+/// How many redundant SAs of crossed rekeys ([`RedundantChild`]) a family
+/// keeps at once, with [`LivenessSession::keep_redundant_children`] on. The
+/// peer is expected to delete each one at once (RFC 7296 §2.8.1: it SHOULD);
+/// one more than this closes the oldest of the family: we send its Delete,
+/// best effort as [`LivenessSession::delete_child_sa`] does, and report it
+/// closed ([`PeerChildEvent::RedundantClosed`]). A bound against a peer that
+/// never deletes them, not a lifetime: nothing else ends one but the peer.
+pub const REDUNDANT_CHILDREN_KEPT: usize = 4;
+
+/// A redundant SA of a crossed rekey kept as a live SA of its family until
+/// the peer closes it ([`LivenessSession::keep_redundant_children`]). Not a
+/// [`SupersededChild`]: it is not pruned after [`SUPERSEDED_CHILD_TTL`], the
+/// peer may send on it, rekey it, or delete the family's current SA instead.
+#[derive(Clone)]
+struct RedundantSa {
+    kind: ChildKind,
+    spis: ChildSpis,
+    /// The traffic selectors the peer proposed for it, if known.
+    ts: Option<ChildTs>,
+    /// When it was created: by the crossed rekey, or by the peer's rekey of
+    /// the redundant SA it replaced.
+    since: Instant,
+}
+
 /// Where the peer-started CHILD SA rekeys this session took on are.
 #[derive(Default)]
 struct PeerChildState {
@@ -427,6 +487,17 @@ struct PeerChildState {
     /// The rekey held unanswered, if any: at most one, the peer's window
     /// being one request wide.
     held: Option<HeldRekey>,
+    /// Whether the caller's data plane holds more than one CHILD SA per
+    /// family ([`LivenessSession::keep_redundant_children`]).
+    keep_redundant: bool,
+    /// The redundant SAs of crossed rekeys kept, oldest first; only ever
+    /// filled with `keep_redundant` on.
+    redundant: Vec<RedundantSa>,
+    /// Those not yet collected ([`LivenessSession::take_redundant_children`]).
+    redundant_new: Vec<RedundantChild>,
+    /// What became of them, not yet collected
+    /// ([`LivenessSession::take_peer_child_events`]).
+    events: Vec<PeerChildEvent>,
 }
 
 /// A rekey of the peer's held unanswered ([`LivenessSession::hold_peer_rekeys`]):
@@ -434,7 +505,8 @@ struct PeerChildState {
 /// what it would have done once it had, kept for the release.
 struct HeldRekey {
     kind: ChildKind,
-    /// The SA it replaces, `kind`'s current one until the release.
+    /// The SA it replaces, `kind`'s current one until the release -- or a
+    /// redundant SA of `kind` ([`LivenessSession::keep_redundant_children`]).
     old: ChildSpis,
     new: ChildSpis,
     /// The traffic selectors the new SA carries, if known.
@@ -505,10 +577,12 @@ struct OwnChildOp {
 /// The peer's own rekey of the CHILD SA we are rekeying, answered as usual
 /// (RFC 7296 §2.8.1): the SA it made, and the lower of that exchange's two
 /// nonces -- which of the two new SAs is redundant is only known once our own
-/// exchange's nonces are in too.
+/// exchange's nonces are in too -- and the traffic selectors it proposed for
+/// its SA, if known.
 struct CrossedRekey {
     child: RekeyedChild,
     lowest_nonce: Vec<u8>,
+    ts: Option<ChildTs>,
 }
 
 /// The traffic selectors a CHILD SA was negotiated with, by side: `ours` is
@@ -845,7 +919,9 @@ impl LivenessSession {
     /// as it has taken a rekey of the peer's and held its answer, without
     /// waiting out `timeout`, so the caller can hand it over without delay
     /// ([`Self::peer_rekey_held`]); a call made while one is already held
-    /// reads on as usual.
+    /// reads on as usual. Likewise, with [`Self::keep_redundant_children`]
+    /// on, as soon as it has moved a family to a redundant SA
+    /// ([`PeerChildEvent::MovedToRedundant`]).
     pub fn peek(&mut self, timeout: Duration) -> Result<Liveness, DriverError> {
         if self.ike.ended {
             return Ok(Liveness::PeerTornDown);
@@ -866,11 +942,13 @@ impl LivenessSession {
     /// [`Self::message_ids_exhausted`]); with none left at all it fails with
     /// [`IkeError::MessageIdsExhausted`], having sent nothing. A rekey of the
     /// peer's held unanswered ([`Self::hold_peer_rekeys`]) is dropped as it is:
-    /// the Delete of the IKE SA ends it too.
+    /// the Delete of the IKE SA ends it too, and so it does every redundant SA
+    /// kept ([`Self::keep_redundant_children`]), which is no longer tracked.
     pub fn close(&mut self) -> Result<(), DriverError> {
         if self.peer_child.held.take().is_some() {
             ike_debug!("CREATE_CHILD_SA: closing with a rekey of the peer's held -- dropped unanswered");
         }
+        self.peer_child.redundant.clear();
         if self.ike.ended {
             // RFC 7296 §2.21.3: an `INVALID_SYNTAX` answer deleted it already,
             // "without needing an explicit Delete payload".
@@ -1195,14 +1273,17 @@ impl LivenessSession {
     /// of a Delete [`Self::commit_rekey`] or [`Self::abandon_rekey`]
     /// reported [`ChildDeleteOutcome::NotSent`]. Refused as
     /// [`ChildDeleteOutcome::NotOwed`] `"in_use"` for an SA the tunnel runs
-    /// on (a family's current SA, or one negotiated and not committed) and
+    /// on (a family's current SA, one negotiated and not committed, or a
+    /// redundant SA kept by [`Self::keep_redundant_children`], which the
+    /// tunnel accepts traffic on) and
     /// `"peer_deletes"` for one the peer's rekey replaced, whose Delete is the
     /// peer's.
     pub fn delete_child(&mut self, local_spi: u32, peer_spi: u32) -> Result<DeleteReport, DriverError> {
         let names = |local: u32, peer: u32| local == local_spi || peer == peer_spi;
         let current = [ChildKind::Primary, ChildKind::Ipv6].into_iter().filter_map(|kind| self.child_spis(kind)).any(|(l, p)| names(l, p));
         let negotiated = self.peer_child.own_rekeys.iter().flatten().any(|r| names(r.new.local, r.new.peer));
-        if current || negotiated {
+        let redundant = self.peer_child.redundant.iter().any(|r| names(r.spis.local, r.spis.peer));
+        if current || negotiated || redundant {
             return Ok(DeleteReport { outcome: ChildDeleteOutcome::NotOwed("in_use"), liveness: Liveness::Alive });
         }
         if self.peer_child.superseded.iter().any(|s| names(s.local_spi, s.peer_spi)) {
@@ -1322,10 +1403,25 @@ impl LivenessSession {
     /// unanswered, retransmissions included, or the peer answered
     /// `CHILD_SA_NOT_FOUND` because its own rekey had already replaced `old`
     /// -- the peer's SA stands and the error means
-    /// nothing. Only the survivor is ever handed to the caller, which holds
+    /// nothing.
+    ///
+    /// By default only the survivor is ever handed to the caller, which holds
     /// one CHILD SA per family: the redundant SA's inbound traffic is not
     /// accepted in the moment before its Delete, although RFC 7296 §2.8.1
-    /// asks for both.
+    /// asks for both ("a node MUST accept incoming packets through either
+    /// SA"). A caller whose data plane holds more than one SA per family asks
+    /// for the other behaviour ([`Self::keep_redundant_children`]): when ours
+    /// is kept, the peer's redundant SA is kept too, as a live SA of `kind`
+    /// until the peer closes it, and handed over apart
+    /// ([`Self::take_redundant_children`]) for the caller to accept inbound
+    /// traffic on. What becomes of it -- the peer deletes it, rekeys it, or
+    /// deletes `kind`'s current SA and leaves it as `kind`'s only one -- is
+    /// told as it happens ([`Self::take_peer_child_events`]). Still not
+    /// covered either way: our answer to the peer's crossed rekey goes out at
+    /// once, before the caller can install the peer's SA, which it only gets
+    /// once our own exchange is settled -- inbound traffic on that SA in
+    /// between (one round trip, or our exchange's whole timeout if our request
+    /// was lost, but then the peer's SA is the survivor) is not accepted.
     ///
     /// The peer may also have deleted `old` meanwhile (§2.25.1: answered as
     /// usual, with our Delete for it). Then a rekey that stood has nothing
@@ -1374,6 +1470,9 @@ impl LivenessSession {
         what: &str,
     ) -> Result<(RekeyedChild, Option<TrafficSelectors>, Option<ChildTs>, OldFate), DriverError> {
         let ours_to_delete = if own.old_deleted { OldFate::Gone } else { OldFate::Ours };
+        // The peer's redundant SA, when ours is kept and the caller keeps
+        // redundant SAs: tracked once ours is `kind`'s, below.
+        let mut kept_redundant = None;
         // A peer rekey answered meanwhile has already recorded its SA, and
         // its traffic selectors, as `kind`'s.
         let (child, tsr, granted) = match (exchanged, own.crossed) {
@@ -1395,7 +1494,11 @@ impl LivenessSession {
                     crossed.child.local_spi, ours.local_spi
                 );
                 let theirs = ChildSpis::of(&crossed.child);
-                self.peer_child.superseded.push(SupersededChild { local_spi: theirs.local, peer_spi: theirs.peer, since: Instant::now() });
+                if self.peer_child.keep_redundant {
+                    kept_redundant = Some((crossed.child, crossed.ts));
+                } else {
+                    self.peer_child.superseded.push(SupersededChild { local_spi: theirs.local, peer_spi: theirs.peer, since: Instant::now() });
+                }
                 // `old` went into `superseded` when the peer's rekey was answered,
                 // for the peer to delete; now it's ours to delete.
                 self.peer_child.superseded.retain(|s| s.peer_spi != old.peer);
@@ -1417,7 +1520,91 @@ impl LivenessSession {
         if granted.is_some() {
             self.child_ts.set(kind, granted.clone());
         }
+        if let Some((theirs, ts)) = kept_redundant {
+            self.keep_redundant_child(kind, theirs, ts, what);
+        }
         Ok((rekeyed, tsr, granted, ours_to_delete))
+    }
+
+    /// Keep `child`, the peer's redundant SA of a crossed rekey of `kind`'s
+    /// CHILD SA (`ts`: what it carries, if known), as a live SA of `kind`
+    /// until the peer closes it, and queue it for the caller
+    /// ([`Self::take_redundant_children`]). One more than
+    /// [`REDUNDANT_CHILDREN_KEPT`] of `kind` closes the oldest: its Delete is
+    /// sent, best effort, and it is reported closed -- or, not collected yet,
+    /// just dropped from the queue. `what` only labels the debug output.
+    fn keep_redundant_child(&mut self, kind: ChildKind, child: RekeyedChild, ts: Option<ChildTs>, what: &str) {
+        let spis = ChildSpis::of(&child);
+        ike_debug!(
+            "CREATE_CHILD_SA ({what}): the peer's redundant SA of the {kind:?} CHILD SA kept until the peer deletes it, inbound only (spi_in={:08x} spi_out={:08x})",
+            spis.local, spis.peer
+        );
+        self.peer_child.redundant.push(RedundantSa { kind, spis, ts, since: Instant::now() });
+        self.peer_child.redundant_new.push(RedundantChild { kind, child });
+        while self.peer_child.redundant.iter().filter(|r| r.kind == kind).count() > REDUNDANT_CHILDREN_KEPT {
+            let Some(oldest) = self.peer_child.redundant.iter().position(|r| r.kind == kind) else { break };
+            let oldest = self.peer_child.redundant.remove(oldest);
+            ike_debug!(
+                "CREATE_CHILD_SA ({what}): more than {REDUNDANT_CHILDREN_KEPT} redundant SAs of the {kind:?} CHILD SA -- closing the oldest (spi_in={:08x} spi_out={:08x}, kept {} ms)",
+                oldest.spis.local,
+                oldest.spis.peer,
+                oldest.since.elapsed().as_millis()
+            );
+            let queued = self.peer_child.redundant_new.len();
+            self.peer_child.redundant_new.retain(|r| r.child.local_spi != oldest.spis.local);
+            if self.peer_child.redundant_new.len() == queued {
+                self.peer_child.events.push(PeerChildEvent::RedundantClosed { kind, local_spi: oldest.spis.local });
+            }
+            if let Err(e) = self.delete_child_sa(oldest.spis) {
+                ike_debug!("CREATE_CHILD_SA ({what}): failed to send Delete for the redundant SA spi_in={:08x}: {e}", oldest.spis.local);
+            }
+        }
+    }
+
+    /// The redundant SA of `kind` the family moves to when the peer deletes
+    /// its current SA: the most recently created one, of those `named` (the
+    /// SPIs the same Delete names) leaves alone.
+    fn redundant_to_move_to(&self, kind: ChildKind, named: &[u32]) -> Option<RedundantSa> {
+        self.peer_child.redundant.iter().rev().find(|r| r.kind == kind && !named.contains(&r.spis.peer)).cloned()
+    }
+
+    /// `kind`'s current SA, `replaced`, is gone -- the peer deleted it -- and
+    /// `to`, a redundant SA of `kind`, takes its place: no longer tracked as
+    /// redundant, it becomes `kind`'s SA, with the traffic selectors the peer
+    /// proposed for it if known, and the caller is told
+    /// ([`PeerChildEvent::MovedToRedundant`]). `why` only labels the debug output.
+    fn move_to_redundant(&mut self, kind: ChildKind, to: RedundantSa, replaced: ChildSpis, why: &str) {
+        ike_debug!(
+            "INFORMATIONAL: peer deleted the {kind:?} CHILD SA (spi_out={:08x}){why} -- its SA of a crossed rekey is still up, moving to it (spi_in={:08x} spi_out={:08x}), nothing to renegotiate",
+            replaced.peer, to.spis.local, to.spis.peer
+        );
+        self.peer_child.redundant.retain(|r| r.spis != to.spis);
+        self.restore_child_spis(kind, to.spis);
+        if to.ts.is_some() {
+            self.child_ts.set(kind, to.ts);
+        }
+        self.peer_child.events.push(PeerChildEvent::MovedToRedundant {
+            kind,
+            local_spi: to.spis.local,
+            peer_spi: to.spis.peer,
+            replaced: (replaced.local, replaced.peer),
+        });
+    }
+
+    /// The peer rekeyed `old`, a redundant SA, into `new` (`ts`: what it
+    /// carries, if known): `new` takes its place, still redundant and the
+    /// most recently created of its family, and `old` is the peer's to delete.
+    fn replace_redundant(&mut self, old: ChildSpis, new: ChildSpis, ts: Option<ChildTs>) {
+        let Some(at) = self.peer_child.redundant.iter().position(|r| r.spis == old) else { return };
+        let replaced = self.peer_child.redundant.remove(at);
+        let ts = if ts.is_some() { ts } else { replaced.ts };
+        self.peer_child.redundant.push(RedundantSa { kind: replaced.kind, spis: new, ts, since: Instant::now() });
+        self.peer_child.superseded.push(SupersededChild { local_spi: old.local, peer_spi: old.peer, since: Instant::now() });
+    }
+
+    /// Whether `spis` are those of a redundant SA of `kind` this session keeps.
+    fn is_redundant(&self, kind: ChildKind, spis: ChildSpis) -> bool {
+        self.peer_child.redundant.iter().any(|r| r.kind == kind && r.spis == spis)
     }
 
     /// Record `child` as `kind`'s CHILD SA.
@@ -1434,9 +1621,16 @@ impl LivenessSession {
     /// `kind`'s CHILD SA is gone -- the peer deleted it while our rekey of it
     /// was in flight, and that rekey came to nothing (`e`). Handled as
     /// [`Self::answer_peer_request`] handles that Delete outside an exchange:
-    /// queued for renegotiation while the other family keeps the tunnel up,
-    /// the tunnel's end otherwise. Returns the error to surface.
+    /// moved to a redundant SA of `kind` if one is kept
+    /// ([`Self::keep_redundant_children`]), else queued for renegotiation
+    /// while the other family keeps the tunnel up, the tunnel's end otherwise.
+    /// Returns the error to surface.
     fn lost_child(&mut self, kind: ChildKind, e: DriverError) -> DriverError {
+        if let Some(to) = self.redundant_to_move_to(kind, &[]) {
+            let replaced = self.child_spis(kind).map_or(ChildSpis { local: 0, peer: 0 }, |(local, peer)| ChildSpis { local, peer });
+            self.move_to_redundant(kind, to, replaced, " while we rekeyed it, and our rekey came to nothing");
+            return e;
+        }
         match kind {
             ChildKind::Primary if self.child6.is_some() => {
                 ike_debug!("CREATE_CHILD_SA: the peer deleted the primary CHILD SA while we rekeyed it -- IPv6 CHILD SA and IKE SA are still up, renegotiating it");
@@ -1706,16 +1900,24 @@ impl LivenessSession {
                 continue;
             }
             let held_before = self.peer_child.held.is_some();
+            let moves_before = self.moves_recorded();
             if self.answer_peer_request(&header, &msg, fragmented)? {
                 return Ok(Liveness::PeerTornDown);
             }
             // A rekey this request newly holds ([`Self::hold_peer_rekeys`]) is for the caller to
             // hand over at once, not after the rest of a `peek`'s wait: the peer's traffic only
-            // moves to the new SA once it has the answer, which is held until then.
-            if awaited.is_none() && !held_before && self.peer_child.held.is_some() {
+            // moves to the new SA once it has the answer, which is held until then. So is a
+            // family newly moved to a redundant SA ([`PeerChildEvent::MovedToRedundant`]): the
+            // caller's outbound traffic is still on the SA the peer just deleted.
+            if awaited.is_none() && ((!held_before && self.peer_child.held.is_some()) || self.moves_recorded() > moves_before) {
                 return Ok(Liveness::Alive);
             }
         }
+    }
+
+    /// How many [`PeerChildEvent::MovedToRedundant`] wait to be collected.
+    fn moves_recorded(&self) -> usize {
+        self.peer_child.events.iter().filter(|e| matches!(e, PeerChildEvent::MovedToRedundant { .. })).count()
     }
 
     /// The [`MessageKey`] of the peer's answer to our request `mid` of
@@ -2042,6 +2244,14 @@ impl LivenessSession {
     /// after every rekey -- and one a CHILD SA exchange of ours is about is
     /// settled by that exchange ([`Self::settle_rekey`]). SPIs this side
     /// doesn't know are passed over.
+    ///
+    /// With [`Self::keep_redundant_children`] on, a redundant SA of a crossed
+    /// rekey is one more pair: its Delete is answered with ours and it is
+    /// reported closed ([`PeerChildEvent::RedundantClosed`]). And a family
+    /// whose current SA the Delete names, with a redundant SA of its own kept
+    /// that the Delete leaves alone, is not lost: it moves to that SA (the
+    /// most recently created, [`PeerChildEvent::MovedToRedundant`]), is not
+    /// queued for renegotiation, and counts as still up for the tunnel's end.
     fn answer_peer_informational(
         &mut self,
         on: OnIkeSa,
@@ -2085,6 +2295,12 @@ impl LivenessSession {
         let names = |spi: u32| named.contains(&spi) && Some(spi) != collided_peer;
         let primary = self.primary_child_alive && names(self.child_peer_spi);
         let child6 = self.child6.filter(|c| names(c.peer));
+        // Redundant SAs of crossed rekeys ([`Self::keep_redundant_children`]):
+        // those named are closed; a family whose current SA is named moves to
+        // the most recent of its own that is not.
+        let redundant_closed: Vec<RedundantSa> = self.peer_child.redundant.iter().filter(|r| named.contains(&r.spis.peer)).cloned().collect();
+        let primary_moves = if primary { self.redundant_to_move_to(ChildKind::Primary, &named) } else { None };
+        let child6_moves = if child6.is_some() { self.redundant_to_move_to(ChildKind::Ipv6, &named) } else { None };
         // The SA a rekey of ours negotiated (and not yet committed) replaced:
         // ours to delete no more, and not one the tunnel runs on.
         let negotiated_old: Vec<usize> = (0..self.peer_child.own_rekeys.len())
@@ -2098,6 +2314,7 @@ impl LivenessSession {
             .chain(primary.then_some(self.child_local_spi))
             .chain(child6.map(|c| c.local))
             .chain(negotiated_old_local)
+            .chain(redundant_closed.iter().map(|r| r.spis.local))
         {
             if !ours.contains(&spi) {
                 ours.push(spi);
@@ -2128,14 +2345,29 @@ impl LivenessSession {
                 rekey.fate = OldFate::Gone;
             }
         }
+        for closed in &redundant_closed {
+            ike_debug!(
+                "INFORMATIONAL: peer deleted its redundant SA of the {:?} CHILD SA (spi_in={:08x} spi_out={:08x}, kept {} ms)",
+                closed.kind,
+                closed.spis.local,
+                closed.spis.peer,
+                closed.since.elapsed().as_millis()
+            );
+            self.peer_child.redundant.retain(|r| r.spis != closed.spis);
+            self.peer_child.events.push(PeerChildEvent::RedundantClosed { kind: closed.kind, local_spi: closed.spis.local });
+        }
         // The tunnel ends when these Deletes leave it no CHILD SA, whatever
         // order they came in: one deleted earlier and still to be
-        // renegotiated doesn't count.
-        let primary_left = self.primary_child_alive && !primary;
-        let child6_left = self.child6.is_some() && child6.is_none();
+        // renegotiated doesn't count, and one that moves to a redundant SA
+        // of its family is still up.
+        let primary_left = self.primary_child_alive && (!primary || primary_moves.is_some());
+        let child6_left = self.child6.is_some() && (child6.is_none() || child6_moves.is_some());
         let tears_down = (primary || child6.is_some()) && !primary_left && !child6_left;
         if !tears_down {
-            if primary {
+            if let Some(to) = primary_moves {
+                let replaced = ChildSpis { local: self.child_local_spi, peer: self.child_peer_spi };
+                self.move_to_redundant(ChildKind::Primary, to, replaced, "");
+            } else if primary {
                 ike_debug!(
                     "INFORMATIONAL: peer deleted the primary CHILD SA (spi_out={:08x}) -- IPv6 CHILD SA and IKE SA are still up, renegotiating it",
                     self.child_peer_spi
@@ -2143,7 +2375,9 @@ impl LivenessSession {
                 self.primary_child_alive = false;
                 self.peer_child.deleted.push(ChildKind::Primary);
             }
-            if let Some(c6) = child6 {
+            if let (Some(c6), Some(to)) = (child6, child6_moves) {
+                self.move_to_redundant(ChildKind::Ipv6, to, c6, "");
+            } else if let Some(c6) = child6 {
                 ike_debug!(
                     "INFORMATIONAL: peer deleted the IPv6 CHILD SA (spi_out={:08x}) -- primary CHILD SA and IKE SA are still up, renegotiating it",
                     c6.peer
@@ -2286,6 +2520,13 @@ impl LivenessSession {
     /// it is held ([`HeldRekey`]). A crossed rekey, one of the SA a negotiated
     /// rekey of ours made current, and every refusal are answered at once,
     /// held or not.
+    ///
+    /// With [`Self::keep_redundant_children`] on, a rekey of a redundant SA
+    /// of a crossed rekey is taken on too, with the same checks as one of its
+    /// family's current SA (the family's traffic selectors, PFS, the
+    /// refusals), answered at once or held the same way: its new SA takes
+    /// the redundant SA's place and goes to the caller with the SA it replaces
+    /// ([`PeerRekeyedChild::replaces`]); the family's current SA stays.
     fn answer_peer_child_request(&mut self, header: &IkeHeader, msg: &[u8], iv: &[u8; 8]) -> Result<(), DriverError> {
         let current = OnIkeSa::Current;
         if self.ike.rekeying.is_some() || self.ike.closing {
@@ -2321,10 +2562,14 @@ impl LivenessSession {
                 &format!("we are deleting the CHILD SA with spi {rekeyed_spi:08x}, which a rekey of ours replaced"),
             );
         }
-        let (kind, old) = if self.primary_child_alive && rekeyed_spi == self.child_peer_spi {
-            (ChildKind::Primary, ChildSpis { local: self.child_local_spi, peer: self.child_peer_spi })
+        // `redundant`: the SA rekeyed is a redundant SA of a crossed rekey
+        // ([`Self::keep_redundant_children`]), not `kind`'s current one.
+        let (kind, old, redundant) = if self.primary_child_alive && rekeyed_spi == self.child_peer_spi {
+            (ChildKind::Primary, ChildSpis { local: self.child_local_spi, peer: self.child_peer_spi }, false)
         } else if let Some(child6) = self.child6.filter(|c| c.peer == rekeyed_spi) {
-            (ChildKind::Ipv6, child6)
+            (ChildKind::Ipv6, child6, false)
+        } else if let Some(r) = self.peer_child.redundant.iter().find(|r| r.spis.peer == rekeyed_spi) {
+            (r.kind, r.spis, true)
         } else {
             return self.refuse_peer_child_request(
                 current,
@@ -2365,7 +2610,8 @@ impl LivenessSession {
             Ok((response, child)) => {
                 let response = self.outgoing(current, response)?;
                 let rekeyed = rekeyed_child(&child);
-                let ours_on_it = self.peer_child.own_rekeys[own_rekey_slot(kind)].is_some();
+                // A negotiated rekey of ours made `kind`'s current SA, not a redundant one.
+                let ours_on_it = !redundant && self.peer_child.own_rekeys[own_rekey_slot(kind)].is_some();
                 if self.peer_child.hold && !crossed && !ours_on_it && self.peer_child.held.is_none() {
                     ike_debug!(
                         "CREATE_CHILD_SA: the peer rekeyed the {kind:?} CHILD SA (message id {}) -- new spi_in={:08x} spi_out={:08x}, its answer held for the caller",
@@ -2387,11 +2633,22 @@ impl LivenessSession {
                     return Ok(());
                 }
                 self.respond(current, header, msg, response, false);
+                let replaces = (old.local, old.peer);
+                if redundant {
+                    ike_debug!(
+                        "CREATE_CHILD_SA: the peer rekeyed its redundant SA of the {kind:?} CHILD SA (spi_in={:08x}, message id {}) -- new spi_in={:08x} spi_out={:08x}, redundant in its place",
+                        old.local, header.message_id, rekeyed.local_spi, rekeyed.peer_spi
+                    );
+                    self.replace_redundant(old, ChildSpis::of(&rekeyed), proposed);
+                    self.peer_child.pending.push(PeerRekeyedChild { kind, child: rekeyed, replaces });
+                    return Ok(());
+                }
                 ike_debug!(
                     "CREATE_CHILD_SA: the peer rekeyed the {kind:?} CHILD SA (message id {}) -- new spi_in={:08x} spi_out={:08x}",
                     header.message_id, rekeyed.local_spi, rekeyed.peer_spi
                 );
                 self.set_child_spis(kind, &rekeyed);
+                let crossed_ts = proposed.clone().filter(|_| crossed);
                 if proposed.is_some() {
                     self.child_ts.set(kind, proposed);
                 }
@@ -2400,9 +2657,9 @@ impl LivenessSession {
                     Some(own) => {
                         ike_debug!("CREATE_CHILD_SA: we are rekeying that CHILD SA too -- settled once our own rekey is answered");
                         let ni = rekey::peer_child_nonce(&self.sa, msg).unwrap_or_default();
-                        own.crossed = Some(CrossedRekey { child: rekeyed, lowest_nonce: ni.min(nr) });
+                        own.crossed = Some(CrossedRekey { child: rekeyed, lowest_nonce: ni.min(nr), ts: crossed_ts });
                     }
-                    None => self.peer_child.pending.push(PeerRekeyedChild { kind, child: rekeyed }),
+                    None => self.peer_child.pending.push(PeerRekeyedChild { kind, child: rekeyed, replaces }),
                 }
                 Ok(())
             }
@@ -2463,7 +2720,10 @@ impl LivenessSession {
     /// peer moves its own traffic to the new SA as soon as it has the answer.
     /// The session's SPIs and the peer's deletion of the replaced SA are
     /// tracked here; only the data plane is the caller's. A rekey held
-    /// unanswered ([`Self::hold_peer_rekeys`]) is not among them.
+    /// unanswered ([`Self::hold_peer_rekeys`]) is not among them. Each names
+    /// the SA it replaces ([`PeerRekeyedChild::replaces`]): with
+    /// [`Self::keep_redundant_children`] off, always its family's current SA
+    /// at the time.
     pub fn take_peer_rekeys(&mut self) -> Vec<PeerRekeyedChild> {
         std::mem::take(&mut self.peer_child.pending)
     }
@@ -2491,9 +2751,74 @@ impl LivenessSession {
     ///
     /// Not held, ever: a rekey that crosses one of ours (§2.8.1), one of the
     /// SA a negotiated rekey of ours made current ([`Self::negotiate_rekey`]),
-    /// and every refusal -- answered at once, as without this.
+    /// and every refusal -- answered at once, as without this. A rekey of a
+    /// redundant SA kept by [`Self::keep_redundant_children`] is held like
+    /// any other, its [`HeldPeerRekey::replaces`] naming that SA.
     pub fn hold_peer_rekeys(&mut self, hold: bool) {
         self.peer_child.hold = hold;
+    }
+
+    /// Tell the session the caller's data plane holds more than one CHILD SA
+    /// per family: off unless asked for, and kept across a rekey of the IKE SA
+    /// as [`Self::hold_peer_rekeys`] is. RFC 7296 §2.8.1: "When there are two
+    /// SAs eligible to receive packets, a node MUST accept incoming packets
+    /// through either SA", and the redundant SA of a crossed rekey "SHOULD be
+    /// closed by the endpoint that created it" -- a SHOULD, which a peer may
+    /// not follow at once, or at all. With this on, when a crossed rekey of
+    /// ours is settled keeping ours ([`Self::settle_rekey`]), the peer's SA is
+    /// kept as a redundant SA of its family until the peer closes it:
+    ///
+    /// - it is handed over, keys and all, for the caller to accept inbound
+    ///   traffic on and never send on ([`Self::take_redundant_children`]),
+    ///   whichever of [`Self::negotiate_rekey`], [`Self::rekey_child`] or
+    ///   [`Self::rekey_child_ipv6`] ran the exchange;
+    /// - the peer's Delete of it is answered with ours for the pair, and the
+    ///   caller is told ([`PeerChildEvent::RedundantClosed`]);
+    /// - the peer's rekey of it is taken on as one of the family's current SA
+    ///   would be (held too, with [`Self::hold_peer_rekeys`]), and its new SA
+    ///   takes its place ([`PeerRekeyedChild::replaces`],
+    ///   [`HeldPeerRekey::replaces`]);
+    /// - the peer's Delete of the family's current SA moves the family to the
+    ///   most recently created redundant SA of its own
+    ///   ([`PeerChildEvent::MovedToRedundant`]): no renegotiation
+    ///   ([`Self::take_peer_deleted_children`] stays empty), and no teardown;
+    /// - a rekey of ours of the family's current SA leaves it as it is;
+    /// - at most [`REDUNDANT_CHILDREN_KEPT`] are kept per family;
+    /// - [`Self::delete_child`] refuses one as `"in_use"`.
+    ///
+    /// Not covered: the answer to the peer's crossed rekey goes out at once,
+    /// before the caller can install the peer's SA, which it gets only once
+    /// our own exchange is settled; inbound traffic on it in between is not
+    /// accepted (see [`Self::settle_rekey`]).
+    ///
+    /// Off, nothing is kept: the redundant SA is the peer's to delete, its
+    /// Delete answered as routine cleanup, and never reaches the caller.
+    /// Turned off with redundant SAs kept, those stay kept until each is
+    /// closed; no new one is.
+    pub fn keep_redundant_children(&mut self, keep: bool) {
+        self.peer_child.keep_redundant = keep;
+    }
+
+    /// The redundant SAs of crossed rekeys kept since the last call, oldest
+    /// first ([`Self::keep_redundant_children`]): the caller drains them right
+    /// after each rekey of its own returns, and accepts inbound traffic on
+    /// each until it is reported closed. Drained before
+    /// [`Self::take_peer_child_events`], which may name them. Always empty
+    /// with [`Self::keep_redundant_children`] off.
+    pub fn take_redundant_children(&mut self) -> Vec<RedundantChild> {
+        std::mem::take(&mut self.peer_child.redundant_new)
+    }
+
+    /// What became of the redundant SAs kept ([`Self::keep_redundant_children`])
+    /// since the last call, in the order it happened: the caller drains it
+    /// after anything that may have answered a request of the peer's
+    /// ([`Self::peek`], [`Self::probe`], any exchange of ours), after
+    /// [`Self::take_redundant_children`]. A [`Self::peek`] that records a
+    /// [`PeerChildEvent::MovedToRedundant`] returns at once, so that the
+    /// caller moves its outbound traffic without waiting out the timeout.
+    /// Always empty with [`Self::keep_redundant_children`] off.
+    pub fn take_peer_child_events(&mut self) -> Vec<PeerChildEvent> {
+        std::mem::take(&mut self.peer_child.events)
     }
 
     /// The rekey held unanswered, if any ([`Self::hold_peer_rekeys`]): which
@@ -2515,7 +2840,10 @@ impl LivenessSession {
     /// [`Self::answer_peer_child_request`] does at once without the hold: it
     /// becomes `kind`'s current SA, with the traffic selectors the peer
     /// proposed, and the SA it replaced is the one the peer deletes -- that
-    /// Delete is routine. Refused with [`IkeError::Crypto`], changing
+    /// Delete is routine. A rekey of a redundant SA of `kind`
+    /// ([`HeldPeerRekey::replaces`]) moves nothing: its new SA takes the
+    /// redundant SA's place, and `kind`'s current SA stays. Refused with
+    /// [`IkeError::Crypto`], changing
     /// nothing, with none held of `kind` matching; with
     /// [`IkeError::PeerTornDown`], sending nothing, when the IKE SA it came on
     /// is over (the rekey is dropped).
@@ -2527,12 +2855,21 @@ impl LivenessSession {
         }
         // Nothing moves `kind`'s SA while its rekey is held: none of our own
         // rekeys of it is let through, and the peer sends nothing more first.
-        if self.child_spis(kind) != Some((held.old.local, held.old.peer)) {
+        let redundant = self.is_redundant(kind, held.old);
+        if !redundant && self.child_spis(kind) != Some((held.old.local, held.old.peer)) {
             self.refuse_held(held, "the CHILD SA it rekeys is no longer current")?;
             return Err(IkeError::Crypto("the CHILD SA the held rekey replaces is no longer current").into());
         }
         let HeldRekey { old, new, proposed, header, request, response, .. } = held;
         self.respond(OnIkeSa::Current, &header, &request, response, false);
+        if redundant {
+            ike_debug!(
+                "CREATE_CHILD_SA: the held answer to the peer's rekey of its redundant SA of the {kind:?} CHILD SA (spi_in={:08x}, message id {}) sent -- new spi_in={:08x} spi_out={:08x}, redundant in its place",
+                old.local, header.message_id, new.local, new.peer
+            );
+            self.replace_redundant(old, new, proposed);
+            return Ok(());
+        }
         ike_debug!(
             "CREATE_CHILD_SA: the held answer to the peer's rekey of the {kind:?} CHILD SA (message id {}) sent -- now on spi_in={:08x} spi_out={:08x}",
             header.message_id, new.local, new.peer
@@ -2595,7 +2932,10 @@ impl LivenessSession {
     /// [`Self::create_child_ipv6`] depending on `kind`. RFC 7296 says nothing
     /// about doing this at all (a Delete just means the SA is gone); trying
     /// to bring the family back automatically instead of leaving it down
-    /// until the user reconnects is this project's own policy choice.
+    /// until the user reconnects is this project's own policy choice. A family
+    /// that still has a redundant SA of a crossed rekey
+    /// ([`Self::keep_redundant_children`]) is never queued here: it moves to
+    /// that SA instead ([`PeerChildEvent::MovedToRedundant`]).
     pub fn take_peer_deleted_children(&mut self) -> Vec<ChildKind> {
         std::mem::take(&mut self.peer_child.deleted)
     }
@@ -11995,5 +12335,450 @@ mod tests {
             other => panic!("expected Err(DriverError::Ike(IkeError::AuthFailed)), got {}", other.is_ok()),
         }
         responder.join().unwrap();
+    }
+
+    // RFC 7296 §2.8.1, the peer's redundant SA of a crossed rekey kept as a live
+    // SA until the peer closes it (`keep_redundant_children`).
+
+    /// The SPIs the scripted gateway of the tests below picks for its SAs.
+    const GATEWAY_REDUNDANT_SPI: u32 = 0xE100_0001;
+    const GATEWAY_KEPT_SPI: u32 = 0xE200_0001;
+
+    /// The gateway's side of a crossed rekey (RFC 7296 §2.8.1) of the CHILD SA
+    /// it knows by `rekeyed` (our outbound SPI of it): it takes our rekey
+    /// request, sends its own rekey of the same SA (Message ID `mid`, its new SA
+    /// on `theirs`, with the lowest nonce there is, so that its SA is the
+    /// redundant one), takes our answer, answers ours with its SA on `ours`,
+    /// and then answers the next `deletes` requests of ours, INFORMATIONAL
+    /// Deletes. Its side of its own SA, and those Deletes as they came.
+    fn gateway_crosses(
+        gateway: &UdpSocket,
+        sa: &CompletedSaInit,
+        mid: u32,
+        rekeyed: u32,
+        theirs: u32,
+        ours: u32,
+        deletes: usize,
+    ) -> (ChildSa, Vec<Vec<u8>>) {
+        gateway.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 4096];
+        let (n, client) = gateway.recv_from(&mut buf).unwrap();
+        let request = buf[..n].to_vec();
+        let ni = [0x00u8; 32];
+        gateway.send_to(&gateway_child_rekey(sa, mid, rekeyed, theirs, &ni), client).unwrap();
+        let (n, _) = gateway.recv_from(&mut buf).unwrap();
+        let (theirs_sa, _) =
+            rekey::initiator_complete_child(sa, &ni, theirs, SkCipher::Aes256Gcm, None, &TrafficSelectors::ipv4_full_tunnel(), &buf[..n])
+                .expect("answered as usual");
+        let (response, _) = rekey::responder_process_rekey_with_pfs(sa, &request, ours, &[0x80u8; 32], SkCipher::Aes256Gcm, None, &[8u8; 8], None).unwrap();
+        gateway.send_to(&response, client).unwrap();
+        let mut deleted = Vec::new();
+        for _ in 0..deletes {
+            let (n, _) = gateway.recv_from(&mut buf).unwrap();
+            let delete = buf[..n].to_vec();
+            gateway.send_to(&informational_answer(sa, &delete, &[]), client).unwrap();
+            deleted.push(delete);
+        }
+        gateway.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        (theirs_sa, deleted)
+    }
+
+    /// `kind`'s CHILD SA, whose outbound SPI is `rekeyed`, rekeyed by
+    /// `negotiate_rekey` while the gateway crosses it ([`gateway_crosses`]),
+    /// ours kept, and the rekey committed: what was negotiated, the gateway's
+    /// side of its redundant SA, and every Delete we sent, answered -- the
+    /// commit's last.
+    #[allow(clippy::too_many_arguments)]
+    fn crossed_and_committed(
+        liveness: &mut LivenessSession,
+        gateway: &UdpSocket,
+        sa: &CompletedSaInit,
+        kind: ChildKind,
+        mid: u32,
+        rekeyed: u32,
+        theirs: u32,
+        ours: u32,
+        deletes: usize,
+    ) -> (NegotiatedRekey, ChildSa, Vec<Vec<u8>>) {
+        thread::scope(|scope| {
+            let crossing = scope.spawn(|| gateway_crosses(gateway, sa, mid, rekeyed, theirs, ours, deletes));
+            let negotiated = liveness.negotiate_rekey(kind, Duration::from_secs(2)).expect("ours is kept");
+            let committed = liveness.commit_rekey(kind, negotiated.child.local_spi, true).unwrap();
+            assert_eq!(committed.outcome, ChildDeleteOutcome::Sent { acknowledged: true }, "ours is kept: the SA both replaced is ours to delete");
+            let (theirs_sa, deleted) = crossing.join().unwrap();
+            (negotiated, theirs_sa, deleted)
+        })
+    }
+
+    /// Off, as by default: a crossed rekey kept as ours queues nothing for
+    /// `take_redundant_children` and records no event -- the gateway's SA is
+    /// its to delete, and that Delete is answered as routine cleanup.
+    #[test]
+    fn without_keeping_redundant_children_a_crossed_rekey_kept_as_ours_queues_nothing_and_records_no_event() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        let (negotiated, theirs, _) =
+            crossed_and_committed(&mut liveness, &gateway, &resp_sa, ChildKind::Primary, 0, 0xAAAA, GATEWAY_REDUNDANT_SPI, GATEWAY_KEPT_SPI, 1);
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some((negotiated.child.local_spi, GATEWAY_KEPT_SPI)), "ours is kept");
+        assert!(liveness.take_redundant_children().is_empty(), "the redundant SA never reaches the caller");
+        assert!(liveness.take_peer_child_events().is_empty());
+
+        assert_eq!(deliver(&mut liveness, &gateway, &esp_delete_request(&resp_sa, 1, GATEWAY_REDUNDANT_SPI)), Liveness::Alive);
+        let ack = sent_to(&gateway).expect("answered");
+        assert_eq!(esp_spis_deleted(&resp_sa, &ack), vec![theirs.outbound.spi()], "with ours for the pair, as routine cleanup");
+        assert!(liveness.take_peer_child_events().is_empty(), "nothing recorded");
+        assert!(liveness.take_redundant_children().is_empty());
+        assert!(liveness.take_peer_deleted_children().is_empty());
+    }
+
+    /// The expected case: a crossed rekey, ours kept. The gateway's SA is
+    /// handed over once, keys and all, as a redundant SA, and the family's SA
+    /// is ours throughout. The gateway then deletes its SA, as RFC 7296
+    /// §2.8.1 says it SHOULD: answered with ours for the pair, and reported
+    /// closed. Nothing is lost or renegotiated.
+    #[test]
+    fn a_kept_redundant_sa_is_handed_over_once_and_the_gateways_delete_of_it_is_answered_and_reported() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        liveness.keep_redundant_children(true);
+        let (negotiated, theirs, _) =
+            crossed_and_committed(&mut liveness, &gateway, &resp_sa, ChildKind::Primary, 0, 0xAAAA, GATEWAY_REDUNDANT_SPI, GATEWAY_KEPT_SPI, 1);
+        let ours = Some((negotiated.child.local_spi, GATEWAY_KEPT_SPI));
+        assert_eq!(liveness.child_spis(ChildKind::Primary), ours, "ours is the family's SA");
+        let kept = liveness.take_redundant_children();
+        assert_eq!(kept.iter().map(|r| (r.kind, r.child.local_spi, r.child.peer_spi)).collect::<Vec<_>>(), [(ChildKind::Primary, theirs.outbound.spi(), GATEWAY_REDUNDANT_SPI)]);
+        assert_eq!(kept[0].child.key_in.enc, theirs.outbound.enc_material(), "what the gateway sends on it, we open");
+        assert_eq!(kept[0].child.key_out.enc, theirs.inbound.enc_material());
+        assert!(liveness.take_redundant_children().is_empty(), "handed over once");
+        assert!(liveness.take_peer_child_events().is_empty(), "nothing happened to it yet");
+        assert_eq!(
+            liveness.delete_child(theirs.outbound.spi(), GATEWAY_REDUNDANT_SPI).unwrap(),
+            DeleteReport { outcome: ChildDeleteOutcome::NotOwed("in_use"), liveness: Liveness::Alive },
+            "an SA the tunnel accepts traffic on"
+        );
+
+        assert_eq!(deliver(&mut liveness, &gateway, &esp_delete_request(&resp_sa, 1, GATEWAY_REDUNDANT_SPI)), Liveness::Alive);
+        let ack = sent_to(&gateway).expect("answered");
+        assert_eq!(esp_spis_deleted(&resp_sa, &ack), vec![theirs.outbound.spi()], "with ours for the pair");
+        assert_eq!(liveness.take_peer_child_events(), [PeerChildEvent::RedundantClosed { kind: ChildKind::Primary, local_spi: theirs.outbound.spi() }]);
+        assert!(liveness.take_peer_deleted_children().is_empty(), "nothing to renegotiate");
+        assert_eq!(liveness.child_spis(ChildKind::Primary), ours, "ours throughout");
+    }
+
+    /// The live case (a FortiGate, 2026-10-02): a crossed rekey, ours kept, and
+    /// the gateway, instead of deleting its redundant SA, sends on it and later
+    /// deletes ours. The Delete is answered with ours for the pair, the family
+    /// moves to the gateway's SA -- `peek` returning at once, so that the
+    /// caller moves its outbound traffic without waiting out its timeout -- and
+    /// nothing is renegotiated or torn down, though that was the tunnel's only
+    /// CHILD SA. Our next rekey of the family rekeys the SA moved to.
+    #[test]
+    fn the_gateway_deleting_ours_after_a_crossed_rekey_moves_the_family_to_its_sa_with_nothing_renegotiated() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        liveness.keep_redundant_children(true);
+        let (negotiated, theirs, _) =
+            crossed_and_committed(&mut liveness, &gateway, &resp_sa, ChildKind::Primary, 0, 0xAAAA, GATEWAY_REDUNDANT_SPI, GATEWAY_KEPT_SPI, 1);
+        let (ours_local, theirs_local) = (negotiated.child.local_spi, theirs.outbound.spi());
+        assert_eq!(liveness.take_redundant_children().len(), 1);
+
+        gateway.send_to(&esp_delete_request(&resp_sa, 1, GATEWAY_KEPT_SPI), liveness.sock.local_addr().unwrap()).unwrap();
+        let started = Instant::now();
+        assert_eq!(liveness.peek(Duration::from_secs(2)).unwrap(), Liveness::Alive, "not a teardown");
+        assert!(started.elapsed() < Duration::from_millis(500), "returned at once, not at its timeout: {:?}", started.elapsed());
+        let ack = sent_to(&gateway).expect("answered");
+        assert_eq!(esp_spis_deleted(&resp_sa, &ack), vec![ours_local], "with ours for the pair");
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some((theirs_local, GATEWAY_REDUNDANT_SPI)), "the family is on the gateway's SA");
+        assert_eq!(
+            liveness.take_peer_child_events(),
+            [PeerChildEvent::MovedToRedundant {
+                kind: ChildKind::Primary,
+                local_spi: theirs_local,
+                peer_spi: GATEWAY_REDUNDANT_SPI,
+                replaced: (ours_local, GATEWAY_KEPT_SPI)
+            }]
+        );
+        assert!(liveness.take_peer_deleted_children().is_empty(), "nothing to renegotiate");
+        assert!(liveness.take_peer_rekeys().is_empty());
+
+        let (negotiated, rekey_sa) = thread::scope(|scope| {
+            let gateway_side = scope.spawn(|| {
+                gateway.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut buf = [0u8; 4096];
+                let (n, client) = gateway.recv_from(&mut buf).unwrap();
+                let (response, _) =
+                    rekey::responder_process_rekey_with_pfs(&resp_sa, &buf[..n], 0xE300_0001, &[0x80u8; 32], SkCipher::Aes256Gcm, None, &[8u8; 8], None).unwrap();
+                gateway.send_to(&response, client).unwrap();
+                rekey::rekey_sa_spi(&resp_sa, &buf[..n])
+            });
+            let negotiated = liveness.negotiate_rekey(ChildKind::Primary, Duration::from_secs(2)).unwrap();
+            (negotiated, gateway_side.join().unwrap())
+        });
+        assert_eq!(rekey_sa, Some(theirs_local), "REKEY_SA names the SA moved to");
+        assert_eq!(negotiated.replaces, (theirs_local, GATEWAY_REDUNDANT_SPI));
+    }
+
+    /// RFC 7296 §2.25.1 with a redundant SA kept: the gateway deletes the SA
+    /// we are rekeying, and then refuses our rekey. The family has lost its
+    /// SA as it would outside the exchange -- and moves to its redundant SA
+    /// as it would there too, instead of being queued for renegotiation. The
+    /// rekey's error is still ours to see.
+    #[test]
+    fn the_gateway_deleting_the_sa_we_rekey_then_refusing_the_rekey_moves_the_family_to_its_redundant_sa() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        liveness.keep_redundant_children(true);
+        let (negotiated, theirs, _) =
+            crossed_and_committed(&mut liveness, &gateway, &resp_sa, ChildKind::Primary, 0, 0xAAAA, GATEWAY_REDUNDANT_SPI, GATEWAY_KEPT_SPI, 1);
+        let ours = (negotiated.child.local_spi, GATEWAY_KEPT_SPI);
+        assert_eq!(liveness.take_redundant_children().len(), 1);
+
+        let (refused, answered) = thread::scope(|scope| {
+            let gateway_side = scope.spawn(|| {
+                gateway.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut buf = [0u8; 4096];
+                let (n, client) = gateway.recv_from(&mut buf).unwrap();
+                let mid = IkeHeader::parse(&buf[..n]).unwrap().message_id;
+                gateway.send_to(&esp_delete_request(&resp_sa, 1, GATEWAY_KEPT_SPI), client).unwrap();
+                let (n, _) = gateway.recv_from(&mut buf).unwrap();
+                let answered = buf[..n].to_vec();
+                gateway.send_to(&rekey::build_child_error(&resp_sa, mid, notify_type::CHILD_SA_NOT_FOUND, &[5u8; 8]).unwrap(), client).unwrap();
+                answered
+            });
+            let refused = liveness.negotiate_rekey(ChildKind::Primary, Duration::from_secs(2)).map(|_| ());
+            (refused, gateway_side.join().unwrap())
+        });
+        assert!(matches!(refused, Err(DriverError::Ike(IkeError::PeerRejected { .. }))), "{refused:?}");
+        assert_eq!(esp_spis_deleted(&resp_sa, &answered), vec![ours.0], "the Delete answered with ours for the pair");
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some((theirs.outbound.spi(), GATEWAY_REDUNDANT_SPI)));
+        assert_eq!(
+            liveness.take_peer_child_events(),
+            [PeerChildEvent::MovedToRedundant {
+                kind: ChildKind::Primary,
+                local_spi: theirs.outbound.spi(),
+                peer_spi: GATEWAY_REDUNDANT_SPI,
+                replaced: ours
+            }]
+        );
+        assert!(liveness.take_peer_deleted_children().is_empty(), "nothing to renegotiate");
+    }
+
+    /// The gateway rekeys its redundant SA instead of deleting it: taken on
+    /// like a rekey of the family's SA, its new SA taking the redundant one's
+    /// place and the family's SA staying ours -- once answered at once and
+    /// handed over with the SA it replaces, once held, refused (the redundant
+    /// SA stays) and then released. The gateway then deletes the redundant SAs
+    /// its rekeys replaced (answered as routine), and then ours: the family
+    /// moves to the newest redundant SA.
+    #[test]
+    fn the_gateway_rekeying_its_redundant_sa_is_taken_on_held_or_not_and_the_newest_is_the_one_moved_to() {
+        const R1: u32 = 0xE400_0001;
+        const R2: u32 = 0xE400_0002;
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        liveness.keep_redundant_children(true);
+        let (negotiated, theirs, _) =
+            crossed_and_committed(&mut liveness, &gateway, &resp_sa, ChildKind::Primary, 0, 0xAAAA, GATEWAY_REDUNDANT_SPI, GATEWAY_KEPT_SPI, 1);
+        let ours = (negotiated.child.local_spi, GATEWAY_KEPT_SPI);
+        let r0 = (theirs.outbound.spi(), GATEWAY_REDUNDANT_SPI);
+        assert_eq!(liveness.take_redundant_children().len(), 1);
+
+        // Not held: answered at once, handed over naming the redundant SA it replaces.
+        deliver(&mut liveness, &gateway, &gateway_rekey_of(&resp_sa, 1, GATEWAY_REDUNDANT_SPI, R1));
+        let r1_sa = gateway_takes_the_answer(&resp_sa, R1, &sent_to(&gateway).expect("answered at once"));
+        let r1 = (r1_sa.outbound.spi(), R1);
+        let taken = liveness.take_peer_rekeys();
+        assert_eq!(taken.iter().map(|t| (t.kind, (t.child.local_spi, t.child.peer_spi), t.replaces)).collect::<Vec<_>>(), [(ChildKind::Primary, r1, r0)]);
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some(ours), "the family's SA is still ours");
+
+        // Held: refused, the redundant SA stays; then taken again and released.
+        liveness.hold_peer_rekeys(true);
+        assert_eq!(deliver(&mut liveness, &gateway, &gateway_rekey_of(&resp_sa, 2, R1, R2)), Liveness::Alive);
+        assert_eq!(sent_to(&gateway), None, "held");
+        let held = liveness.take_held_peer_rekey().expect("held like any other");
+        assert_eq!((held.kind, held.replaces), (ChildKind::Primary, r1));
+        liveness.refuse_peer_rekey(ChildKind::Primary, held.child.local_spi).unwrap();
+        assert_eq!(create_child_notify(&resp_sa, &sent_to(&gateway).expect("refused")), Some(notify_type::TEMPORARY_FAILURE));
+        assert_eq!(
+            liveness.delete_child(r1.0, r1.1).unwrap().outcome,
+            ChildDeleteOutcome::NotOwed("in_use"),
+            "the redundant SA a refused rekey named is still kept"
+        );
+        assert_eq!(deliver(&mut liveness, &gateway, &gateway_rekey_of(&resp_sa, 3, R1, R2)), Liveness::Alive);
+        let held = liveness.take_held_peer_rekey().expect("held again");
+        assert_eq!(held.replaces, r1);
+        liveness.release_peer_rekey(ChildKind::Primary, held.child.local_spi).unwrap();
+        let r2_sa = gateway_takes_the_answer(&resp_sa, R2, &sent_to(&gateway).expect("answered on release"));
+        let r2 = (r2_sa.outbound.spi(), R2);
+        assert_eq!(held.child.local_spi, r2.0);
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some(ours), "the family's SA is still ours");
+        assert!(liveness.take_peer_rekeys().is_empty(), "a held one is not handed over twice");
+
+        // The redundant SAs its rekeys replaced: routine, answered with ours, nothing reported.
+        for (mid, (local, peer)) in [(4, r0), (5, r1)] {
+            assert_eq!(deliver(&mut liveness, &gateway, &esp_delete_request(&resp_sa, mid, peer)), Liveness::Alive);
+            assert_eq!(esp_spis_deleted(&resp_sa, &sent_to(&gateway).expect("answered")), vec![local]);
+        }
+        assert!(liveness.take_peer_child_events().is_empty());
+
+        assert_eq!(deliver(&mut liveness, &gateway, &esp_delete_request(&resp_sa, 6, GATEWAY_KEPT_SPI)), Liveness::Alive);
+        assert_eq!(esp_spis_deleted(&resp_sa, &sent_to(&gateway).expect("answered")), vec![ours.0]);
+        assert_eq!(
+            liveness.take_peer_child_events(),
+            [PeerChildEvent::MovedToRedundant { kind: ChildKind::Primary, local_spi: r2.0, peer_spi: R2, replaced: ours }]
+        );
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some(r2), "moved to the newest redundant SA");
+        assert!(liveness.take_peer_deleted_children().is_empty());
+    }
+
+    /// The live sequence end to end: a crossed rekey, ours kept; the gateway
+    /// keeps sending on its SA and rekeys it again and again (held and
+    /// released each time, as the pump's caller does), deleting each SA its
+    /// rekeys replace; then it deletes ours. At no point is the family lost or
+    /// queued for renegotiation, and in the end it is on the gateway's newest SA.
+    #[test]
+    fn the_gateways_lineage_of_a_redundant_sa_survives_rekeys_and_takes_over_when_it_deletes_ours() {
+        const REKEYS: u32 = 3;
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        liveness.keep_redundant_children(true);
+        liveness.hold_peer_rekeys(true);
+        let (negotiated, theirs, _) =
+            crossed_and_committed(&mut liveness, &gateway, &resp_sa, ChildKind::Primary, 0, 0xAAAA, GATEWAY_REDUNDANT_SPI, GATEWAY_KEPT_SPI, 1);
+        let ours = (negotiated.child.local_spi, GATEWAY_KEPT_SPI);
+        assert_eq!(liveness.take_redundant_children().len(), 1);
+        let mut lineage = (theirs.outbound.spi(), GATEWAY_REDUNDANT_SPI);
+        let mut mid = 1;
+        for k in 0..REKEYS {
+            let new = 0xE500_0001 + k;
+            assert_eq!(deliver(&mut liveness, &gateway, &gateway_rekey_of(&resp_sa, mid, lineage.1, new)), Liveness::Alive);
+            let held = liveness.take_held_peer_rekey().expect("held");
+            assert_eq!(held.replaces, lineage, "rekey {k}");
+            liveness.release_peer_rekey(ChildKind::Primary, held.child.local_spi).unwrap();
+            assert_eq!(gateway_takes_the_answer(&resp_sa, new, &sent_to(&gateway).expect("released")).outbound.spi(), held.child.local_spi);
+            assert_eq!(deliver(&mut liveness, &gateway, &esp_delete_request(&resp_sa, mid + 1, lineage.1)), Liveness::Alive);
+            assert_eq!(esp_spis_deleted(&resp_sa, &sent_to(&gateway).expect("answered")), vec![lineage.0], "rekey {k}: the SA it replaced");
+            lineage = (held.child.local_spi, new);
+            mid += 2;
+            assert_eq!(liveness.child_spis(ChildKind::Primary), Some(ours), "rekey {k}: the family's SA is still ours");
+            assert!(liveness.take_peer_deleted_children().is_empty() && liveness.take_peer_child_events().is_empty(), "rekey {k}");
+        }
+
+        assert_eq!(deliver(&mut liveness, &gateway, &esp_delete_request(&resp_sa, mid, GATEWAY_KEPT_SPI)), Liveness::Alive, "never torn down");
+        assert_eq!(esp_spis_deleted(&resp_sa, &sent_to(&gateway).expect("answered")), vec![ours.0]);
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some(lineage), "on the gateway's newest SA");
+        assert_eq!(
+            liveness.take_peer_child_events(),
+            [PeerChildEvent::MovedToRedundant { kind: ChildKind::Primary, local_spi: lineage.0, peer_spi: lineage.1, replaced: ours }]
+        );
+        assert!(liveness.take_peer_deleted_children().is_empty(), "never queued for renegotiation");
+    }
+
+    /// Each family keeps its own redundant SAs: the gateway's Delete of the
+    /// IPv6 one leaves the primary's alone, the IPv6 family -- none left --
+    /// is lost and queued for renegotiation as ever, and then a Delete of the
+    /// primary SA in use, the last CHILD SA of the only family up, moves the
+    /// family to its redundant SA instead of tearing the tunnel down.
+    #[test]
+    fn redundant_sas_are_kept_per_family_and_one_left_keeps_the_only_family_up_from_a_teardown() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, Some(ChildSpis { local: 0x6666, peer: 0x7777 }));
+        liveness.keep_redundant_children(true);
+        let (primary, theirs, _) =
+            crossed_and_committed(&mut liveness, &gateway, &resp_sa, ChildKind::Primary, 0, 0xAAAA, GATEWAY_REDUNDANT_SPI, GATEWAY_KEPT_SPI, 1);
+        let (ipv6, theirs6, _) = crossed_and_committed(&mut liveness, &gateway, &resp_sa, ChildKind::Ipv6, 1, 0x7777, 0xE600_0001, 0xE600_0002, 1);
+        let kept = liveness.take_redundant_children();
+        assert_eq!(
+            kept.iter().map(|r| (r.kind, r.child.local_spi)).collect::<Vec<_>>(),
+            [(ChildKind::Primary, theirs.outbound.spi()), (ChildKind::Ipv6, theirs6.outbound.spi())]
+        );
+
+        assert_eq!(deliver(&mut liveness, &gateway, &esp_delete_request(&resp_sa, 2, 0xE600_0001)), Liveness::Alive);
+        assert_eq!(esp_spis_deleted(&resp_sa, &sent_to(&gateway).expect("answered")), vec![theirs6.outbound.spi()]);
+        assert_eq!(liveness.take_peer_child_events(), [PeerChildEvent::RedundantClosed { kind: ChildKind::Ipv6, local_spi: theirs6.outbound.spi() }]);
+        assert_eq!(
+            liveness.delete_child(theirs.outbound.spi(), GATEWAY_REDUNDANT_SPI).unwrap().outcome,
+            ChildDeleteOutcome::NotOwed("in_use"),
+            "the primary's redundant SA is still kept"
+        );
+
+        assert_eq!(deliver(&mut liveness, &gateway, &esp_delete_request(&resp_sa, 3, 0xE600_0002)), Liveness::Alive);
+        assert_eq!(esp_spis_deleted(&resp_sa, &sent_to(&gateway).expect("answered")), vec![ipv6.child.local_spi]);
+        assert_eq!(liveness.take_peer_deleted_children(), [ChildKind::Ipv6], "no redundant SA of its own left: lost as ever");
+        assert!(liveness.take_peer_child_events().is_empty());
+
+        assert_eq!(deliver(&mut liveness, &gateway, &esp_delete_request(&resp_sa, 4, GATEWAY_KEPT_SPI)), Liveness::Alive, "not a teardown");
+        assert_eq!(esp_spis_deleted(&resp_sa, &sent_to(&gateway).expect("answered")), vec![primary.child.local_spi]);
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some((theirs.outbound.spi(), GATEWAY_REDUNDANT_SPI)));
+        assert_eq!(
+            liveness.take_peer_child_events(),
+            [PeerChildEvent::MovedToRedundant {
+                kind: ChildKind::Primary,
+                local_spi: theirs.outbound.spi(),
+                peer_spi: GATEWAY_REDUNDANT_SPI,
+                replaced: (primary.child.local_spi, GATEWAY_KEPT_SPI)
+            }]
+        );
+        assert!(liveness.take_peer_deleted_children().is_empty());
+        assert_eq!(liveness.probe(Duration::from_millis(100)).unwrap(), Liveness::NoReply, "the IKE SA is still ours to probe");
+    }
+
+    /// The bound: one redundant SA more than [`REDUNDANT_CHILDREN_KEPT`] of a
+    /// family closes the oldest -- its Delete on the wire, at the negotiation,
+    /// and its closing reported -- and the others stay kept.
+    #[test]
+    fn a_redundant_sa_past_the_bound_closes_the_oldest_with_a_delete_and_reports_it() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        liveness.keep_redundant_children(true);
+        let mut rekeyed = 0xAAAA;
+        let mut kept = Vec::new();
+        let mut last_deletes = Vec::new();
+        for k in 0..=REDUNDANT_CHILDREN_KEPT as u32 {
+            let deletes = if k == REDUNDANT_CHILDREN_KEPT as u32 { 2 } else { 1 };
+            let (_, theirs, deleted) =
+                crossed_and_committed(&mut liveness, &gateway, &resp_sa, ChildKind::Primary, k, rekeyed, 0xE700_0001 + k, 0xE800_0001 + k, deletes);
+            rekeyed = 0xE800_0001 + k;
+            kept.extend(liveness.take_redundant_children().into_iter().map(|r| r.child.local_spi));
+            assert_eq!(kept.last(), Some(&theirs.outbound.spi()));
+            last_deletes = deleted;
+        }
+        assert_eq!(delete_in(&resp_sa, &last_deletes[0]), Some(Delete::esp(vec![kept[0]])), "the oldest closed by us, at the negotiation");
+        assert_eq!(liveness.take_peer_child_events(), [PeerChildEvent::RedundantClosed { kind: ChildKind::Primary, local_spi: kept[0] }]);
+        for (k, &local) in kept.iter().enumerate().skip(1) {
+            let report = liveness.delete_child(local, 0xE700_0001 + k as u32).unwrap();
+            assert_eq!(report.outcome, ChildDeleteOutcome::NotOwed("in_use"), "redundant SA {k} still kept");
+        }
+    }
+
+    /// The setting is the session's: a rekey of the IKE SA by the gateway keeps
+    /// it, and a crossed rekey on the new IKE SA keeps the gateway's SA too.
+    #[test]
+    fn keeping_redundant_children_survives_an_ike_sa_rekey() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        liveness.keep_redundant_children(true);
+        let ni = [0x55u8; 32];
+        assert_eq!(deliver(&mut liveness, &gateway, &gateway_ike_rekey(&resp_sa, 0, &ni)), Liveness::Alive);
+        let new_sa = gateway_ike_rekey_done(&resp_sa, &ni, &sent_to(&gateway).expect("the IKE SA rekey is answered"));
+
+        let (_, theirs, _) =
+            crossed_and_committed(&mut liveness, &gateway, &new_sa, ChildKind::Primary, 0, 0xAAAA, GATEWAY_REDUNDANT_SPI, GATEWAY_KEPT_SPI, 1);
+        let kept = liveness.take_redundant_children();
+        assert_eq!(kept.iter().map(|r| r.child.local_spi).collect::<Vec<_>>(), [theirs.outbound.spi()], "kept on the new IKE SA too");
+        assert_eq!(
+            liveness.delete_child(theirs.outbound.spi(), GATEWAY_REDUNDANT_SPI).unwrap(),
+            DeleteReport { outcome: ChildDeleteOutcome::NotOwed("in_use"), liveness: Liveness::Alive }
+        );
+        assert_eq!(sent_to(&gateway), None, "nothing sent for it");
     }
 }

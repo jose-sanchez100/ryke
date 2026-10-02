@@ -2593,7 +2593,7 @@ mod tests {
         let gaps: Vec<Duration> = times.windows(2).map(|w| w[1] - w[0]).collect();
         assert!(gaps.windows(2).all(|g| g[1] >= g[0] + Duration::from_millis(100)), "the waits between the sends were {gaps:?}");
         let budget = timeout * QUICK_MODE_ATTEMPTS;
-        assert!(elapsed >= budget && elapsed < budget + Duration::from_millis(600), "gave up after {elapsed:?}, budget {budget:?}");
+        assert!(elapsed + TIMER_SLACK >= budget && elapsed < budget + Duration::from_millis(600), "gave up after {elapsed:?}, budget {budget:?}");
     }
 
     /// RFC 2408 §5.1: the rekey's timer follows what the ISAKMP SA has measured of the
@@ -2627,7 +2627,7 @@ mod tests {
         let at: Vec<u128> = times.iter().map(|t| (*t - times[0]).as_millis() / 20).collect();
         assert!(at[1] >= 2 && at[1] <= 6 && at[2] >= 8 && at[2] <= 12, "the sends were at {:?} ms", times.iter().map(|t| (*t - times[0]).as_millis()).collect::<Vec<_>>());
         let budget = timeout * QUICK_MODE_ATTEMPTS;
-        assert!(elapsed >= budget && elapsed < budget + Duration::from_millis(600), "gave up after {elapsed:?}, budget {budget:?}");
+        assert!(elapsed + TIMER_SLACK >= budget && elapsed < budget + Duration::from_millis(600), "gave up after {elapsed:?}, budget {budget:?}");
         assert_eq!(istate.rtt.backoff(), 4, "four timers ran out");
     }
 
@@ -2671,7 +2671,7 @@ mod tests {
         assert!(matches!(err, Err(DriverError::Ike(IkeError::Crypto(m))) if m.contains("timed out")), "got {:?}", err.map(|_| ()));
         assert_eq!(recorder.join().unwrap(), 4, "four sends, however much else was read");
         let budget = timeout * QUICK_MODE_ATTEMPTS;
-        assert!(elapsed >= budget && elapsed < budget + Duration::from_millis(600), "gave up after {elapsed:?}, budget {budget:?}");
+        assert!(elapsed + TIMER_SLACK >= budget && elapsed < budget + Duration::from_millis(600), "gave up after {elapsed:?}, budget {budget:?}");
     }
 
     /// A rekey that is answered is a sample of the path, in the estimate of the SA it ran
@@ -2734,12 +2734,12 @@ mod tests {
         responder.join().unwrap();
     }
 
-    /// The tolerance of the lower bound below that compares a measured time
-    /// with the timeouts of a rekey. A timed receive can end up to about one
-    /// system timer tick before the time asked for (~16 ms on Windows, where
+    /// The tolerance of the lower bounds of these tests that compare a measured
+    /// time with the timeouts of a rekey. A timed receive can end up to about
+    /// one system timer tick before the time asked for (~16 ms on Windows, where
     /// the timer's granularity is 15.6 ms; seen natively: 1.1998 s for 1.2 s).
-    /// The schedule is right; a bound stricter than the timer is not. The upper
-    /// bound is not widened.
+    /// The schedule is right; a bound stricter than the timer is not. Upper
+    /// bounds are not widened.
     const TIMER_SLACK: Duration = Duration::from_millis(20);
 
     /// However many datagrams for some other exchange reach the socket, the

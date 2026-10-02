@@ -13,9 +13,17 @@
 //! - The hard limit is the smallest figure among the origins the policy holds hard
 //!   ([`VolumeLimits::hard_bytes`]); an advisory figure is never presented as one, whatever else is
 //!   present.
-//! - A renewal is measured against one figure, by precedence negotiated, else configured, else
-//!   learned ([`VolumeLimits::renewal_basis`]): a figure of a lower precedence never replaces one of
-//!   a higher one, even a larger one.
+//! - A renewal is measured against one figure ([`VolumeLimits::renewal_basis`]). The candidates are
+//!   the figure chosen by precedence -- negotiated, else configured, else learned, whatever its
+//!   enforcement -- and every figure present whose origin the policy holds hard; each one's renewal
+//!   point is its own origin's share of it, and the one whose point is the lowest is measured
+//!   against (on a tie, the one earlier in precedence). So a renewal point is never above the
+//!   renewal point of any hard limit, hence never above the hard limit itself: an SA is not ended
+//!   before its renewal is asked for. An advisory figure other than the one chosen by precedence is
+//!   never a candidate: a learned figure never replaces a configured one, even a lower one.
+//! - Under a policy whose only hard origin is [`Origin::Negotiated`], the figure measured against
+//!   is always the one chosen by precedence: a negotiated figure, when present, is both that figure
+//!   and the only hard one; when it is absent, no figure is hard.
 //! - A renewal point is reached by either direction of the SA on its own, never by their sum, and
 //!   no reading says nothing ([`VolumeLimits::renewal_signal`]). A signal only ever asks for a
 //!   renewal: nothing here retires or blocks an SA.
@@ -149,24 +157,46 @@ impl VolumeLimits {
             .min()
     }
 
-    /// The figure a renewal is measured against, in bytes, and where it comes from: by precedence
-    /// negotiated, else configured, else learned.
+    /// The figure a renewal is measured against, in bytes, and where it comes from. The candidates
+    /// are the figure chosen by precedence (negotiated, else configured, else learned, whatever its
+    /// enforcement) and every figure present whose origin the policy holds
+    /// [`Enforcement::Hard`]; the one returned is the candidate whose renewal point -- the
+    /// [`renew_at`](Treatment::renew_at) share its own origin is given -- is the lowest, and on a
+    /// tie the one earlier in precedence.
+    ///
+    /// So a hard limit lower in precedence governs only when its renewal point comes first, and an
+    /// advisory figure lower in precedence never does, even a smaller one. Under a policy that holds
+    /// only [`Origin::Negotiated`] hard, this is the figure chosen by precedence, always.
     pub fn renewal_basis(&self) -> Option<(u64, Origin)> {
-        let negotiated = self.negotiated.map(|bytes| (bytes, Origin::Negotiated));
-        let configured = self.configured.map(|bytes| (bytes, Origin::Configured));
-        let learned = self.learned.map(|bytes| (bytes, Origin::Learned));
-        negotiated.or(configured).or(learned)
+        self.governing().map(|(bytes, _, origin)| (bytes, origin))
     }
 
     /// The volume, in bytes per direction, at which the SA in use is to be renewed, and the origin
     /// of the figure it is taken from: the [`renew_at`](Treatment::renew_at) share the policy gives
-    /// that origin, of the [`renewal_basis`](Self::renewal_basis).
+    /// that origin, of the [`renewal_basis`](Self::renewal_basis) -- the lowest renewal point of the
+    /// candidates it names. Never above the renewal point of any hard limit present, so (a share
+    /// being never more than the whole) never above [`hard_bytes`](Self::hard_bytes).
     pub fn renewal_point(&self) -> Option<(u64, Origin)> {
-        self.renewal_basis().map(|(bytes, origin)| (self.policy.treatment(origin).renew_at.of(bytes), origin))
+        self.governing().map(|(_, at_bytes, origin)| (at_bytes, origin))
+    }
+
+    /// The governing figure, its renewal point and its origin (see
+    /// [`renewal_basis`](Self::renewal_basis)): of the figures present in precedence order, the
+    /// first one and every hard one, the lowest point; `min_by_key` keeps the first of equal ones,
+    /// which is the one earlier in precedence.
+    fn governing(&self) -> Option<(u64, u64, Origin)> {
+        [Origin::Negotiated, Origin::Configured, Origin::Learned]
+            .into_iter()
+            .filter_map(|origin| self.figure(origin).map(|bytes| (bytes, origin)))
+            .enumerate()
+            .filter(|&(rank, (_, origin))| rank == 0 || self.policy.treatment(origin).enforcement == Enforcement::Hard)
+            .map(|(_, (bytes, origin))| (bytes, self.policy.treatment(origin).renew_at.of(bytes), origin))
+            .min_by_key(|&(_, at_bytes, _)| at_bytes)
     }
 
     /// Whether the SA in use, having moved `used` (`(rx, tx)`, its own counts), is to be renewed:
-    /// either direction at the [`renewal_point`](Self::renewal_point) or past it, each direction on
+    /// either direction at the [`renewal_point`](Self::renewal_point) (the governing figure's, which
+    /// the signal names) or past it, each direction on
     /// its own and never the sum (an IPsec SA is one direction). `used` of `None` (no reading)
     /// means the volume says nothing, not that it is zero.
     pub fn renewal_signal(&self, used: Option<(u64, u64)>) -> Option<RenewalSignal> {
@@ -316,7 +346,7 @@ mod tests {
         let all_hard = VolumePolicy { negotiated: HARD_AT_EIGHT_TENTHS, configured: HARD_AT_EIGHT_TENTHS, learned: HARD_AT_EIGHT_TENTHS };
         let two = VolumeLimits::new(all_hard).with(Negotiated, Some(9_000_000)).with(Configured, Some(5_120_000));
         assert_eq!(two.hard_bytes(), Some(5_120_000), "two hard figures: the smaller");
-        assert_eq!(two.renewal_basis(), Some((9_000_000, Negotiated)), "the basis keeps its precedence");
+        assert_eq!(two.renewal_basis(), Some((5_120_000, Configured)), "the hard figure whose renewal point comes first");
         let three = two.with(Learned, Some(6_000_000));
         assert_eq!(three.hard_bytes(), Some(5_120_000));
         assert_eq!(three.with(Learned, Some(1)).hard_bytes(), Some(1));
@@ -346,5 +376,237 @@ mod tests {
         let l = l.with(Negotiated, Some(10));
         assert_eq!((l.figure(Negotiated), l.figure(Configured), l.figure(Learned)), (Some(10), None, Some(3)), "replaced, not added to");
         assert_eq!(VolumeLimits::new(POLICY), none());
+    }
+
+    const ALL_HARD: VolumePolicy =
+        VolumePolicy { negotiated: HARD_AT_EIGHT_TENTHS, configured: HARD_AT_EIGHT_TENTHS, learned: HARD_AT_EIGHT_TENTHS };
+    const HARD_AT_HALF: Treatment = Treatment { enforcement: Enforcement::Hard, renew_at: Share::new(1, 2, Rounding::Up) };
+
+    /// Every policy over `shares`: each origin hard or advisory, at each of the shares.
+    fn policies(shares: &[Share]) -> Vec<VolumePolicy> {
+        let mut treatments = Vec::new();
+        for enforcement in [Enforcement::Hard, Enforcement::Advisory] {
+            treatments.extend(shares.iter().map(|&renew_at| Treatment { enforcement, renew_at }));
+        }
+        let mut all = Vec::new();
+        for &negotiated in &treatments {
+            for &configured in &treatments {
+                for &learned in &treatments {
+                    all.push(VolumePolicy { negotiated, configured, learned });
+                }
+            }
+        }
+        all
+    }
+
+    /// Every combination of `values` (and of no figure) for the three origins, under `policy`.
+    fn combinations(policy: VolumePolicy, values: &[u64]) -> Vec<VolumeLimits> {
+        let figures: Vec<Option<u64>> = std::iter::once(None).chain(values.iter().copied().map(Some)).collect();
+        let mut all = Vec::new();
+        for &n in &figures {
+            for &c in &figures {
+                for &l in &figures {
+                    all.push(VolumeLimits::new(policy).with(Negotiated, n).with(Configured, c).with(Learned, l));
+                }
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn a_hard_limit_lower_in_precedence_but_more_restrictive_governs_the_renewal() {
+        // The case the precedence alone got wrong: a hard limit of 1 000 bytes, renewed at 8 000.
+        let l = VolumeLimits::new(ALL_HARD).with(Negotiated, Some(10_000)).with(Configured, Some(1_000));
+        assert_eq!(l.hard_bytes(), Some(1_000));
+        assert_eq!(l.renewal_basis(), Some((1_000, Configured)));
+        assert_eq!(l.renewal_point(), Some((800, Configured)), "renewed before the hard limit it would end at");
+        let learned = VolumeLimits::new(ALL_HARD).with(Negotiated, Some(10_000)).with(Configured, Some(5_000)).with(Learned, Some(100));
+        assert_eq!(learned.renewal_point(), Some((80, Learned)), "the lowest in precedence, when it is hard and comes first");
+        assert_eq!(learned.renewal_basis(), Some((100, Learned)));
+        // A larger hard figure whose own share puts its renewal point first governs too.
+        let shares = VolumePolicy { configured: HARD_AT_HALF, ..ALL_HARD };
+        let l = VolumeLimits::new(shares).with(Negotiated, Some(1_000)).with(Configured, Some(1_200));
+        assert_eq!(l.hard_bytes(), Some(1_000));
+        assert_eq!(l.renewal_point(), Some((600, Configured)), "half of 1 200 comes before 8/10 of 1 000");
+        assert_eq!(l.renewal_basis(), Some((1_200, Configured)));
+    }
+
+    #[test]
+    fn with_two_or_three_hard_limits_the_lowest_renewal_point_governs_in_every_order_of_size() {
+        let origins = [Negotiated, Configured, Learned];
+        // Two hard figures, every pair of origins, either one the smaller.
+        for (i, &first) in origins.iter().enumerate() {
+            for &second in &origins[i + 1..] {
+                for (a, b) in [(1_000, 2_000), (2_000, 1_000)] {
+                    let l = VolumeLimits::new(ALL_HARD).with(first, Some(a)).with(second, Some(b));
+                    let (smaller, origin) = if a < b { (a, first) } else { (b, second) };
+                    assert_eq!(l.hard_bytes(), Some(smaller), "{first:?} {a}, {second:?} {b}");
+                    assert_eq!(l.renewal_basis(), Some((smaller, origin)), "{first:?} {a}, {second:?} {b}");
+                    assert_eq!(l.renewal_point(), Some((smaller * 8 / 10, origin)), "{first:?} {a}, {second:?} {b}");
+                }
+            }
+        }
+        // Three hard figures, every order of size.
+        for (n, c, l) in [(1, 2, 3), (1, 3, 2), (2, 1, 3), (2, 3, 1), (3, 1, 2), (3, 2, 1)] {
+            let limits = VolumeLimits::new(ALL_HARD)
+                .with(Negotiated, Some(n * 1_000))
+                .with(Configured, Some(c * 1_000))
+                .with(Learned, Some(l * 1_000));
+            let origin = [(n, Negotiated), (c, Configured), (l, Learned)].into_iter().min_by_key(|&(size, _)| size).unwrap().1;
+            assert_eq!(limits.hard_bytes(), Some(1_000), "{n} {c} {l}");
+            assert_eq!(limits.renewal_basis(), Some((1_000, origin)), "{n} {c} {l}");
+            assert_eq!(limits.renewal_point(), Some((800, origin)), "{n} {c} {l}");
+        }
+    }
+
+    #[test]
+    fn a_hard_limit_less_restrictive_than_the_figure_by_precedence_leaves_that_figure_governing() {
+        let l = VolumeLimits::new(ALL_HARD).with(Negotiated, Some(1_000)).with(Configured, Some(10_000)).with(Learned, Some(5_000));
+        assert_eq!(l.renewal_basis(), Some((1_000, Negotiated)));
+        assert_eq!(l.renewal_point(), Some((800, Negotiated)));
+        // The figure by precedence governs even when it is advisory, as long as its point comes first.
+        let advisory_grant = VolumePolicy { negotiated: ADVISORY_AT_HALF, ..ALL_HARD };
+        let l = VolumeLimits::new(advisory_grant).with(Negotiated, Some(1_000)).with(Configured, Some(10_000));
+        assert_eq!(l.hard_bytes(), Some(10_000));
+        assert_eq!(l.renewal_basis(), Some((1_000, Negotiated)));
+        assert_eq!(l.renewal_point(), Some((500, Negotiated)));
+    }
+
+    #[test]
+    fn on_a_tie_of_renewal_points_the_figure_earlier_in_precedence_governs() {
+        let shares = VolumePolicy { configured: HARD_AT_HALF, ..ALL_HARD };
+        let l = VolumeLimits::new(shares).with(Negotiated, Some(1_000)).with(Configured, Some(1_600));
+        assert_eq!(l.renewal_point(), Some((800, Negotiated)), "8/10 of 1 000 and half of 1 600");
+        assert_eq!(l.renewal_basis(), Some((1_000, Negotiated)));
+        let lower = VolumePolicy { learned: HARD_AT_HALF, ..ALL_HARD };
+        let l = VolumeLimits::new(lower).with(Configured, Some(1_000)).with(Learned, Some(1_600));
+        assert_eq!(l.renewal_point(), Some((800, Configured)));
+        assert_eq!(l.renewal_basis(), Some((1_000, Configured)));
+        let same = VolumeLimits::new(ALL_HARD).with(Negotiated, Some(1_000)).with(Configured, Some(1_000)).with(Learned, Some(1_000));
+        assert_eq!(same.renewal_basis(), Some((1_000, Negotiated)), "equal figures at equal shares");
+    }
+
+    #[test]
+    fn an_advisory_figure_lower_in_precedence_is_never_a_candidate_even_the_smallest() {
+        let l = none().with(Negotiated, Some(10_000)).with(Configured, Some(1)).with(Learned, Some(1));
+        assert_eq!(l.renewal_point(), Some((8_000, Negotiated)));
+        let learned_advisory = VolumePolicy { learned: ADVISORY_AT_HALF, ..ALL_HARD };
+        let l = VolumeLimits::new(learned_advisory).with(Negotiated, Some(10_000)).with(Configured, Some(5_000)).with(Learned, Some(1));
+        assert_eq!(l.renewal_point(), Some((4_000, Configured)), "the hard one that comes first, never the advisory one");
+        assert_eq!(l.renewal_basis(), Some((5_000, Configured)));
+        let configured = none().with(Configured, Some(5_120_000)).with(Learned, Some(1));
+        assert_eq!(configured.renewal_point(), Some((2_560_000, Configured)), "a learned figure never replaces a configured one");
+    }
+
+    #[test]
+    fn a_governing_hard_limit_is_signalled_by_either_direction_on_its_own_to_the_byte() {
+        let l = VolumeLimits::new(ALL_HARD).with(Negotiated, Some(10_000)).with(Configured, Some(1_000));
+        let signal = Some(RenewalSignal { origin: Configured, at_bytes: 800 });
+        assert_eq!(l.renewal_signal(Some((799, 799))), None, "each direction a byte short");
+        assert_eq!(l.renewal_signal(Some((400, 400))), None, "their sum at the point is no reading");
+        assert_eq!(l.renewal_signal(Some((799, 0))), None, "inbound a byte short");
+        assert_eq!(l.renewal_signal(Some((800, 0))), signal, "inbound at the point");
+        assert_eq!(l.renewal_signal(Some((801, 0))), signal, "inbound past it");
+        assert_eq!(l.renewal_signal(Some((0, 799))), None, "outbound a byte short");
+        assert_eq!(l.renewal_signal(Some((0, 800))), signal, "outbound at the point");
+        assert_eq!(l.renewal_signal(Some((0, 801))), signal, "outbound past it");
+        assert_eq!(l.renewal_signal(None), None, "no reading: no signal");
+    }
+
+    #[test]
+    fn the_renewal_point_never_exceeds_the_point_of_any_hard_limit_nor_the_hard_limit() {
+        let shares = [
+            Share::new(0, 1, Rounding::Down),
+            Share::new(1, 2, Rounding::Up),
+            Share::new(8, 10, Rounding::Down),
+            Share::new(1, 1, Rounding::Down),
+        ];
+        let origins = [Negotiated, Configured, Learned];
+        for policy in policies(&shares) {
+            for l in combinations(policy, &[0, 1, 999, 1_000, 1_001]) {
+                let first = origins.into_iter().find(|&origin| l.figure(origin).is_some());
+                let Some((at, origin)) = l.renewal_point() else {
+                    assert_eq!(first, None, "{l:?}");
+                    assert_eq!(l.hard_bytes(), None, "{l:?}");
+                    continue;
+                };
+                let (basis, basis_origin) = l.renewal_basis().unwrap();
+                assert_eq!(basis_origin, origin, "{l:?}");
+                assert_eq!(policy.treatment(origin).renew_at.of(basis), at, "{l:?}");
+                let hard = policy.treatment(origin).enforcement == Enforcement::Hard;
+                assert!(Some(origin) == first || hard, "{l:?}: an advisory figure other than the first governs");
+                let first = first.unwrap();
+                assert!(at <= policy.treatment(first).renew_at.of(l.figure(first).unwrap()), "{l:?}");
+                for other in origins.into_iter().filter(|&o| policy.treatment(o).enforcement == Enforcement::Hard) {
+                    if let Some(bytes) = l.figure(other) {
+                        assert!(at <= policy.treatment(other).renew_at.of(bytes), "{l:?}: above {other:?}'s point");
+                    }
+                }
+                if let Some(hard_bytes) = l.hard_bytes() {
+                    assert!(at <= hard_bytes, "{l:?}: renewal point {at} above the hard limit {hard_bytes}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn with_no_figure_or_only_a_hard_one_removed_the_rule_falls_back_as_figures_go() {
+        let l = VolumeLimits::new(ALL_HARD);
+        assert_eq!((l.hard_bytes(), l.renewal_basis(), l.renewal_point()), (None, None, None));
+        assert_eq!(l.renewal_signal(Some((u64::MAX, u64::MAX))), None);
+        let both = l.with(Negotiated, Some(10_000)).with(Configured, Some(1_000));
+        assert_eq!(both.with(Configured, None).renewal_point(), Some((8_000, Negotiated)), "the hard figure removed: the precedence one again");
+        assert_eq!(both.with(Negotiated, None).renewal_point(), Some((800, Configured)));
+    }
+
+    #[test]
+    fn a_zero_hard_figure_governs_at_zero() {
+        let l = VolumeLimits::new(ALL_HARD).with(Negotiated, Some(10_000)).with(Configured, Some(0));
+        assert_eq!(l.hard_bytes(), Some(0));
+        assert_eq!(l.renewal_point(), Some((0, Configured)));
+        assert_eq!(l.renewal_signal(Some((0, 0))), Some(RenewalSignal { origin: Configured, at_bytes: 0 }));
+        let learned = VolumeLimits::new(ALL_HARD).with(Configured, Some(1_000)).with(Learned, Some(0));
+        assert_eq!(learned.renewal_basis(), Some((0, Learned)));
+        let advisory = none().with(Negotiated, Some(10_000)).with(Configured, Some(0));
+        assert_eq!(advisory.renewal_point(), Some((8_000, Negotiated)), "an advisory zero lower in precedence is not a candidate");
+    }
+
+    #[test]
+    fn under_a_policy_holding_only_the_negotiated_figure_hard_nothing_differs_from_precedence_alone() {
+        // The rule before hard limits were candidates, verbatim, kept here as the reference.
+        fn old_renewal_basis(l: &VolumeLimits) -> Option<(u64, Origin)> {
+            let negotiated = l.negotiated.map(|bytes| (bytes, Origin::Negotiated));
+            let configured = l.configured.map(|bytes| (bytes, Origin::Configured));
+            let learned = l.learned.map(|bytes| (bytes, Origin::Learned));
+            negotiated.or(configured).or(learned)
+        }
+        fn old_renewal_point(l: &VolumeLimits) -> Option<(u64, Origin)> {
+            old_renewal_basis(l).map(|(bytes, origin)| (l.policy.treatment(origin).renew_at.of(bytes), origin))
+        }
+        fn old_renewal_signal(l: &VolumeLimits, used: Option<(u64, u64)>) -> Option<RenewalSignal> {
+            let (rx, tx) = used?;
+            let (at_bytes, origin) = old_renewal_point(l)?;
+            (rx >= at_bytes || tx >= at_bytes).then_some(RenewalSignal { origin, at_bytes })
+        }
+        let shares = [Share::new(8, 10, Rounding::Down), Share::new(1, 2, Rounding::Up), Share::new(1, 1, Rounding::Down)];
+        let values = [0, 1, 999, 1_000, 1_001, 5_120_000, 4_294_967_295_000, u64::MAX / 8 + 1, u64::MAX];
+        let readings = [None, Some((0, 0)), Some((799, 0)), Some((0, 800)), Some((2_560_000, 0)), Some((u64::MAX, u64::MAX))];
+        let only_negotiated_hard = policies(&shares).into_iter().filter(|policy| {
+            [Negotiated, Configured, Learned]
+                .into_iter()
+                .all(|origin| (policy.treatment(origin).enforcement == Enforcement::Hard) == (origin == Negotiated))
+        });
+        let mut compared = 0;
+        for policy in only_negotiated_hard {
+            for l in combinations(policy, &values) {
+                assert_eq!(l.renewal_basis(), old_renewal_basis(&l), "{l:?}");
+                assert_eq!(l.renewal_point(), old_renewal_point(&l), "{l:?}");
+                for used in readings {
+                    assert_eq!(l.renewal_signal(used), old_renewal_signal(&l, used), "{l:?} {used:?}");
+                }
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 27 * 1000, "every policy of that shape, every presence and value of the three figures");
     }
 }

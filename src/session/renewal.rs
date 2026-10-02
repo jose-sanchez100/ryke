@@ -453,18 +453,6 @@ impl<T: Copy> FamilyRenewal<T> {
         self.settled.iter()
     }
 
-    /// Transitional, removed once the consumer is on [`retire_within`](Self::retire_within):
-    /// that, with `kept` settled entries and no bound on the owed ones.
-    pub fn retire(&mut self, r: Retired, kept: usize) {
-        let _ = self.retire_within(r, RetiredBounds { settled_kept: kept, owed_max: usize::MAX });
-    }
-
-    /// Transitional, removed once the consumer is on [`owed`](Self::owed) and
-    /// [`settled`](Self::settled): the owed ones, oldest first, then the settled ones, oldest first.
-    pub fn retired(&self) -> Vec<Retired> {
-        self.owed.iter().chain(&self.settled).copied().collect()
-    }
-
     /// `r`, settled, kept last among the settled ones; past `kept`, the oldest goes first.
     fn keep_settled(&mut self, r: Retired, kept: usize) {
         self.settled.push_back(r);

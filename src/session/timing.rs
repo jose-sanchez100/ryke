@@ -200,7 +200,9 @@ mod tests {
     const ATTEMPT_WORST_CASE: Duration = Duration::from_secs(15);
 
     /// The figures of a consumer that renews at 8/10 of a lifetime or a volume, never before half
-    /// of a lifetime, keeps 20 s free before the end and retries between 5 and 30 s.
+    /// of a lifetime, keeps 20 s free before the end and retries between 5 and 30 s. Its volume
+    /// margin is in the historical arithmetic that consumer's figures were pinned with, which a test
+    /// below pins at an amount whose product overflows a `u64`.
     const TIMING: RenewalTiming = RenewalTiming {
         margin: Share::new(8, 10, Rounding::Down),
         earliest: Share::new(1, 2, Rounding::Down),
@@ -208,7 +210,7 @@ mod tests {
         min_interval: MIN_INTERVAL,
         retry_min: RETRY_MIN,
         retry_max: RETRY_MAX,
-        volume_margin: Share::new(8, 10, Rounding::Down),
+        volume_margin: Share::saturating_u64(8, 10, Rounding::Down),
     };
 
     fn secs(s: u64) -> Duration {
@@ -368,6 +370,9 @@ mod tests {
         assert_eq!(t.volume_renewal_point(u64::from(u32::MAX) * 1000), 3_435_973_836_000, "the largest KB grant: exact");
         assert_eq!(t.volume_renewal_point(u64::MAX / 8), 1_844_674_407_370_955_160);
         assert_eq!(t.volume_renewal_point(u64::MAX), u64::MAX / 10, "saturated: early, never wrapped to a small value");
+        let exact = RenewalTiming { volume_margin: Share::new(8, 10, Rounding::Down), ..t };
+        assert_eq!(exact.volume_renewal_point(u64::MAX / 8), 1_844_674_407_370_955_160);
+        assert_eq!(exact.volume_renewal_point(u64::MAX), 14_757_395_258_967_641_292, "the exact share: 8/10 of it, rounded down");
     }
 
     #[test]

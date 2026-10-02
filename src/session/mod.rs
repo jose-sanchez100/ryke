@@ -50,14 +50,17 @@ pub struct Share {
 /// Which arithmetic a [`Share`] is computed with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arithmetic {
-    /// [`Share::new`]'s.
+    /// [`Share::new`]'s: the product taken in `u128`, the exact share.
     Exact,
     /// [`Share::saturating_u64`]'s: the product taken in `u64`, saturating.
     SaturatingU64,
 }
 
 impl Share {
-    /// The share `num / den` of an amount, rounded as `rounding` says.
+    /// The share `num / den` of an amount, rounded as `rounding` says, exactly: [`of`](Self::of)
+    /// takes the product `amount * num` in a `u128`, where it always fits, and divides it by `den`,
+    /// rounding down (the floor) or up (the ceiling). Equivalent fractions give equal results for
+    /// every amount, and the result is always between `0` and `amount`.
     ///
     /// Panics if `den == 0` (a share of nothing) or `num > den` (more than the whole); in a `const`,
     /// either is a compile error.
@@ -65,8 +68,25 @@ impl Share {
         Self::checked(num, den, rounding, Arithmetic::Exact)
     }
 
-    /// The share `num / den` of an amount, rounded as `rounding` says, computed with the historical
-    /// arithmetic, for a consumer whose figures were validated with it.
+    /// The share `num / den` of an amount, rounded as `rounding` says, in the historical
+    /// arithmetic: compatibility arithmetic, for a consumer whose figures were validated with it. New
+    /// consumers use [`new`](Self::new).
+    ///
+    /// The product is taken in a `u64` and saturates:
+    ///
+    /// - [`Rounding::Down`]: `amount.saturating_mul(num) / den`. A product that would overflow
+    ///   saturates, which gives an *earlier* point than the exact share -- never a wrapped, small one.
+    /// - [`Rounding::Up`]: `amount - amount.saturating_mul(den - num) / den`. Here the product is the
+    ///   part taken off `amount`: one that would overflow saturates, so less is taken off than
+    ///   exactly would be, which gives a *later* point than the exact share -- still never past
+    ///   `amount`, and never a wrapped one. (With `den - num == 1`, as for a half, the product
+    ///   cannot overflow.)
+    ///
+    /// The result is between `0` and `amount`, and it is the exact share -- what [`new`](Self::new)
+    /// gives -- whenever the product fits a `u64`: it differs only when `amount * num` (rounding
+    /// down) or `amount * (den - num)` (rounding up) exceeds `u64::MAX`. There it is not the exact
+    /// share, and equivalent fractions can disagree: `1/1` of 1000 is 1000, `u64::MAX/u64::MAX` of
+    /// 1000 is 1.
     ///
     /// Panics as [`new`](Self::new) does.
     pub const fn saturating_u64(num: u64, den: u64, rounding: Rounding) -> Self {
@@ -79,22 +99,26 @@ impl Share {
         Self { num, den, rounding, arithmetic }
     }
 
-    /// This share of `amount`, in integers, with no overflow and never more than `amount`:
-    ///
-    /// - [`Rounding::Down`]: `amount.saturating_mul(num) / den`. A product that would overflow
-    ///   saturates, which gives an *earlier* point than the exact share -- never a wrapped, small one.
-    /// - [`Rounding::Up`]: `amount - amount.saturating_mul(den - num) / den`, the exact share rounded
-    ///   up. Here the product is the part taken off `amount`: one that would overflow saturates, so
-    ///   less is taken off than exactly would be, which gives a *later* point than the exact share --
-    ///   still never past `amount`, and never a wrapped one. (With `den - num == 1`, as for a half,
-    ///   the product cannot overflow.)
-    ///
-    /// Either way the result is between `0` and `amount`, and it is exact whenever the product fits
-    /// a `u64`.
+    /// This share of `amount`, in integers, with no overflow and never more than `amount`, in the
+    /// arithmetic of the constructor the share was made with: [`new`](Self::new)'s exact one,
+    /// `amount * num / den` rounded down or up, or [`saturating_u64`](Self::saturating_u64)'s
+    /// historical one.
     pub const fn of(self, amount: u64) -> u64 {
         match self.arithmetic {
-            Arithmetic::Exact | Arithmetic::SaturatingU64 => self.saturating_of(amount),
+            Arithmetic::Exact => self.exact_of(amount),
+            Arithmetic::SaturatingU64 => self.saturating_of(amount),
         }
+    }
+
+    /// [`Share::new`]'s arithmetic. The product of two `u64`s always fits a `u128`, and with
+    /// `num <= den` the quotient, either way rounded, is at most `amount`, so it fits a `u64` again.
+    const fn exact_of(self, amount: u64) -> u64 {
+        let product = amount as u128 * self.num as u128;
+        let den = self.den as u128;
+        (match self.rounding {
+            Rounding::Down => product / den,
+            Rounding::Up => product.div_ceil(den),
+        }) as u64
     }
 
     /// [`Share::saturating_u64`]'s arithmetic.
@@ -150,23 +174,14 @@ mod tests {
     }
 
     #[test]
-    fn the_whole_and_none_are_shares_too_exact_while_the_product_fits() {
+    fn the_whole_and_none_are_shares_too_at_any_amount() {
         for rounding in [Rounding::Down, Rounding::Up] {
             let whole = Share::new(7, 7, rounding);
             let none = Share::new(0, 7, rounding);
-            for amount in [0, 1, 6, 7, 8, u64::MAX / 7] {
+            for amount in [0, 1, 6, 7, 8, u64::MAX / 7, u64::MAX / 7 + 1, u64::MAX] {
                 assert_eq!(whole.of(amount), amount, "{rounding:?} {amount}");
                 assert_eq!(none.of(amount), 0, "{rounding:?} {amount}");
             }
-        }
-        // Past that, the saturated product moves the point as documented: earlier rounding down,
-        // later rounding up -- while a product with a zero factor (the whole rounding up, none rounding
-        // down) cannot overflow, and stays exact at any amount.
-        for amount in [u64::MAX / 7 + 1, u64::MAX] {
-            assert_eq!(Share::new(7, 7, Rounding::Down).of(amount), u64::MAX / 7, "{amount}");
-            assert_eq!(Share::new(7, 7, Rounding::Up).of(amount), amount, "{amount}");
-            assert_eq!(Share::new(0, 7, Rounding::Down).of(amount), 0, "{amount}");
-            assert_eq!(Share::new(0, 7, Rounding::Up).of(amount), amount - u64::MAX / 7, "{amount}");
         }
     }
 
@@ -190,25 +205,105 @@ mod tests {
     }
 
     #[test]
-    fn an_overflowing_product_saturates_early_rounding_down_and_late_rounding_up() {
-        // Down: the exact 8/10 of u64::MAX is about 1.48e19; the saturated product gives u64::MAX / 10.
-        assert_eq!(EIGHT_TENTHS.of(u64::MAX), u64::MAX / 10);
+    fn a_product_past_a_u64_is_still_the_exact_share() {
+        // Down: 8/10 of u64::MAX, where the historical arithmetic saturates to u64::MAX / 10.
+        assert_eq!(EIGHT_TENTHS.of(u64::MAX), 14_757_395_258_967_641_292);
         assert_eq!(EIGHT_TENTHS.of(u64::MAX / 8), 1_844_674_407_370_955_160, "the last amount whose product fits");
-        assert_eq!(EIGHT_TENTHS.of(u64::MAX / 8 + 1), 1_844_674_407_370_955_161, "the first that saturates");
-        // Up: the part taken off saturates, so the point moves toward the amount, never past it.
+        assert_eq!(EIGHT_TENTHS.of(u64::MAX / 8 + 1), 1_844_674_407_370_955_161, "the first past it: 8/10 of 2^61, rounded down");
+        // Up: a third of u64::MAX is a whole number, so rounding up adds nothing.
         let third_up = Share::new(1, 3, Rounding::Up);
-        assert_eq!(third_up.of(u64::MAX), u64::MAX - u64::MAX / 3);
-        assert!(third_up.of(u64::MAX) > u64::MAX / 3 + 1);
-        // Half rounded up never saturates: den - num is 1.
+        assert_eq!(third_up.of(u64::MAX), u64::MAX / 3);
         assert_eq!(HALF_UP.of(u64::MAX), u64::MAX / 2 + 1);
     }
 
     #[test]
-    fn eight_tenths_down_and_half_up_are_the_integer_formulas_they_replace() {
+    fn eight_tenths_down_and_half_up_are_the_exact_integer_formulas() {
         for x in spread() {
-            assert_eq!(EIGHT_TENTHS.of(x), x.saturating_mul(8) / 10, "{x}");
+            assert_eq!(u128::from(EIGHT_TENTHS.of(x)), u128::from(x) * 8 / 10, "{x}");
             assert_eq!(HALF_UP.of(x), x - x / 2, "{x}");
         }
+    }
+
+    #[test]
+    fn equivalent_fractions_give_equal_shares_of_every_amount() {
+        let half = u64::MAX / 2;
+        let families: [&[(u64, u64)]; 3] = [&[(1, 1), (u64::MAX, u64::MAX)], &[(1, 2), (2, 4), (half, u64::MAX - 1)], &[(8, 10), (4, 5), (800, 1000)]];
+        for rounding in [Rounding::Down, Rounding::Up] {
+            for family in families {
+                let (num, den) = family[0];
+                let first = Share::new(num, den, rounding);
+                for &(num, den) in &family[1..] {
+                    let other = Share::new(num, den, rounding);
+                    for amount in spread() {
+                        assert_eq!(other.of(amount), first.of(amount), "{other:?} and {first:?} of {amount}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn none_and_the_whole_of_zero_one_and_the_largest_amount() {
+        for rounding in [Rounding::Down, Rounding::Up] {
+            for amount in [0, 1, u64::MAX] {
+                assert_eq!(Share::new(0, 1, rounding).of(amount), 0, "{rounding:?} {amount}");
+                assert_eq!(Share::new(0, u64::MAX, rounding).of(amount), 0, "{rounding:?} {amount}");
+                assert_eq!(Share::new(1, 1, rounding).of(amount), amount, "{rounding:?} {amount}");
+                assert_eq!(Share::new(u64::MAX, u64::MAX, rounding).of(amount), amount, "{rounding:?} {amount}");
+            }
+        }
+    }
+
+    #[test]
+    fn rounding_shows_only_where_the_share_is_not_a_whole_number_at_any_size() {
+        let (third_down, third_up) = (Share::new(1, 3, Rounding::Down), Share::new(1, 3, Rounding::Up));
+        // u64::MAX is a multiple of 3; u64::MAX - 1 is not.
+        assert_eq!((third_down.of(u64::MAX), third_up.of(u64::MAX)), (u64::MAX / 3, u64::MAX / 3));
+        assert_eq!((third_down.of(u64::MAX - 1), third_up.of(u64::MAX - 1)), (u64::MAX / 3 - 1, u64::MAX / 3));
+        let (down, up) = (Share::new(u64::MAX - 1, u64::MAX, Rounding::Down), Share::new(u64::MAX - 1, u64::MAX, Rounding::Up));
+        assert_eq!((down.of(u64::MAX), up.of(u64::MAX)), (u64::MAX - 1, u64::MAX - 1), "exact");
+        assert_eq!((down.of(1), up.of(1)), (0, 1), "a hair under one");
+        assert_eq!((down.of(2), up.of(2)), (1, 2));
+    }
+
+    #[test]
+    fn extreme_fractions_and_amounts_match_a_u128_reference() {
+        let near = [1, 2, 3, u64::MAX / 2, u64::MAX / 2 + 1, u64::MAX - 2, u64::MAX - 1, u64::MAX];
+        for &den in &near {
+            for &num in near.iter().chain(&[0]).filter(|&&num| num <= den) {
+                for &amount in near.iter().chain(&[0]) {
+                    let product = u128::from(amount) * u128::from(num);
+                    let den_wide = u128::from(den);
+                    let down = Share::new(num, den, Rounding::Down).of(amount);
+                    let up = Share::new(num, den, Rounding::Up).of(amount);
+                    assert_eq!(u128::from(down), product / den_wide, "{num}/{den} of {amount}, down");
+                    assert_eq!(u128::from(up), product.div_ceil(den_wide), "{num}/{den} of {amount}, up");
+                    assert!(down <= up && up <= amount, "{num}/{den} of {amount}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_exact_and_the_historical_arithmetic_agree_wherever_the_product_fits_a_u64() {
+        let fractions = [(0, 1), (1, 1), (1, 2), (1, 3), (2, 3), (8, 10), (9, 10), (1, 1000), (999, 1000), (7, 7), (0, 7), (1, u64::MAX), (u64::MAX - 1, u64::MAX)];
+        let mut compared = 0;
+        for (num, den) in fractions {
+            for rounding in [Rounding::Down, Rounding::Up] {
+                let factor = match rounding {
+                    Rounding::Down => num,
+                    Rounding::Up => den - num,
+                };
+                for amount in spread() {
+                    if amount.checked_mul(factor).is_some() {
+                        let historical = Share::saturating_u64(num, den, rounding).of(amount);
+                        assert_eq!(Share::new(num, den, rounding).of(amount), historical, "{num}/{den} {rounding:?} of {amount}");
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        assert!(compared > 26 * 9_000, "every fraction and rounding over the small amounts at least: {compared}");
     }
 
     #[test]

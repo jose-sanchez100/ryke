@@ -212,8 +212,10 @@ mod tests {
     use crate::session::Rounding;
     use Origin::{Configured, Learned, Negotiated};
 
+    /// In the historical arithmetic the consumer's figures were pinned with: a test below pins it at
+    /// an amount whose product overflows a `u64`.
     const HARD_AT_EIGHT_TENTHS: Treatment =
-        Treatment { enforcement: Enforcement::Hard, renew_at: Share::new(8, 10, Rounding::Down) };
+        Treatment { enforcement: Enforcement::Hard, renew_at: Share::saturating_u64(8, 10, Rounding::Down) };
     const ADVISORY_AT_HALF: Treatment =
         Treatment { enforcement: Enforcement::Advisory, renew_at: Share::new(1, 2, Rounding::Up) };
 
@@ -267,6 +269,12 @@ mod tests {
     fn the_renewal_point_of_a_huge_basis_saturates_and_never_exceeds_the_basis() {
         let huge = none().with(Negotiated, Some(u64::MAX));
         assert_eq!(huge.renewal_point(), Some((u64::MAX / 10, Negotiated)), "saturated before dividing: early, never wrapped");
+        let exact = VolumePolicy {
+            negotiated: Treatment { enforcement: Enforcement::Hard, renew_at: Share::new(8, 10, Rounding::Down) },
+            ..POLICY
+        };
+        let huge_exact = VolumeLimits::new(exact).with(Negotiated, Some(u64::MAX));
+        assert_eq!(huge_exact.renewal_point(), Some((14_757_395_258_967_641_292, Negotiated)), "the exact share, rounded down");
         let largest_kb = none().with(Learned, Some(4_294_967_295_000));
         assert_eq!(largest_kb.renewal_point(), Some((2_147_483_647_500, Learned)), "the largest KB figure: exact");
         let largest = none().with(Configured, Some(u64::MAX));

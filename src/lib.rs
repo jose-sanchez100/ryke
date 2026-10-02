@@ -122,10 +122,12 @@
 //! ### Session lifecycle
 //!
 //! [`session`] is arithmetic over figures and instants the caller supplies -- when an SA is to be
-//! renewed, and how far apart renewal attempts are kept -- and over nothing else: every figure of
-//! the policy is a parameter, no clock is read, and it enforces nothing, counts nothing and starts
-//! nothing. It is not a session object and drives no exchange; the schedule stays the consumer's
-//! (below), which can take its arithmetic from here.
+//! renewed, and how far apart renewal attempts are kept -- and a record of the facts the caller
+//! reports of one family's renewals ([`session::renewal`]: its attempts, a rekey negotiated and not
+//! yet resolved, a deferred switch, the SAs it retired and their Deletes), and nothing else: every
+//! figure of the policy is a parameter, no clock is read, and it enforces nothing, counts nothing
+//! and starts nothing. It is not a session object and drives no exchange; the schedule stays the
+//! consumer's (below), which can take its arithmetic and its record from here.
 //!
 //! ### Bundled servers
 //!

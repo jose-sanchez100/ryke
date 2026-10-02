@@ -1,16 +1,21 @@
-//! Lifecycle logic over the protocol sessions: when an SA is to be renewed, and how far apart
-//! renewal attempts are kept.
+//! Lifecycle logic over the protocol sessions: when an SA is to be renewed, how far apart renewal
+//! attempts are kept, and what a family of SAs has to remember between them.
 //!
 //! Everything here is pure and driven by the caller. It owns no socket, thread or clock, and sees no
 //! key material: time comes in as an argument (an [`Instant`](std::time::Instant) or a
 //! [`Duration`](std::time::Duration) the caller read), and so do the counts of what an SA has moved.
 //! The protocol exchanges themselves stay in [`crate::ikev1`] and [`crate::ikev2`], with their
-//! existing blocking APIs; what is here only says *when* the caller should start one of them.
+//! existing blocking APIs; what is here only says *when* the caller should start one of them, and
+//! keeps the facts the caller reports of them.
 //!
 //! What it holds today:
 //!
 //! - [`limits`]: the volume figures of an SA by where each comes from, which of them is a hard
 //!   limit under the consumer's policy, and the renewal one may ask for.
+//! - [`renewal`]: the record of one family's renewals -- its last attempt, a rekey negotiated and
+//!   not yet resolved, a switch of outbound deferred until the peer has the new SA, the SAs it
+//!   retired and where their Deletes stand -- and an SA's clock by age. It records facts and
+//!   answers queries; it decides nothing.
 //! - [`spacing`]: how far apart renewal attempts of one SA are kept, and when the next one may
 //!   start.
 //! - [`timing`]: when an SA is to be renewed by its age and by its volume, where it stands against
@@ -22,6 +27,7 @@
 //! the same for every consumer.
 
 pub mod limits;
+pub mod renewal;
 pub mod spacing;
 pub mod timing;
 

@@ -2734,6 +2734,14 @@ mod tests {
         responder.join().unwrap();
     }
 
+    /// The tolerance of the lower bound below that compares a measured time
+    /// with the timeouts of a rekey. A timed receive can end up to about one
+    /// system timer tick before the time asked for (~16 ms on Windows, where
+    /// the timer's granularity is 15.6 ms; seen natively: 1.1998 s for 1.2 s).
+    /// The schedule is right; a bound stricter than the timer is not. The upper
+    /// bound is not widened.
+    const TIMER_SLACK: Duration = Duration::from_millis(20);
+
     /// However many datagrams for some other exchange reach the socket, the
     /// retransmissions leave when their waits say, and the rekey is given up on
     /// when the timeouts say: what arrives cannot lengthen a wait, and reading it
@@ -2777,7 +2785,7 @@ mod tests {
         let gaps: Vec<Duration> = times.windows(2).map(|w| w[1] - w[0]).collect();
         assert!(gaps.windows(2).all(|g| g[1] >= g[0] + Duration::from_millis(100)), "the waits between the sends were {gaps:?}");
         let budget = timeout * QUICK_MODE_ATTEMPTS;
-        assert!(elapsed >= budget && elapsed < budget + Duration::from_millis(600), "gave up after {elapsed:?}, budget {budget:?}");
+        assert!(elapsed + TIMER_SLACK >= budget && elapsed < budget + Duration::from_millis(600), "gave up after {elapsed:?}, budget {budget:?}");
     }
 
     /// The reason `IkeSocket` exists: a host whose ESP pump is the only reader

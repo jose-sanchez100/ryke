@@ -43,7 +43,7 @@ use crate::ikev2::informational::{
 };
 use crate::ikev2::message::{payloads, ExchangeType, IkeHeader, PayloadType};
 use crate::ikev1::quick::{ChildKeyMaterial, RekeyedChild};
-use crate::ikev2::natt::{unwrap_ike_4500, wrap_ike_4500};
+use crate::ikev2::natt::{is_ike_on_4500, unwrap_ike_4500, wrap_ike_4500};
 use crate::ikev2::negotiate::{self, ChosenEspSuite};
 use crate::ikev2::payload::{
     notify_type, notify_type_name, protocol_id, Configuration, Delete, Identification, Notify, SecurityAssociation, TrafficSelectors,
@@ -1742,7 +1742,7 @@ impl LivenessSession {
         // (§2.1): the peer answers a retransmission with the answer it already
         // gave, so no second SA is made.
         let request = self.outgoing(OnIkeSa::Current, req)?;
-        let response = match self.request_response(&request, mid, timeout)? {
+        let response = match self.request_response(&request, mid, Some(new_local_spi), timeout)? {
             Reply::Response(response) => response,
             Reply::PeerTornDown => return Err(IkeError::PeerTornDown.into()),
             Reply::Unanswered => {
@@ -3062,7 +3062,7 @@ impl LivenessSession {
         let req = ike_rekey::build_ike_rekey_request(&self.sa, mid, new_spi_i, &ni, &dh_private, &iv)?;
         let request = self.outgoing(OnIkeSa::Current, req)?;
         self.ike.rekeying = Some(OwnIkeRekey::default());
-        let reply = self.request_response(&request, mid, timeout);
+        let reply = self.request_response(&request, mid, None, timeout);
         let own = self.ike.rekeying.take().unwrap_or_default();
         let ours = match reply {
             // `INVALID_SYNTAX`, in either direction, ended the IKE SA this rekey
@@ -3148,11 +3148,33 @@ impl LivenessSession {
     /// [`Reply::Unanswered`] too when the peer deleted the IKE SA after
     /// rekeying it itself (see [`OwnIkeRekey::old_deleted`]): no answer is
     /// coming.
-    fn request_response(&mut self, request: &Outgoing, mid: u32, timeout: Duration) -> Result<Reply, DriverError> {
+    ///
+    /// `proposed` is the inbound SPI of the CHILD SA the request proposes, for
+    /// a `CREATE_CHILD_SA` that makes one (a rekey of a CHILD SA, or a new
+    /// one); `None` for any other request. RFC 7296 §2.8: "If an initiator
+    /// receives a message on an SA for which it has not received a response
+    /// to its CREATE_CHILD_SA request, it interprets that as a likely packet
+    /// loss and retransmits the CREATE_CHILD_SA request." So, on a floated
+    /// transport, an ESP-in-UDP datagram on that SPI read here before the
+    /// answer ([`is_esp_on`]) -- the peer took the request and sends on the
+    /// new SA, its answer lost -- has the request sent again at once, the same
+    /// bytes. Once per request: an extra send, which neither takes the place
+    /// of a scheduled retransmission nor moves one, and the request is given
+    /// up on when it would have been without it. Any other datagram that is
+    /// not IKE is passed over, as always. Without NAT-T, ESP is not UDP and
+    /// never reaches this socket. Nor does it on Linux with NAT-T: the kernel
+    /// takes ESP-in-UDP off the encapsulation socket, and drops a packet on an
+    /// SPI it has no state for, so this happens only where the caller relays
+    /// such a datagram to the session itself (see
+    /// [`Self::install_external_receiver`]). [`Self::send_and_await`] carries
+    /// INFORMATIONAL requests only, which propose no CHILD SA.
+    fn request_response(&mut self, request: &Outgoing, mid: u32, proposed: Option<u32>, timeout: Duration) -> Result<Reply, DriverError> {
         let waits = retransmit_waits(self.first_retransmit, timeout);
         let early = early_first_retransmit(self.first_retransmit, timeout).is_some();
         let exchange = request.header(self.float)?.exchange_type;
         let mut answer = Reassembly::new(self.answer_key(mid, exchange));
+        // The SPI whose ESP has the request sent again, until it has been.
+        let mut resend_on_esp = proposed.filter(|_| self.float);
         let first_sent = Instant::now();
         for (attempt, &wait) in waits.iter().enumerate() {
             if attempt > 0 {
@@ -3173,6 +3195,12 @@ impl LivenessSession {
                     Err(e) => return Err(e.into()),
                 };
                 crate::debug::dump("<<<", self.dest, &buf[..n]);
+                if let Some(spi_in) = resend_on_esp.filter(|&spi_in| is_esp_on(&buf[..n], spi_in)) {
+                    resend_on_esp = None;
+                    ike_debug!("request {mid}: ESP arrived on the CHILD SA it proposes (spi_in={spi_in:08x}) before its answer -- sending it again at once (RFC 7296 2.8)");
+                    request.send(&self.sock, self.dest)?;
+                    continue;
+                }
                 let Ok(msg) = unwrap(&buf[..n], self.float) else { continue };
                 let Ok(header) = IkeHeader::parse(&msg) else { continue };
                 let (header, msg, fragmented) = if header.next_payload == PayloadType::EncryptedFragment {
@@ -3572,6 +3600,15 @@ fn whole_from_peer(sa: &CompletedSaInit, header: IkeHeader, first: PayloadType, 
 
 fn wrap(msg: &[u8], float: bool) -> Vec<u8> {
     if float { wrap_ike_4500(msg) } else { msg.to_vec() }
+}
+
+/// Whether `datagram`, read off a floated transport (UDP 4500), is
+/// ESP-in-UDP on the SPI `spi` (RFC 3948 §2.1): not an IKE message behind the
+/// non-ESP marker, at least an ESP header long (SPI and sequence number, 8
+/// bytes -- so never the 1-byte NAT-T keepalive), its first four bytes `spi`
+/// big-endian.
+fn is_esp_on(datagram: &[u8], spi: u32) -> bool {
+    !is_ike_on_4500(datagram) && datagram.len() >= 8 && datagram[..4] == spi.to_be_bytes()
 }
 
 fn unwrap(dgram: &[u8], float: bool) -> Result<Vec<u8>, IkeError> {
@@ -9933,6 +9970,255 @@ mod tests {
         assert_eq!(probe_mid, 0, "on the new IKE SA");
         assert_eq!(lost, again, "a retransmission is the same bytes");
         assert!(took + TIMER_SLACK >= first && took < timeout / 2, "the earlier wait still holds: {took:?}");
+    }
+
+    // ESP on the CHILD SA a CREATE_CHILD_SA request of ours proposes, before its answer (RFC 7296 §2.8).
+
+    /// An ESP-in-UDP datagram on `spi`, as a peer sends it on a floated transport: SPI, sequence number `seq` and bytes
+    /// standing for the rest.
+    fn esp_datagram(spi: u32, seq: u32) -> Vec<u8> {
+        [spi.to_be_bytes(), seq.to_be_bytes()].concat().into_iter().chain([0xE5; 40]).collect()
+    }
+
+    /// A session as [`session_facing`] makes it, on a floated transport (UDP 4500, NAT-T): what it sends carries the
+    /// non-ESP marker, and what it takes for IKE must.
+    fn floated_session_facing(gateway: &UdpSocket, sa: CompletedSaInit) -> LivenessSession {
+        let mut liveness = session_facing(gateway, sa, None);
+        liveness.float = true;
+        liveness
+    }
+
+    /// The client's next datagram, its non-ESP marker taken off when `float`, with when it came and where from.
+    fn recv_client(sock: &UdpSocket, float: bool) -> (Vec<u8>, Instant, SocketAddr) {
+        let mut buf = [0u8; 4096];
+        let (n, from) = sock.recv_from(&mut buf).unwrap();
+        let msg = if float { unwrap_ike_4500(&buf[..n]).expect("an IKE message behind the non-ESP marker") } else { &buf[..n] };
+        (msg.to_vec(), Instant::now(), from)
+    }
+
+    /// The gateway takes the client's CREATE_CHILD_SA `request`: the inbound SPI it proposes -- the client's new SA,
+    /// which the gateway sends ESP on from then -- and the gateway's answer, wrapped for the transport when `float`.
+    fn take_child_request(sa: &CompletedSaInit, request: &[u8], float: bool) -> (u32, Vec<u8>) {
+        let (answer, child) = gateway_answers_rekey(sa, request, &[0x80u8; 32]);
+        (child.outbound.spi(), wrap(&answer, float))
+    }
+
+    /// The gateway takes a rekey request and its answer is lost; it then sends on the new SA. That ESP, on the SPI the
+    /// request proposes, has the request sent again at once -- well before the first scheduled retransmission, the
+    /// same bytes -- and the answer to it completes the rekey, on that SA.
+    #[test]
+    fn esp_on_the_sa_a_rekey_proposes_has_the_request_sent_again_at_once_and_the_answer_completes_it() {
+        let (first, timeout) = (Duration::from_secs(1), Duration::from_secs(5));
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = floated_session_facing(&gateway, init_sa);
+        liveness.set_first_retransmit(Some(first));
+        gateway.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let peer = thread::spawn(move || {
+            let (request, _, from) = recv_client(&gateway, true);
+            let (proposed, answer) = take_child_request(&resp_sa, &request, true); // the answer is lost
+            let esp_sent = Instant::now();
+            gateway.send_to(&esp_datagram(proposed, 1), from).unwrap();
+            let (again, again_at, _) = recv_client(&gateway, true);
+            gateway.send_to(&answer, from).unwrap();
+            (request, again, again_at.duration_since(esp_sent), proposed)
+        });
+        let started = Instant::now();
+        let negotiated = liveness.negotiate_rekey(ChildKind::Primary, timeout).expect("answered at the second send");
+        let took = started.elapsed();
+        let (request, again, resent_after, proposed) = peer.join().unwrap();
+        assert_eq!(request, again, "the same bytes");
+        assert!(resent_after < first / 4, "sent again on the ESP, not at the first retransmission: {resent_after:?} after it");
+        assert!(took < first / 2, "complete well before the first retransmission was due: {took:?}");
+        assert_eq!((negotiated.child.local_spi, negotiated.child.peer_spi), (proposed, PEER_L_SPI), "the SA the ESP came on");
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some((proposed, PEER_L_SPI)));
+    }
+
+    /// A rekey request never answered while the gateway sends on the SA it proposes, twice after every send of it: one
+    /// extra send in all, on the first ESP, and every scheduled one still at its time -- `first` on or off -- and the
+    /// request given up on at three timeouts, as without the ESP.
+    fn esp_resend_is_once_and_the_schedule_unchanged(first: Option<Duration>, timeout: Duration) {
+        let waits = retransmit_waits(first, timeout);
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = floated_session_facing(&gateway, init_sa);
+        liveness.set_first_retransmit(first);
+        let quiet = waits.iter().max().unwrap().saturating_add(Duration::from_millis(300));
+        gateway.set_read_timeout(Some(quiet)).unwrap();
+        let peer = thread::spawn(move || {
+            let mut sent = Vec::new();
+            let mut seq = 0;
+            let mut buf = [0u8; 4096];
+            while let Ok((n, from)) = gateway.recv_from(&mut buf) {
+                sent.push((Instant::now(), buf[..n].to_vec()));
+                let (proposed, _) = take_child_request(&resp_sa, unwrap_ike_4500(&buf[..n]).unwrap(), true);
+                for _ in 0..2 {
+                    seq += 1;
+                    gateway.send_to(&esp_datagram(proposed, seq), from).unwrap();
+                }
+            }
+            sent
+        });
+        let started = Instant::now();
+        let err = liveness.negotiate_rekey(ChildKind::Primary, timeout).map(|_| ()).expect_err("never answered");
+        let took = started.elapsed();
+        let sent = peer.join().unwrap();
+        let label = format!("first {first:?}, timeout {timeout:?}");
+        assert!(matches!(&err, DriverError::Io(e) if e.kind() == io::ErrorKind::TimedOut), "{label}: {err}");
+        assert_eq!(sent.len(), waits.len() + 1, "{label}: the schedule's sends and one more");
+        assert!(sent.iter().all(|(_, msg)| *msg == sent[0].1), "{label}: the same bytes every time");
+        let extra = sent[1].0.duration_since(started);
+        assert!(extra < waits[0] / 2, "{label}: the extra send at once on the first ESP, not at the first retransmission: {extra:?}");
+        let scheduled = [&sent[..1], &sent[2..]].concat();
+        let mut due = Duration::ZERO;
+        for (k, (at, _)) in scheduled.iter().enumerate() {
+            let after = at.duration_since(started);
+            assert!(after + TIMER_SLACK >= due && after < due + waits[0] * 3 / 4, "{label}: scheduled send {k} at {after:?}, due at {due:?}");
+            due += waits[k];
+        }
+        assert!(took + TIMER_SLACK >= timeout * 3 && took < timeout * 3 + Duration::from_millis(900), "{label}: given up on at {took:?}");
+    }
+
+    /// The extra send is once per request, with the earlier first retransmission on: it neither takes the place of a
+    /// scheduled retransmission nor moves one, and the request is given up on when it was before.
+    #[test]
+    fn esp_on_the_sa_a_rekey_proposes_has_it_sent_again_once_only_and_the_scheduled_retransmissions_stand() {
+        esp_resend_is_once_and_the_schedule_unchanged(Some(Duration::from_millis(200)), Duration::from_millis(600));
+    }
+
+    /// The gateway sends what is not ESP on the SA the rekey proposes -- ESP on another SPI, a NAT-T keepalive, a
+    /// datagram too short for an ESP header that begins with the SPI -- and, without NAT-T, a datagram that would be ESP
+    /// on that SPI: none has the request sent again before its retransmission is due.
+    #[test]
+    fn nothing_but_esp_on_the_sa_a_rekey_proposes_on_a_floated_transport_has_it_sent_again() {
+        let timeout = Duration::from_millis(400);
+        let strays = |proposed: u32| -> Vec<Vec<u8>> {
+            vec![esp_datagram(proposed ^ 1, 1), esp_datagram(0xBBBB, 2), vec![0xFF], [&proposed.to_be_bytes()[..], &[0, 0, 0]].concat()]
+        };
+        let not_floated = |proposed: u32| -> Vec<Vec<u8>> { vec![esp_datagram(proposed, 1)] };
+        for (float, strays) in [(true, &strays as &(dyn Fn(u32) -> Vec<Vec<u8>> + Sync)), (false, &not_floated)] {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut liveness = session_facing(&gateway, init_sa, None);
+            liveness.float = float;
+            gateway.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let (result, (request, quiet, again, proposed)) = thread::scope(|scope| {
+                let peer = scope.spawn(|| {
+                    let (request, _, from) = recv_client(&gateway, float);
+                    let (proposed, answer) = take_child_request(&resp_sa, &request, float);
+                    for stray in strays(proposed) {
+                        gateway.send_to(&stray, from).unwrap();
+                    }
+                    gateway.set_read_timeout(Some(timeout / 2)).unwrap();
+                    let quiet = gateway.recv_from(&mut [0u8; 4096]).is_err();
+                    gateway.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let (again, _, _) = recv_client(&gateway, float);
+                    gateway.send_to(&answer, from).unwrap();
+                    (request, quiet, again, proposed)
+                });
+                let started = Instant::now();
+                let result = liveness.negotiate_rekey(ChildKind::Primary, timeout).map(|n| (n.child.local_spi, started.elapsed()));
+                (result, peer.join().unwrap())
+            });
+            let (local_spi, took) = result.expect("answered at the scheduled retransmission");
+            assert!(quiet, "float {float}: nothing sent before the retransmission was due");
+            assert_eq!(request, again, "float {float}: the retransmission, the same bytes");
+            assert!(took + TIMER_SLACK >= timeout, "float {float}: complete only after the retransmission: {took:?}");
+            assert_eq!(local_spi, proposed);
+        }
+    }
+
+    /// A new CHILD SA (the IPv6 one) is proposed by a CREATE_CHILD_SA as a rekey is: ESP on it before the answer has
+    /// the request sent again at once, and the answer completes it.
+    #[test]
+    fn esp_on_the_ipv6_child_sa_a_request_proposes_has_it_sent_again_at_once() {
+        let timeout = Duration::from_secs(2);
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = floated_session_facing(&gateway, init_sa);
+        gateway.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let peer = thread::spawn(move || {
+            let (request, _, from) = recv_client(&gateway, true);
+            let (proposed, answer) = take_child_request(&resp_sa, &request, true);
+            let esp_sent = Instant::now();
+            gateway.send_to(&esp_datagram(proposed, 1), from).unwrap();
+            let (again, again_at, _) = recv_client(&gateway, true);
+            gateway.send_to(&answer, from).unwrap();
+            (request, again, again_at.duration_since(esp_sent), proposed)
+        });
+        let started = Instant::now();
+        let v6 = liveness.create_child_ipv6(timeout).expect("answered at the second send");
+        let took = started.elapsed();
+        let (request, again, resent_after, proposed) = peer.join().unwrap();
+        assert_eq!(request, again, "the same bytes");
+        assert!(resent_after < timeout / 8, "sent again on the ESP: {resent_after:?} after it");
+        assert!(took < timeout / 4, "complete well before the retransmission was due: {took:?}");
+        assert_eq!(v6.child.local_spi, proposed);
+        assert_eq!(liveness.child_spis(ChildKind::Ipv6), Some((proposed, PEER_L_SPI)));
+    }
+
+    /// Requests that propose no CHILD SA -- a liveness check and a Delete (INFORMATIONAL), a rekey of the IKE SA -- are
+    /// never sent again on ESP, whatever its SPI: each goes out exactly as often as without it.
+    #[test]
+    fn esp_never_has_a_request_that_proposes_no_child_sa_sent_again() {
+        #[derive(Debug, Clone, Copy)]
+        enum Exchange {
+            Probe,
+            Delete,
+            IkeRekey,
+        }
+        for exchange in [Exchange::Probe, Exchange::Delete, Exchange::IkeRekey] {
+            let (init_sa, _resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut liveness = floated_session_facing(&gateway, init_sa);
+            gateway.set_read_timeout(Some(Duration::from_millis(800))).unwrap();
+            let peer = thread::spawn(move || {
+                let mut sent = 0;
+                let mut buf = [0u8; 4096];
+                while let Ok((_, from)) = gateway.recv_from(&mut buf) {
+                    sent += 1;
+                    for (seq, spi) in [0xBBBB, 0xAAAA, 0x1234_5678, 0xFFFF_FFFF].into_iter().enumerate() {
+                        gateway.send_to(&esp_datagram(spi, seq as u32 + 1), from).unwrap();
+                    }
+                }
+                sent
+            });
+            match exchange {
+                Exchange::Probe => assert_eq!(liveness.probe(Duration::from_millis(200)).unwrap(), Liveness::NoReply),
+                Exchange::Delete => liveness.delete_child_sa(ChildSpis { local: 0xBBBB, peer: 0xAAAA }).unwrap(),
+                Exchange::IkeRekey => assert_eq!(liveness.rekey_ike(Duration::from_millis(200)).unwrap(), Liveness::NoReply),
+            }
+            assert_eq!(peer.join().unwrap(), REQUEST_SENDS as usize, "{exchange:?}: sent as without the ESP");
+        }
+    }
+
+    /// With the earlier first retransmission off, the default: ESP on the SA a rekey proposes has the request sent again
+    /// at once all the same, and the answer completes the rekey; never answered, the request goes out at 0, T and 2T,
+    /// plus the one extra send, and is given up on at 3T.
+    #[test]
+    fn without_an_earlier_first_retransmission_esp_on_the_sa_a_rekey_proposes_still_has_it_sent_again_once() {
+        let timeout = Duration::from_secs(2);
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = floated_session_facing(&gateway, init_sa);
+        gateway.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let peer = thread::spawn(move || {
+            let (request, _, from) = recv_client(&gateway, true);
+            let (proposed, answer) = take_child_request(&resp_sa, &request, true);
+            gateway.send_to(&esp_datagram(proposed, 1), from).unwrap();
+            let (again, _, _) = recv_client(&gateway, true);
+            gateway.send_to(&answer, from).unwrap();
+            (request == again, proposed)
+        });
+        let started = Instant::now();
+        let negotiated = liveness.negotiate_rekey(ChildKind::Primary, timeout).expect("answered at the second send");
+        let took = started.elapsed();
+        let (same, proposed) = peer.join().unwrap();
+        assert!(same, "the same bytes");
+        assert!(took < timeout / 4, "complete well before the retransmission was due: {took:?}");
+        assert_eq!(negotiated.child.local_spi, proposed);
+
+        esp_resend_is_once_and_the_schedule_unchanged(None, Duration::from_millis(300));
     }
 
     /// The exchange, Message ID and Response flag of a message from the client.

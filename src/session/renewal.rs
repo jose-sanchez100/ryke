@@ -6,8 +6,9 @@
 //! [`Spacing::schedule`](super::spacing::Spacing::schedule) is fed), a rekey of ours negotiated
 //! and not yet committed or abandoned ([`Negotiated`]), the switch of outbound to an SA this side
 //! answered for, deferred until the peer is known to have it ([`DeferredSwitch`]), and the SAs no
-//! longer the family's, with where each one's Delete stands ([`Retired`]). An SA's clock by age
-//! ([`AgeClock`]) is kept beside it, one per SA.
+//! longer the family's, with where each one's Delete stands ([`Retired`]): those whose Delete this
+//! side owes apart from the settled ones, within the bounds the caller gives ([`RetiredBounds`]).
+//! An SA's clock by age ([`AgeClock`]) is kept beside it, one per SA.
 //!
 //! The record records facts and answers queries: it decides nothing and does nothing. It retries
 //! no Delete -- it says which are owed -- and times nothing out -- it says when a deferred switch
@@ -18,8 +19,10 @@
 //! generation that tell one SA from the next, and the telling is the caller's.
 //!
 //! Nothing here reads a clock: every instant is the caller's, and so is every figure -- how long a
-//! deferred switch may wait, how many settled retired SAs are kept.
+//! deferred switch may wait, how many settled retired SAs are kept and how many owed ones there may
+//! be.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use super::spacing::LastAttempt;
@@ -204,6 +207,60 @@ impl Retired {
                 DeleteStand::NotSent | DeleteStand::Failed | DeleteStand::Unknown | DeleteStand::Sent { acknowledged: false }
             )
     }
+
+    /// The same SA as `other`: the same SPIs and the same generation, both (a `None` generation is
+    /// the same only as another `None`).
+    fn same_sa(&self, other: &Retired) -> bool {
+        self.spis == other.spis && self.generation == other.generation
+    }
+}
+
+/// The bounds on the retired SAs a record keeps; both figures are the caller's.
+///
+/// `settled_kept` bounds the settled entries -- its Delete answered, none owed, or the peer's to
+/// delete --: past it, the oldest settled one goes first. `owed_max` bounds nothing the record
+/// drops: it is where the caller stops *starting* what may owe another Delete
+/// ([`FamilyRenewal::owed_room`], asked before the operation). A Delete owed is kept whatever the
+/// count ([`Retirement::OverCapacity`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetiredBounds {
+    /// How many settled retired SAs are kept, at most.
+    pub settled_kept: usize,
+    /// How many retired SAs may stand with their Delete owed before the caller stops starting
+    /// what may owe another.
+    pub owed_max: usize,
+}
+
+/// What became of an SA retired ([`FamilyRenewal::retire_within`]).
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retirement {
+    /// Nothing owed for it: kept among the settled ones, within `settled_kept` (the oldest settled
+    /// one goes first -- with 0, it is not kept at all).
+    Settled,
+    /// Its Delete is owed: kept; `room` more may be owed within `owed_max` (0: at capacity).
+    Owed {
+        /// How many more may be owed within `owed_max`.
+        room: usize,
+    },
+    /// Its Delete is owed and the record already held `owed_max`: kept all the same -- `owed` are
+    /// held now. Refusing it would be dropping it.
+    OverCapacity {
+        /// How many are owed now, this one included.
+        owed: usize,
+    },
+}
+
+/// What became of an update of an owed Delete ([`FamilyRenewal::update`]).
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Update {
+    /// No owed entry of that SA, by its SPIs and its generation: nothing changed.
+    NoSuchDebt,
+    /// Updated, and its Delete still owed: in its place among the owed ones.
+    Owed,
+    /// Updated, and no longer owed: put last among the settled ones, within `settled_kept`.
+    Settled,
 }
 
 /// The renewal record of one family of CHILD SAs: its last attempt, a rekey of ours negotiated and
@@ -215,8 +272,10 @@ pub struct FamilyRenewal<T> {
     last_attempt: Option<LastAttempt>,
     negotiated: Option<Negotiated>,
     switch: Option<DeferredSwitch<T>>,
-    /// Oldest first.
-    retired: Vec<Retired>,
+    /// The retired SAs whose Delete this side owes, oldest first; never dropped.
+    owed: Vec<Retired>,
+    /// The other retired SAs, oldest first; at most what the caller keeps.
+    settled: VecDeque<Retired>,
 }
 
 impl<T: Copy> Default for FamilyRenewal<T> {
@@ -228,7 +287,7 @@ impl<T: Copy> Default for FamilyRenewal<T> {
 impl<T: Copy> FamilyRenewal<T> {
     /// A family with nothing recorded: no attempt, nothing pending, nothing retired.
     pub fn new() -> Self {
-        Self { last_attempt: None, negotiated: None, switch: None, retired: Vec::new() }
+        Self { last_attempt: None, negotiated: None, switch: None, owed: Vec::new(), settled: VecDeque::new() }
     }
 
     /// The last renewal attempt, as [`Spacing::schedule`](super::spacing::Spacing::schedule) takes
@@ -323,30 +382,95 @@ impl<T: Copy> FamilyRenewal<T> {
         self.switch.is_some_and(|switch| switch.replaced.0 == local_spi)
     }
 
-    /// An SA is no longer the family's. It is kept last. An entry whose Delete this side owes
-    /// ([`owed`](Self::owed)) is never dropped: owed entries stay, in the order retired among all,
-    /// until the record itself is dropped -- nothing here settles one yet (a later phase's). `kept`
-    /// bounds the settled entries only -- its Delete answered, none owed, or the peer's to delete --:
-    /// past `kept` settled ones, the oldest settled goes first, even the one just retired. `kept` is
-    /// the caller's; with 0, no settled entry is kept, and every owed one is.
-    pub fn retire(&mut self, r: Retired, kept: usize) {
-        self.retired.push(r);
-        while self.retired.iter().filter(|r| !r.owed()).count() > kept {
-            let Some(oldest_settled) = self.retired.iter().position(|r| !r.owed()) else { break };
-            self.retired.remove(oldest_settled);
+    /// An SA is no longer the family's, kept last among the owed ones or the settled ones, by
+    /// whether this side owes its Delete (not tried, failed, not known to have gone, or sent with no
+    /// answer yet). The record never drops, refuses or overwrites an owed entry: not at
+    /// `bounds.owed_max`, not past it -- an owed Delete is kept whatever the count, and
+    /// [`Retirement::OverCapacity`] says so. A settled one is kept within `bounds.settled_kept`:
+    /// past it the oldest settled one goes first, even the one just retired (with 0, none is kept).
+    /// Walks nothing.
+    ///
+    /// What settles a debt later ([`update`](Self::update)) is the caller's to know and to have
+    /// evidence of: the peer's answer to this side's Delete of that SA, the peer's own Delete of it,
+    /// or the end of the IKE SA it was made under. Never its age, a timeout, or another SA put in
+    /// its place: nothing in the record settles one by itself, and nothing here sends a Delete again.
+    pub fn retire_within(&mut self, r: Retired, bounds: RetiredBounds) -> Retirement {
+        if !r.owed() {
+            self.keep_settled(r, bounds.settled_kept);
+            return Retirement::Settled;
+        }
+        let before = self.owed.len();
+        self.owed.push(r);
+        if before >= bounds.owed_max {
+            Retirement::OverCapacity { owed: self.owed.len() }
+        } else {
+            Retirement::Owed { room: bounds.owed_max - self.owed.len() }
         }
     }
 
-    /// The retired SAs kept, oldest first.
-    pub fn retired(&self) -> &[Retired] {
-        &self.retired
+    /// Where an owed Delete came to. The SA is named by `r.spis` and `r.generation`, both (a `None`
+    /// generation names only an entry with `None`): the oldest owed entry of exactly that SA takes
+    /// `r.deleted_by` and `r.stand`. Still owed, it stays in its place ([`Update::Owed`]); no longer
+    /// owed, it leaves the owed ones (their order kept) and is put last among the settled ones,
+    /// within `bounds.settled_kept` ([`Update::Settled`]). With no owed entry of that SA, nothing
+    /// changes ([`Update::NoSuchDebt`]): an update never records an SA, never touches a settled
+    /// entry, nor an entry of the same SPIs in another generation, nor another SA. Two owed entries
+    /// of the same SA are the caller's error: both are kept, and the oldest is the one updated.
+    ///
+    /// Only evidence settles a debt, and it is the caller's to have: the peer's answer to this
+    /// side's Delete of that SA (`Sent { acknowledged: true }`), the peer's own Delete of it
+    /// ([`Party::Peers`]), the end of the IKE SA it was made under ([`DeleteStand::NotOwed`]).
+    /// `bounds.owed_max` is not looked at.
+    pub fn update(&mut self, r: Retired, bounds: RetiredBounds) -> Update {
+        let Some(at) = self.owed.iter().position(|owed| owed.same_sa(&r)) else { return Update::NoSuchDebt };
+        let entry = &mut self.owed[at];
+        entry.deleted_by = r.deleted_by;
+        entry.stand = r.stand;
+        if entry.owed() {
+            return Update::Owed;
+        }
+        let settled = self.owed.remove(at);
+        self.keep_settled(settled, bounds.settled_kept);
+        Update::Settled
+    }
+
+    /// How many more Deletes may be owed within `owed_max`: 0 at it, and past it. The caller asks it
+    /// before it starts what may owe another.
+    pub fn owed_room(&self, owed_max: usize) -> usize {
+        owed_max.saturating_sub(self.owed.len())
     }
 
     /// The retired SAs whose Delete this side owes and has not had answered (not tried, failed, not
     /// known to have gone, or sent with no answer yet), oldest first. Nothing here sends one again:
     /// when, and whether, is the caller's.
-    pub fn owed(&self) -> impl Iterator<Item = &Retired> {
-        self.retired.iter().filter(|r| r.owed())
+    pub fn owed(&self) -> &[Retired] {
+        &self.owed
+    }
+
+    /// The settled retired SAs kept -- their Delete answered, none owed, or the peer's to delete --,
+    /// oldest first.
+    pub fn settled(&self) -> impl ExactSizeIterator<Item = &Retired> + '_ {
+        self.settled.iter()
+    }
+
+    /// Transitional, removed once the consumer is on [`retire_within`](Self::retire_within):
+    /// that, with `kept` settled entries and no bound on the owed ones.
+    pub fn retire(&mut self, r: Retired, kept: usize) {
+        let _ = self.retire_within(r, RetiredBounds { settled_kept: kept, owed_max: usize::MAX });
+    }
+
+    /// Transitional, removed once the consumer is on [`owed`](Self::owed) and
+    /// [`settled`](Self::settled): the owed ones, oldest first, then the settled ones, oldest first.
+    pub fn retired(&self) -> Vec<Retired> {
+        self.owed.iter().chain(&self.settled).copied().collect()
+    }
+
+    /// `r`, settled, kept last among the settled ones; past `kept`, the oldest goes first.
+    fn keep_settled(&mut self, r: Retired, kept: usize) {
+        self.settled.push_back(r);
+        while self.settled.len() > kept {
+            self.settled.pop_front();
+        }
     }
 }
 
@@ -593,89 +717,87 @@ mod tests {
         assert!(!f.waits_on_delete_of(0x11), "switched: it waits on nothing");
     }
 
+    /// Bounds keeping `settled_kept` settled entries, with no bound on the owed ones that matters.
+    fn kept(settled_kept: usize) -> RetiredBounds {
+        RetiredBounds { settled_kept, owed_max: usize::MAX }
+    }
+
+    /// An SA on SPIs `(n, n + 0x100)` in generation `generation`.
+    fn sa(n: u32, generation: Option<u64>, deleted_by: Party, stand: DeleteStand) -> Retired {
+        Retired { spis: (n, n + 0x100), generation, deleted_by, stand }
+    }
+
+    fn settled_of(f: &FamilyRenewal<u64>) -> Vec<Retired> {
+        f.settled().copied().collect()
+    }
+
+    /// Every way of being settled: its Delete answered, none owed, or the peer's to delete whatever
+    /// its stand.
+    const SETTLED: [(Party, DeleteStand); 8] = [
+        (Ours, Sent { acknowledged: true }),
+        (Ours, NotOwed("not_asked")),
+        (Peers, Sent { acknowledged: true }),
+        (Peers, Sent { acknowledged: false }),
+        (Peers, NotSent),
+        (Peers, NotOwed("the peer deleted it")),
+        (Peers, Failed),
+        (Peers, Unknown),
+    ];
+
+    /// Every way of being owed.
+    const OWED: [DeleteStand; 4] = [NotSent, Failed, Unknown, Sent { acknowledged: false }];
+
     #[test]
-    fn retired_sas_are_kept_oldest_first_and_the_oldest_settled_one_goes_first() {
+    fn settled_sas_are_kept_within_what_is_kept_and_the_oldest_settled_one_goes_first() {
+        for kept_n in [0, 1, 2, 3, 20] {
+            let mut f = FamilyRenewal::<u64>::new();
+            let mut all = Vec::new();
+            for (n, (by, stand)) in SETTLED.into_iter().enumerate() {
+                let r = retired(n as u32 + 1, by, stand);
+                assert_eq!(f.retire_within(r, kept(kept_n)), Retirement::Settled, "{r:?}");
+                all.push(r);
+                let from = all.len().saturating_sub(kept_n);
+                assert_eq!(settled_of(&f), all[from..], "kept {kept_n}: the newest ones, oldest first");
+                assert!(f.settled().len() <= kept_n);
+            }
+            assert!(f.owed().is_empty(), "none owed");
+        }
+        // The oldest settled one goes first, though an older owed one stays; the one just retired
+        // goes too when nothing is kept.
         let mut f = FamilyRenewal::<u64>::new();
-        let (a, b, c) = (retired(1, Ours, NotSent), retired(2, Ours, Sent { acknowledged: true }), retired(3, Ours, Failed));
+        let (a, b, c, d) = (retired(1, Ours, NotSent), retired(2, Ours, Sent { acknowledged: true }), retired(3, Ours, Failed), retired(4, Ours, NotOwed("not_asked")));
         for r in [a, b, c] {
-            f.retire(r, 1);
+            let _ = f.retire_within(r, kept(1));
         }
-        assert_eq!(f.retired(), [a, b, c], "in the order retired: one settled, as many as are kept");
-        let d = retired(4, Ours, NotOwed("not_asked"));
-        f.retire(d, 1);
-        assert_eq!(f.retired(), [a, c, d], "past one settled, the oldest settled one went, though not the oldest");
-        let e = retired(5, Ours, Sent { acknowledged: false });
-        f.retire(e, 1);
-        assert_eq!(f.retired(), [a, c, d, e], "an owed one: nothing goes");
-        // None settled: nothing goes, however few are kept.
-        let mut f = FamilyRenewal::<u64>::new();
-        let owed = [retired(1, Ours, NotSent), retired(2, Ours, Failed), retired(3, Ours, Unknown), retired(4, Ours, Sent { acknowledged: false })];
-        for r in owed {
-            f.retire(r, 1);
-        }
-        assert_eq!(f.retired(), owed, "none settled: nothing goes");
-        // Each way of being settled goes before an older entry that is owed.
-        for settled in [Sent { acknowledged: true }, NotOwed("the peer deleted it")] {
-            let mut f = FamilyRenewal::<u64>::new();
-            let (owed, done, new) = (retired(1, Ours, NotSent), retired(2, Ours, settled), retired(3, Ours, Failed));
-            for r in [owed, done, new] {
-                f.retire(r, 0);
-            }
-            assert_eq!(f.retired(), [owed, new], "{settled:?}");
-        }
-        for stand in [NotSent, Failed, Unknown, Sent { acknowledged: false }] {
-            let mut f = FamilyRenewal::<u64>::new();
-            let (owed, peers, new) = (retired(1, Ours, NotSent), retired(2, Peers, stand), retired(3, Ours, Failed));
-            for r in [owed, peers, new] {
-                f.retire(r, 0);
-            }
-            assert_eq!(f.retired(), [owed, new], "the peer's to delete is settled whatever its stand: {stand:?}");
-        }
-        // The one just retired goes too, when it is the oldest settled one past what is kept.
-        let mut f = FamilyRenewal::<u64>::new();
-        let (x, y, z) = (retired(1, Ours, NotSent), retired(2, Ours, Failed), retired(3, Peers, NotOwed("the peer's")));
-        for r in [x, y, z] {
-            f.retire(r, 0);
-        }
-        assert_eq!(f.retired(), [x, y]);
+        assert_eq!((f.owed(), settled_of(&f)), (&[a, c][..], vec![b]));
+        assert_eq!(f.retire_within(d, kept(1)), Retirement::Settled);
+        assert_eq!((f.owed(), settled_of(&f)), (&[a, c][..], vec![d]), "past one settled, the oldest settled one went, not the older owed one");
+        assert_eq!(f.retire_within(retired(5, Peers, NotOwed("the peer's")), kept(0)), Retirement::Settled);
+        assert_eq!((f.owed(), f.settled().len()), (&[a, c][..], 0), "with 0 kept, none: not even the one just retired");
     }
 
     #[test]
-    fn with_nothing_to_keep_no_settled_entry_is_kept_and_every_owed_one_is() {
-        let mut f = FamilyRenewal::<u64>::new();
-        for r in [retired(1, Ours, Sent { acknowledged: true }), retired(2, Peers, Sent { acknowledged: true }), retired(3, Ours, NotOwed("not_asked"))] {
-            f.retire(r, 0);
-            assert!(f.retired().is_empty(), "{r:?}");
+    fn an_owed_sa_is_never_dropped_and_its_room_is_exact_up_to_the_bound_and_past_it() {
+        for owed_max in [0, 1, 3, 8] {
+            for settled_kept in [0, 2] {
+                let bounds = RetiredBounds { settled_kept, owed_max };
+                let mut f = FamilyRenewal::<u64>::new();
+                let mut owed = Vec::new();
+                assert_eq!(f.owed_room(owed_max), owed_max, "nothing owed yet");
+                for n in 0..owed_max + 4 {
+                    let r = retired(n as u32 + 1, Ours, OWED[n % OWED.len()]);
+                    let expected = if n < owed_max { Retirement::Owed { room: owed_max - n - 1 } } else { Retirement::OverCapacity { owed: n + 1 } };
+                    assert_eq!(f.retire_within(r, bounds), expected, "{owed_max}: the {}th", n + 1);
+                    owed.push(r);
+                    assert_eq!(f.owed(), owed, "{owed_max}: every one before still there, in order, as it was");
+                    assert_eq!(f.owed_room(owed_max), owed_max.saturating_sub(n + 1), "{owed_max}: saturating past the bound");
+                    // A settled one in between drops none of them.
+                    assert_eq!(f.retire_within(retired(1000 + n as u32, Ours, Sent { acknowledged: true }), bounds), Retirement::Settled);
+                    assert_eq!(f.owed(), owed);
+                    assert_eq!(f.settled().len(), settled_kept.min(n + 1));
+                }
+            }
         }
-        assert_eq!(f.owed().count(), 0);
-        f.retire(retired(4, Ours, NotSent), 0);
-        f.retire(retired(5, Peers, Failed), 0);
-        f.retire(retired(6, Ours, Failed), 0);
-        f.retire(retired(7, Ours, Unknown), 0);
-        assert_eq!(f.retired(), [retired(4, Ours, NotSent), retired(6, Ours, Failed), retired(7, Ours, Unknown)], "every owed one kept, oldest first");
-        assert_eq!(f.owed().count(), 3);
-    }
-
-    #[test]
-    fn owed_deletes_are_never_dropped_however_many_and_settled_ones_stay_within_what_is_kept() {
-        let mut f = FamilyRenewal::<u64>::new();
-        let owed_stands = [NotSent, Failed, Unknown, Sent { acknowledged: false }];
-        let mut owed = Vec::new();
-        let mut settled = Vec::new();
-        for n in 0..20u32 {
-            let r = retired(2 * n + 1, Ours, owed_stands[n as usize % owed_stands.len()]);
-            f.retire(r, 2);
-            owed.push(r);
-            let s = if n % 2 == 0 { retired(2 * n + 2, Ours, Sent { acknowledged: true }) } else { retired(2 * n + 2, Peers, NotOwed("the peer deleted it")) };
-            f.retire(s, 2);
-            settled.push(s);
-            let kept_settled = f.retired().iter().filter(|r| settled.contains(r)).count();
-            assert!(kept_settled <= 2, "after {n}: {kept_settled} settled kept");
-        }
-        assert_eq!(f.owed().copied().collect::<Vec<_>>(), owed, "all 20 owed, oldest first");
-        let mut expected = owed[..19].to_vec();
-        expected.extend([settled[18], owed[19], settled[19]]);
-        assert_eq!(f.retired(), expected, "the owed ones in the order retired, and the two newest settled ones in their places");
     }
 
     #[test]
@@ -696,13 +818,127 @@ mod tests {
             (retired(12, Peers, Unknown), false),
         ];
         for (r, _) in all {
-            f.retire(r, all.len());
+            let _ = f.retire_within(r, kept(all.len()));
         }
-        let owed: Vec<Retired> = f.owed().copied().collect();
         let expected: Vec<Retired> = all.iter().filter(|(_, owed)| *owed).map(|(r, _)| *r).collect();
-        assert_eq!(owed, expected, "oldest first");
-        assert_eq!(owed.iter().map(|r| r.spis.0).collect::<Vec<_>>(), [2, 3, 5, 11]);
-        assert_eq!(f.retired().len(), all.len(), "a query takes nothing");
+        assert_eq!(f.owed(), expected, "oldest first");
+        assert_eq!(f.owed().iter().map(|r| r.spis.0).collect::<Vec<_>>(), [2, 3, 5, 11]);
+        let expected: Vec<Retired> = all.iter().filter(|(_, owed)| !*owed).map(|(r, _)| *r).collect();
+        assert_eq!(settled_of(&f), expected, "oldest first");
+        assert_eq!(f.owed().len() + f.settled().len(), all.len(), "a query takes nothing");
+    }
+
+    #[test]
+    fn an_update_names_an_sa_by_its_spis_and_its_generation_and_reaches_no_other() {
+        let bounds = RetiredBounds { settled_kept: 4, owed_max: 8 };
+        let mut f = FamilyRenewal::<u64>::new();
+        let (a1, a2, b_none, b2) = (sa(1, Some(1), Ours, NotSent), sa(1, Some(2), Ours, Failed), sa(2, None, Ours, Unknown), sa(2, Some(2), Ours, Sent { acknowledged: false }));
+        let done = sa(3, Some(3), Ours, Sent { acknowledged: true });
+        for r in [a1, a2, b_none, done, b2] {
+            let _ = f.retire_within(r, bounds);
+        }
+        assert_eq!((f.owed(), settled_of(&f)), (&[a1, a2, b_none, b2][..], vec![done]));
+        let answered = |r: Retired| Retired { stand: Sent { acknowledged: true }, ..r };
+        for (what, r) in [
+            ("a settled entry", answered(done)),
+            ("a settled entry, still owed by the update", Retired { stand: Failed, ..done }),
+            ("an unknown SA", sa(9, Some(9), Ours, Sent { acknowledged: true })),
+            ("the right SPIs, a generation none has", answered(sa(1, Some(3), Ours, NotSent))),
+            ("the right SPIs, no generation where theirs is known", answered(sa(1, None, Ours, NotSent))),
+            ("the right generation, other SPIs", answered(sa(4, Some(2), Ours, NotSent))),
+            ("the local SPI right, the peer's not", Retired { spis: (1, 0x999), ..answered(a1) }),
+        ] {
+            let before = f.clone();
+            assert_eq!(f.update(r, bounds), Update::NoSuchDebt, "{what}");
+            assert_eq!(f, before, "{what}: nothing changes");
+        }
+        // Of the same SPIs, only the generation named.
+        assert_eq!(f.update(answered(a2), bounds), Update::Settled);
+        assert_eq!((f.owed(), settled_of(&f)), (&[a1, b_none, b2][..], vec![done, answered(a2)]), "a1, of the same SPIs, untouched");
+        // `None` names only `None`, `Some` only `Some`.
+        assert_eq!(f.update(Retired { stand: Unknown, ..b2 }, bounds), Update::Owed);
+        assert_eq!(f.owed(), [a1, b_none, Retired { stand: Unknown, ..b2 }], "b2 updated in place, b_none untouched");
+        assert_eq!(f.update(Retired { stand: Failed, ..b_none }, bounds), Update::Owed);
+        assert_eq!(f.owed(), [a1, Retired { stand: Failed, ..b_none }, Retired { stand: Unknown, ..b2 }]);
+    }
+
+    #[test]
+    fn an_update_still_owed_stays_in_place_and_one_settled_by_evidence_moves_last_among_the_settled() {
+        // Owed to owed: in place, its order kept, by each stand still owed.
+        let bounds = RetiredBounds { settled_kept: 2, owed_max: 4 };
+        let mut f = FamilyRenewal::<u64>::new();
+        let (a, b, c) = (retired(1, Ours, NotSent), retired(2, Ours, NotSent), retired(3, Ours, NotSent));
+        for r in [a, b, c] {
+            let _ = f.retire_within(r, bounds);
+        }
+        for stand in OWED {
+            assert_eq!(f.update(Retired { stand, ..b }, bounds), Update::Owed, "{stand:?}");
+            assert_eq!(f.owed(), [a, Retired { stand, ..b }, c], "{stand:?}: in its place");
+            assert_eq!(f.owed_room(4), 1);
+        }
+        // Owed to settled, by each of the three kinds of evidence.
+        let evidence = [(Ours, Sent { acknowledged: true }), (Peers, NotOwed("gateway_deleted")), (Peers, Sent { acknowledged: false }), (Ours, NotOwed("ike_sa_gone"))];
+        for settled_kept in [0, 1, 2] {
+            for (by, stand) in evidence {
+                let bounds = RetiredBounds { settled_kept, owed_max: 4 };
+                let mut f = FamilyRenewal::<u64>::new();
+                let (s1, s2) = (retired(10, Ours, Sent { acknowledged: true }), retired(11, Peers, NotOwed("peer_deletes")));
+                for r in [a, s1, b, s2, c] {
+                    let _ = f.retire_within(r, bounds);
+                }
+                let room = f.owed_room(4);
+                let now_settled = Retired { deleted_by: by, stand, ..b };
+                assert_eq!(f.update(now_settled, bounds), Update::Settled, "{by:?} {stand:?}");
+                assert_eq!(f.owed(), [a, c], "{by:?} {stand:?}: gone from the owed ones, their order kept");
+                let mut expected = vec![s1, s2, now_settled];
+                expected.drain(..expected.len().saturating_sub(settled_kept));
+                assert_eq!(settled_of(&f), expected, "kept {settled_kept}: last among the settled ones, within what is kept");
+                assert_eq!(f.owed_room(4), room + 1, "room for one more");
+                let before = f.clone();
+                assert_eq!(f.update(now_settled, bounds), Update::NoSuchDebt, "settled: no debt any more");
+                assert_eq!(f, before);
+            }
+        }
+    }
+
+    #[test]
+    fn of_two_owed_entries_of_the_same_sa_the_oldest_is_updated() {
+        let bounds = RetiredBounds { settled_kept: 4, owed_max: 4 };
+        let mut f = FamilyRenewal::<u64>::new();
+        let (first, other, second) = (retired(1, Ours, NotSent), retired(2, Ours, NotSent), retired(1, Ours, Failed));
+        for r in [first, other, second] {
+            let _ = f.retire_within(r, bounds);
+        }
+        assert_eq!(f.update(Retired { stand: Unknown, ..first }, bounds), Update::Owed);
+        assert_eq!(f.owed(), [Retired { stand: Unknown, ..first }, other, second], "the oldest, both kept");
+        assert_eq!(f.update(Retired { stand: Sent { acknowledged: true }, ..first }, bounds), Update::Settled);
+        assert_eq!(f.owed(), [other, second], "the oldest settled; the other stays owed");
+        assert_eq!(f.update(Retired { stand: Sent { acknowledged: true }, ..first }, bounds), Update::Settled, "then the other");
+        assert_eq!(f.owed(), [other]);
+    }
+
+    #[test]
+    fn many_settled_sas_with_a_few_owed_ones_in_between_keep_the_settled_ones_bounded_and_every_owed_one() {
+        let bounds = RetiredBounds { settled_kept: 8, owed_max: 8 };
+        let mut f = FamilyRenewal::<u64>::new();
+        let (mut owed, mut settled) = (Vec::new(), Vec::new());
+        for n in 0..500u32 {
+            let r = if n % 37 == 5 {
+                let r = retired(n, Ours, OWED[owed.len() % OWED.len()]);
+                owed.push(r);
+                r
+            } else {
+                let (by, stand) = SETTLED[n as usize % SETTLED.len()];
+                let r = retired(n, by, stand);
+                settled.push(r);
+                r
+            };
+            let _ = f.retire_within(r, bounds);
+            assert!(f.settled().len() <= bounds.settled_kept, "after {n}");
+            assert_eq!(f.owed(), owed, "after {n}: every owed one");
+        }
+        assert!(owed.len() > bounds.owed_max, "past the bound: {}", owed.len());
+        assert_eq!(settled_of(&f), settled[settled.len() - bounds.settled_kept..], "the newest settled ones, oldest first");
     }
 
     #[test]
@@ -715,11 +951,11 @@ mod tests {
         f.attempt_started(t0);
         f.negotiated(n);
         f.defer_switch(s);
-        f.retire(retired(1, Ours, NotSent), 4);
+        assert_eq!(f.retire_within(retired(1, Ours, NotSent), RetiredBounds { settled_kept: 4, owed_max: 4 }), Retirement::Owed { room: 3 });
         assert_eq!(f.take_switch(), Some(s));
         assert_eq!(f.pending(), Some(n), "taking the switch resolves nothing");
         assert_eq!(f.resolve(0x21), Some(n));
         assert_eq!(f.last_attempt(), Some(LastAttempt { started: t0, failed: false }), "resolving is not a failure, nor a new attempt");
-        assert_eq!(f.retired(), [retired(1, Ours, NotSent)]);
+        assert_eq!((f.owed(), f.settled().len()), (&[retired(1, Ours, NotSent)][..], 0));
     }
 }

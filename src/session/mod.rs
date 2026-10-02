@@ -36,11 +36,24 @@ pub enum Rounding {
 
 /// A fraction `num / den` of an amount, with its [`Rounding`]: where in a lifetime or a volume
 /// something is to happen.
+///
+/// A share also says which arithmetic [`of`](Self::of) uses, fixed by the constructor it was made
+/// with; two shares that differ only in that are not equal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Share {
     num: u64,
     den: u64,
     rounding: Rounding,
+    arithmetic: Arithmetic,
+}
+
+/// Which arithmetic a [`Share`] is computed with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arithmetic {
+    /// [`Share::new`]'s.
+    Exact,
+    /// [`Share::saturating_u64`]'s: the product taken in `u64`, saturating.
+    SaturatingU64,
 }
 
 impl Share {
@@ -49,9 +62,21 @@ impl Share {
     /// Panics if `den == 0` (a share of nothing) or `num > den` (more than the whole); in a `const`,
     /// either is a compile error.
     pub const fn new(num: u64, den: u64, rounding: Rounding) -> Self {
+        Self::checked(num, den, rounding, Arithmetic::Exact)
+    }
+
+    /// The share `num / den` of an amount, rounded as `rounding` says, computed with the historical
+    /// arithmetic, for a consumer whose figures were validated with it.
+    ///
+    /// Panics as [`new`](Self::new) does.
+    pub const fn saturating_u64(num: u64, den: u64, rounding: Rounding) -> Self {
+        Self::checked(num, den, rounding, Arithmetic::SaturatingU64)
+    }
+
+    const fn checked(num: u64, den: u64, rounding: Rounding, arithmetic: Arithmetic) -> Self {
         assert!(den > 0, "a share needs a non-zero denominator");
         assert!(num <= den, "a share is never more than the whole");
-        Self { num, den, rounding }
+        Self { num, den, rounding, arithmetic }
     }
 
     /// This share of `amount`, in integers, with no overflow and never more than `amount`:
@@ -67,6 +92,13 @@ impl Share {
     /// Either way the result is between `0` and `amount`, and it is exact whenever the product fits
     /// a `u64`.
     pub const fn of(self, amount: u64) -> u64 {
+        match self.arithmetic {
+            Arithmetic::Exact | Arithmetic::SaturatingU64 => self.saturating_of(amount),
+        }
+    }
+
+    /// [`Share::saturating_u64`]'s arithmetic.
+    const fn saturating_of(self, amount: u64) -> u64 {
         match self.rounding {
             Rounding::Down => amount.saturating_mul(self.num) / self.den,
             Rounding::Up => amount - amount.saturating_mul(self.den - self.num) / self.den,
@@ -189,5 +221,64 @@ mod tests {
     #[should_panic(expected = "more than the whole")]
     fn a_share_above_the_whole_is_refused() {
         let _ = Share::new(11, 10, Rounding::Up);
+    }
+
+    const EIGHT_TENTHS_U64: Share = Share::saturating_u64(8, 10, Rounding::Down);
+    const HALF_UP_U64: Share = Share::saturating_u64(1, 2, Rounding::Up);
+
+    #[test]
+    fn the_historical_arithmetic_is_the_two_integer_formulas_it_was_validated_as() {
+        for x in spread() {
+            assert_eq!(EIGHT_TENTHS_U64.of(x), x.saturating_mul(8) / 10, "{x}");
+            assert_eq!(HALF_UP_U64.of(x), x - x / 2, "{x}");
+        }
+    }
+
+    #[test]
+    fn the_historical_arithmetic_saturates_early_rounding_down_and_late_rounding_up() {
+        assert_eq!(EIGHT_TENTHS_U64.of(u64::MAX), u64::MAX / 10);
+        assert_eq!(EIGHT_TENTHS_U64.of(u64::MAX / 8), 1_844_674_407_370_955_160, "the last amount whose product fits");
+        assert_eq!(EIGHT_TENTHS_U64.of(u64::MAX / 8 + 1), 1_844_674_407_370_955_161, "the first that saturates");
+        let third_up = Share::saturating_u64(1, 3, Rounding::Up);
+        assert_eq!(third_up.of(u64::MAX), u64::MAX - u64::MAX / 3);
+        assert!(third_up.of(u64::MAX) > u64::MAX / 3 + 1);
+        assert_eq!(HALF_UP_U64.of(u64::MAX), u64::MAX / 2 + 1, "half rounded up never saturates: den - num is 1");
+        for amount in [u64::MAX / 7 + 1, u64::MAX] {
+            assert_eq!(Share::saturating_u64(7, 7, Rounding::Down).of(amount), u64::MAX / 7, "{amount}");
+            assert_eq!(Share::saturating_u64(7, 7, Rounding::Up).of(amount), amount, "{amount}");
+            assert_eq!(Share::saturating_u64(0, 7, Rounding::Down).of(amount), 0, "{amount}");
+            assert_eq!(Share::saturating_u64(0, 7, Rounding::Up).of(amount), amount - u64::MAX / 7, "{amount}");
+        }
+        for share in [EIGHT_TENTHS_U64, HALF_UP_U64, Share::saturating_u64(1, u64::MAX, Rounding::Up)] {
+            for amount in spread() {
+                assert!(share.of(amount) <= amount, "{share:?} of {amount}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_historical_arithmetic_can_disagree_on_equivalent_fractions_as_documented() {
+        // 1000 * u64::MAX saturates to u64::MAX, and u64::MAX / u64::MAX is 1: not the whole.
+        assert_eq!(Share::saturating_u64(1, 1, Rounding::Down).of(1000), 1000);
+        assert_eq!(Share::saturating_u64(u64::MAX, u64::MAX, Rounding::Down).of(1000), 1);
+    }
+
+    #[test]
+    fn shares_that_differ_only_in_their_arithmetic_are_not_equal() {
+        assert_ne!(Share::new(8, 10, Rounding::Down), EIGHT_TENTHS_U64);
+        assert_eq!(Share::saturating_u64(8, 10, Rounding::Down), EIGHT_TENTHS_U64);
+        assert_ne!(Share::saturating_u64(4, 5, Rounding::Down), EIGHT_TENTHS_U64, "equal fractions, not equal shares");
+    }
+
+    #[test]
+    #[should_panic(expected = "non-zero denominator")]
+    fn a_historical_share_of_nothing_is_refused() {
+        let _ = Share::saturating_u64(0, 0, Rounding::Down);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than the whole")]
+    fn a_historical_share_above_the_whole_is_refused() {
+        let _ = Share::saturating_u64(11, 10, Rounding::Up);
     }
 }

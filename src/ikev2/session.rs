@@ -9257,6 +9257,12 @@ mod tests {
 
     // An earlier first retransmission (`LivenessSession::set_first_retransmit`).
 
+    /// The tolerance of every lower bound below that compares a measured time with a retransmission wait or a timeout.
+    /// A timed receive can end up to about one system timer tick before the time asked for (~16 ms on Windows, where
+    /// the timer's granularity is 15.6 ms; seen natively: 297.7 ms for 300 ms). The session is right; a bound stricter
+    /// than the timer is not. Upper bounds are not widened.
+    const TIMER_SLACK: Duration = Duration::from_millis(20);
+
     /// The schedule on its own. Off -- `None`, zero, or not shorter than the timeout -- it is the timeout three times.
     /// On, the first wait is the one asked for and each after it twice the one before, the last cut to what is left of
     /// three times the timeout: 300 ms with 5 s sends at 0, 0.3, 0.9, 2.1, 4.5 and 9.3 s and gives up at 15 s. Even a
@@ -9343,9 +9349,9 @@ mod tests {
         for (k, (at, _)) in sends.iter().enumerate() {
             let due = t * k as u32;
             let after = at.duration_since(started);
-            assert!(after >= due && after < due + t / 2, "send {k} at {after:?}, due at {due:?}");
+            assert!(after + TIMER_SLACK >= due && after < due + t / 2, "send {k} at {after:?}, due at {due:?}");
         }
-        assert!(took >= t * 3 && took < t * 3 + Duration::from_secs(1), "given up on at 3T: {took:?}");
+        assert!(took + TIMER_SLACK >= t * 3 && took < t * 3 + Duration::from_secs(1), "given up on at 3T: {took:?}");
     }
 
     /// On, a CREATE_CHILD_SA whose first send is lost is sent again after the earlier wait, the same bytes, and the
@@ -9378,7 +9384,7 @@ mod tests {
         let took = started.elapsed();
         let (lost, again, old_local_spi, client_deleted, gateway_made) = gateway.join().unwrap();
         assert_eq!(lost, again, "a retransmission is the same bytes");
-        assert!(took >= first && took < timeout / 2, "about the earlier wait, not the timeout: {took:?}");
+        assert!(took + TIMER_SLACK >= first && took < timeout / 2, "about the earlier wait, not the timeout: {took:?}");
         assert_eq!((rekeyed.local_spi, rekeyed.peer_spi), (gateway_made, PEER_L_SPI));
         assert_eq!(client_deleted, Some(Delete::esp(vec![old_local_spi])), "the rekey is done as usual");
     }
@@ -9407,7 +9413,7 @@ mod tests {
         let took = started.elapsed();
         let (lost, again) = gateway.join().unwrap();
         assert_eq!(lost, again, "a retransmission is the same bytes");
-        assert!(took >= first && took < timeout / 2, "about the earlier wait, not the timeout: {took:?}");
+        assert!(took + TIMER_SLACK >= first && took < timeout / 2, "about the earlier wait, not the timeout: {took:?}");
     }
 
     /// On, a request that is never answered is given up on no earlier and not much later than three times the timeout,
@@ -9435,13 +9441,13 @@ mod tests {
             let took = started.elapsed();
             let sends = sends.join().unwrap();
 
-            assert!(took >= timeout * 3 && took < timeout * 3 + Duration::from_millis(900), "{exchange:?}: given up on at {took:?}");
+            assert!(took + TIMER_SLACK >= timeout * 3 && took < timeout * 3 + Duration::from_millis(900), "{exchange:?}: given up on at {took:?}");
             assert_eq!(sends.len(), waits.len(), "{exchange:?}: the schedule's sends");
             assert!(sends.iter().all(|(_, msg)| *msg == sends[0].1), "{exchange:?}: a retransmission is the same bytes");
             assert_eq!(IkeHeader::parse(&sends[0].1).unwrap().exchange_type, exchange);
             let mut due = Duration::ZERO;
             for (k, (at, _)) in sends.iter().enumerate() {
-                assert!(at.duration_since(started) >= due, "{exchange:?}: send {k} before it was due at {due:?}");
+                assert!(at.duration_since(started) + TIMER_SLACK >= due, "{exchange:?}: send {k} before it was due at {due:?}");
                 due += waits[k];
             }
         }
@@ -9543,7 +9549,7 @@ mod tests {
         assert!(deleted_old);
         assert_eq!(probe_mid, 0, "on the new IKE SA");
         assert_eq!(lost, again, "a retransmission is the same bytes");
-        assert!(took >= first && took < timeout / 2, "the earlier wait still holds: {took:?}");
+        assert!(took + TIMER_SLACK >= first && took < timeout / 2, "the earlier wait still holds: {took:?}");
     }
 
     /// The exchange, Message ID and Response flag of a message from the client.

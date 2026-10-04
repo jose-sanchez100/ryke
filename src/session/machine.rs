@@ -535,7 +535,10 @@ pub enum Input<T> {
     Negotiated(Result<NewChild, Failure>),
     /// Answer to [`Action::Prepare`]: the new SA's name in the data plane, or the refusal.
     Prepared(Result<T, NotPrepared>),
-    /// Answer to [`Action::Abandon`]: what the new SA's Delete came to.
+    /// Answer to [`Action::Abandon`]: what the Delete the machine owes came to -- the new SA's, or,
+    /// where the machine owes the replaced SA's (the new SA no longer the family's in the session
+    /// at the refused install, [`NotPrepared`]), the replaced SA's, which `ryke`'s `abandon_rekey`
+    /// reports apart ([`crate::DeleteReport::replaced`]) when the peer's rekey replaced the new SA.
     Abandoned(DeleteCame),
     /// Answer to [`Action::Commit`].
     Committed(Committed),
@@ -1617,10 +1620,11 @@ impl<T: Copy> FamilyMachine<T> {
     /// to, and gets no other try: an abandoned rekey's Delete has one chance. With none asked -- the
     /// driver's veto, or its silence -- the new SA is retired with nothing owed: why, the report's
     /// reason when it names a fact (the peer deleted it, the IKE SA is over), else `"not_asked"` (the
-    /// veto) or `"driver_silent"`. A Delete the protocol reports though none was asked can only be of
-    /// the replaced SA (a rekey of the peer's of the new SA answered with the hold off), which the
-    /// record cannot place: not recorded. The driver's silence ends in [`Outcome::Unresolved`], never
-    /// as a failure or a success.
+    /// veto) or `"driver_silent"`. The report is always of the new SA: a Delete of the replaced SA
+    /// (possible only when a rekey of the peer's of the new SA was answered with the hold off, and
+    /// then only with the Delete asked) is reported apart by the protocol
+    /// ([`crate::DeleteReport::replaced`]) and is not this input. The driver's silence ends in
+    /// [`Outcome::Unresolved`], never as a failure or a success.
     fn driver_abandoned(&mut self, h: HandedOver, how: Abandoning, report: DeleteCame, policy: &Policy, out: &mut Vec<Action<T>>) -> Flow<T> {
         let _ = self.record.resolve(h.new.0);
         let (spis, generation) = (h.new, Some(h.generation));

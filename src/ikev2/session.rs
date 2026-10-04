@@ -430,7 +430,8 @@ pub enum ChildDeleteOutcome {
     /// that SA itself), `"gateway_deleted"` (it already did: for
     /// [`LivenessSession::abandon_rekey`] and [`LivenessSession::delete_child`]
     /// that may be the SA a negotiated rekey made, which the peer deleted
-    /// before its commit), `"superseded"`
+    /// before its commit -- for `delete_child`, or the SA it replaced),
+    /// `"superseded"`
     /// (the peer's rekey replaced it, and deletes it: for
     /// [`LivenessSession::abandon_rekey`], the SA a negotiated rekey made,
     /// rekeyed by the peer before the abandon), `"ike_sa_gone"` (the IKE SA it was
@@ -1180,6 +1181,14 @@ impl LivenessSession {
     /// this session starts: a request left unanswered that long is sent again
     /// (RFC 7296 §2.1), three attempts in all, before the exchange fails with
     /// [`io::ErrorKind::TimedOut`] and leaves the CHILD SA as it was.
+    ///
+    /// Refused with [`IkeError::Crypto`], sending nothing and changing
+    /// nothing, while a rekey of the same CHILD SA by [`Self::negotiate_rekey`]
+    /// awaits its commit or abandon (one whose SA the peer deleted included,
+    /// until it is abandoned), as `negotiate_rekey` itself is: this would
+    /// rekey, and then delete, the SA that rekey negotiated, under a caller
+    /// that may not run on it yet, and leave that rekey pending on an SA no
+    /// longer current. The same for [`Self::rekey_child_ipv6`].
     pub fn rekey_child(&mut self, timeout: Duration) -> Result<RekeyedChild, DriverError> {
         self.rekey_child_settled(timeout).map(|settled| settled.child)
     }
@@ -1187,6 +1196,7 @@ impl LivenessSession {
     /// [`Self::rekey_child`], saying too whether the SA returned is the peer's: its rekey of the same SA crossed ours
     /// and was kept (RFC 7296 §2.8.1, [`SettledRekey::by_peer`]).
     pub fn rekey_child_settled(&mut self, timeout: Duration) -> Result<SettledRekey, DriverError> {
+        self.refuse_while_negotiated(ChildKind::Primary)?;
         let old = ChildSpis { local: self.child_local_spi, peer: self.child_peer_spi };
         // A unified SA keeps being proposed as one: rekeying it IPv4-only would
         // silently drop IPv6 at the first rekey.
@@ -1279,13 +1289,15 @@ impl LivenessSession {
 
     /// Rekey the IPv6 CHILD SA -- [`Self::rekey_child`]'s counterpart for the
     /// SA [`Self::create_child_ipv6`] made, with its own SPIs, keys and `REKEY_SA`.
-    /// Errors if there is no IPv6 CHILD SA.
+    /// Errors if there is no IPv6 CHILD SA, and while a rekey of it by
+    /// [`Self::negotiate_rekey`] is pending, as [`Self::rekey_child`].
     pub fn rekey_child_ipv6(&mut self, timeout: Duration) -> Result<RekeyedChild, DriverError> {
         self.rekey_child_ipv6_settled(timeout).map(|settled| settled.child)
     }
 
     /// [`Self::rekey_child_ipv6`], saying too whether the SA returned is the peer's ([`SettledRekey::by_peer`]).
     pub fn rekey_child_ipv6_settled(&mut self, timeout: Duration) -> Result<SettledRekey, DriverError> {
+        self.refuse_while_negotiated(ChildKind::Ipv6)?;
         let old = self.child6.ok_or(IkeError::Crypto("no IPv6 CHILD SA to rekey"))?;
         let (child, _tsr, _, by_peer) = self.child_exchange(Some((ChildKind::Ipv6, old)), &TrafficSelectors::ipv6_full_tunnel(), "rekey IPv6", timeout)?;
         Ok(SettledRekey { child, by_peer })
@@ -1345,12 +1357,7 @@ impl LivenessSession {
     /// commit is then refused and the abandon sends no Delete of either SA.
     pub fn negotiate_rekey(&mut self, kind: ChildKind, timeout: Duration) -> Result<NegotiatedRekey, DriverError> {
         let slot = own_rekey_slot(kind);
-        if self.peer_child.own_rekeys[slot].is_some() {
-            return Err(IkeError::Crypto("a rekey of this CHILD SA is already negotiated").into());
-        }
-        if self.peer_child.deleted_rekeys[slot].is_some() {
-            return Err(IkeError::Crypto("a rekey of this CHILD SA negotiated, whose SA the peer deleted, is still to be abandoned").into());
-        }
+        self.refuse_while_negotiated(kind)?;
         if self.held_kind() == Some(kind) {
             return Err(IkeError::Crypto("the peer's rekey of this CHILD SA is held unanswered").into());
         }
@@ -1621,6 +1628,11 @@ impl LivenessSession {
     /// `"peer_deletes"` for one the peer's rekey replaced, whose Delete is the
     /// peer's, and `"gateway_deleted"` for one a rekey of ours negotiated that
     /// the peer deleted before its commit or abandon (until that abandon).
+    /// The SA a negotiated rekey replaced, while that rekey awaits its commit
+    /// or abandon, is refused for what the commit would report of it:
+    /// `"in_use"` while it is ours to delete (the caller may still run on it,
+    /// and the abandon goes back to it), `"peer_deletes"` when a crossed rekey
+    /// of the peer's was kept, `"gateway_deleted"` when the peer deleted it.
     pub fn delete_child(&mut self, local_spi: u32, peer_spi: u32) -> Result<DeleteReport, DriverError> {
         let names = |local: u32, peer: u32| local == local_spi || peer == peer_spi;
         if self.peer_child.deleted_rekeys.iter().flatten().any(|deleted| names(deleted.new.local, deleted.new.peer)) {
@@ -1631,6 +1643,14 @@ impl LivenessSession {
         let redundant = self.peer_child.redundant.iter().any(|r| names(r.spis.local, r.spis.peer));
         if current || negotiated || redundant {
             return Ok(DeleteReport { outcome: ChildDeleteOutcome::NotOwed("in_use"), liveness: Liveness::Alive, replaced: None });
+        }
+        if let Some(rekey) = self.peer_child.own_rekeys.iter().flatten().find(|r| names(r.old.local, r.old.peer)) {
+            let why = match rekey.fate {
+                OldFate::Ours => "in_use",
+                OldFate::PeerDeletes => "peer_deletes",
+                OldFate::Gone => "gateway_deleted",
+            };
+            return Ok(DeleteReport { outcome: ChildDeleteOutcome::NotOwed(why), liveness: Liveness::Alive, replaced: None });
         }
         if self.peer_child.superseded.iter().any(|s| names(s.local_spi, s.peer_spi)) {
             return Ok(DeleteReport { outcome: ChildDeleteOutcome::NotOwed("peer_deletes"), liveness: Liveness::Alive, replaced: None });
@@ -1644,6 +1664,21 @@ impl LivenessSession {
     /// Delete ([`Self::abandon_rekey`]), which is what clears this.
     pub fn negotiated_sa_deleted_by_peer(&self, kind: ChildKind) -> Option<(u32, u32)> {
         self.peer_child.deleted_rekeys[own_rekey_slot(kind)].as_ref().map(|deleted| (deleted.new.local, deleted.new.peer))
+    }
+
+    /// Refuse a rekey of `kind`'s CHILD SA -- [`Self::negotiate_rekey`],
+    /// [`Self::rekey_child`] or [`Self::rekey_child_ipv6`] -- while a rekey of
+    /// it negotiated is pending: awaiting its commit or abandon, or, the peer
+    /// having deleted its SA, its abandon.
+    fn refuse_while_negotiated(&self, kind: ChildKind) -> Result<(), DriverError> {
+        let slot = own_rekey_slot(kind);
+        if self.peer_child.own_rekeys[slot].is_some() {
+            return Err(IkeError::Crypto("a rekey of this CHILD SA is already negotiated").into());
+        }
+        if self.peer_child.deleted_rekeys[slot].is_some() {
+            return Err(IkeError::Crypto("a rekey of this CHILD SA negotiated, whose SA the peer deleted, is still to be abandoned").into());
+        }
+        Ok(())
     }
 
     /// Take `kind`'s negotiated rekey whose new SA is `new_local_spi`, or
@@ -3637,11 +3672,11 @@ impl LivenessSession {
     /// ([`HeldRekey::awaits_own`]) as much as any. Not the
     /// answer to a crossed rekey held for a negotiated rekey of ours
     /// ([`HeldAnswer`]), which nothing here is to refuse an exchange for:
-    /// [`Self::negotiate_rekey`] of that CHILD SA is refused meanwhile anyway,
-    /// its negotiated rekey being still pending; [`Self::rekey_child`] and
-    /// [`Self::rekey_child_ipv6`] go on as they did, a retransmission of
-    /// their request sending the held answer first; and nothing about it is
-    /// the caller's to serve.
+    /// [`Self::negotiate_rekey`], [`Self::rekey_child`] and
+    /// [`Self::rekey_child_ipv6`] of that CHILD SA are refused meanwhile
+    /// anyway, its negotiated rekey being still pending; those of the other
+    /// one go on as they did, a retransmission of their request sending the
+    /// held answer first; and nothing about it is the caller's to serve.
     fn held_kind(&self) -> Option<ChildKind> {
         self.peer_child.held.as_ref().map(|held| held.kind)
     }
@@ -8705,6 +8740,237 @@ mod tests {
     #[test]
     fn abandon_rekey_matrix_ipv6_hold_off() {
         abandon_rekey_matrix(AbandonFamily::Ipv6, false);
+    }
+
+    /// A session facing `gateway` with a rekey of ours of `family`'s SA
+    /// negotiated and pending, as [`abandon_rekey_case`] sets it up, `fate`
+    /// who deletes the SA it replaced -- with [`OldFate::PeerDeletes`], that SA
+    /// among those the gateway's rekeys replaced if `superseded`, as the
+    /// gateway's crossed rekey left it, or no longer, past
+    /// [`SUPERSEDED_CHILD_TTL`]. The session, the family, and the replaced and
+    /// the negotiated SA.
+    fn pending_rekey_facing(
+        gateway: &UdpSocket,
+        init_sa: CompletedSaInit,
+        family: AbandonFamily,
+        fate: OldFate,
+        superseded: bool,
+    ) -> (LivenessSession, ChildKind, ChildSpis, ChildSpis) {
+        let (kind, old, new, child6) = match family {
+            AbandonFamily::Ipv4 => (ChildKind::Primary, OURS_REPLACED, OURS_NEGOTIATED, Some(ChildSpis { local: 0x5656, peer: 0x5757 })),
+            AbandonFamily::Unified => (ChildKind::Primary, OURS_REPLACED, OURS_NEGOTIATED, None),
+            AbandonFamily::Ipv6 => {
+                let new = ChildSpis { local: 0x6868, peer: 0x7979 };
+                (ChildKind::Ipv6, ChildSpis { local: 0x6666, peer: 0x7777 }, new, Some(new))
+            }
+        };
+        let mut liveness = session_facing(gateway, init_sa, child6);
+        gateway.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let old_ts = if matches!(family, AbandonFamily::Unified) {
+            liveness.child_carries_ipv6 = true;
+            let both = TrafficSelectors::unified_full_tunnel();
+            Some(ChildTs { ours: both.clone(), theirs: both })
+        } else {
+            Some(replaced_ts())
+        };
+        liveness.peer_child.own_rekeys[own_rekey_slot(kind)] = Some(OwnRekey { old, old_ts, new, fate });
+        if superseded {
+            liveness.peer_child.superseded.push(SupersededChild { local_spi: old.local, peer_spi: old.peer, since: Instant::now() });
+        }
+        (liveness, kind, old, new)
+    }
+
+    /// `sent` as the gateway reads it: each message's exchange, Message ID and
+    /// Response flag, and the Delete a request of ours carries, if any.
+    fn wire_of(sa: &CompletedSaInit, sent: &[Vec<u8>]) -> Vec<((ExchangeType, u32, bool), Option<Delete>)> {
+        sent.iter()
+            .map(|m| {
+                let header = client_header(m);
+                (header, if header.0 == ExchangeType::Informational && !header.2 { delete_in(sa, m) } else { None })
+            })
+            .collect()
+    }
+
+    /// Both families' SAs, as the session has them.
+    fn both_child_spis(liveness: &LivenessSession) -> [Option<(u32, u32)>; 2] {
+        [liveness.child_spis(ChildKind::Primary), liveness.child_spis(ChildKind::Ipv6)]
+    }
+
+    /// What `liveness` comes to from here: its pending rekey of `kind` to
+    /// `new` committed, asking for the Delete of the SA it replaced, or
+    /// abandoned, asking for the Delete of the new one; then a liveness check;
+    /// the gateway answering every INFORMATIONAL request meanwhile. The
+    /// report, the check's outcome, the wire, and both families' SAs after.
+    fn finish_pending_rekey(
+        liveness: &mut LivenessSession,
+        gateway: &UdpSocket,
+        resp_sa: &CompletedSaInit,
+        kind: ChildKind,
+        new: ChildSpis,
+        commit: bool,
+    ) -> (DeleteReport, Liveness, Vec<((ExchangeType, u32, bool), Option<Delete>)>, [Option<(u32, u32)>; 2]) {
+        let ((report, probed), sent) = with_informationals_answered(gateway, resp_sa, || {
+            let report = if commit { liveness.commit_rekey(kind, new.local, true) } else { liveness.abandon_rekey(kind, new.local, true) };
+            (report.unwrap(), liveness.probe(Duration::from_millis(500)).unwrap())
+        });
+        (report, probed, wire_of(resp_sa, &sent), both_child_spis(liveness))
+    }
+
+    /// Between [`LivenessSession::negotiate_rekey`] and its commit or
+    /// abandon, [`LivenessSession::delete_child`] of the SA the rekey replaced
+    /// sends nothing and changes nothing. It used to send that SA's Delete:
+    /// the SA the caller may still run on, and the one an abandon goes back
+    /// to. Refused for what the commit would report of that SA: `"in_use"`
+    /// while it is ours to delete, `"peer_deletes"` while the gateway's
+    /// crossed rekey was kept -- that SA among those the gateway's rekeys
+    /// replaced or, past [`SUPERSEDED_CHILD_TTL`], no longer -- and
+    /// `"gateway_deleted"` once the gateway deleted it. No Message ID is
+    /// used, both families stay on their SAs, and the commit or the abandon
+    /// that follows -- and a liveness check after it -- reports, sends and
+    /// leaves exactly what it does in the same session without the refused
+    /// call. IPv4, unified and IPv6.
+    #[test]
+    fn delete_child_of_the_sa_a_pending_rekey_replaced_is_refused_sending_nothing() {
+        let fates = [
+            (OldFate::Ours, false, "in_use"),
+            (OldFate::PeerDeletes, true, "peer_deletes"),
+            (OldFate::PeerDeletes, false, "peer_deletes"),
+            (OldFate::Gone, false, "gateway_deleted"),
+        ];
+        for family in [AbandonFamily::Ipv4, AbandonFamily::Unified, AbandonFamily::Ipv6] {
+            for (fate, superseded, why) in fates {
+                for commit in [true, false] {
+                    let case = format!("{family:?} {fate:?} superseded={superseded} {}", if commit { "commit" } else { "abandon" });
+                    let control = {
+                        let (init_sa, resp_sa) = liveness_sa_pair();
+                        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+                        let (mut liveness, kind, _, new) = pending_rekey_facing(&gateway, init_sa, family, fate, superseded);
+                        finish_pending_rekey(&mut liveness, &gateway, &resp_sa, kind, new, commit)
+                    };
+
+                    let (init_sa, resp_sa) = liveness_sa_pair();
+                    let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    let (mut liveness, kind, old, new) = pending_rekey_facing(&gateway, init_sa, family, fate, superseded);
+                    let spis = both_child_spis(&liveness);
+                    let refused = liveness.delete_child(old.local, old.peer).unwrap();
+                    assert_eq!(refused, DeleteReport { outcome: ChildDeleteOutcome::NotOwed(why), liveness: Liveness::Alive, replaced: None }, "{case}");
+                    let sent = wire_of(&resp_sa, &all_sent_to(&gateway));
+                    assert!(sent.is_empty(), "{case}: nothing sent: {sent:x?}");
+                    assert_eq!(both_child_spis(&liveness), spis, "{case}: nothing moved");
+                    assert_eq!(liveness.next_message_id, 2, "{case}: no Message ID used");
+                    assert_eq!(finish_pending_rekey(&mut liveness, &gateway, &resp_sa, kind, new, commit), control, "{case}: as without the refused call");
+                }
+            }
+        }
+    }
+
+    /// Once the rekey is committed asking for no Delete (`"not_asked"`), the
+    /// SA it replaced is the caller's to delete: [`LivenessSession::delete_child`]
+    /// of it sends its Delete, as it always did -- Message ID 2, the first,
+    /// the commit having used none. IPv4, unified and IPv6.
+    #[test]
+    fn delete_child_of_the_sa_a_rekey_replaced_after_a_commit_that_asked_for_no_delete_sends_it() {
+        for family in [AbandonFamily::Ipv4, AbandonFamily::Unified, AbandonFamily::Ipv6] {
+            let case = format!("{family:?}");
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let (mut liveness, kind, old, new) = pending_rekey_facing(&gateway, init_sa, family, OldFate::Ours, false);
+            let committed = liveness.commit_rekey(kind, new.local, false).unwrap();
+            assert_eq!(committed, DeleteReport { outcome: ChildDeleteOutcome::NotOwed("not_asked"), liveness: Liveness::Alive, replaced: None }, "{case}");
+            assert_eq!(all_sent_to(&gateway), Vec::<Vec<u8>>::new(), "{case}: the commit sends nothing");
+            let (report, sent) = with_informationals_answered(&gateway, &resp_sa, || liveness.delete_child(old.local, old.peer).unwrap());
+            assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::Sent { acknowledged: true }, liveness: Liveness::Alive, replaced: None }, "{case}");
+            assert_eq!(wire_of(&resp_sa, &sent), [((ExchangeType::Informational, 2, false), Some(Delete::esp(vec![old.local])))], "{case}");
+            assert_eq!(liveness.child_spis(kind), Some((new.local, new.peer)), "{case}: on the committed SA");
+        }
+    }
+
+    /// While a rekey of ours [`LivenessSession::negotiate_rekey`] negotiated
+    /// awaits its commit or abandon -- or, the gateway having deleted its SA,
+    /// its abandon -- a rekey of that family by [`LivenessSession::rekey_child`]
+    /// or [`LivenessSession::rekey_child_settled`] (`Primary`, IPv4 or
+    /// unified), [`LivenessSession::rekey_child_ipv6`] or
+    /// [`LivenessSession::rekey_child_ipv6_settled`] (`Ipv6`) is refused with
+    /// [`IkeError::Crypto`], as `negotiate_rekey` itself is. It used to go
+    /// out: a `CREATE_CHILD_SA` rekeying the negotiated SA the caller may not
+    /// have installed yet, then that SA's Delete, the negotiated rekey left
+    /// pending on an SA no longer current (its commit then deleting the SA it
+    /// replaced, its abandon reporting the new SA `"superseded"`). Nothing is
+    /// sent, no Message ID is used, both families stay on their SAs, and the
+    /// commit or the abandon that follows -- and a liveness check after it --
+    /// reports, sends and leaves exactly what it does in the same session
+    /// without the refused calls. With the hold on and off.
+    #[test]
+    fn a_rekey_of_a_family_whose_negotiated_rekey_is_pending_is_refused_sending_nothing() {
+        let timeout = Duration::from_millis(50);
+        for family in [AbandonFamily::Ipv4, AbandonFamily::Unified, AbandonFamily::Ipv6] {
+            for gateway_deleted_new in [false, true] {
+                for hold in [true, false] {
+                    // The commit of a rekey whose SA the gateway deleted is refused: only its abandon follows.
+                    for commit in if gateway_deleted_new { vec![false] } else { vec![true, false] } {
+                        let case = format!(
+                            "{family:?} gateway_deleted_new={gateway_deleted_new} hold={hold} {}",
+                            if commit { "commit" } else { "abandon" }
+                        );
+                        let setup = |gateway: &UdpSocket, init_sa: CompletedSaInit, resp_sa: &CompletedSaInit| {
+                            let (mut liveness, kind, _, new) = pending_rekey_facing(gateway, init_sa, family, OldFate::Ours, false);
+                            liveness.hold_peer_rekeys(hold);
+                            if gateway_deleted_new {
+                                deliver(&mut liveness, gateway, &gateway_deletes_children(resp_sa, 0, &[new.peer]));
+                                drain(gateway);
+                                assert!(liveness.negotiated_sa_deleted_by_peer(kind).is_some(), "{case}: awaiting its abandon");
+                            }
+                            (liveness, kind, new)
+                        };
+                        let control = {
+                            let (init_sa, resp_sa) = liveness_sa_pair();
+                            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+                            let (mut liveness, kind, new) = setup(&gateway, init_sa, &resp_sa);
+                            finish_pending_rekey(&mut liveness, &gateway, &resp_sa, kind, new, commit)
+                        };
+
+                        let (init_sa, resp_sa) = liveness_sa_pair();
+                        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+                        let (mut liveness, kind, new) = setup(&gateway, init_sa, &resp_sa);
+                        let spis = both_child_spis(&liveness);
+                        if kind == ChildKind::Primary {
+                            assert!(refused_crypto(liveness.rekey_child(timeout)), "{case}: rekey_child");
+                            assert!(refused_crypto(liveness.rekey_child_settled(timeout)), "{case}: rekey_child_settled");
+                        } else {
+                            assert!(refused_crypto(liveness.rekey_child_ipv6(timeout)), "{case}: rekey_child_ipv6");
+                            assert!(refused_crypto(liveness.rekey_child_ipv6_settled(timeout)), "{case}: rekey_child_ipv6_settled");
+                        }
+                        let sent = wire_of(&resp_sa, &all_sent_to(&gateway));
+                        assert!(sent.is_empty(), "{case}: nothing sent: {sent:x?}");
+                        assert_eq!(both_child_spis(&liveness), spis, "{case}: nothing moved");
+                        assert_eq!(liveness.next_message_id, 2, "{case}: no Message ID used");
+                        assert_eq!(finish_pending_rekey(&mut liveness, &gateway, &resp_sa, kind, new, commit), control, "{case}: as without the refused calls");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A negotiated rekey pending refuses the rekeys of its own family only:
+    /// the other family's goes out as it always did -- here unanswered, and
+    /// given up on after its retransmissions.
+    #[test]
+    fn a_negotiated_rekey_pending_leaves_the_rekey_of_the_other_family_alone() {
+        let timeout = Duration::from_millis(50);
+        for family in [AbandonFamily::Ipv4, AbandonFamily::Ipv6] {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let (mut liveness, kind, _, _) = pending_rekey_facing(&gateway, init_sa, family, OldFate::Ours, false);
+            let (other, rekeyed) = match kind {
+                ChildKind::Primary => (liveness.rekey_child_ipv6(timeout).map(|_| ()), 0x5656),
+                ChildKind::Ipv6 => (liveness.rekey_child(timeout).map(|_| ()), 0xBBBB),
+            };
+            let err = other.expect_err("never answered here");
+            assert!(matches!(&err, DriverError::Io(e) if e.kind() == io::ErrorKind::TimedOut), "{family:?}: {err}");
+            let request = sent_to(&gateway).expect("the other family's rekey went out");
+            assert_eq!(client_header(&request), (ExchangeType::CreateChildSa, 2, false), "{family:?}");
+            assert_eq!(rekey::rekey_sa_spi(&resp_sa, &request), Some(rekeyed), "{family:?}: naming the other family's SA");
+        }
     }
 
     /// RFC 7296 §2.2: two counters, one for our requests and one for the

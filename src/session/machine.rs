@@ -90,25 +90,39 @@
 //!
 //! # Refused inputs
 //!
-//! A refusal ([`Unexpected`]) changes nothing in the machine. What the adapter does with one depends
-//! on which it is; neither "close the connection" nor "drop it" is right for all of them:
+//! A refusal ([`Unexpected`]) changes nothing in the machine and hands the input back whole
+//! ([`Unexpected::input`]). Its kind says what becomes of the operation under way and of the input
+//! itself; it never says whether the input had effects outside the machine. Any refused answer may
+//! bring something ([`Input::brought`]) -- a CHILD SA negotiated on the wire, an SA put in a data
+//! plane --, whichever entry it came by and whatever the refusal: [`Refusal::NotAnEvent`] (an answer
+//! given to [`FamilyMachine::step`]) and [`Refusal::NotItsAnswer`] included. Events bring nothing.
+//!
+//! The adapter examines what a refused answer brought every time, against its own records and the
+//! data plane that holds it. An effect it already tracks -- the SA in use, the one the operation under
+//! way holds, a generation its records know -- is a duplicate or a known effect, and is never
+//! removed: never cleaned up as an orphan. Only what no record tracks is new, and is reconciled in the
+//! data plane that holds it and no other. What it cannot clean up, or must not -- a CHILD SA nothing
+//! tracks, an SA in a data plane it does not hold --, it keeps as an obligation, with the identity and
+//! the context to resolve it later: what it is, the data plane that holds it, the family, the refusal,
+//! where the machine stood ([`Unexpected::phase`]). A refusal authorises nothing on another
+//! connection. Neither "close the connection" nor "drop it" is right for every kind:
 //!
 //! - A late or duplicated answer -- [`Refusal::NotTheAsk`], [`Refusal::NothingAsked`]. It is of an
 //!   action already answered: of this operation, of an earlier one, of another connection's machine.
 //!   The operation under way is untouched and goes on, and nothing is closed for it: it may not even
-//!   be of this connection. What it says came to exist ([`Input::brought`]) the adapter reconciles
-//!   against its own records and the data plane that holds it. An effect it already tracks -- the SA
-//!   in use, the one the operation under way holds, a generation its records know -- is a duplicate,
-//!   and is left alone: never cleaned up as an orphan. Only what no record tracks is new, and is the
-//!   adapter's to clean up, in the data plane that holds it and no other.
+//!   be of this connection.
 //! - An answer to the pending ask that is not what its action asks for -- [`Refusal::NotItsAnswer`].
 //!   The adapter and the machine disagree about the operation under way. The adapter does not go on
 //!   as if the action had succeeded, and gives nothing made up in its place: the machine stays where
 //!   it is, its ask pending and its record with all it owes (a Delete is recorded as owed before it
-//!   is asked), and the adapter reports the failure to the consumer, whose recovery it is.
-//! - A refusal with no effects -- [`Refusal::Busy`], [`Refusal::NotAnEvent`]. The operation under way
-//!   stays pending; the input comes back whole ([`Unexpected::input`]), and an event is the adapter's
-//!   to give again once the machine is idle.
+//!   is asked), and the adapter reports the failure to the consumer, whose recovery it is. The pending
+//!   operation is kept, and the effects of the incompatible input are not forgotten: what it brought
+//!   is examined as any other refused answer's -- with the adapter's records in doubt, kept rather
+//!   than acted on.
+//! - An input given while busy, or by the wrong entry -- [`Refusal::Busy`], [`Refusal::NotAnEvent`].
+//!   The operation under way stays pending. An event is the adapter's to give again once the machine
+//!   is idle. An answer given to `step` is no input to give again, but what it brought is reconciled
+//!   as a late answer's is.
 //!
 //! The family's current generation ([`ChildId`]) and its clock by age are the consumer's, not the
 //! machine's: an event carries the current generation where the operation needs it, and the machine
@@ -401,12 +415,17 @@ impl<T> Input<T> {
 impl<T: Copy> Input<T> {
     /// What the answer says came to exist outside the machine: the CHILD SA a rekey negotiated
     /// ([`Input::Negotiated`]), or the SA a data plane took ([`Input::Prepared`],
-    /// [`Input::PreparedDeferred`], [`Input::Added`]); `None` for any other input, and for a refusal.
+    /// [`Input::PreparedDeferred`], [`Input::Added`]); `None` for every event, for any other answer,
+    /// and for those answers when they carry the error (nothing was made).
     ///
-    /// A consumer whose answer was refused ([`Unexpected`]) reconciles this against its own records:
-    /// whether it is a duplicate of something it tracks or an orphan is not the machine's to decide,
-    /// as the machine never took it. A refused report of a Delete loses nothing: the Delete was
-    /// recorded as owed before it was asked (the controller's `owe_delete`), and stays owed.
+    /// A consumer whose answer was refused ([`Unexpected`]) reconciles this against its own records,
+    /// whatever the refusal and whichever entry the answer came by -- [`Refusal::NotAnEvent`] (given
+    /// to [`FamilyMachine::step`]) and [`Refusal::NotItsAnswer`] included: the refusal's kind never
+    /// says the answer brought nothing. Whether it is a duplicate of something it tracks, something
+    /// new, or something it can only keep as an obligation is not the machine's to decide, as the
+    /// machine never took it ([Refused inputs](crate::session::machine#refused-inputs)). A refused
+    /// report of a Delete loses nothing: the Delete was recorded as owed before it was asked (the
+    /// controller's `owe_delete`), and stays owed.
     pub fn brought(&self) -> Option<Brought<T>> {
         match self {
             Input::Negotiated(Ok(n)) => Some(Brought::Child { new: n.new }),
@@ -733,9 +752,12 @@ pub struct Ask {
 /// What an adapter does with each is in [Refused inputs](crate::session::machine#refused-inputs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// An event (not [`Input::DataPlaneReset`]) given while an operation is under way.
+    /// An event (not [`Input::DataPlaneReset`]) given while an operation is under way. An event brings
+    /// nothing: it comes back whole, for the adapter to give again once the machine is idle.
     Busy,
-    /// An answer given with [`FamilyMachine::step`].
+    /// An answer given with [`FamilyMachine::step`]. The kind says only that it came by the wrong
+    /// entry, not that it had no effects: it may bring an SA put in a data plane or a CHILD SA
+    /// negotiated ([`Input::brought`]), which the adapter examines as any refused answer's.
     NotAnEvent,
     /// An answer given while nothing is asked: the machine is idle.
     NothingAsked,
@@ -743,7 +765,8 @@ pub enum Refusal {
     /// answered, another machine's.
     NotTheAsk,
     /// The pending [`Ask`], with an input that is not the answer its action asks for (an event
-    /// included).
+    /// included). The pending operation is kept; what the input brought, if anything
+    /// ([`Input::brought`]), is examined all the same.
     NotItsAnswer,
 }
 
@@ -949,8 +972,9 @@ impl<T: Copy> FamilyMachine<T> {
     /// Taken only while the machine is idle, but [`Input::DataPlaneReset`], taken anywhere: under way,
     /// an operation goes on as it was and the reset waits for its end (no action, the same ask).
     ///
-    /// Refused ([`Unexpected`]), nothing changed: an answer ([`Refusal::NotAnEvent`]), an event while
-    /// an operation is under way ([`Refusal::Busy`]).
+    /// Refused ([`Unexpected`]), nothing changed in the machine: an answer ([`Refusal::NotAnEvent`]) --
+    /// which may still have brought something outside it, for the adapter to examine
+    /// ([`Input::brought`]) --, an event while an operation is under way ([`Refusal::Busy`]).
     pub fn step(&mut self, input: Input<T>, policy: &Policy) -> Result<Step<T>, Unexpected<T>> {
         if !input.is_event() {
             return Err(self.refused(Refusal::NotAnEvent, input));
@@ -2923,6 +2947,50 @@ mod tests {
         let ask = m.step(renew(t0, CURRENT), &POLICY).unwrap().ask.unwrap();
         let refused = m.answer(ask, negotiated(t0, NEW), &POLICY).unwrap_err();
         assert_eq!((refused.why, refused.input.brought()), (Refusal::NotItsAnswer, Some(Brought::Child { new: NEW })));
+    }
+
+    #[test]
+    fn an_answer_given_as_an_event_is_refused_whole_and_still_hands_back_what_it_brought() {
+        let t0 = t0();
+        let bringing = [
+            (Input::Prepared(Ok(ID)), Brought::InPlane(ID)),
+            (Input::PreparedDeferred(Ok((ID, REPLACED))), Brought::InPlane(ID)),
+            (Input::Added(Ok(ID)), Brought::InPlane(ID)),
+            (negotiated(t0, NEW), Brought::Child { new: NEW }),
+        ];
+        // Idle; waiting on the use; waiting on the install, whose very answer `Prepared` is; and waiting on
+        // a held rekey's install, whose very answer `PreparedDeferred` is.
+        let mut machines = vec![FamilyMachine::<u64>::new()];
+        let mut use_asked = FamilyMachine::new();
+        use_asked.step(renew(t0, CURRENT), &POLICY).unwrap();
+        machines.push(use_asked);
+        let mut d = Driven::new(FamilyMachine::new());
+        for input in [renew(t0, CURRENT), due(), negotiated(t0, NEW)] {
+            d.go(input);
+        }
+        machines.push(d.m);
+        let mut d = Driven::new(FamilyMachine::new());
+        d.go(held(t0));
+        machines.push(d.m);
+        let phases: Vec<&str> = machines.iter().map(|m| m.phase.name()).collect();
+        assert_eq!(phases, ["idle", "use", "preparing", "held_preparing"]);
+        for m in &mut machines {
+            let (before, phase) = (m.clone(), m.phase.name());
+            for (input, brought) in bringing {
+                let refused = m.step(input, &POLICY).unwrap_err();
+                assert_eq!(refused, Unexpected { phase, why: Refusal::NotAnEvent, input }, "{input:?} in {phase}: refused, handed back whole");
+                assert_eq!(*m, before, "{input:?} in {phase}: nothing changes in the machine");
+                assert_eq!(refused.input.brought(), Some(brought), "{input:?} in {phase}: what it brought handed back with it");
+            }
+        }
+        // Events bring nothing, taken or refused as busy.
+        for event in every_input(t0).into_iter().filter(Input::is_event) {
+            assert_eq!(event.brought(), None, "{event:?}");
+        }
+        let busy = &mut machines[1];
+        let event = held(t0);
+        let refused = busy.step(event, &POLICY).unwrap_err();
+        assert_eq!((refused.why, refused.input.brought()), (Refusal::Busy, None));
     }
 
     /// One operation of every flow, from a machine with a switch pending or not (`start`): together

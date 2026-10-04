@@ -35,17 +35,31 @@
 //!    ([`Refusal::NotTheAsk`]), instead of taking it for the pending action's.
 //! 3. Events only while idle; one refused ([`Refusal::Busy`]) comes back whole in
 //!    [`Unexpected::input`] and is the adapter's to give again.
-//! 4. Every data-plane action of an operation is for the data plane the operation began on. A reset
-//!    given while an operation is under way is deferred to the operation's end
-//!    ([`FamilyMachine::reset_pending`]): the operation's actions that touch the data plane, before
-//!    and after the reset is given, are for the data plane the operation began on -- its names `T`
-//!    mean nothing in another. The adapter keeps that data plane for the operation (as the
-//!    controller's flows keep the handle they cloned) and never carries such an action out on a data
-//!    plane that took its place; where it no longer has it, it answers what an action asks with the
-//!    refusal or with "no data plane" ([`NotSwitched::NoDataPlane`], [`NoDataPlane`]) and drops the
-//!    actions that ask nothing ([`Action::Withdraw`], [`Action::CloseRedundant`],
-//!    [`Action::KeepRedundant`]). Wire obligations are untouched by a reset: an abandon, a commit, a
-//!    Delete owed, a refusal or release of a held rekey go on as ever.
+//! 4. Every data-plane action of an operation is for the data plane the operation began on, and the
+//!    adapter answers for that data plane until it is retired. The adapter takes that data plane's
+//!    identity at the operation's start (the controller's flows clone the pump's handle) and keeps it
+//!    to the operation's end; it never reads the consumer's "current data plane" again in between, so
+//!    that no action of the operation lands on one that took its place -- the names `T` mean nothing
+//!    there, and a data plane is to refuse a name that is not its own. A reset given while an
+//!    operation is under way is deferred to the operation's end ([`FamilyMachine::reset_pending`]).
+//!    It is not a cancellation: the operation goes on, action by action, to its outcome, and its wire
+//!    obligations are untouched -- an abandon, a commit, a Delete owed, a refusal or release of a held
+//!    rekey go on as ever. What becomes of its data-plane actions the adapter tells by what it knows
+//!    of the data plane the operation began on:
+//!
+//!    - still there, only no longer the consumer's current one (another took its place): they are
+//!      carried out on it, as before the reset, and on no other;
+//!    - withdrawn (stopped, or being stopped): none is carried out on it; what asks is answered with
+//!      the refusal or with "no data plane" ([`NotSwitched::NoDataPlane`], [`NoDataPlane`]), what
+//!      asks nothing ([`Action::Withdraw`], [`Action::CloseRedundant`], [`Action::KeepRedundant`]) is
+//!      dropped.
+//!
+//!    Losing sight of a data plane does not retire it: an SA the operation already put in it is still
+//!    there, and still accepted inbound for as long as that data plane runs. Once the operation is
+//!    over, the adapter sees to it that the data plane it began on carries nothing more -- it retires
+//!    what that data plane holds, or has the word of whoever stops it that it has stopped -- and only
+//!    then lets go of its identity. The machine sees none of this: it defers the reset and drops the
+//!    deferred switch, nothing else.
 //! 5. A composite action is one obligation ([Composite actions](#composite-actions)).
 //!
 //! The machine enforces 2, by the `Ask`; 3, by refusing the event; and the reset's place, by
@@ -73,6 +87,28 @@
 //!   switch will leave, if the current generation moved between the install and the read.
 //! - `MoveToRedundant`: between the pending switch and the promotion, outbound on the SA the peer
 //!   just deleted.
+//!
+//! # Refused inputs
+//!
+//! A refusal ([`Unexpected`]) changes nothing in the machine. What the adapter does with one depends
+//! on which it is; neither "close the connection" nor "drop it" is right for all of them:
+//!
+//! - A late or duplicated answer -- [`Refusal::NotTheAsk`], [`Refusal::NothingAsked`]. It is of an
+//!   action already answered: of this operation, of an earlier one, of another connection's machine.
+//!   The operation under way is untouched and goes on, and nothing is closed for it: it may not even
+//!   be of this connection. What it says came to exist ([`Input::brought`]) the adapter reconciles
+//!   against its own records and the data plane that holds it. An effect it already tracks -- the SA
+//!   in use, the one the operation under way holds, a generation its records know -- is a duplicate,
+//!   and is left alone: never cleaned up as an orphan. Only what no record tracks is new, and is the
+//!   adapter's to clean up, in the data plane that holds it and no other.
+//! - An answer to the pending ask that is not what its action asks for -- [`Refusal::NotItsAnswer`].
+//!   The adapter and the machine disagree about the operation under way. The adapter does not go on
+//!   as if the action had succeeded, and gives nothing made up in its place: the machine stays where
+//!   it is, its ask pending and its record with all it owes (a Delete is recorded as owed before it
+//!   is asked), and the adapter reports the failure to the consumer, whose recovery it is.
+//! - A refusal with no effects -- [`Refusal::Busy`], [`Refusal::NotAnEvent`]. The operation under way
+//!   stays pending; the input comes back whole ([`Unexpected::input`]), and an event is the adapter's
+//!   to give again once the machine is idle.
 //!
 //! The family's current generation ([`ChildId`]) and its clock by age are the consumer's, not the
 //! machine's: an event carries the current generation where the operation needs it, and the machine
@@ -278,11 +314,9 @@ pub enum Input<T> {
     /// be answered, and the switch is dropped once the operation is over -- one the operation itself
     /// deferred too, as it was put in the data plane that is gone. The controller never meets this:
     /// `attach`, `detach` and every flow run under the same lock, and a flow completes against the
-    /// handle it cloned at its start. The operation's actions that touch the data plane, before and
-    /// after the reset is given, are for the data plane the operation began on; the adapter never
-    /// carries one out on a data plane that took its place, and where it no longer has that one it
-    /// answers with the refusal or "no data plane" and drops the actions that ask nothing. The wire
-    /// obligations go on as ever.
+    /// handle it cloned at its start. The deferral is not a cancellation; what the adapter does with
+    /// the operation's data-plane actions, and with the data plane the operation began on once it is
+    /// over, is [contract point 4](crate::session::machine#the-contract-with-the-consumers-adapter).
     DataPlaneReset,
     /// Answer to [`Action::ReadUse`]: `used` is what the SA asked about has moved, `(rx, tx)`, or
     /// `None` when the data plane's current generation of the family is not that SA, or there is no
@@ -695,6 +729,8 @@ pub struct Ask {
 }
 
 /// Why an input was refused ([`Unexpected`]).
+///
+/// What an adapter does with each is in [Refused inputs](crate::session::machine#refused-inputs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     /// An event (not [`Input::DataPlaneReset`]) given while an operation is under way.
@@ -2740,6 +2776,63 @@ mod tests {
             }
         }
         assert_eq!(settled(&m), [retired(CURRENT, Ours, Sent { acknowledged: true })], "the Delete recorded once");
+    }
+
+    #[test]
+    fn an_answer_that_is_not_the_pending_ones_keeps_the_operation_and_what_it_owes() {
+        let t0 = t0();
+        // The same renewal with no wrong answer given: what its end is to be.
+        let rest = [Input::Switched(Ok(())), Input::Deleted(ACKED)];
+        let mut plain = FamilyMachine::<u64>::new();
+        let without = renewal(&mut plain, &POLICY, t0, Committed::OursDeleteNotAsked, &rest);
+        // Brought to the phase that waits on the replaced SA's Delete, answered by hand.
+        let mut m = FamilyMachine::<u64>::new();
+        let mut step = m.step(renew(t0, CURRENT), &POLICY).unwrap();
+        let mut actions = step.actions.clone();
+        let committed = Input::Committed(Committed::OursDeleteNotAsked);
+        for answer in [due(), negotiated(t0, NEW), Input::Prepared(Ok(ID)), committed, rest[0]] {
+            step = m.answer(step.ask.unwrap(), answer, &POLICY).unwrap();
+            actions.extend(step.actions.iter().copied());
+        }
+        let ask = step.ask.unwrap();
+        assert_eq!((m.phase.name(), m.asked()), ("deleting", Some(ask)));
+        assert_eq!(step.actions, [Action::DeleteChild { spis: CURRENT.spis() }]);
+        let owed = [retired(CURRENT, Ours, NotSent)];
+        assert_eq!(m.record().owed(), owed, "owed before it is asked");
+        // What is not the Delete's answer, an event included, is refused with the ask still pending.
+        let before = m.clone();
+        for wrong in [committed, Input::SwitchCheck { now: t0, peer_sent: true }, Input::Switched(Ok(())), Input::Abandoned(ACKED), due()] {
+            assert_eq!(m.answer(ask, wrong, &POLICY), Err(Unexpected { phase: "deleting", why: Refusal::NotItsAnswer, input: wrong }), "{wrong:?}");
+            assert_eq!(m, before, "{wrong:?}: nothing changes");
+            assert_eq!((m.asked(), m.record().owed()), (Some(ask), &owed[..]), "{wrong:?}: still asked, still owed");
+        }
+        // The right answer is taken, and the operation ends as it would have with none of them.
+        let step = m.answer(ask, rest[1], &POLICY).unwrap();
+        actions.extend(step.actions.iter().copied());
+        assert_eq!((step.outcome, step.ask), (Some(without.outcome), None));
+        assert_eq!(actions, without.actions);
+        assert_eq!(but_serial(&m), but_serial(&plain));
+        assert_eq!(settled(&m), [retired(CURRENT, Ours, Sent { acknowledged: true })], "the Delete recorded once");
+    }
+
+    #[test]
+    fn an_event_given_during_an_operation_comes_back_whole_and_is_taken_once_it_is_over() {
+        let t0 = t0();
+        let at = t0 + secs(1);
+        // A switch deferred, a renewal under way on the replaced SA: a switch check waits.
+        let mut m = with_a_switch_pending(t0);
+        let pending = m.pending_switch().unwrap();
+        let event = Input::SwitchCheck { now: at, peer_sent: true };
+        let ask = m.step(renew(at, NEXT), &POLICY).unwrap().ask.unwrap();
+        let before = m.clone();
+        assert_eq!(m.step(event, &POLICY), Err(Unexpected { phase: "pending_use", why: Refusal::Busy, input: event }));
+        assert_eq!((&m, m.asked()), (&before, Some(ask)), "nothing changes, the ask still pending");
+        // The renewal ends (not due, the switch not made); the same event is taken now.
+        let step = m.answer(ask, not_due(), &POLICY).unwrap();
+        assert_eq!((step.outcome, m.idle(), m.pending_switch()), (Some(Outcome::NotDue), true, Some(pending)));
+        let step = m.step(event, &POLICY).unwrap();
+        assert_eq!(step.actions, [Action::Switch { switch: pending, proof: SwitchProof::PeerSent, now: at }]);
+        assert!(step.outcome.is_none() && step.ask.is_some());
     }
 
     #[test]

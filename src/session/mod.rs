@@ -12,6 +12,9 @@
 //!
 //! - [`limits`]: the volume figures of an SA by where each comes from, which of them is a hard
 //!   limit under the consumer's policy, and the renewal one may ask for.
+//! - [`machine`]: one family's renewals as a machine of events and actions -- a renewal of ours by
+//!   volume, the switches deferred as the responder, the peer's rekeys served -- over its record,
+//!   in the order a consumer carries them out, its data plane and its protocol session its own.
 //! - [`renewal`]: the record of one family's renewals -- its last attempt, a rekey negotiated and
 //!   not yet resolved, a switch of outbound deferred until the peer has the new SA, the SAs it
 //!   retired and where their Deletes stand -- and an SA's clock by age. It records facts and
@@ -27,6 +30,7 @@
 //! the same for every consumer.
 
 pub mod limits;
+pub mod machine;
 pub mod renewal;
 pub mod spacing;
 pub mod timing;

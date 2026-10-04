@@ -105,7 +105,20 @@
 //! tracks, an SA in a data plane it does not hold --, it keeps as an obligation, with the identity and
 //! the context to resolve it later: what it is, the data plane that holds it, the family, the refusal,
 //! where the machine stood ([`Unexpected::phase`]). A refusal authorises nothing on another
-//! connection. Neither "close the connection" nor "drop it" is right for every kind:
+//! connection.
+//!
+//! What identifies what a refused input brought is the consumer's to keep; the machine keeps none
+//! of it. An SA in a data plane ([`Brought::InPlane`]) is named by the consumer's own name, which
+//! should name its data plane -- so that it still says which one when the consumer holds no handle
+//! of it. A CHILD SA ([`Brought::Child`]) is negotiated on the wire by an IKE session, not held by
+//! a data plane, and its SPIs alone do not identify it across sessions: the consumer keeps the
+//! operation that issued it. The [`Ask`] an answer was given with names the machine it was asked
+//! by, by its scope ([`Ask::scope`], [`FamilyMachine::with_scope`]); an answer given to
+//! [`FamilyMachine::step`] comes with no ask, and nothing names its origin. Where no identity is
+//! demonstrated, no two sightings are assumed to be the same thing. Retiring a local data plane
+//! resolves what was in it, and proves nothing about a CHILD SA at the peer.
+//!
+//! Neither "close the connection" nor "drop it" is right for every kind:
 //!
 //! - A late or duplicated answer -- [`Refusal::NotTheAsk`], [`Refusal::NothingAsked`]. It is of an
 //!   action already answered: of this operation, of an earlier one, of another connection's machine.
@@ -278,12 +291,16 @@ pub struct Moved {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoDataPlane;
 
-/// What an answer says came to exist outside the machine ([`Input::brought`]).
+/// What an answer says came to exist outside the machine ([`Input::brought`]). What identifies it
+/// beyond this is the consumer's to keep ([Refused inputs](crate::session::machine#refused-inputs)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Brought<T> {
-    /// A CHILD SA negotiated on the wire, of SPIs `new` `(local, peer)`.
+    /// A CHILD SA negotiated on the wire, of SPIs `new` `(local, peer)`. The SPIs alone do not say
+    /// which session negotiated it; the [`Ask`] the answer was given with, if any, names the machine
+    /// whose operation did, by its scope ([`Ask::scope`]).
     Child { new: (u32, u32) },
-    /// An SA put in the data plane, of this name.
+    /// An SA put in the data plane, of this name: the consumer's own, which should name its data
+    /// plane.
     InPlane(T),
 }
 
@@ -745,6 +762,14 @@ pub struct Step<T> {
 pub struct Ask {
     scope: u64,
     serial: u64,
+}
+
+impl Ask {
+    /// The scope of the machine it is of ([`FamilyMachine::with_scope`]): what tells, for an answer
+    /// given with it, the machine whose operation issued it.
+    pub fn scope(&self) -> u64 {
+        self.scope
+    }
 }
 
 /// Why an input was refused ([`Unexpected`]).
@@ -2891,6 +2916,7 @@ mod tests {
         assert_eq!((a.scope(), b.scope(), FamilyMachine::<u64>::new().scope()), (1, 2, 0));
         let ask_a = a.step(renew(t0, CURRENT), &POLICY).unwrap().ask.unwrap();
         let ask_b = b.step(renew(t0, CURRENT), &POLICY).unwrap().ask.unwrap();
+        assert_eq!((ask_a.scope(), ask_b.scope()), (a.scope(), b.scope()), "an ask reports its machine's scope");
         assert_eq!(ask_a.serial, ask_b.serial, "the same serial");
         assert_ne!(ask_a, ask_b);
         let before = a.clone();

@@ -165,6 +165,8 @@ pub enum Party {
 /// (`Sent { acknowledged: true }`: the peer answered it), failed (`Failed`: certainly not sent),
 /// and uncertain (`Sent { acknowledged: false }`: sent, with no answer; `Unknown`: not known
 /// whether it was sent). `NotSent` is a Delete not tried yet, and `NotOwed` one there is none of.
+/// `ConnectionEnded` is a Delete that can no longer be sent because the IKE SA is over: the local
+/// record of it is closed, and what the peer still holds is not known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteStand {
     /// Sent; `acknowledged` once the peer's answer to it came in.
@@ -180,6 +182,14 @@ pub enum DeleteStand {
     /// Tried, and whether it was sent is not known: the attempt ended in an error that may have
     /// come after it was handed to the socket.
     Unknown,
+    /// The connection ended: the IKE SA it was owed under is over (the protocol's
+    /// `NotOwed("ike_sa_gone")`, as the consumer maps it), so there is nothing left to send it on.
+    /// That ends only the local record of the debt. It is not a confirmation: no answer of the
+    /// peer's to a Delete of this SA came, the end of the IKE SA proves nothing about the SA at the
+    /// peer -- this side's Delete of the IKE SA may never have been received -- and what the peer
+    /// still holds is not known. Not the peer's to delete either, nor a Delete there never was.
+    /// Never tried again.
+    ConnectionEnded,
 }
 
 /// An SA that is no longer its family's, and its Delete: who owes it and where it stands. It
@@ -199,7 +209,8 @@ pub struct Retired {
 
 impl Retired {
     /// This side owes its Delete and has not had it answered: not tried, failed, not known to have
-    /// gone, or sent with no answer yet.
+    /// gone, or sent with no answer yet. Not one whose connection ended
+    /// ([`DeleteStand::ConnectionEnded`]): it is not answered either, but it cannot be sent any more.
     fn owed(&self) -> bool {
         self.deleted_by == Party::Ours
             && matches!(
@@ -217,8 +228,9 @@ impl Retired {
 
 /// The bounds on the retired SAs a record keeps; both figures are the caller's.
 ///
-/// `settled_kept` bounds the settled entries -- its Delete answered, none owed, or the peer's to
-/// delete --: past it, the oldest settled one goes first. `owed_max` bounds nothing the record
+/// `settled_kept` bounds the settled entries -- those no longer owed in the local record: its Delete
+/// answered, none owed, the peer's to delete, or its connection ended with the peer's outcome not
+/// known ([`DeleteStand::ConnectionEnded`]) --: past it, the oldest settled one goes first. `owed_max` bounds nothing the record
 /// drops: it is where the caller stops *starting* what may owe another Delete
 /// ([`FamilyRenewal::owed_room`], asked before the operation). A Delete owed is kept whatever the
 /// count ([`Retirement::OverCapacity`]).
@@ -235,8 +247,9 @@ pub struct RetiredBounds {
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Retirement {
-    /// Nothing owed for it: kept among the settled ones, within `settled_kept` (the oldest settled
-    /// one goes first -- with 0, it is not kept at all).
+    /// Nothing owed for it (or nothing that can still be sent: its connection ended): kept among the
+    /// settled ones, within `settled_kept` (the oldest settled one goes first -- with 0, it is not kept
+    /// at all).
     Settled,
     /// Its Delete is owed: kept; `room` more may be owed within `owed_max` (0: at capacity).
     Owed {
@@ -259,7 +272,9 @@ pub enum Update {
     NoSuchDebt,
     /// Updated, and its Delete still owed: in its place among the owed ones.
     Owed,
-    /// Updated, and no longer owed: put last among the settled ones, within `settled_kept`.
+    /// Updated, and no longer owed: put last among the settled ones, within `settled_kept`. Its
+    /// stand says why -- answered, the peer's, none owed, or the connection ended
+    /// ([`DeleteStand::ConnectionEnded`], which is no confirmation).
     Settled,
 }
 
@@ -391,9 +406,11 @@ impl<T: Copy> FamilyRenewal<T> {
     /// Walks nothing.
     ///
     /// What settles a debt later ([`update`](Self::update)) is the caller's to know and to have
-    /// evidence of: the peer's answer to this side's Delete of that SA, the peer's own Delete of it,
-    /// or the end of the IKE SA it was made under. Never its age, a timeout, or another SA put in
-    /// its place: nothing in the record settles one by itself, and nothing here sends a Delete again.
+    /// evidence of: the peer's answer to this side's Delete of that SA, or the peer's own Delete of
+    /// it. The end of the IKE SA it was made under is no such evidence: it closes the local record of
+    /// the debt ([`DeleteStand::ConnectionEnded`]), what the peer holds not known. Never its age, a
+    /// timeout, or another SA put in its place: nothing in the record settles one by itself, and
+    /// nothing here sends a Delete again.
     pub fn retire_within(&mut self, r: Retired, bounds: RetiredBounds) -> Retirement {
         if !r.owed() {
             self.keep_settled(r, bounds.settled_kept);
@@ -419,8 +436,10 @@ impl<T: Copy> FamilyRenewal<T> {
     ///
     /// Only evidence settles a debt, and it is the caller's to have: the peer's answer to this
     /// side's Delete of that SA (`Sent { acknowledged: true }`), the peer's own Delete of it
-    /// ([`Party::Peers`]), the end of the IKE SA it was made under ([`DeleteStand::NotOwed`]).
-    /// `bounds.owed_max` is not looked at.
+    /// ([`Party::Peers`]). The end of the IKE SA it was made under
+    /// ([`DeleteStand::ConnectionEnded`]) takes it out of the owed ones too, there being nothing
+    /// left to send it on, but it finalises the local record only: it is neither an answer nor the
+    /// peer's Delete, and says nothing of what the peer holds. `bounds.owed_max` is not looked at.
     pub fn update(&mut self, r: Retired, bounds: RetiredBounds) -> Update {
         let Some(at) = self.owed.iter().position(|owed| owed.same_sa(&r)) else { return Update::NoSuchDebt };
         let entry = &mut self.owed[at];
@@ -447,8 +466,9 @@ impl<T: Copy> FamilyRenewal<T> {
         &self.owed
     }
 
-    /// The settled retired SAs kept -- their Delete answered, none owed, or the peer's to delete --,
-    /// oldest first.
+    /// The settled retired SAs kept -- their Delete answered, none owed, the peer's to delete, or
+    /// their connection ended with the peer's outcome not known ([`DeleteStand::ConnectionEnded`]:
+    /// closed in the local record, not confirmed) --, oldest first.
     pub fn settled(&self) -> impl ExactSizeIterator<Item = &Retired> + '_ {
         self.settled.iter()
     }
@@ -467,7 +487,7 @@ mod tests {
     use super::*;
     use crate::session::spacing::{Schedule, Spacing};
     use crate::session::{Rounding, Share};
-    use DeleteStand::{Failed, NotOwed, NotSent, Sent, Unknown};
+    use DeleteStand::{ConnectionEnded, Failed, NotOwed, NotSent, Sent, Unknown};
     use Party::{Ours, Peers};
 
     const RETRY_MIN: Duration = Duration::from_secs(5);
@@ -719,11 +739,13 @@ mod tests {
         f.settled().copied().collect()
     }
 
-    /// Every way of being settled: its Delete answered, none owed, or the peer's to delete whatever
-    /// its stand.
-    const SETTLED: [(Party, DeleteStand); 8] = [
+    /// Every way of being settled: its Delete answered, none owed, its connection ended (the local
+    /// record closed, the peer's outcome not known), or the peer's to delete whatever its stand.
+    const SETTLED: [(Party, DeleteStand); 10] = [
         (Ours, Sent { acknowledged: true }),
         (Ours, NotOwed("not_asked")),
+        (Ours, ConnectionEnded),
+        (Peers, ConnectionEnded),
         (Peers, Sent { acknowledged: true }),
         (Peers, Sent { acknowledged: false }),
         (Peers, NotSent),
@@ -804,6 +826,8 @@ mod tests {
             (retired(10, Peers, Failed), false),
             (retired(11, Ours, Unknown), true),
             (retired(12, Peers, Unknown), false),
+            (retired(13, Ours, ConnectionEnded), false),
+            (retired(14, Peers, ConnectionEnded), false),
         ];
         for (r, _) in all {
             let _ = f.retire_within(r, kept(all.len()));
@@ -864,8 +888,16 @@ mod tests {
             assert_eq!(f.owed(), [a, Retired { stand, ..b }, c], "{stand:?}: in its place");
             assert_eq!(f.owed_room(4), 1);
         }
-        // Owed to settled, by each of the three kinds of evidence.
-        let evidence = [(Ours, Sent { acknowledged: true }), (Peers, NotOwed("gateway_deleted")), (Peers, Sent { acknowledged: false }), (Ours, NotOwed("ike_sa_gone"))];
+        // Owed to settled: by each kind of evidence -- its Delete answered, the peer's own Delete, the
+        // peer's to delete --, by a reason none is owed the consumer gave, or by the end of its
+        // connection, which closes the local record only.
+        let evidence = [
+            (Ours, Sent { acknowledged: true }),
+            (Peers, NotOwed("gateway_deleted")),
+            (Peers, Sent { acknowledged: false }),
+            (Ours, NotOwed("ike_sa_gone")),
+            (Ours, ConnectionEnded),
+        ];
         for settled_kept in [0, 1, 2] {
             for (by, stand) in evidence {
                 let bounds = RetiredBounds { settled_kept, owed_max: 4 };
@@ -887,6 +919,45 @@ mod tests {
                 assert_eq!(f, before);
             }
         }
+    }
+
+    #[test]
+    fn a_debt_whose_connection_ended_closes_its_local_record_as_ended_neither_confirmed_nor_the_peers_nor_owed_again() {
+        let bounds = RetiredBounds { settled_kept: 8, owed_max: 8 };
+        let mut f = FamilyRenewal::<u64>::new();
+        let confirmed = retired(1, Ours, Sent { acknowledged: true });
+        let debts: [Retired; 4] = std::array::from_fn(|k| retired(10 + k as u32, Ours, OWED[k]));
+        let _ = f.retire_within(confirmed, bounds);
+        for r in debts {
+            let _ = f.retire_within(r, bounds);
+        }
+        assert_eq!(f.owed(), debts);
+        // Each debt the end of its IKE SA reached: out of the owed ones, closed as ended -- one stand
+        // of its own, which is no answer, not the peer's, not a Delete never owed.
+        for (k, r) in debts.into_iter().enumerate() {
+            let ended = Retired { stand: ConnectionEnded, ..r };
+            assert_eq!(f.update(ended, bounds), Update::Settled, "{r:?}");
+            assert_eq!(f.owed(), &debts[k + 1..], "{r:?}: no longer owed, nothing left to send it on");
+            assert_eq!(f.owed_room(bounds.owed_max), bounds.owed_max - (debts.len() - k - 1));
+            let kept = *f.settled().last().unwrap();
+            assert_eq!(kept, ended, "{r:?}: closed as ended, ours");
+            assert_ne!(kept.stand, Sent { acknowledged: true }, "not confirmed");
+            assert!(!matches!(kept.stand, NotOwed(_)), "not a Delete never owed");
+            assert_eq!(kept.deleted_by, Ours, "not the peer's");
+            // Closed: a later report changes nothing -- the record does not take a late answer as one.
+            let before = f.clone();
+            assert_eq!(f.update(Retired { stand: Sent { acknowledged: true }, ..r }, bounds), Update::NoSuchDebt);
+            assert_eq!(f, before);
+        }
+        // The debt confirmed before the end stays confirmed: the end reaches no settled entry.
+        let before = f.clone();
+        assert_eq!(f.update(Retired { stand: ConnectionEnded, ..confirmed }, bounds), Update::NoSuchDebt);
+        assert_eq!(f, before);
+        assert_eq!(settled_of(&f)[0], confirmed);
+        // Retired as ended at once: kept among the settled ones, never owed.
+        let late = retired(30, Ours, ConnectionEnded);
+        assert_eq!(f.retire_within(late, bounds), Retirement::Settled);
+        assert!(f.owed().is_empty() && f.settled().last() == Some(&late));
     }
 
     #[test]

@@ -203,7 +203,10 @@
 //!   ([`Outcome::NoRetry`]). A rekey awaiting the driver awaits it still after.
 //!
 //! A Delete sent and unanswered stays owed ([`DeleteStand::Sent`] `{ acknowledged: false }`): it is
-//! no confirmation. The bound of owed Deletes suspends nothing in this order (the driver decides its
+//! no confirmation. One that can no longer be sent because the IKE SA is over, as the consumer reports
+//! it ([`DeleteStand::ConnectionEnded`]), leaves the owed ones and is never tried again, but it is no
+//! confirmation either: the end of the connection closes the local record of it, and what the peer
+//! holds stays unknown. The bound of owed Deletes suspends nothing in this order (the driver decides its
 //! retries): past it every Delete is kept, noted ([`Note::OwedOverCapacity`]). The spacing of
 //! attempts is the consumer's in this order, asked before [`Input::RenewDue`] is given: the record
 //! keeps no attempt. No switch is ever deferred. The only [`Note`]s are the record's own, as in the
@@ -246,7 +249,9 @@ pub struct Policy {
 
 /// What came of a Delete of this side's, as the consumer maps its protocol's report onto the
 /// record's terms (the controller's `delete_stand`): who deletes the SA, where its Delete stands, and
-/// whether the report says the IKE SA is over.
+/// whether the report says the IKE SA is over. The protocol's `NotOwed("ike_sa_gone")` -- nothing sent,
+/// the IKE SA over -- is best mapped to [`DeleteStand::ConnectionEnded`], which keeps the end of the
+/// connection apart from a Delete never owed; the machine records whichever stand it is given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeleteCame {
     /// Who deletes the SA.
@@ -455,7 +460,9 @@ pub enum NotCommitted {
 /// Why a Delete the driver asked to try again was not ([`Outcome::NoRetry`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WhyNoRetry {
-    /// It is settled: answered by the peer, none owed, or the peer's to delete.
+    /// It is settled in the record: answered by the peer, none owed, the peer's to delete, or its
+    /// connection ended ([`DeleteStand::ConnectionEnded`]: no IKE SA left to send it on, the local
+    /// record closed, the peer's outcome not known -- not a confirmation).
     Settled,
     /// It was sent and never answered: owed still -- that is no confirmation -- but a Delete that
     /// went is not sent again.
@@ -1619,8 +1626,9 @@ impl<T: Copy> FamilyMachine<T> {
     /// attempt counted failed. With its Delete asked, the debt owed before the ask takes what it came
     /// to, and gets no other try: an abandoned rekey's Delete has one chance. With none asked -- the
     /// driver's veto, or its silence -- the new SA is retired with nothing owed: why, the report's
-    /// reason when it names a fact (the peer deleted it, the IKE SA is over), else `"not_asked"` (the
-    /// veto) or `"driver_silent"`. The report is always of the new SA: a Delete of the replaced SA
+    /// reason when it names a fact (the peer deleted it), [`DeleteStand::ConnectionEnded`] when the
+    /// report says the connection ended (the IKE SA over: what the peer holds not known), else
+    /// `"not_asked"` (the veto) or `"driver_silent"`. The report is always of the new SA: a Delete of the replaced SA
     /// (possible only when a rekey of the peer's of the new SA was answered with the hold off, and
     /// then only with the Delete asked) is reported apart by the protocol
     /// ([`crate::DeleteReport::replaced`]) and is not this input. The driver's silence ends in
@@ -1636,12 +1644,13 @@ impl<T: Copy> FamilyMachine<T> {
                 }
             }
             Abandoning::Word { send_delete: false } | Abandoning::Silent => {
-                let (deleted_by, why) = match (how, report.stand) {
-                    (_, DeleteStand::NotOwed(why)) if why != "not_asked" => (report.deleted_by, why),
-                    (Abandoning::Silent, _) => (Party::Ours, "driver_silent"),
-                    _ => (Party::Ours, "not_asked"),
+                let (deleted_by, stand) = match (how, report.stand) {
+                    (_, DeleteStand::ConnectionEnded) => (Party::Ours, DeleteStand::ConnectionEnded),
+                    (_, DeleteStand::NotOwed(why)) if why != "not_asked" => (report.deleted_by, DeleteStand::NotOwed(why)),
+                    (Abandoning::Silent, _) => (Party::Ours, DeleteStand::NotOwed("driver_silent")),
+                    _ => (Party::Ours, DeleteStand::NotOwed("not_asked")),
                 };
-                let _ = self.record.retire_within(Retired { spis, generation, deleted_by, stand: DeleteStand::NotOwed(why) }, policy.retired);
+                let _ = self.record.retire_within(Retired { spis, generation, deleted_by, stand }, policy.retired);
             }
         }
         self.prune_tries();
@@ -1938,8 +1947,8 @@ impl<T: Copy> FamilyMachine<T> {
     }
 
     /// The controller's `delete_came_to`: the owed entry of exactly that SA takes what its Delete came
-    /// to -- settled on evidence, still owed otherwise, and never sent again. With none, nothing
-    /// changes.
+    /// to -- settled on evidence, closed as ended when its connection ended (no evidence: the peer's
+    /// outcome not known), still owed otherwise, and never sent again. With none, nothing changes.
     fn delete_came_to(&mut self, spis: (u32, u32), generation: Option<u64>, report: DeleteCame, policy: &Policy, out: &mut Vec<Action<T>>) {
         let stand = report.stand;
         match self.record.update(Retired { spis, generation, deleted_by: report.deleted_by, stand }, policy.retired) {
@@ -2143,7 +2152,7 @@ mod tests {
     use super::*;
     use crate::session::limits::Origin;
     use crate::session::spacing::LastAttempt;
-    use DeleteStand::{Failed, NotOwed, NotSent, Sent, Unknown};
+    use DeleteStand::{ConnectionEnded, Failed, NotOwed, NotSent, Sent, Unknown};
     use Party::{Ours, Peers};
 
     fn secs(s: u64) -> Duration {
@@ -2483,6 +2492,7 @@ mod tests {
                 (came(Ours, Unknown), Outcome::Failed),
                 (DeleteCame { ike_sa_over: true, ..ACKED }, Outcome::TornDown),
                 (DeleteCame { ike_sa_over: true, ..came(Ours, NotOwed("ike_sa_gone")) }, Outcome::TornDown),
+                (DeleteCame { ike_sa_over: true, ..came(Ours, ConnectionEnded) }, Outcome::TornDown),
             ] {
                 let mut m = FamilyMachine::<u64>::new();
                 let answers = [due(), negotiated(t0, NEW), Input::Prepared(Err(NotPrepared { session_on })), Input::Abandoned(report)];
@@ -2564,7 +2574,7 @@ mod tests {
     fn ours_kept_the_replaced_sas_delete_is_owed_before_it_is_asked_and_takes_what_it_came_to() {
         let t0 = t0();
         let owed = retired(CURRENT, Ours, NotSent);
-        for (stand, still_owed) in [(Sent { acknowledged: true }, false), (Sent { acknowledged: false }, true), (Unknown, true), (Failed, true), (NotOwed("ike_sa_gone"), false)] {
+        for (stand, still_owed) in [(Sent { acknowledged: true }, false), (Sent { acknowledged: false }, true), (Unknown, true), (Failed, true), (NotOwed("ike_sa_gone"), false), (ConnectionEnded, false)] {
             for ike_sa_over in [false, true] {
                 let report = DeleteCame { deleted_by: Ours, stand, ike_sa_over };
                 let mut m = FamilyMachine::<u64>::new();
@@ -4500,6 +4510,48 @@ mod tests {
             assert_eq!(take(&mut m, Input::DeleteRetry { named: n }), over(Outcome::NotPending), "{n:?}");
         }
         assert_eq!(m, before);
+    }
+
+    #[test]
+    fn a_debt_the_end_of_the_connection_reached_is_closed_as_ended_however_the_driver_resolved_it_and_never_tried_again() {
+        let t0 = t0();
+        let new = ChildId { generation: CURRENT.generation + 1, local_spi: NEW.0, peer_spi: NEW.1 };
+        let ended = DeleteCame { deleted_by: Ours, stand: ConnectionEnded, ike_sa_over: true };
+        // (the driver's word on the rekey it names, what the protocol answered, the SA retired, the outcome)
+        type Word = fn(DriverRef) -> Input<u64>;
+        let cases: [(Word, Input<u64>, ChildId, Outcome<u64>); 5] = [
+            // The commit, with the replaced SA's Delete: the IKE SA over before it went.
+            (|named| Input::DriverInstalled { named, delete_replaced: true }, Input::Committed(Committed::Other(ended)), CURRENT, Outcome::Renewed { new: NEW, deferred: false, ike_sa_over: true }),
+            // The abandon, with the new SA's Delete, with the driver's veto, and its silence.
+            (|named| Input::DriverNotUsed { named, send_delete: true }, Input::Abandoned(ended), new, Outcome::TornDown),
+            (|named| Input::DriverNotUsed { named, send_delete: false }, Input::Abandoned(ended), new, Outcome::TornDown),
+            (|_| Input::DriverSilent, Input::Abandoned(ended), new, Outcome::Unresolved { ike_sa_over: true }),
+            // The commit with no Delete asked, then its retry: the IKE SA over by then.
+            (|named| Input::DriverInstalled { named, delete_replaced: false }, Input::Committed(Committed::OursDeleteNotAsked), CURRENT, Outcome::Renewed { new: NEW, deferred: false, ike_sa_over: false }),
+        ];
+        for (k, (word, answer, sa, outcome)) in cases.into_iter().enumerate() {
+            let mut m = driven();
+            let h = handed(&mut m, t0);
+            assert_eq!(go(&mut m, word(named(&h)), &[answer]).1, outcome, "{k}");
+            if k == 4 {
+                assert_eq!(m.record().owed(), [retired(sa, Ours, NotSent)], "{k}: owed, never tried");
+                let (actions, outcome) = go(&mut m, Input::DeleteRetry { named: named_retired(sa) }, &[Input::Deleted(ended)]);
+                assert_eq!((actions, outcome), (vec![Action::DeleteChild { spis: sa.spis() }], Outcome::DeleteRetried { ike_sa_over: true }), "{k}");
+            }
+            // Closed in the local record as ended: not owed, not confirmed, not the peer's, not a reason none was owed.
+            assert_eq!((m.record().owed(), settled(&m)), (&[][..], vec![retired(sa, Ours, ConnectionEnded)]), "{k}");
+            assert!(m.tries.is_empty(), "{k}: no count kept of what cannot be sent");
+            // Never tried again: nothing asked, nothing changed.
+            let before = m.clone();
+            assert_eq!(take(&mut m, Input::DeleteRetry { named: named_retired(sa) }), over(Outcome::NoRetry(WhyNoRetry::Settled)), "{k}");
+            assert_eq!(m, before, "{k}");
+        }
+        // A Delete answered before the end stays confirmed: a later report of the end finds no debt.
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        go(&mut m, Input::DriverInstalled { named: named(&h), delete_replaced: true }, &[Input::Committed(Committed::Other(ACKED))]);
+        assert_eq!(take(&mut m, Input::DeleteRetry { named: named_retired(CURRENT) }), over(Outcome::NoRetry(WhyNoRetry::Settled)));
+        assert_eq!(settled(&m), [retired(CURRENT, Ours, Sent { acknowledged: true })], "confirmed, as it was");
     }
 
     #[test]

@@ -439,7 +439,10 @@ pub enum ChildDeleteOutcome {
     /// `"in_use"` (the SA is still one the tunnel runs on) or, from
     /// [`LivenessSession::delete_child`] only, `"inconsistent_spis"` (the two
     /// SPIs are not one SA's: one is that of an SA the session knows, the
-    /// other is not; nothing is known of what the caller meant).
+    /// other is not; nothing is known of what the caller meant) or
+    /// `"held_rekey"` (the new SA of a rekey of the peer's whose answer is
+    /// held, [`LivenessSession::hold_peer_rekeys`]: the peer does not have it
+    /// yet, and its release or refusal decides it).
     NotOwed(&'static str),
 }
 
@@ -1646,6 +1649,12 @@ impl LivenessSession {
     /// `"in_use"` while it is ours to delete (the caller may still run on it,
     /// and the abandon goes back to it), `"peer_deletes"` when a crossed rekey
     /// of the peer's was kept, `"gateway_deleted"` when the peer deleted it.
+    /// The new SA of a rekey of the peer's held unanswered
+    /// ([`Self::hold_peer_rekeys`], one awaiting a negotiated rekey of ours
+    /// included) is refused `"held_rekey"`, the hold left as it was: the peer
+    /// has no such SA until it gets the answer held, and a release would make
+    /// current an SA its Delete had named. [`Self::release_peer_rekey`] or
+    /// [`Self::refuse_peer_rekey`] decides it.
     ///
     /// The pair names one SA, by both its SPIs: an SA this session knows is
     /// selected only when both match. A pair one of whose SPIs is that of an
@@ -1682,7 +1691,8 @@ impl LivenessSession {
     /// does not send, with why, in the order it looks for them: the SA of a
     /// negotiated rekey the peer deleted, the current SAs, those negotiated
     /// and not committed, the redundant SAs kept, the SA a pending rekey
-    /// replaced (by who deletes it) and those the peer's rekeys replaced.
+    /// replaced (by who deletes it), those the peer's rekeys replaced and the
+    /// new SA of a rekey of the peer's held unanswered.
     fn children_not_to_delete(&self) -> Vec<(ChildSpis, &'static str)> {
         let deleted = self.peer_child.deleted_rekeys.iter().flatten().map(|deleted| (deleted.new, "gateway_deleted"));
         let current = [ChildKind::Primary, ChildKind::Ipv6].into_iter().filter_map(|kind| self.child_spis(kind)).map(|(local, peer)| (ChildSpis { local, peer }, "in_use"));
@@ -1697,7 +1707,8 @@ impl LivenessSession {
             (rekey.old, why)
         });
         let superseded = self.peer_child.superseded.iter().map(|s| (ChildSpis { local: s.local_spi, peer: s.peer_spi }, "peer_deletes"));
-        deleted.chain(current).chain(negotiated).chain(redundant).chain(replaced).chain(superseded).collect()
+        let held = self.peer_child.held.iter().map(|held| (held.new, "held_rekey"));
+        deleted.chain(current).chain(negotiated).chain(redundant).chain(replaced).chain(superseded).chain(held).collect()
     }
 
     /// The (local, peer) SPIs of the SA `kind`'s negotiated rekey made, if the
@@ -8249,6 +8260,337 @@ mod tests {
         let (report, sent) = with_informationals_answered(&gateway, &resp_sa, || liveness.delete_child(unknown.local, unknown.peer).unwrap());
         assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::Sent { acknowledged: true }, liveness: Liveness::Alive, replaced: None });
         assert_eq!(wire_of(&resp_sa, &sent), [((ExchangeType::Informational, 2, false), Some(Delete::esp(vec![unknown.local])))]);
+    }
+
+    /// Which rekey of the gateway's a session of
+    /// [`session_holding_a_gateway_rekey`] holds unanswered.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum HeldGatewayRekey {
+        /// Of the primary SA, the IPv6 one [`HELD_BESIDE6`] next to it.
+        Primary,
+        /// Of the IPv6 SA [`HELD_BESIDE6`], the primary next to it.
+        Ipv6,
+        /// Of `OURS_NEGOTIATED`, the SA a negotiated rekey of ours made
+        /// current, pending its commit or abandon ([`HeldRekey::awaits_own`]).
+        AwaitsOwn,
+    }
+
+    /// The IPv6 CHILD SA of a session of [`session_holding_a_gateway_rekey`]
+    /// that holds a rekey of the gateway's of either family.
+    const HELD_BESIDE6: ChildSpis = ChildSpis { local: 0x6666, peer: 0x7777 };
+
+    /// A session facing `gateway` that holds the gateway's rekey `how`
+    /// unanswered ([`LivenessSession::hold_peer_rekeys`]): its request,
+    /// Message ID 0, taken in, its new SA derived on [`PEER_NEW_SPI`] and our
+    /// (random) inbound SPI, nothing sent. The session, the held rekey's
+    /// family, its new SA and the SA it replaces.
+    fn session_holding_a_gateway_rekey(
+        gateway: &UdpSocket,
+        init_sa: CompletedSaInit,
+        resp_sa: &CompletedSaInit,
+        how: HeldGatewayRekey,
+    ) -> (LivenessSession, ChildKind, ChildSpis, ChildSpis) {
+        let liveness = match how {
+            HeldGatewayRekey::AwaitsOwn => gateway_rekeys_our_negotiated_sa(gateway, init_sa, resp_sa, true).0,
+            HeldGatewayRekey::Primary | HeldGatewayRekey::Ipv6 => {
+                let mut liveness = session_facing(gateway, init_sa, Some(HELD_BESIDE6));
+                liveness.hold_peer_rekeys(true);
+                let rekeyed = if how == HeldGatewayRekey::Primary { 0xAAAA } else { HELD_BESIDE6.peer };
+                assert_eq!(deliver(&mut liveness, gateway, &gateway_rekey_of(resp_sa, 0, rekeyed, PEER_NEW_SPI)), Liveness::Alive);
+                liveness
+            }
+        };
+        gateway.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        assert_eq!(sent_to(gateway), None, "{how:?}: nothing answered");
+        let held = liveness.peer_child.held.as_ref().expect("held");
+        assert_eq!(held.awaits_own, how == HeldGatewayRekey::AwaitsOwn, "{how:?}");
+        assert_eq!(held.new.peer, PEER_NEW_SPI, "{how:?}");
+        let (kind, new, old) = (held.kind, held.new, held.old);
+        (liveness, kind, new, old)
+    }
+
+    /// The rekey `liveness` holds, as everything a later release or
+    /// refusal of it reads: its family, the SA it replaces, its new SA,
+    /// since when, whether it awaits a negotiated rekey of ours, and whether
+    /// its keys are still there to take.
+    fn held_rekey_as_it_is(liveness: &LivenessSession) -> Option<(ChildKind, ChildSpis, ChildSpis, Instant, bool, bool)> {
+        liveness.peer_child.held.as_ref().map(|held| (held.kind, held.old, held.new, held.since, held.awaits_own, held.child.is_some()))
+    }
+
+    /// [`LivenessSession::delete_child`] of the new SA of a rekey of the
+    /// gateway's held unanswered -- an ordinary held rekey of either family,
+    /// or one held for the commit or abandon of a negotiated rekey of ours --
+    /// is refused `"held_rekey"`, sending nothing and changing nothing: no
+    /// Message ID is used, both families stay on their SAs, and the held
+    /// rekey is as it was, keys and all. It used to go out: a Delete naming
+    /// an SA the gateway does not have until it gets the answer still held --
+    /// the SA a release would then make current, after we had told the
+    /// gateway it was deleted.
+    #[test]
+    fn delete_child_of_the_new_sa_of_a_gateway_rekey_held_unanswered_is_refused_held_rekey_sending_nothing() {
+        for how in [HeldGatewayRekey::Primary, HeldGatewayRekey::Ipv6, HeldGatewayRekey::AwaitsOwn] {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let (mut liveness, _, new, _) = session_holding_a_gateway_rekey(&gateway, init_sa, &resp_sa, how);
+            let (spis, held, next) = (both_child_spis(&liveness), held_rekey_as_it_is(&liveness), liveness.next_message_id);
+            let report = liveness.delete_child(new.local, new.peer).unwrap();
+            let sent = wire_of(&resp_sa, &all_sent_to(&gateway));
+            assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::NotOwed("held_rekey"), liveness: Liveness::Alive, replaced: None }, "{how:?}; sent {sent:x?}");
+            assert!(sent.is_empty(), "{how:?}: nothing sent: {sent:x?}");
+            assert_eq!(liveness.next_message_id, next, "{how:?}: no Message ID used");
+            assert_eq!(both_child_spis(&liveness), spis, "{how:?}: nothing moved");
+            assert_eq!(held_rekey_as_it_is(&liveness), held, "{how:?}: the held rekey as it was");
+        }
+    }
+
+    /// A pair one of whose SPIs is that of the new SA of a rekey of the
+    /// gateway's held unanswered and the other not that SA's is refused
+    /// `"inconsistent_spis"`, as for any SA the session knows, sending nothing
+    /// and changing nothing. Those whose other half is unknown used to go out
+    /// as a pair the session does not know; those whose other half is the SA
+    /// the held rekey replaces were refused already, and still are.
+    #[test]
+    fn delete_child_of_a_pair_half_of_which_is_the_new_sa_of_a_held_gateway_rekey_is_refused_inconsistent_spis() {
+        let unknown = ChildSpis { local: 0x7E7E, peer: 0x7F7F };
+        for how in [HeldGatewayRekey::Primary, HeldGatewayRekey::Ipv6, HeldGatewayRekey::AwaitsOwn] {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let (mut liveness, _, new, old) = session_holding_a_gateway_rekey(&gateway, init_sa, &resp_sa, how);
+            let (spis, held, next) = (both_child_spis(&liveness), held_rekey_as_it_is(&liveness), liveness.next_message_id);
+            let pairs = [
+                ("held new local, unknown peer", new.local, unknown.peer),
+                ("unknown local, held new peer", unknown.local, new.peer),
+                ("held new local, replaced peer", new.local, old.peer),
+                ("replaced local, held new peer", old.local, new.peer),
+            ];
+            for (case, local, peer) in pairs {
+                let report = liveness.delete_child(local, peer).unwrap();
+                let sent = wire_of(&resp_sa, &all_sent_to(&gateway));
+                assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::NotOwed("inconsistent_spis"), liveness: Liveness::Alive, replaced: None }, "{how:?}, {case}; sent {sent:x?}");
+                assert!(sent.is_empty(), "{how:?}, {case}: nothing sent: {sent:x?}");
+                assert_eq!(liveness.next_message_id, next, "{how:?}, {case}: no Message ID used");
+                assert_eq!(both_child_spis(&liveness), spis, "{how:?}, {case}: nothing moved");
+                assert_eq!(held_rekey_as_it_is(&liveness), held, "{how:?}, {case}: the held rekey as it was");
+            }
+        }
+    }
+
+    /// What a session holding a rekey of the gateway's comes to in
+    /// [`serve_held_gateway_rekey`].
+    #[derive(Debug, PartialEq)]
+    struct HeldServed {
+        /// What [`LivenessSession::commit_rekey`] of our negotiated rekey
+        /// reported, for a rekey held for it and released.
+        committed: Option<DeleteReport>,
+        /// What [`LivenessSession::take_held_peer_rekey`] handed over: the
+        /// family, the SA replaced, the gateway's SPI, and whether our SPI is
+        /// the held new SA's.
+        taken: Option<(ChildKind, (u32, u32), u32, bool)>,
+        /// Whether the release or the refusal was accepted.
+        served: bool,
+        /// The liveness check after.
+        probed: Liveness,
+        /// Each message sent meanwhile: its exchange, Message ID and Response
+        /// flag, the Delete it carries, the error a `CREATE_CHILD_SA` answer
+        /// refuses with, and whether the gateway derives from it the held new
+        /// SA.
+        wire: Vec<((ExchangeType, u32, bool), Option<Delete>, Option<u16>, bool)>,
+        /// Both families' SAs after, the held new SA's (random) inbound SPI zeroed.
+        spis: [Option<(u32, u32)>; 2],
+        next_message_id: u32,
+        /// Whether a rekey is still held.
+        still_held: bool,
+    }
+
+    /// What `liveness`, holding the rekey of the gateway's `how` whose new SA
+    /// is `new`, comes to from here: released (after the commit of our
+    /// negotiated rekey, for one held for it) or refused, then a liveness
+    /// check; the gateway answering every INFORMATIONAL request meanwhile.
+    fn serve_held_gateway_rekey(
+        liveness: &mut LivenessSession,
+        gateway: &UdpSocket,
+        resp_sa: &CompletedSaInit,
+        how: HeldGatewayRekey,
+        kind: ChildKind,
+        new: ChildSpis,
+        release: bool,
+    ) -> HeldServed {
+        let ((committed, taken, served, probed), sent) = with_informationals_answered(gateway, resp_sa, || {
+            let committed = (release && how == HeldGatewayRekey::AwaitsOwn).then(|| liveness.commit_rekey(kind, OURS_NEGOTIATED.local, true).unwrap());
+            let taken = liveness.take_held_peer_rekey().map(|h| (h.kind, h.replaces, h.child.peer_spi, h.child.local_spi == new.local));
+            let served = if release { liveness.release_peer_rekey(kind, new.local) } else { liveness.refuse_peer_rekey(kind, new.local) };
+            (committed, taken, served.is_ok(), liveness.probe(Duration::from_millis(500)).unwrap())
+        });
+        let wire = sent
+            .iter()
+            .map(|m| {
+                let header = client_header(m);
+                let delete = if header.0 == ExchangeType::Informational && !header.2 { delete_in(resp_sa, m) } else { None };
+                let (refused, carries) = if header.0 == ExchangeType::CreateChildSa && header.2 {
+                    match create_child_notify(resp_sa, m) {
+                        Some(error) => (Some(error), false),
+                        None => (None, gateway_takes_the_answer(resp_sa, PEER_NEW_SPI, m).outbound.spi() == new.local),
+                    }
+                } else {
+                    (None, false)
+                };
+                (header, delete, refused, carries)
+            })
+            .collect();
+        let spis = both_child_spis(liveness).map(|sa| sa.map(|(local, peer)| (if local == new.local { 0 } else { local }, peer)));
+        HeldServed { committed, taken, served, probed, wire, spis, next_message_id: liveness.next_message_id, still_held: liveness.peer_child.held.is_some() }
+    }
+
+    /// After the refused calls of
+    /// [`delete_child_of_the_new_sa_of_a_gateway_rekey_held_unanswered_is_refused_held_rekey_sending_nothing`]
+    /// and
+    /// [`delete_child_of_a_pair_half_of_which_is_the_new_sa_of_a_held_gateway_rekey_is_refused_inconsistent_spis`],
+    /// the held rekey is released or refused, and a liveness check follows,
+    /// exactly as in the same session without them: released, its keys
+    /// handed over, its answer -- carrying the held new SA -- on Message ID 0
+    /// (after the commit's Delete of the SA our rekey replaced, for one held
+    /// for it), the family on the new SA; refused, `TEMPORARY_FAILURE`, the
+    /// family where it was; the check on the next Message ID either way.
+    #[test]
+    fn a_refused_delete_child_of_a_held_gateway_rekeys_sa_leaves_its_release_or_refusal_as_without_it() {
+        let unknown = ChildSpis { local: 0x7E7E, peer: 0x7F7F };
+        for how in [HeldGatewayRekey::Primary, HeldGatewayRekey::Ipv6, HeldGatewayRekey::AwaitsOwn] {
+            for release in [true, false] {
+                let case = format!("{how:?}, release {release}");
+                let control = {
+                    let (init_sa, resp_sa) = liveness_sa_pair();
+                    let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    let (mut liveness, kind, new, _) = session_holding_a_gateway_rekey(&gateway, init_sa, &resp_sa, how);
+                    serve_held_gateway_rekey(&mut liveness, &gateway, &resp_sa, how, kind, new, release)
+                };
+                assert!(control.served && !control.still_held, "{case}: the control session served it: {control:#x?}");
+                let answer = control.wire.iter().find(|(header, ..)| *header == (ExchangeType::CreateChildSa, 0, true)).expect("answered");
+                if release {
+                    assert!(answer.3, "{case}: the control's answer carries the held new SA");
+                } else {
+                    assert_eq!(answer.2, Some(notify_type::TEMPORARY_FAILURE), "{case}: the control refused it");
+                }
+
+                let (init_sa, resp_sa) = liveness_sa_pair();
+                let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+                let (mut liveness, kind, new, old) = session_holding_a_gateway_rekey(&gateway, init_sa, &resp_sa, how);
+                for (local, peer) in [(new.local, new.peer), (new.local, unknown.peer), (unknown.local, new.peer), (new.local, old.peer), (old.local, new.peer)] {
+                    let _ = liveness.delete_child(local, peer);
+                }
+                assert_eq!(serve_held_gateway_rekey(&mut liveness, &gateway, &resp_sa, how, kind, new, release), control, "{case}: as without the refused calls");
+            }
+        }
+    }
+
+    /// While a rekey of the gateway's is held unanswered, every SA the
+    /// session knew is refused as it was -- the SA the held rekey replaces
+    /// and the other family's `"in_use"`, and for one held for a negotiated
+    /// rekey of ours the SA that rekey replaced as well -- and a pair it does
+    /// not know goes out as ever, Message ID 2, its Delete naming its local
+    /// SPI and answered: our requests go on while the gateway's window is
+    /// taken. The held rekey is as it was throughout.
+    #[test]
+    fn with_a_gateway_rekey_held_the_sas_the_session_knew_are_refused_as_before_and_an_unknown_pair_is_sent() {
+        let unknown = ChildSpis { local: 0x7E7E, peer: 0x7F7F };
+        for how in [HeldGatewayRekey::Primary, HeldGatewayRekey::Ipv6, HeldGatewayRekey::AwaitsOwn] {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let (mut liveness, _, _, old) = session_holding_a_gateway_rekey(&gateway, init_sa, &resp_sa, how);
+            let known: Vec<ChildSpis> = match how {
+                HeldGatewayRekey::Primary => vec![old, HELD_BESIDE6],
+                HeldGatewayRekey::Ipv6 => vec![old, ChildSpis { local: 0xBBBB, peer: 0xAAAA }],
+                HeldGatewayRekey::AwaitsOwn => vec![old, OURS_REPLACED],
+            };
+            let (spis, held) = (both_child_spis(&liveness), held_rekey_as_it_is(&liveness));
+            for sa in known {
+                let report = liveness.delete_child(sa.local, sa.peer).unwrap();
+                assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::NotOwed("in_use"), liveness: Liveness::Alive, replaced: None }, "{how:?}: {sa:x?}");
+                let sent = wire_of(&resp_sa, &all_sent_to(&gateway));
+                assert!(sent.is_empty(), "{how:?}: {sa:x?}: nothing sent: {sent:x?}");
+            }
+            assert_eq!(liveness.next_message_id, 2, "{how:?}: no Message ID used");
+            let (report, sent) = with_informationals_answered(&gateway, &resp_sa, || liveness.delete_child(unknown.local, unknown.peer).unwrap());
+            assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::Sent { acknowledged: true }, liveness: Liveness::Alive, replaced: None }, "{how:?}");
+            assert_eq!(wire_of(&resp_sa, &sent), [((ExchangeType::Informational, 2, false), Some(Delete::esp(vec![unknown.local])))], "{how:?}");
+            assert_eq!(both_child_spis(&liveness), spis, "{how:?}: nothing moved");
+            assert_eq!(held_rekey_as_it_is(&liveness), held, "{how:?}: the held rekey as it was");
+        }
+    }
+
+    /// A session facing `gateway`, holding the gateway's rekey of the primary
+    /// SA and keeping redundant SAs, after `negotiate_rekey` of that SA
+    /// crossed by the gateway's rekey of it (RFC 7296 §2.8.1, its new SA on
+    /// [`PEER_NEW_SPI`]): the gateway's SA kept with `gateways_kept`, ours
+    /// otherwise (the gateway's then a redundant SA). The answer to the
+    /// gateway's rekey is held for the commit ([`HeldAnswer`]). The session,
+    /// what was negotiated, and the gateway's SA by both SPIs.
+    fn session_holding_a_crossed_answer(
+        gateway: &UdpSocket,
+        init_sa: CompletedSaInit,
+        resp_sa: &CompletedSaInit,
+        gateways_kept: bool,
+    ) -> (LivenessSession, NegotiatedRekey, ChildSpis) {
+        let mut liveness = session_facing(gateway, init_sa, None);
+        liveness.keep_redundant_children(true);
+        liveness.hold_peer_rekeys(true);
+        let negotiated = thread::scope(|scope| {
+            scope.spawn(|| {
+                let (theirs_ni, ours_nr) = if gateways_kept { (HIGHEST_NONCE, LOWEST_NONCE) } else { (LOWEST_NONCE, MIDDLE_NONCE) };
+                let (ours, _, client) = gateway_rekeys_across(gateway, resp_sa, &theirs_ni);
+                gateway_answers_ours(gateway, resp_sa, &ours, &ours_nr, client);
+                if gateways_kept {
+                    // The Delete of our redundant SA.
+                    let (delete, _) = next_from_client(gateway);
+                    gateway.send_to(&informational_answer(resp_sa, &delete, &[]), client).unwrap();
+                }
+            });
+            liveness.negotiate_rekey(ChildKind::Primary, Duration::from_secs(2)).expect("negotiated")
+        });
+        assert_eq!(negotiated.by_peer, gateways_kept);
+        gateway.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        assert_eq!(sent_to(gateway), None, "the answer to the gateway's rekey still unsent");
+        let crossed = ChildSpis { local: liveness.peer_child.crossed_answer.as_ref().expect("its answer held").new_local_spi, peer: PEER_NEW_SPI };
+        (liveness, negotiated, crossed)
+    }
+
+    /// While the answer to the gateway's rekey crossing `negotiate_rekey` is
+    /// held for the commit ([`HeldAnswer`]), the gateway's SA it carries is
+    /// already one the session knows -- the family's current SA if the
+    /// gateway's was kept, a redundant SA if ours was -- and
+    /// [`LivenessSession::delete_child`] refuses it `"in_use"`, and a pair
+    /// half of which is its `"inconsistent_spis"`, as it did: nothing sent,
+    /// no Message ID used, the answer still held. The commit sends it first,
+    /// as ever.
+    #[test]
+    fn delete_child_of_the_sa_of_a_crossed_rekey_whose_answer_is_held_is_refused_as_an_sa_the_session_knows() {
+        let unknown = ChildSpis { local: 0x7E7E, peer: 0x7F7F };
+        for gateways_kept in [true, false] {
+            let case = format!("the gateway's kept {gateways_kept}");
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let (mut liveness, negotiated, crossed) = session_holding_a_crossed_answer(&gateway, init_sa, &resp_sa, gateways_kept);
+            let (spis, next) = (both_child_spis(&liveness), liveness.next_message_id);
+            let pairs = [
+                (crossed.local, crossed.peer, "in_use"),
+                (crossed.local, unknown.peer, "inconsistent_spis"),
+                (unknown.local, crossed.peer, "inconsistent_spis"),
+            ];
+            for (local, peer, why) in pairs {
+                let report = liveness.delete_child(local, peer).unwrap();
+                assert_eq!(report, DeleteReport { outcome: ChildDeleteOutcome::NotOwed(why), liveness: Liveness::Alive, replaced: None }, "{case}: {local:08x}/{peer:08x}");
+                let sent = wire_of(&resp_sa, &all_sent_to(&gateway));
+                assert!(sent.is_empty(), "{case}: {local:08x}/{peer:08x}: nothing sent: {sent:x?}");
+            }
+            assert_eq!(liveness.next_message_id, next, "{case}: no Message ID used");
+            assert_eq!(both_child_spis(&liveness), spis, "{case}: nothing moved");
+            assert!(liveness.peer_child.crossed_answer.is_some(), "{case}: the answer still held");
+
+            let (_, sent) = with_informationals_answered(&gateway, &resp_sa, || liveness.commit_rekey(ChildKind::Primary, negotiated.child.local_spi, true).unwrap());
+            let answer = sent.first().expect("the commit sends the answer");
+            assert_eq!(client_header(answer), (ExchangeType::CreateChildSa, 0, true), "{case}: the held answer first");
+            let ni = if gateways_kept { HIGHEST_NONCE } else { LOWEST_NONCE };
+            assert_eq!(gateway_completes(&resp_sa, &ni, answer).outbound.spi(), crossed.local, "{case}: carrying the gateway's SA");
+        }
     }
 
     /// The traffic selectors the SA [`our_rekey_negotiated`]'s rekey replaced

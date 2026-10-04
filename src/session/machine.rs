@@ -171,6 +171,45 @@
 //! Wherever another operation needs the family's next generation, a switch still pending is made
 //! first ([`SwitchProof::SlotNeeded`]).
 //!
+//! # The driver's order
+//!
+//! All of the above is [`Order::CommitThenSwitch`], the default ([`FamilyMachine::new`],
+//! [`FamilyMachine::with_scope`], [`Driving::COMMIT_THEN_SWITCH`]): its flows and its steps are as
+//! they were, and none of what follows reaches them. A machine made with
+//! [`FamilyMachine::with_driving`] for [`Order::DriverFirst`] keeps the same record, the same
+//! [`Ask`]s and the same refusals for a consumer whose data plane belongs to a *driver* that answers
+//! later, by words of its own -- Free VPN's Linux daemon, which installs the new SA and switches
+//! outbound before the worker commits the rekey. It takes the driver's events only
+//! ([`Input::is_drivers`], and [`Input::DataPlaneReset`]), and refuses the other order's
+//! ([`Refusal::NotAnEvent`]), as a machine of the other order refuses the driver's:
+//!
+//! - [`Input::RenewDue`] (idle only; its causes explicit, [`RenewCauses`]): the rekey negotiated
+//!   ([`Action::Negotiate`]), then the operation is over -- [`Outcome::HandedToDriver`] -- and the
+//!   machine is left *awaiting the driver's word* ([`FamilyMachine::awaiting_driver`]): not idle, no
+//!   ask pending, the rekey recorded as negotiated and not resolved ([`FamilyRenewal::pending`]).
+//!   That record, the phase and the identity it holds ([`HandedOver`]), is the operation's only
+//!   state between the driver's commands; no call is pending meanwhile. A second renewal is refused
+//!   ([`Refusal::Busy`]) until it is resolved.
+//! - [`Input::DriverInstalled`], [`Input::DriverNotUsed`] (the driver's word, naming the new SA whole,
+//!   [`DriverRef`]): the commit ([`Action::Commit`], the replaced SA's Delete in the same call if the
+//!   driver asks for it) or the abandon ([`Action::Abandon`], the new SA's Delete only if the driver
+//!   asks for it: its veto). A word that does not name the rekey awaiting -- another connection,
+//!   attempt, generation or SPI, one already resolved, nothing awaiting -- is
+//!   [`Outcome::NotPending`], nothing changed: a late or repeated word is never applied twice.
+//! - [`Input::DriverSilent`]: the driver's word will not come (its channel was lost); the result is
+//!   not known, and the rekey is abandoned with no Delete ([`Outcome::Unresolved`]).
+//! - [`Input::DeleteRetry`]: one more try of an owed Delete on the driver's word, up to
+//!   [`Driving::delete_tries`] in all; never of one sent and unanswered, nor of an abandoned rekey's
+//!   ([`Outcome::NoRetry`]). A rekey awaiting the driver awaits it still after.
+//!
+//! A Delete sent and unanswered stays owed ([`DeleteStand::Sent`] `{ acknowledged: false }`): it is
+//! no confirmation. The bound of owed Deletes suspends nothing in this order (the driver decides its
+//! retries): past it every Delete is kept, noted ([`Note::OwedOverCapacity`]). The spacing of
+//! attempts is the consumer's in this order, asked before [`Input::RenewDue`] is given: the record
+//! keeps no attempt. No switch is ever deferred. The only [`Note`]s are the record's own, as in the
+//! other order ([`Note::OwedOverCapacity`], [`Note::OwedRecordedSettled`], [`Note::DeleteOwed`],
+//! [`Note::NoSuchDebt`]); the consumer logs the rest by the outcomes.
+//!
 //! # What stays the consumer's
 //!
 //! Everything that holds keys or touches the wire or the data plane is done by the consumer, as an
@@ -291,6 +330,141 @@ pub struct Moved {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoDataPlane;
 
+/// In which order a renewal of ours is carried out, and so which events the machine takes
+/// ([The driver's order](crate::session::machine#the-drivers-order)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Order {
+    /// The consumer's own data plane: the new SA is put in it, the rekey committed, outbound
+    /// switched, and then the replaced SA's Delete asked -- the order of Free VPN's Windows
+    /// controller, and the machine's default ([`FamilyMachine::new`]). Its events are
+    /// [`Input::RenewByVolume`] to [`Input::MovedToRedundant`]; the driver's are refused.
+    CommitThenSwitch,
+    /// A driver that owns the data plane and answers later, by a word of its own: the rekey is
+    /// negotiated and handed to the driver, which installs the new SA and switches outbound first;
+    /// only on its word is the rekey committed, the replaced SA's Delete going with the commit if the
+    /// driver asks for it -- or abandoned, the new SA's Delete only if the driver asks for it. Its
+    /// events are [`Input::RenewDue`] to [`Input::DeleteRetry`]; those of
+    /// [`CommitThenSwitch`](Self::CommitThenSwitch) are refused.
+    DriverFirst,
+}
+
+/// How the machine is driven: its [`Order`], and how many times in all the driver may have one
+/// Delete of ours tried ([`Input::DeleteRetry`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Driving {
+    /// The order a renewal of ours is carried out in.
+    pub order: Order,
+    /// Under [`Order::DriverFirst`]: how many tries in all a Delete of a replaced SA gets -- the one
+    /// that went with the commit (or the first retry, for a Delete the commit was not asked to send)
+    /// counted -- before [`Input::DeleteRetry`] is answered [`WhyNoRetry::TriesExhausted`]. Under
+    /// [`Order::CommitThenSwitch`] nothing is ever sent again, whatever this says.
+    pub delete_tries: u32,
+}
+
+impl Driving {
+    /// The machine's default: [`Order::CommitThenSwitch`], one try of each Delete (none is ever
+    /// sent again).
+    pub const COMMIT_THEN_SWITCH: Driving = Driving { order: Order::CommitThenSwitch, delete_tries: 1 };
+}
+
+/// Why a renewal of ours is due ([`Input::RenewDue`]), each cause on its own: the SA's age, what it
+/// moved, the driver's request (its number). Two or three may coincide; the renewal is negotiated
+/// once whatever they are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RenewCauses {
+    /// The SA's clock by age says it is due.
+    pub age: bool,
+    /// What the SA moved reached the volume renewal point, as the consumer reads it.
+    pub volume: bool,
+    /// The driver asked for it, by this request number.
+    pub request: Option<u64>,
+}
+
+impl RenewCauses {
+    /// Whether any cause is there.
+    pub fn any(&self) -> bool {
+        self.age || self.volume || self.request.is_some()
+    }
+}
+
+/// A CHILD SA as a word of the driver names it ([`Input::DriverInstalled`],
+/// [`Input::DriverNotUsed`], [`Input::DeleteRetry`]): the connection, the generation in the
+/// family's line, both SPIs and, for a renewal of ours, the attempt. The family is the machine's.
+/// Taken only when all of it is what the machine holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverRef {
+    /// The consumer's number for the connection ([`FamilyMachine::with_driving`]).
+    pub connection: u64,
+    /// The generation in the family's line.
+    pub generation: u64,
+    /// The SPI this side receives on.
+    pub local_spi: u32,
+    /// The SPI the peer receives on.
+    pub peer_spi: u32,
+    /// The attempt that negotiated it, for a renewal of ours; `None` for any other SA.
+    pub attempt: Option<u64>,
+}
+
+impl DriverRef {
+    /// Its SPIs, `(local, peer)`.
+    pub fn spis(&self) -> (u32, u32) {
+        (self.local_spi, self.peer_spi)
+    }
+}
+
+/// A rekey of ours negotiated and handed to the driver, awaiting its word
+/// ([`Outcome::HandedToDriver`], [`FamilyMachine::awaiting_driver`]): the machine's whole record of
+/// that operation between the driver's commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandedOver {
+    /// The consumer's number for the attempt ([`Input::RenewDue`]).
+    pub attempt: u64,
+    /// Why it was renewed.
+    pub causes: RenewCauses,
+    /// The SA it replaces: the family's current one, still in use.
+    pub replaces: ChildId,
+    /// The new SA's SPIs, `(local, peer)`.
+    pub new: (u32, u32),
+    /// Its generation once current: the next after `replaces`'s.
+    pub generation: u64,
+    /// The instant the consumer read once the exchange was over ([`NewChild::now`]).
+    pub negotiated: Instant,
+}
+
+impl HandedOver {
+    /// Whether `named` names it whole: the connection `connection`, its attempt, generation and
+    /// SPIs.
+    fn named_by(&self, named: DriverRef, connection: u64) -> bool {
+        named.connection == connection && named.attempt == Some(self.attempt) && named.generation == self.generation && named.spis() == self.new
+    }
+}
+
+/// A commit the protocol refused ([`Input::NotCommitted`]), under [`Order::DriverFirst`]. Nothing was
+/// sent for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotCommitted {
+    /// The peer deleted the new SA before the commit: the protocol refused it, changing nothing, and
+    /// keeps the rekey for its abandon -- it still awaits the driver's word.
+    PeerDeleted,
+    /// Any other error: whether the protocol took the commit is not known. The rekey is given up as
+    /// the record of an operation -- nothing retired, nothing current, no clock -- and nothing is
+    /// asked for it again.
+    Unknown,
+}
+
+/// Why a Delete the driver asked to try again was not ([`Outcome::NoRetry`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhyNoRetry {
+    /// It is settled: answered by the peer, none owed, or the peer's to delete.
+    Settled,
+    /// It was sent and never answered: owed still -- that is no confirmation -- but a Delete that
+    /// went is not sent again.
+    SentUnanswered,
+    /// It had all its tries ([`Driving::delete_tries`]), or it is the Delete of an abandoned rekey,
+    /// which has one chance only: owed still, not tried again.
+    TriesExhausted,
+}
+
 /// What an answer says came to exist outside the machine ([`Input::brought`]). What identifies it
 /// beyond this is the consumer's to keep ([Refused inputs](crate::session::machine#refused-inputs)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +556,27 @@ pub enum Input<T> {
     /// Answer to [`Action::MoveToRedundant`]: what came of the pending switch and the promotion, or
     /// no data plane to make them in.
     Moved(Result<Moved, NoDataPlane>),
+    /// Event, [`Order::DriverFirst`]: renew the family's current SA, `current` in the consumer's
+    /// record, for `causes`, as attempt `attempt` (the consumer's number). The consumer has asked the
+    /// spacing of attempts already: under this order it is the consumer's, and the record keeps no
+    /// attempt. Refused ([`Refusal::Busy`]) while a rekey of ours awaits the driver's word: one
+    /// negotiation per SA.
+    RenewDue { now: Instant, current: ChildId, causes: RenewCauses, attempt: u64 },
+    /// Event, [`Order::DriverFirst`]: the driver installed the new SA `named` and switched outbound to
+    /// it; the rekey is to be committed, with the replaced SA's Delete if `delete_replaced`.
+    DriverInstalled { named: DriverRef, delete_replaced: bool },
+    /// Event, [`Order::DriverFirst`]: the driver will not use the new SA `named`; the rekey is to be
+    /// abandoned, with the new SA's own Delete only if `send_delete` -- the driver's veto otherwise.
+    DriverNotUsed { named: DriverRef, send_delete: bool },
+    /// Event, [`Order::DriverFirst`]: the driver's word on the rekey handed to it did not come, and
+    /// will not: whether the driver installed the new SA is not known. The rekey is abandoned with no
+    /// Delete.
+    DriverSilent,
+    /// Event, [`Order::DriverFirst`]: the driver asks for one more try of the Delete of the retired SA
+    /// `named` (its attempt is not looked at: the record of retired SAs keeps none).
+    DeleteRetry { named: DriverRef },
+    /// Answer to [`Action::Commit`], [`Order::DriverFirst`] only: the protocol refused the commit.
+    NotCommitted(NotCommitted),
 }
 
 impl<T> Input<T> {
@@ -398,7 +593,24 @@ impl<T> Input<T> {
                 | Input::Replacement { .. }
                 | Input::MovedToRedundant { .. }
                 | Input::DataPlaneReset
+                | Input::RenewDue { .. }
+                | Input::DriverInstalled { .. }
+                | Input::DriverNotUsed { .. }
+                | Input::DriverSilent
+                | Input::DeleteRetry { .. }
         )
+    }
+
+    /// Whether the input is an event only [`Order::DriverFirst`] takes ([`Input::RenewDue`] to
+    /// [`Input::DeleteRetry`]).
+    pub fn is_drivers(&self) -> bool {
+        matches!(self, Input::RenewDue { .. } | Input::DriverInstalled { .. } | Input::DriverNotUsed { .. } | Input::DriverSilent | Input::DeleteRetry { .. })
+    }
+
+    /// Whether the input is an event only [`Order::CommitThenSwitch`] takes ([`Input::RenewByVolume`]
+    /// to [`Input::MovedToRedundant`]).
+    fn is_consumers_plane(&self) -> bool {
+        self.is_event() && !self.is_drivers() && !matches!(self, Input::DataPlaneReset)
     }
 
     /// The input's name, as a consumer may print a refused one.
@@ -425,6 +637,12 @@ impl<T> Input<T> {
             Input::Added(_) => "Added",
             Input::InstalledAndSwitched(_) => "InstalledAndSwitched",
             Input::Moved(_) => "Moved",
+            Input::RenewDue { .. } => "RenewDue",
+            Input::DriverInstalled { .. } => "DriverInstalled",
+            Input::DriverNotUsed { .. } => "DriverNotUsed",
+            Input::DriverSilent => "DriverSilent",
+            Input::DeleteRetry { .. } => "DeleteRetry",
+            Input::NotCommitted(_) => "NotCommitted",
         }
     }
 }
@@ -740,6 +958,27 @@ pub enum Outcome<T> {
     /// Flow E: the family is on the redundant SA of SPIs `new`; `installed`, outbound moved to it in
     /// the data plane, else left to the consumer to install as before.
     MovedTo { new: (u32, u32), installed: bool },
+    /// [`Order::DriverFirst`]: the rekey negotiated and handed to the driver. The machine is left
+    /// awaiting its word ([`FamilyMachine::awaiting_driver`]), not idle, with no ask pending.
+    HandedToDriver(HandedOver),
+    /// [`Order::DriverFirst`]: a word of the driver's that names nothing the machine holds -- another
+    /// connection, attempt, generation or SPI, a rekey already resolved, or nothing awaiting. Nothing
+    /// changed, nothing was asked.
+    NotPending,
+    /// [`Order::DriverFirst`]: the protocol refused the commit ([`Input::NotCommitted`]); `pending`,
+    /// the rekey still awaits the driver's word (the peer deleted the new SA), else it is given up for
+    /// a result not known.
+    NotCommitted { pending: bool },
+    /// [`Order::DriverFirst`]: the driver was silent ([`Input::DriverSilent`]) -- a result not known,
+    /// neither the driver's refusal nor its success --; the rekey abandoned with no Delete.
+    /// `ike_sa_over`: the abandon's report says the IKE SA is over.
+    Unresolved { ike_sa_over: bool },
+    /// [`Order::DriverFirst`]: the Delete the driver asked for was tried once more
+    /// ([`Input::DeleteRetry`]), the record taking what it came to. `ike_sa_over`: its report says the
+    /// IKE SA is over.
+    DeleteRetried { ike_sa_over: bool },
+    /// [`Order::DriverFirst`]: the Delete the driver asked for was not tried, for this reason.
+    NoRetry(WhyNoRetry),
 }
 
 /// One step of the machine: the actions to carry out, in order, and, once the operation is over,
@@ -748,7 +987,9 @@ pub enum Outcome<T> {
 pub struct Step<T> {
     /// What the consumer is to do, in order. At most one asks for an answer, and it is the last.
     pub actions: Vec<Action<T>>,
-    /// `None` while the operation goes on (the last action asks); how it ended once it is over.
+    /// `None` while the operation goes on (the last action asks); how it ended once it is over -- the
+    /// machine idle again, or, under [`Order::DriverFirst`], awaiting the driver's word
+    /// ([`FamilyMachine::awaiting_driver`]).
     pub outcome: Option<Outcome<T>>,
     /// The ask the machine waits on, to be given with the answer ([`FamilyMachine::answer`]): `Some`
     /// exactly when `outcome` is `None`.
@@ -782,7 +1023,8 @@ pub enum Refusal {
     Busy,
     /// An answer given with [`FamilyMachine::step`]. The kind says only that it came by the wrong
     /// entry, not that it had no effects: it may bring an SA put in a data plane or a CHILD SA
-    /// negotiated ([`Input::brought`]), which the adapter examines as any refused answer's.
+    /// negotiated ([`Input::brought`]), which the adapter examines as any refused answer's. Also an
+    /// event of the other [`Order`]: not an event this machine takes (an event brings nothing).
     NotAnEvent,
     /// An answer given while nothing is asked: the machine is idle.
     NothingAsked,
@@ -874,6 +1116,26 @@ enum Phase<T> {
     ReplacementInstalling { new: (u32, u32) },
     /// Flow E: the move asked for.
     Moving { now: Instant, current: Option<ChildId>, to: (u32, u32), replaced: (u32, u32), in_plane: Option<T>, consumer_owes_install: bool, pending: Option<DeferredSwitch<T>> },
+    /// [`Order::DriverFirst`]: the rekey asked for.
+    DriverNegotiating { now: Instant, current: ChildId, causes: RenewCauses, attempt: u64 },
+    /// [`Order::DriverFirst`]: the rekey handed to the driver, awaiting its word. No ask is pending.
+    AwaitingDriver(HandedOver),
+    /// [`Order::DriverFirst`]: the commit asked for, on the driver's word.
+    DriverCommitting(HandedOver),
+    /// [`Order::DriverFirst`]: the abandon asked for, on the driver's word or its silence.
+    DriverAbandoning(HandedOver, Abandoning),
+    /// [`Order::DriverFirst`]: one more try of the Delete of the SA of `spis` in `generation` asked for;
+    /// `then`, the rekey awaiting the driver that the retry came in on, to go back to.
+    Retrying { spis: (u32, u32), generation: u64, then: Option<HandedOver> },
+}
+
+/// Why a rekey handed to the driver is abandoned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Abandoning {
+    /// The driver's word: not used, its Delete asked or not.
+    Word { send_delete: bool },
+    /// The driver's silence.
+    Silent,
 }
 
 impl<T> Phase<T> {
@@ -899,16 +1161,34 @@ impl<T> Phase<T> {
             Phase::ReplacementPreparing { .. } => "replacement_preparing",
             Phase::ReplacementInstalling { .. } => "replacement_installing",
             Phase::Moving { .. } => "moving",
+            Phase::DriverNegotiating { .. } => "driver_negotiating",
+            Phase::AwaitingDriver(_) => "awaiting_driver",
+            Phase::DriverCommitting(_) => "driver_committing",
+            Phase::DriverAbandoning(..) => "driver_abandoning",
+            Phase::Retrying { .. } => "retrying",
         }
     }
 }
 
 /// Where a step leaves the operation: an action asked for and the phase that waits on its answer, or
-/// the operation over. Returned once per step and taken apart at once: not worth a box.
+/// the operation over -- the machine idle, or ([`Order::DriverFirst`]) left awaiting the driver's
+/// word. Returned once per step and taken apart at once: not worth a box.
 #[allow(clippy::large_enum_variant)]
 enum Flow<T> {
     Ask(Action<T>, Phase<T>),
     Done(Outcome<T>),
+    /// Over, with this outcome, the machine left in this phase, which asks nothing: a rekey awaiting
+    /// the driver's word ([`Phase::AwaitingDriver`]).
+    Rest(Outcome<T>, Phase<T>),
+}
+
+/// How many tries a Delete of the record has had ([`Order::DriverFirst`]): kept only for an owed
+/// Delete that had one, and dropped with its debt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Tried {
+    spis: (u32, u32),
+    generation: Option<u64>,
+    tries: u32,
 }
 
 /// The renewals of one family of CHILD SAs: its record ([`FamilyRenewal`]), where the operation
@@ -925,6 +1205,13 @@ pub struct FamilyMachine<T> {
     serial: u64,
     /// A [`Input::DataPlaneReset`] came while an operation was under way: applied at its end.
     reset_pending: bool,
+    /// How it is driven ([`Driving::COMMIT_THEN_SWITCH`] unless [`FamilyMachine::with_driving`]).
+    driving: Driving,
+    /// The consumer's number for the connection every word of the driver must name (0 unless
+    /// [`FamilyMachine::with_driving`]).
+    connection: u64,
+    /// The tries of the owed Deletes that had one ([`Order::DriverFirst`]); empty otherwise.
+    tries: Vec<Tried>,
 }
 
 impl<T: Copy> Default for FamilyMachine<T> {
@@ -942,7 +1229,15 @@ impl<T: Copy> FamilyMachine<T> {
     /// As [`new`](Self::new), its asks in `scope`: a number the consumer chooses so that this
     /// machine's asks differ from any other machine's (its connection and family).
     pub fn with_scope(scope: u64) -> Self {
-        Self { record: FamilyRenewal::new(), phase: Phase::Idle, suspended: false, scope, serial: 0, reset_pending: false }
+        Self::with_driving(scope, 0, Driving::COMMIT_THEN_SWITCH)
+    }
+
+    /// As [`with_scope`](Self::with_scope), driven as `driving` says, for the connection the consumer
+    /// numbers `connection` (which every word of a driver must name: [`DriverRef::connection`]).
+    /// [`Driving::COMMIT_THEN_SWITCH`] is what [`with_scope`](Self::with_scope) gives, whatever
+    /// `connection` -- a machine of that order takes no word of a driver.
+    pub fn with_driving(scope: u64, connection: u64, driving: Driving) -> Self {
+        Self { record: FamilyRenewal::new(), phase: Phase::Idle, suspended: false, scope, serial: 0, reset_pending: false, driving, connection, tries: Vec::new() }
     }
 
     /// The machine's scope ([`with_scope`](Self::with_scope)).
@@ -950,11 +1245,33 @@ impl<T: Copy> FamilyMachine<T> {
         self.scope
     }
 
+    /// How the machine is driven ([`with_driving`](Self::with_driving)).
+    pub fn driving(&self) -> Driving {
+        self.driving
+    }
+
+    /// [`Order::DriverFirst`]: the rekey of ours handed to the driver and awaiting its word, if one
+    /// does -- the machine's own record of that operation, from [`Outcome::HandedToDriver`] to the
+    /// driver's word or silence. Read-only: only the machine's flows change it.
+    pub fn awaiting_driver(&self) -> Option<HandedOver> {
+        match self.phase {
+            Phase::AwaitingDriver(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    /// [`Order::DriverFirst`]: how many tries the owed Delete of the SA of `spis` in `generation` has
+    /// had: 0 for one never tried, or one not owed.
+    pub fn delete_tries(&self, spis: (u32, u32), generation: Option<u64>) -> u32 {
+        self.tries.iter().find(|t| t.spis == spis && t.generation == generation).map_or(0, |t| t.tries)
+    }
+
     /// The ask the machine waits on, the same as the last step's [`Step::ask`]: `Some` exactly while
-    /// an operation is under way.
+    /// an operation is under way -- and not while a rekey awaits the driver's word
+    /// ([`awaiting_driver`](Self::awaiting_driver)), which asks the consumer nothing.
     pub fn asked(&self) -> Option<Ask> {
         match self.phase {
-            Phase::Idle => None,
+            Phase::Idle | Phase::AwaitingDriver(_) => None,
             _ => Some(Ask { scope: self.scope, serial: self.serial }),
         }
     }
@@ -969,7 +1286,9 @@ impl<T: Copy> FamilyMachine<T> {
         &self.record
     }
 
-    /// Whether no operation is under way: an event may come.
+    /// Whether no operation is under way: an event may come. Under [`Order::DriverFirst`], `false`
+    /// too while a rekey awaits the driver's word ([`awaiting_driver`](Self::awaiting_driver)), when
+    /// the driver's events are still taken.
     pub fn idle(&self) -> bool {
         matches!(self.phase, Phase::Idle)
     }
@@ -1003,6 +1322,12 @@ impl<T: Copy> FamilyMachine<T> {
     pub fn step(&mut self, input: Input<T>, policy: &Policy) -> Result<Step<T>, Unexpected<T>> {
         if !input.is_event() {
             return Err(self.refused(Refusal::NotAnEvent, input));
+        }
+        match self.driving.order {
+            Order::DriverFirst if input.is_consumers_plane() => return Err(self.refused(Refusal::NotAnEvent, input)),
+            Order::DriverFirst => return self.driver_event(input, policy),
+            Order::CommitThenSwitch if input.is_drivers() => return Err(self.refused(Refusal::NotAnEvent, input)),
+            Order::CommitThenSwitch => {}
         }
         let busy = !self.idle();
         if busy && !matches!(input, Input::DataPlaneReset) {
@@ -1052,7 +1377,14 @@ impl<T: Copy> FamilyMachine<T> {
             | Input::Released(_)
             | Input::Added(_)
             | Input::InstalledAndSwitched(_)
-            | Input::Moved(_) => return Err(self.refused(Refusal::NotAnEvent, input)),
+            | Input::Moved(_)
+            // The driver's: refused above, under this order.
+            | Input::RenewDue { .. }
+            | Input::DriverInstalled { .. }
+            | Input::DriverNotUsed { .. }
+            | Input::DriverSilent
+            | Input::DeleteRetry { .. }
+            | Input::NotCommitted(_) => return Err(self.refused(Refusal::NotAnEvent, input)),
         };
         Ok(self.finish(flow, Vec::new()))
     }
@@ -1122,6 +1454,15 @@ impl<T: Copy> FamilyMachine<T> {
             (Phase::Moving { now, current, to, replaced, in_plane, consumer_owes_install, pending }, Input::Moved(moved)) => {
                 Self::moved(now, current, to, replaced, in_plane, consumer_owes_install, pending, moved, out)
             }
+            (Phase::DriverNegotiating { now, current, causes, attempt }, Input::Negotiated(negotiated)) => self.driver_negotiated(now, current, causes, attempt, negotiated, out),
+            (Phase::DriverCommitting(h), Input::Committed(committed)) => self.driver_committed(h, committed, policy, out),
+            (Phase::DriverCommitting(h), Input::NotCommitted(NotCommitted::PeerDeleted)) => Flow::Rest(Outcome::NotCommitted { pending: true }, Phase::AwaitingDriver(h)),
+            (Phase::DriverCommitting(h), Input::NotCommitted(NotCommitted::Unknown)) => {
+                let _ = self.record.resolve(h.new.0);
+                Flow::Done(Outcome::NotCommitted { pending: false })
+            }
+            (Phase::DriverAbandoning(h, how), Input::Abandoned(report)) => self.driver_abandoned(h, how, report, policy, out),
+            (Phase::Retrying { spis, generation, then }, Input::Deleted(report)) => self.retried(spis, generation, then, report, policy, out),
             (_, input) => return Err(self.refused(Refusal::NotItsAnswer, input)),
         };
         Ok(self.finish(flow, actions))
@@ -1151,7 +1492,218 @@ impl<T: Copy> FamilyMachine<T> {
                 }
                 Step { actions, outcome: Some(outcome), ask: None }
             }
+            Flow::Rest(outcome, phase) => {
+                // Only `Phase::AwaitingDriver`, which asks nothing; the driver's order defers no
+                // switch, so a reset pending has nothing to drop.
+                self.phase = phase;
+                if std::mem::take(&mut self.reset_pending) {
+                    let _ = self.record.take_switch();
+                }
+                Step { actions, outcome: Some(outcome), ask: None }
+            }
         }
+    }
+
+    // The driver's order (`Order::DriverFirst`).
+
+    /// An event under [`Order::DriverFirst`], the other order's refused already. While an action is
+    /// asked, a reset waits for the operation's end and any other event is refused
+    /// ([`Refusal::Busy`]), as in the other order. Otherwise it is taken idle or awaiting the
+    /// driver's word: [`Input::RenewDue`] only idle (one negotiation per SA); a word of the driver's
+    /// only for the rekey awaiting it, named whole ([`HandedOver::named_by`]) -- anything else is
+    /// [`Outcome::NotPending`], nothing changed --; the driver's silence only for a rekey awaiting it;
+    /// a retry of a Delete either way, the rekey awaiting the driver, if any, still awaiting it after.
+    fn driver_event(&mut self, input: Input<T>, policy: &Policy) -> Result<Step<T>, Unexpected<T>> {
+        if self.asked().is_some() {
+            if matches!(input, Input::DataPlaneReset) {
+                self.reset_pending = true;
+                return Ok(Step { actions: Vec::new(), outcome: None, ask: self.asked() });
+            }
+            return Err(self.refused(Refusal::Busy, input));
+        }
+        let awaiting = self.awaiting_driver();
+        let connection = self.connection;
+        let named = |named: DriverRef| awaiting.filter(|h| h.named_by(named, connection));
+        let mut actions = Vec::new();
+        let flow = match input {
+            Input::RenewDue { .. } if awaiting.is_some() => return Err(self.refused(Refusal::Busy, input)),
+            Input::RenewDue { now, current, causes, attempt } => {
+                if !causes.any() || self.record.in_flight() {
+                    Flow::Done(Outcome::NotDue)
+                } else {
+                    Flow::Ask(Action::Negotiate, Phase::DriverNegotiating { now, current, causes, attempt })
+                }
+            }
+            Input::DriverInstalled { named: n, delete_replaced } => match named(n) {
+                Some(h) => Flow::Ask(Action::Commit { new_local_spi: h.new.0, delete: delete_replaced }, Phase::DriverCommitting(h)),
+                None => rest(awaiting, Outcome::NotPending),
+            },
+            Input::DriverNotUsed { named: n, send_delete } => match named(n) {
+                Some(h) => {
+                    // Owed before it is asked, as every Delete of ours: a report lost loses nothing.
+                    if send_delete {
+                        self.owe_delete(h.new, Some(h.generation), policy, &mut actions);
+                    }
+                    Flow::Ask(Action::Abandon { new_local_spi: h.new.0, delete: send_delete }, Phase::DriverAbandoning(h, Abandoning::Word { send_delete }))
+                }
+                None => rest(awaiting, Outcome::NotPending),
+            },
+            Input::DriverSilent => match awaiting {
+                Some(h) => Flow::Ask(Action::Abandon { new_local_spi: h.new.0, delete: false }, Phase::DriverAbandoning(h, Abandoning::Silent)),
+                None => Flow::Done(Outcome::Nothing),
+            },
+            Input::DeleteRetry { named: n } => self.retry(n, awaiting),
+            Input::DataPlaneReset => {
+                // No switch is ever deferred in this order: nothing to drop, nothing else changes.
+                let _ = self.record.take_switch();
+                rest(awaiting, Outcome::Nothing)
+            }
+            // The other order's events are refused before this.
+            other => return Err(self.refused(Refusal::NotAnEvent, other)),
+        };
+        Ok(self.finish(flow, actions))
+    }
+
+    /// The rekey's answer, [`Order::DriverFirst`]. Over: torn down, the attempt not counted failed.
+    /// Failed: counted (by the consumer's clock and spacing, [`Action::AgeClockFailed`]), the SA in
+    /// use untouched. Negotiated: recorded as the rekey not yet resolved and handed to the driver; the
+    /// machine awaits its word.
+    fn driver_negotiated(&mut self, now: Instant, current: ChildId, causes: RenewCauses, attempt: u64, negotiated: Result<NewChild, Failure>, out: &mut Vec<Action<T>>) -> Flow<T> {
+        match negotiated {
+            Err(Failure::IkeSaOver) => Flow::Done(Outcome::TornDown),
+            Err(Failure::Other) => {
+                self.attempt_failed(out);
+                Flow::Done(Outcome::Failed)
+            }
+            Ok(n) => {
+                // None can be displaced: taken idle, and every way out of the operation resolves it.
+                let _ = self.record.negotiated(Negotiated { replaces: current, new: n.new, started: now });
+                let h = HandedOver { attempt, causes, replaces: current, new: n.new, generation: current.successor(n.new.0, n.new.1).generation, negotiated: n.now };
+                Flow::Rest(Outcome::HandedToDriver(h), Phase::AwaitingDriver(h))
+            }
+        }
+    }
+
+    /// The commit's answer, [`Order::DriverFirst`]: the rekey resolved, the replaced SA retired with
+    /// what its Delete came to -- the peer's to delete, owed and not tried (the driver asked for none),
+    /// or what the one Delete that went with the commit came to, a try counted when it is owed still
+    /// -- then the family's clock started again and its current generation the new SA. The driver
+    /// switched already: nothing is deferred. The retirement is recorded from the answer, not owed
+    /// before the commit is asked: in this order the commit and the replaced SA's Delete are one call
+    /// of the protocol, which may refuse the commit ([`Input::NotCommitted`]), the replaced SA then
+    /// still in use.
+    fn driver_committed(&mut self, h: HandedOver, committed: Committed, policy: &Policy, out: &mut Vec<Action<T>>) -> Flow<T> {
+        let _ = self.record.resolve(h.new.0);
+        let (came, tried) = match committed {
+            Committed::PeersKept(came) => (came, false),
+            Committed::OursDeleteNotAsked => (DeleteCame { deleted_by: Party::Ours, stand: DeleteStand::NotSent, ike_sa_over: false }, false),
+            Committed::Other(came) => (came, true),
+        };
+        let (spis, generation) = (h.replaces.spis(), Some(h.replaces.generation));
+        if let Retirement::OverCapacity { owed } = self.record.retire_within(Retired { spis, generation, deleted_by: came.deleted_by, stand: came.stand }, policy.retired) {
+            out.push(Action::Note(Note::OwedOverCapacity { owed }));
+        }
+        if tried && self.owes(spis, generation) {
+            self.set_tries(spis, generation, 1);
+        }
+        self.prune_tries();
+        out.push(Action::AgeClockRestart);
+        out.push(Action::BecameCurrent(h.replaces.successor(h.new.0, h.new.1)));
+        Flow::Done(Outcome::Renewed { new: h.new, deferred: false, ike_sa_over: came.ike_sa_over })
+    }
+
+    /// The abandon's answer, [`Order::DriverFirst`]: the rekey resolved, the new SA retired, the
+    /// attempt counted failed. With its Delete asked, the debt owed before the ask takes what it came
+    /// to, and gets no other try: an abandoned rekey's Delete has one chance. With none asked -- the
+    /// driver's veto, or its silence -- the new SA is retired with nothing owed: why, the report's
+    /// reason when it names a fact (the peer deleted it, the IKE SA is over), else `"not_asked"` (the
+    /// veto) or `"driver_silent"`. A Delete the protocol reports though none was asked can only be of
+    /// the replaced SA (a rekey of the peer's of the new SA answered with the hold off), which the
+    /// record cannot place: not recorded. The driver's silence ends in [`Outcome::Unresolved`], never
+    /// as a failure or a success.
+    fn driver_abandoned(&mut self, h: HandedOver, how: Abandoning, report: DeleteCame, policy: &Policy, out: &mut Vec<Action<T>>) -> Flow<T> {
+        let _ = self.record.resolve(h.new.0);
+        let (spis, generation) = (h.new, Some(h.generation));
+        match how {
+            Abandoning::Word { send_delete: true } => {
+                self.delete_came_to(spis, generation, report, policy, out);
+                if self.owes(spis, generation) {
+                    self.set_tries(spis, generation, self.driving.delete_tries.max(1));
+                }
+            }
+            Abandoning::Word { send_delete: false } | Abandoning::Silent => {
+                let (deleted_by, why) = match (how, report.stand) {
+                    (_, DeleteStand::NotOwed(why)) if why != "not_asked" => (report.deleted_by, why),
+                    (Abandoning::Silent, _) => (Party::Ours, "driver_silent"),
+                    _ => (Party::Ours, "not_asked"),
+                };
+                let _ = self.record.retire_within(Retired { spis, generation, deleted_by, stand: DeleteStand::NotOwed(why) }, policy.retired);
+            }
+        }
+        self.prune_tries();
+        self.attempt_failed(out);
+        Flow::Done(match how {
+            Abandoning::Silent => Outcome::Unresolved { ike_sa_over: report.ike_sa_over },
+            Abandoning::Word { .. } if report.ike_sa_over => Outcome::TornDown,
+            Abandoning::Word { .. } => Outcome::Failed,
+        })
+    }
+
+    /// One more try of the Delete of the retired SA `named` names, on the driver's word: asked only
+    /// when the record owes it, it was never sent unanswered, and it has tries left
+    /// ([`Driving::delete_tries`]); otherwise why not ([`Outcome::NoRetry`]), or nothing of that SA
+    /// ([`Outcome::NotPending`]). Nothing changes but the try asked; a rekey awaiting the driver
+    /// (`awaiting`) still awaits it after.
+    fn retry(&mut self, named: DriverRef, awaiting: Option<HandedOver>) -> Flow<T> {
+        let (spis, generation) = (named.spis(), Some(named.generation));
+        if named.connection != self.connection {
+            return rest(awaiting, Outcome::NotPending);
+        }
+        if let Some(owed) = self.record.owed().iter().find(|r| r.spis == spis && r.generation == generation) {
+            if owed.stand == (DeleteStand::Sent { acknowledged: false }) {
+                return rest(awaiting, Outcome::NoRetry(WhyNoRetry::SentUnanswered));
+            }
+            if self.delete_tries(spis, generation) >= self.driving.delete_tries {
+                return rest(awaiting, Outcome::NoRetry(WhyNoRetry::TriesExhausted));
+            }
+            return Flow::Ask(Action::DeleteChild { spis }, Phase::Retrying { spis, generation: named.generation, then: awaiting });
+        }
+        if self.record.settled().any(|r| r.spis == spis && r.generation == generation) {
+            return rest(awaiting, Outcome::NoRetry(WhyNoRetry::Settled));
+        }
+        rest(awaiting, Outcome::NotPending)
+    }
+
+    /// The retry's answer: one more try counted, the owed entry taking what it came to.
+    #[allow(clippy::too_many_arguments)]
+    fn retried(&mut self, spis: (u32, u32), generation: u64, then: Option<HandedOver>, report: DeleteCame, policy: &Policy, out: &mut Vec<Action<T>>) -> Flow<T> {
+        let generation = Some(generation);
+        let tries = self.delete_tries(spis, generation).saturating_add(1);
+        self.delete_came_to(spis, generation, report, policy, out);
+        if self.owes(spis, generation) {
+            self.set_tries(spis, generation, tries);
+        }
+        self.prune_tries();
+        rest(then, Outcome::DeleteRetried { ike_sa_over: report.ike_sa_over })
+    }
+
+    /// Whether the record owes the Delete of the SA of `spis` in `generation`.
+    fn owes(&self, spis: (u32, u32), generation: Option<u64>) -> bool {
+        self.record.owed().iter().any(|r| r.spis == spis && r.generation == generation)
+    }
+
+    /// The owed Delete of the SA of `spis` in `generation` has had `tries` tries.
+    fn set_tries(&mut self, spis: (u32, u32), generation: Option<u64>, tries: u32) {
+        match self.tries.iter_mut().find(|t| t.spis == spis && t.generation == generation) {
+            Some(t) => t.tries = tries,
+            None => self.tries.push(Tried { spis, generation, tries }),
+        }
+    }
+
+    /// The tries of Deletes no longer owed dropped: the count lives as long as the debt.
+    fn prune_tries(&mut self) {
+        let owed = self.record.owed();
+        self.tries.retain(|t| owed.iter().any(|r| r.spis == t.spis && r.generation == t.generation));
     }
 
     // Flow A: a renewal of ours by volume (`renew_family`).
@@ -1563,6 +2115,15 @@ impl<T: Copy> FamilyMachine<T> {
         if let Some(earlier) = self.record.defer_switch(switch) {
             out.push(Action::Note(Note::SwitchDropped { local_spi: earlier.local_spi }));
         }
+    }
+}
+
+/// An operation of the driver's order over with `outcome`: the machine back to awaiting the driver's
+/// word on `awaiting`, if a rekey awaited it, else idle.
+fn rest<T>(awaiting: Option<HandedOver>, outcome: Outcome<T>) -> Flow<T> {
+    match awaiting {
+        Some(h) => Flow::Rest(outcome, Phase::AwaitingDriver(h)),
+        None => Flow::Done(outcome),
     }
 }
 
@@ -3526,5 +4087,473 @@ mod tests {
         for name in ["A ours kept", "A peer's kept, then B", "C served", "D by the peer", "D ours"] {
             assert_eq!(broken(name), Vec::<&str>::new(), "{name}: nothing seen between parts that all went through");
         }
+    }
+
+    // The driver's order (`Order::DriverFirst`).
+
+    /// The connection the driver's words name, in these tests.
+    const CONN: u64 = 41;
+    /// A driver that may have a Delete tried twice in all.
+    const DRIVER: Driving = Driving { order: Order::DriverFirst, delete_tries: 2 };
+    /// The driver's request, alone.
+    const REQUESTED: RenewCauses = RenewCauses { age: false, volume: false, request: Some(5) };
+
+    fn driven() -> FamilyMachine<u64> {
+        FamilyMachine::with_driving(9, CONN, DRIVER)
+    }
+
+    fn due_for(now: Instant, causes: RenewCauses, attempt: u64) -> Input<u64> {
+        Input::RenewDue { now, current: CURRENT, causes, attempt }
+    }
+
+    /// The driver's name for the new SA of `h`.
+    fn named(h: &HandedOver) -> DriverRef {
+        DriverRef { connection: CONN, generation: h.generation, local_spi: h.new.0, peer_spi: h.new.1, attempt: Some(h.attempt) }
+    }
+
+    /// The driver's name for `c`, a retired SA.
+    fn named_retired(c: ChildId) -> DriverRef {
+        DriverRef { connection: CONN, generation: c.generation, local_spi: c.local_spi, peer_spi: c.peer_spi, attempt: None }
+    }
+
+    /// `event`, then `answers` one per step with the step's ask, until the operation is over; every
+    /// step checked against the protocol -- one asking action and the last, an ask, the machine's;
+    /// or an outcome with no ask, the machine idle or awaiting the driver -- and, at every step that
+    /// asks, the inputs out of turn refused ([`out_of_turn`]). All the actions, and the outcome.
+    fn go(m: &mut FamilyMachine<u64>, event: Input<u64>, answers: &[Input<u64>]) -> (Vec<Action<u64>>, Outcome<u64>) {
+        let mut answers = answers.iter().copied();
+        let mut actions = Vec::new();
+        let mut step = m.step(event, &POLICY).unwrap_or_else(|e| panic!("{event:?} refused: {e:?}"));
+        loop {
+            actions.extend(step.actions.iter().copied());
+            match step.outcome {
+                None => {
+                    assert_eq!(step.actions.iter().filter(|a| a.asks()).count(), 1, "{:?}", step.actions);
+                    assert!(step.actions.last().unwrap().asks(), "{:?}", step.actions);
+                    let ask = step.ask.expect("an ask while the operation goes on");
+                    assert_eq!(m.asked(), Some(ask));
+                    assert!(!m.idle() && m.awaiting_driver().is_none());
+                    let answer = answers.next().unwrap_or_else(|| panic!("the script ran out after {actions:?}"));
+                    out_of_turn(m, ask, answer);
+                    step = m.answer(ask, answer, &POLICY).unwrap_or_else(|e| panic!("{answer:?} refused: {e:?}"));
+                }
+                Some(outcome) => {
+                    assert!(step.actions.iter().all(|a| !a.asks()), "{:?}", step.actions);
+                    assert_eq!((step.ask, m.asked()), (None, None));
+                    assert_eq!(m.awaiting_driver().is_some(), !m.idle(), "idle, or awaiting the driver");
+                    assert!(answers.next().is_none(), "answers left over after {outcome:?}");
+                    return (actions, outcome);
+                }
+            }
+        }
+    }
+
+    /// Where `m` waits on `ask` for `answer`: that answer with another ask, as an event, the driver's
+    /// renewal, the other order's event, and an answer that is not its own are each refused, handed
+    /// back whole, and change nothing.
+    fn out_of_turn(m: &mut FamilyMachine<u64>, ask: Ask, answer: Input<u64>) {
+        let before = m.clone();
+        let phase = m.phase.name();
+        for wrong in [Ask { serial: ask.serial.wrapping_sub(1), ..ask }, Ask { serial: ask.serial.wrapping_add(1), ..ask }, Ask { scope: ask.scope.wrapping_add(1), ..ask }] {
+            assert_eq!(m.answer(wrong, answer, &POLICY), Err(Unexpected { phase, why: Refusal::NotTheAsk, input: answer }), "{wrong:?} in {phase}");
+        }
+        assert_eq!(m.step(answer, &POLICY), Err(Unexpected { phase, why: Refusal::NotAnEvent, input: answer }), "{phase}");
+        let renewal = due_for(Instant::now(), REQUESTED, 99);
+        assert_eq!(m.step(renewal, &POLICY), Err(Unexpected { phase, why: Refusal::Busy, input: renewal }), "{phase}");
+        let windows = Input::SwitchCheck { now: Instant::now(), peer_sent: true };
+        assert_eq!(m.step(windows, &POLICY), Err(Unexpected { phase, why: Refusal::NotAnEvent, input: windows }), "{phase}");
+        let other = if matches!(answer, Input::Deleted(_)) { Input::Abandoned(ACKED) } else { Input::Deleted(ACKED) };
+        assert_eq!(m.answer(ask, other, &POLICY), Err(Unexpected { phase, why: Refusal::NotItsAnswer, input: other }), "{phase}");
+        assert_eq!(*m, before, "{phase}: nothing changes");
+    }
+
+    /// A renewal of `CURRENT` to `NEW` for `causes`, attempt `attempt`, handed to the driver at `now`.
+    fn handed_for(m: &mut FamilyMachine<u64>, now: Instant, causes: RenewCauses, attempt: u64) -> HandedOver {
+        let (actions, outcome) = go(m, due_for(now, causes, attempt), &[negotiated(now, NEW)]);
+        assert_eq!(actions, [Action::Negotiate]);
+        let Outcome::HandedToDriver(h) = outcome else { panic!("{outcome:?}") };
+        assert_eq!(m.awaiting_driver(), Some(h));
+        h
+    }
+
+    fn handed(m: &mut FamilyMachine<u64>, now: Instant) -> HandedOver {
+        handed_for(m, now, REQUESTED, 1)
+    }
+
+    /// The step `input` makes where `m` stands, which must take it.
+    fn take(m: &mut FamilyMachine<u64>, input: Input<u64>) -> Step<u64> {
+        m.step(input, &POLICY).unwrap_or_else(|e| panic!("{input:?} refused: {e:?}"))
+    }
+
+    /// A step that is over at once with `outcome`, asking and doing nothing.
+    fn over(outcome: Outcome<u64>) -> Step<u64> {
+        Step { actions: vec![], outcome: Some(outcome), ask: None }
+    }
+
+    #[test]
+    fn the_default_is_the_commit_then_switch_order_and_any_machine_of_that_order_steps_every_flow_as_before() {
+        assert_eq!(FamilyMachine::<u64>::new().driving(), Driving::COMMIT_THEN_SWITCH);
+        assert_eq!(FamilyMachine::<u64>::with_scope(3).driving(), Driving::COMMIT_THEN_SWITCH);
+        assert_eq!(FamilyMachine::<u64>::with_driving(3, 0, Driving::COMMIT_THEN_SWITCH), FamilyMachine::with_scope(3), "the same machine");
+        // The figure of tries and the connection change nothing in that order: every flow, step for step.
+        let t0 = t0();
+        for (pending, event, answers) in every_flow(t0) {
+            let mut default = start(t0, pending);
+            let mut other = FamilyMachine { driving: Driving { order: Order::CommitThenSwitch, delete_tries: 7 }, connection: CONN, ..start(t0, pending) };
+            let (a, b) = (drive(&mut default, &POLICY, event, &answers), drive(&mut other, &POLICY, event, &answers));
+            assert_eq!((&a.actions, a.outcome, &a.asks), (&b.actions, b.outcome, &b.asks), "{event:?}");
+            assert_eq!(FamilyMachine { driving: default.driving, connection: default.connection, ..other }, default, "{event:?}: the same machine after");
+            assert!(default.tries.is_empty());
+        }
+    }
+
+    #[test]
+    fn each_order_refuses_the_others_events_and_changes_nothing() {
+        let t0 = t0();
+        let h = HandedOver { attempt: 1, causes: REQUESTED, replaces: CURRENT, new: NEW, generation: 8, negotiated: t0 };
+        let drivers = [
+            due_for(t0, REQUESTED, 1),
+            Input::DriverInstalled { named: named(&h), delete_replaced: true },
+            Input::DriverNotUsed { named: named(&h), send_delete: true },
+            Input::DriverSilent,
+            Input::DeleteRetry { named: named_retired(CURRENT) },
+        ];
+        // The default order: idle, and with a renewal under way.
+        let mut idle = FamilyMachine::<u64>::new();
+        let mut busy = FamilyMachine::<u64>::new();
+        let _ = take(&mut busy, renew(t0, CURRENT));
+        for m in [&mut idle, &mut busy] {
+            for input in drivers {
+                assert!(input.is_event() && input.is_drivers());
+                let before = m.clone();
+                let phase = m.phase.name();
+                assert_eq!(m.step(input, &POLICY), Err(Unexpected { phase, why: Refusal::NotAnEvent, input }), "{input:?} in {phase}");
+                assert_eq!(*m, before);
+            }
+        }
+        // The driver's order: idle, and awaiting the driver.
+        let mut idle = driven();
+        let mut awaiting = driven();
+        handed(&mut awaiting, t0);
+        for m in [&mut idle, &mut awaiting] {
+            for input in every_input(t0).into_iter().filter(|i| i.is_event() && !matches!(i, Input::DataPlaneReset)) {
+                assert!(!input.is_drivers());
+                let before = m.clone();
+                let phase = m.phase.name();
+                assert_eq!(m.step(input, &POLICY), Err(Unexpected { phase, why: Refusal::NotAnEvent, input }), "{input:?} in {phase}");
+                assert_eq!(*m, before);
+            }
+            // A data plane reset is taken in both orders: nothing to drop, nothing changes.
+            let before = m.clone();
+            assert_eq!(take(m, Input::DataPlaneReset), over(Outcome::Nothing));
+            assert_eq!(*m, before);
+        }
+        // Answers the driver's order never asks are no answer of its own.
+        let mut m = driven();
+        let _ = take(&mut m, due_for(t0, REQUESTED, 1));
+        let ask = m.asked().unwrap();
+        for answer in [Input::Prepared(Ok(ID)), Input::Switched(Ok(())), due()] {
+            assert_eq!(m.answer(ask, answer, &POLICY), Err(Unexpected { phase: "driver_negotiating", why: Refusal::NotItsAnswer, input: answer }));
+        }
+    }
+
+    #[test]
+    fn a_renewal_in_the_drivers_order_is_handed_to_the_driver_and_committed_on_its_word_once() {
+        let t0 = t0();
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        assert_eq!(h, HandedOver { attempt: 1, causes: REQUESTED, replaces: CURRENT, new: NEW, generation: CURRENT.generation + 1, negotiated: t0 + TOOK });
+        assert!(!m.idle() && m.asked().is_none(), "awaiting the driver: no ask pending");
+        assert_eq!(m.record().pending(), Some(Negotiated { replaces: CURRENT, new: NEW, started: t0 }), "the rekey not resolved, in the record");
+        assert_eq!(m.record().last_attempt(), None, "the spacing is the consumer's: no attempt in the record");
+        // Nothing is asked meanwhile: an answer is refused; a second renewal too; nothing changes.
+        let before = m.clone();
+        let answer = Input::Committed(Committed::Other(ACKED));
+        assert_eq!(m.answer(Ask { scope: 9, serial: 1 }, answer, &POLICY), Err(Unexpected { phase: "awaiting_driver", why: Refusal::NothingAsked, input: answer }));
+        let again = due_for(t0, RenewCauses { age: true, volume: true, request: Some(6) }, 2);
+        assert_eq!(m.step(again, &POLICY), Err(Unexpected { phase: "awaiting_driver", why: Refusal::Busy, input: again }));
+        assert_eq!(m, before);
+        // The driver's word: committed with the replaced SA's Delete, which the peer answered.
+        let (actions, outcome) = go(&mut m, Input::DriverInstalled { named: named(&h), delete_replaced: true }, &[Input::Committed(Committed::Other(ACKED))]);
+        assert_eq!(actions, [Action::Commit { new_local_spi: NEW.0, delete: true }, Action::AgeClockRestart, Action::BecameCurrent(CURRENT.successor(NEW.0, NEW.1))]);
+        assert_eq!(outcome, Outcome::Renewed { new: NEW, deferred: false, ike_sa_over: false });
+        assert!(m.idle() && m.record().pending().is_none() && m.pending_switch().is_none());
+        assert_eq!((m.record().owed(), settled(&m)), (&[][..], vec![retired(CURRENT, Ours, Sent { acknowledged: true })]));
+        // The same word again, late: nothing pending, nothing changes.
+        let before = m.clone();
+        assert_eq!(take(&mut m, Input::DriverInstalled { named: named(&h), delete_replaced: true }), over(Outcome::NotPending));
+        assert_eq!(take(&mut m, Input::DriverNotUsed { named: named(&h), send_delete: true }), over(Outcome::NotPending));
+        assert_eq!(m, before);
+    }
+
+    #[test]
+    fn a_word_that_does_not_name_the_rekey_awaiting_whole_is_not_pending_and_changes_nothing() {
+        let t0 = t0();
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        let right = named(&h);
+        let wrong = [
+            DriverRef { connection: CONN + 1, ..right },
+            DriverRef { attempt: Some(h.attempt + 1), ..right },
+            DriverRef { attempt: None, ..right },
+            DriverRef { generation: h.generation + 1, ..right },
+            DriverRef { generation: CURRENT.generation, ..right },
+            DriverRef { local_spi: NEW.0 + 1, ..right },
+            DriverRef { peer_spi: NEW.1 + 1, ..right },
+            named_retired(CURRENT),
+        ];
+        let before = m.clone();
+        for n in wrong {
+            for word in [Input::DriverInstalled { named: n, delete_replaced: true }, Input::DriverNotUsed { named: n, send_delete: true }] {
+                assert_eq!(take(&mut m, word), over(Outcome::NotPending), "{n:?}");
+                assert_eq!(m, before, "{n:?}: still awaiting, nothing owed, nothing asked");
+            }
+        }
+        // The right name is taken.
+        let (actions, _) = go(&mut m, Input::DriverInstalled { named: right, delete_replaced: false }, &[Input::Committed(Committed::OursDeleteNotAsked)]);
+        assert_eq!(actions[0], Action::Commit { new_local_spi: NEW.0, delete: false });
+    }
+
+    #[test]
+    fn the_drivers_abandon_with_its_veto_or_with_the_new_sas_delete_which_has_one_chance() {
+        let t0 = t0();
+        let new = ChildId { generation: CURRENT.generation + 1, local_spi: NEW.0, peer_spi: NEW.1 };
+        // The veto: no Delete asked, none owed.
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        let (actions, outcome) = go(&mut m, Input::DriverNotUsed { named: named(&h), send_delete: false }, &[Input::Abandoned(came(Ours, NotOwed("not_asked")))]);
+        assert_eq!((actions, outcome), (vec![Action::Abandon { new_local_spi: NEW.0, delete: false }, Action::AgeClockFailed], Outcome::Failed));
+        assert_eq!((m.record().owed(), settled(&m)), (&[][..], vec![retired(new, Ours, NotOwed("not_asked"))]));
+        assert!(m.idle() && m.record().pending().is_none());
+        assert_eq!(take(&mut m, Input::DeleteRetry { named: named_retired(new) }), over(Outcome::NoRetry(WhyNoRetry::Settled)));
+        // Its Delete asked: owed before the ask; not known to have gone, it stays owed and has had its one chance.
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        let step = take(&mut m, Input::DriverNotUsed { named: named(&h), send_delete: true });
+        assert_eq!(step.actions, [Action::Abandon { new_local_spi: NEW.0, delete: true }]);
+        assert_eq!(m.record().owed(), [retired(new, Ours, NotSent)], "owed before it is asked");
+        let step = m.answer(step.ask.unwrap(), Input::Abandoned(came(Ours, Unknown)), &POLICY).unwrap();
+        let owed = Note::DeleteOwed { local_spi: NEW.0, generation: Some(new.generation), stand: Unknown, owed: 1 };
+        assert_eq!((step.actions, step.outcome), (vec![Action::Note(owed), Action::AgeClockFailed], Some(Outcome::Failed)));
+        assert_eq!(m.record().owed(), [retired(new, Ours, Unknown)], "not known to have gone: owed still");
+        assert_eq!(m.delete_tries(NEW, Some(new.generation)), DRIVER.delete_tries);
+        assert_eq!(take(&mut m, Input::DeleteRetry { named: named_retired(new) }), over(Outcome::NoRetry(WhyNoRetry::TriesExhausted)));
+        // The peer deleted the new SA already: nothing sent, the debt settled as the peer's.
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        let gone = came(Peers, NotOwed("gateway_deleted"));
+        let (_, outcome) = go(&mut m, Input::DriverNotUsed { named: named(&h), send_delete: true }, &[Input::Abandoned(gone)]);
+        assert_eq!(outcome, Outcome::Failed);
+        assert_eq!((m.record().owed(), settled(&m)), (&[][..], vec![retired(new, Peers, NotOwed("gateway_deleted"))]));
+        assert!(m.tries.is_empty(), "no count kept of a settled Delete");
+        // The report says the IKE SA is over: torn down.
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        let over_ = DeleteCame { deleted_by: Ours, stand: NotOwed("ike_sa_gone"), ike_sa_over: true };
+        assert_eq!(go(&mut m, Input::DriverNotUsed { named: named(&h), send_delete: false }, &[Input::Abandoned(over_)]).1, Outcome::TornDown);
+        assert_eq!(settled(&m), [retired(new, Ours, NotOwed("ike_sa_gone"))], "the report's reason: a fact");
+    }
+
+    #[test]
+    fn the_drivers_silence_abandons_the_rekey_with_no_delete_for_a_result_not_known() {
+        let t0 = t0();
+        let new = ChildId { generation: CURRENT.generation + 1, local_spi: NEW.0, peer_spi: NEW.1 };
+        let mut m = driven();
+        // Nothing awaiting: nothing to do.
+        assert_eq!(take(&mut m, Input::DriverSilent), over(Outcome::Nothing));
+        assert_eq!(but_serial(&m), driven());
+        let h = handed(&mut m, t0);
+        let (actions, outcome) = go(&mut m, Input::DriverSilent, &[Input::Abandoned(came(Ours, NotOwed("not_asked")))]);
+        assert_eq!(actions, [Action::Abandon { new_local_spi: NEW.0, delete: false }, Action::AgeClockFailed]);
+        assert_eq!(outcome, Outcome::Unresolved { ike_sa_over: false }, "neither a failure nor a success");
+        assert_eq!((m.record().owed(), settled(&m)), (&[][..], vec![retired(new, Ours, NotOwed("driver_silent"))]));
+        // The driver's late word is no longer pending.
+        let before = m.clone();
+        assert_eq!(take(&mut m, Input::DriverInstalled { named: named(&h), delete_replaced: true }), over(Outcome::NotPending));
+        assert_eq!(m, before);
+        // Silent on a rekey the peer deleted: the report's fact kept; the IKE SA over: said so.
+        let mut m = driven();
+        handed(&mut m, t0);
+        let gone = DeleteCame { deleted_by: Peers, stand: NotOwed("gateway_deleted"), ike_sa_over: true };
+        assert_eq!(go(&mut m, Input::DriverSilent, &[Input::Abandoned(gone)]).1, Outcome::Unresolved { ike_sa_over: true });
+        assert_eq!(settled(&m), [retired(new, Peers, NotOwed("gateway_deleted"))]);
+    }
+
+    #[test]
+    fn a_commit_the_protocol_refuses_keeps_the_rekey_for_the_drivers_next_word_or_gives_it_up_when_not_known() {
+        let t0 = t0();
+        let new = ChildId { generation: CURRENT.generation + 1, local_spi: NEW.0, peer_spi: NEW.1 };
+        // The peer deleted the new SA: refused, nothing changed, the rekey still awaits the driver.
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        let (actions, outcome) = go(&mut m, Input::DriverInstalled { named: named(&h), delete_replaced: true }, &[Input::NotCommitted(NotCommitted::PeerDeleted)]);
+        assert_eq!((actions, outcome), (vec![Action::Commit { new_local_spi: NEW.0, delete: true }], Outcome::NotCommitted { pending: true }));
+        assert_eq!(m.awaiting_driver(), Some(h));
+        assert!(m.record().pending().is_some() && m.record().owed().is_empty() && settled(&m).is_empty(), "nothing retired, nothing current");
+        // Then its abandon, with its Delete asked: nothing goes, the peer deleted it.
+        let (_, outcome) = go(&mut m, Input::DriverNotUsed { named: named(&h), send_delete: true }, &[Input::Abandoned(came(Peers, NotOwed("gateway_deleted")))]);
+        assert_eq!(outcome, Outcome::Failed);
+        assert_eq!(settled(&m), [retired(new, Peers, NotOwed("gateway_deleted"))]);
+        // Any other refusal: not known whether it was taken; given up, nothing retired, no clock, no generation.
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        let (actions, outcome) = go(&mut m, Input::DriverInstalled { named: named(&h), delete_replaced: true }, &[Input::NotCommitted(NotCommitted::Unknown)]);
+        assert_eq!((actions, outcome), (vec![Action::Commit { new_local_spi: NEW.0, delete: true }], Outcome::NotCommitted { pending: false }));
+        assert!(m.idle() && m.record().pending().is_none() && m.record().owed().is_empty() && settled(&m).is_empty());
+        assert_eq!(take(&mut m, Input::DriverNotUsed { named: named(&h), send_delete: true }), over(Outcome::NotPending));
+    }
+
+    #[test]
+    fn causes_that_coincide_negotiate_once_a_renewal_with_none_is_not_due_and_none_starts_while_one_awaits_the_driver() {
+        let t0 = t0();
+        let all = RenewCauses { age: true, volume: true, request: Some(7) };
+        let mut m = driven();
+        let h = handed_for(&mut m, t0, all, 3);
+        assert_eq!((h.causes, h.attempt), (all, 3), "every cause kept, one negotiation");
+        let again = due_for(t0, all, 4);
+        let before = m.clone();
+        assert_eq!(m.step(again, &POLICY), Err(Unexpected { phase: "awaiting_driver", why: Refusal::Busy, input: again }), "one negotiation per SA");
+        assert_eq!(m, before);
+        // Each cause alone is one.
+        for causes in [RenewCauses { age: true, ..Default::default() }, RenewCauses { volume: true, ..Default::default() }, REQUESTED] {
+            assert!(causes.any());
+            let mut m = driven();
+            assert_eq!(handed_for(&mut m, t0, causes, 1).causes, causes);
+        }
+        // None: not due, nothing asked, nothing changed.
+        let mut m = driven();
+        assert_eq!(take(&mut m, due_for(t0, RenewCauses::default(), 1)), over(Outcome::NotDue));
+        assert_eq!(m, driven());
+    }
+
+    #[test]
+    fn a_failed_negotiation_is_counted_and_one_the_ike_sa_ended_is_not() {
+        let t0 = t0();
+        let mut m = driven();
+        let (actions, outcome) = go(&mut m, due_for(t0, REQUESTED, 1), &[Input::Negotiated(Err(Failure::Other))]);
+        assert_eq!((actions, outcome), (vec![Action::Negotiate, Action::AgeClockFailed], Outcome::Failed));
+        assert!(m.idle() && m.record().pending().is_none());
+        let (actions, outcome) = go(&mut m, due_for(t0, REQUESTED, 2), &[Input::Negotiated(Err(Failure::IkeSaOver))]);
+        assert_eq!((actions, outcome), (vec![Action::Negotiate], Outcome::TornDown));
+        assert_eq!(but_serial(&m), driven(), "nothing recorded");
+    }
+
+    #[test]
+    fn the_commits_report_of_the_ike_sa_over_renews_all_the_same() {
+        let t0 = t0();
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        let over_ = DeleteCame { deleted_by: Ours, stand: NotOwed("ike_sa_gone"), ike_sa_over: true };
+        let (_, outcome) = go(&mut m, Input::DriverInstalled { named: named(&h), delete_replaced: true }, &[Input::Committed(Committed::Other(over_))]);
+        assert_eq!(outcome, Outcome::Renewed { new: NEW, deferred: false, ike_sa_over: true });
+        assert_eq!(settled(&m), [retired(CURRENT, Ours, NotOwed("ike_sa_gone"))]);
+        // The peer's SA of a crossed rekey kept: the replaced SA is the peer's to delete, and nothing is deferred.
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        let (actions, outcome) = go(&mut m, Input::DriverInstalled { named: named(&h), delete_replaced: true }, &[Input::Committed(Committed::PeersKept(PEERS))]);
+        assert_eq!(outcome, Outcome::Renewed { new: NEW, deferred: false, ike_sa_over: false });
+        assert!(actions.contains(&Action::BecameCurrent(CURRENT.successor(NEW.0, NEW.1))) && m.pending_switch().is_none());
+        assert_eq!(settled(&m), [retired(CURRENT, Peers, NotOwed("peer_deletes"))]);
+    }
+
+    #[test]
+    fn a_retry_on_the_drivers_word_goes_up_to_its_tries_and_never_for_a_delete_sent_unanswered_or_settled() {
+        let t0 = t0();
+        let retry = Input::DeleteRetry { named: named_retired(CURRENT) };
+        // Committed with no Delete asked (the driver's veto at the commit): owed, never tried.
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        go(&mut m, Input::DriverInstalled { named: named(&h), delete_replaced: false }, &[Input::Committed(Committed::OursDeleteNotAsked)]);
+        assert_eq!((m.record().owed(), m.delete_tries(CURRENT.spis(), Some(CURRENT.generation))), (&[retired(CURRENT, Ours, NotSent)][..], 0));
+        // Tried once, not known to have gone; tried again; then no more.
+        for tries in 1..=DRIVER.delete_tries {
+            let (actions, outcome) = go(&mut m, retry, &[Input::Deleted(came(Ours, Unknown))]);
+            let owed = Note::DeleteOwed { local_spi: CURRENT.local_spi, generation: Some(CURRENT.generation), stand: Unknown, owed: 1 };
+            assert_eq!((actions, outcome), (vec![Action::DeleteChild { spis: CURRENT.spis() }, Action::Note(owed)], Outcome::DeleteRetried { ike_sa_over: false }));
+            assert_eq!((m.record().owed(), m.delete_tries(CURRENT.spis(), Some(CURRENT.generation))), (&[retired(CURRENT, Ours, Unknown)][..], tries));
+        }
+        let before = m.clone();
+        assert_eq!(take(&mut m, retry), over(Outcome::NoRetry(WhyNoRetry::TriesExhausted)));
+        assert_eq!(m, before, "owed still, not tried again");
+        // The commit's own Delete not known to have gone: one try had; the retry answered settles it.
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        go(&mut m, Input::DriverInstalled { named: named(&h), delete_replaced: true }, &[Input::Committed(Committed::Other(came(Ours, Unknown)))]);
+        assert_eq!(m.delete_tries(CURRENT.spis(), Some(CURRENT.generation)), 1);
+        assert_eq!(go(&mut m, retry, &[Input::Deleted(ACKED)]).1, Outcome::DeleteRetried { ike_sa_over: false });
+        assert_eq!((m.record().owed(), settled(&m)), (&[][..], vec![retired(CURRENT, Ours, Sent { acknowledged: true })]));
+        assert!(m.tries.is_empty(), "the count goes with the debt");
+        assert_eq!(take(&mut m, retry), over(Outcome::NoRetry(WhyNoRetry::Settled)));
+        // Sent and never answered: owed -- no confirmation --, never sent again.
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        go(&mut m, Input::DriverInstalled { named: named(&h), delete_replaced: true }, &[Input::Committed(Committed::Other(came(Ours, Sent { acknowledged: false })))]);
+        assert_eq!(m.record().owed(), [retired(CURRENT, Ours, Sent { acknowledged: false })]);
+        let before = m.clone();
+        assert_eq!(take(&mut m, retry), over(Outcome::NoRetry(WhyNoRetry::SentUnanswered)));
+        // Not of this record, or of another connection: nothing.
+        for n in [named_retired(NEXT), DriverRef { generation: CURRENT.generation + 1, ..named_retired(CURRENT) }, DriverRef { connection: CONN + 1, ..named_retired(CURRENT) }] {
+            assert_eq!(take(&mut m, Input::DeleteRetry { named: n }), over(Outcome::NotPending), "{n:?}");
+        }
+        assert_eq!(m, before);
+    }
+
+    #[test]
+    fn a_retry_taken_while_a_rekey_awaits_the_driver_leaves_it_awaiting() {
+        let t0 = t0();
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        go(&mut m, Input::DriverInstalled { named: named(&h), delete_replaced: false }, &[Input::Committed(Committed::OursDeleteNotAsked)]);
+        // The next renewal, of the new SA, handed to the driver; then the old SA's Delete tried on the driver's word.
+        let next = Input::RenewDue { now: t0 + secs(1), current: NEXT, causes: REQUESTED, attempt: 2 };
+        let (_, outcome) = go(&mut m, next, &[negotiated(t0 + secs(1), (0x31, 0x32))]);
+        let Outcome::HandedToDriver(h2) = outcome else { panic!("{outcome:?}") };
+        let (actions, outcome) = go(&mut m, Input::DeleteRetry { named: named_retired(CURRENT) }, &[Input::Deleted(ACKED)]);
+        assert_eq!((actions, outcome), (vec![Action::DeleteChild { spis: CURRENT.spis() }], Outcome::DeleteRetried { ike_sa_over: false }));
+        assert_eq!(m.awaiting_driver(), Some(h2), "the rekey awaiting the driver is untouched");
+        // A retry refused leaves it awaiting too; then the driver's word on it is taken.
+        assert_eq!(take(&mut m, Input::DeleteRetry { named: named_retired(CURRENT) }), over(Outcome::NoRetry(WhyNoRetry::Settled)));
+        assert_eq!(m.awaiting_driver(), Some(h2));
+        let (_, outcome) = go(&mut m, Input::DriverInstalled { named: named(&h2), delete_replaced: true }, &[Input::Committed(Committed::Other(ACKED))]);
+        assert_eq!(outcome, Outcome::Renewed { new: (0x31, 0x32), deferred: false, ike_sa_over: false });
+        assert_eq!(settled(&m), [retired(CURRENT, Ours, Sent { acknowledged: true }), retired(NEXT, Ours, Sent { acknowledged: true })]);
+    }
+
+    #[test]
+    fn in_the_drivers_order_a_reset_while_an_action_is_asked_waits_and_while_awaiting_changes_nothing() {
+        let t0 = t0();
+        let mut m = driven();
+        let step = take(&mut m, due_for(t0, REQUESTED, 1));
+        let ask = step.ask.unwrap();
+        assert_eq!(take(&mut m, Input::DataPlaneReset), Step { actions: vec![], outcome: None, ask: Some(ask) });
+        assert!(m.reset_pending());
+        let step = m.answer(ask, negotiated(t0, NEW), &POLICY).unwrap();
+        assert!(matches!(step.outcome, Some(Outcome::HandedToDriver(_))) && !m.reset_pending() && m.awaiting_driver().is_some());
+    }
+
+    #[test]
+    fn past_the_bound_of_owed_deletes_the_drivers_order_suspends_nothing_and_keeps_every_debt() {
+        let t0 = t0();
+        let policy = owing(1);
+        let mut m = driven();
+        let mut current = CURRENT;
+        for k in 0..4u32 {
+            let new = (0x100 + k, 0x200 + k);
+            let step = m.step(Input::RenewDue { now: t0, current, causes: REQUESTED, attempt: u64::from(k) }, &policy).unwrap();
+            assert_eq!(step.actions, [Action::Negotiate], "the {k}th: never suspended");
+            let step = m.answer(step.ask.unwrap(), negotiated(t0, new), &policy).unwrap();
+            let Some(Outcome::HandedToDriver(h)) = step.outcome else { panic!("{step:?}") };
+            let step = m.step(Input::DriverInstalled { named: named(&h), delete_replaced: false }, &policy).unwrap();
+            let step = m.answer(step.ask.unwrap(), Input::Committed(Committed::OursDeleteNotAsked), &policy).unwrap();
+            let notes: Vec<Note> = step.actions.iter().filter_map(|a| if let Action::Note(n) = a { Some(*n) } else { None }).collect();
+            if k == 0 {
+                assert_eq!(notes, []);
+            } else {
+                assert_eq!(notes, [Note::OwedOverCapacity { owed: k as usize + 1 }]);
+            }
+            current = current.successor(new.0, new.1);
+        }
+        assert_eq!(m.record().owed().len(), 4);
+        assert!(!m.suspended());
     }
 }

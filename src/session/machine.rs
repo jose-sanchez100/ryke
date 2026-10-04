@@ -10,14 +10,69 @@
 //!
 //! # The protocol
 //!
-//! The consumer drives the machine with [`FamilyMachine::step`]. An [`Input`] is either an *event*,
-//! which starts an operation and is taken only while the machine is [`idle`](FamilyMachine::idle),
-//! or the *answer* to the action the previous step asked for. Each [`Step`] carries the actions the
-//! consumer is to carry out, in order, each completely before the next: at most one of them asks
-//! for an answer ([`Action::asks`]), and it is the last; then the operation goes on and
-//! [`Step::outcome`] is `None`. Otherwise the operation is over, the outcome says how, and the
-//! machine is idle again. An input that does not fit where the machine stands is refused
-//! ([`Unexpected`]): nothing changes, and nothing panics.
+//! An [`Input`] is either an *event* ([`Input::is_event`]), which starts an operation, or the
+//! *answer* to the action the last step asked for. The consumer gives an event with
+//! [`FamilyMachine::step`], taken only while the machine is [`idle`](FamilyMachine::idle) --
+//! [`Input::DataPlaneReset`] aside, taken anywhere --, and an answer with [`FamilyMachine::answer`],
+//! with the [`Ask`] of the step that asked for it. Each [`Step`] carries the actions the consumer is
+//! to carry out, in order, each completely before the next: at most one of them asks for an answer
+//! ([`Action::asks`]), and it is the last; then the operation goes on, [`Step::outcome`] is `None`
+//! and [`Step::ask`] names the action asked. Otherwise the operation is over, the outcome says how,
+//! and the machine is idle again. An input that does not fit where the machine stands is refused
+//! ([`Unexpected`], with its [`Refusal`]): handed back whole, nothing changes, and nothing panics.
+//!
+//! # The contract with the consumer's adapter
+//!
+//! What the machine asks is right only if the adapter that carries it out keeps to this:
+//!
+//! 1. One operation at a time per machine, from its event to its outcome, the adapter holding
+//!    exclusive access to the machine and to the consumer state the operation reads for all of it
+//!    (the controller's `LIVENESS` lock).
+//! 2. Each asking action is carried out exactly once, and its answer is what carrying it out
+//!    returned, given with the step's [`Ask`] before any other input (only
+//!    [`Input::DataPlaneReset`] may come in between). Under that, a late or duplicated answer cannot
+//!    exist; the `Ask` is what makes the machine refuse one if the adapter breaks the rule
+//!    ([`Refusal::NotTheAsk`]), instead of taking it for the pending action's.
+//! 3. Events only while idle; one refused ([`Refusal::Busy`]) comes back whole in
+//!    [`Unexpected::input`] and is the adapter's to give again.
+//! 4. Every data-plane action of an operation is for the data plane the operation began on. A reset
+//!    given while an operation is under way is deferred to the operation's end
+//!    ([`FamilyMachine::reset_pending`]): the operation's actions that touch the data plane, before
+//!    and after the reset is given, are for the data plane the operation began on -- its names `T`
+//!    mean nothing in another. The adapter keeps that data plane for the operation (as the
+//!    controller's flows keep the handle they cloned) and never carries such an action out on a data
+//!    plane that took its place; where it no longer has it, it answers what an action asks with the
+//!    refusal or with "no data plane" ([`NotSwitched::NoDataPlane`], [`NoDataPlane`]) and drops the
+//!    actions that ask nothing ([`Action::Withdraw`], [`Action::CloseRedundant`],
+//!    [`Action::KeepRedundant`]). Wire obligations are untouched by a reset: an abandon, a commit, a
+//!    Delete owed, a refusal or release of a held rekey go on as ever.
+//! 5. A composite action is one obligation ([Composite actions](#composite-actions)).
+//!
+//! The machine enforces 2, by the `Ask`; 3, by refusing the event; and the reset's place, by
+//! deferring it. 1, 4 and 5 only the adapter can keep: the machine does not see how its actions are
+//! carried out.
+//!
+//! # Composite actions
+//!
+//! Some actions are more than one change of the data plane: [`Action::Switch`] and
+//! [`Action::SwitchAtOnce`] (the switch, and on a refusal the new SA withdrawn),
+//! [`Action::InstallAndSwitch`] (the install as the next generation, the switch, and on a refusal
+//! the new SA withdrawn), [`Action::PrepareDeferred`] (the install as the next generation, and the
+//! read of the current generation's SPIs), [`Action::MoveToRedundant`] (the pending switch, then the
+//! promotion). Grouping them in one action states an obligation of the adapter: to carry all of it
+//! out as one change of the data plane, with nothing else changing or using the family's SAs in
+//! between -- no packet sealed between the parts. The machine cannot see how it is carried out and
+//! guarantees none of it; how the adapter gets it (a lock, a single thread, a transaction) is its
+//! own. The controller holds its data plane's lock across the parts. Split, each would show:
+//!
+//! - `Switch`, `SwitchAtOnce`, `InstallAndSwitch` refused: between the refusal and the withdrawal, a
+//!   next generation left installed that nothing will switch to or withdraw, inbound accepted on it.
+//! - `InstallAndSwitch`: between the install and the switch, the family's next generation there for
+//!   anything else to switch to or replace.
+//! - `PrepareDeferred`: the SPIs answered (`replaced`) not those of the generation the deferred
+//!   switch will leave, if the current generation moved between the install and the read.
+//! - `MoveToRedundant`: between the pending switch and the promotion, outbound on the SA the peer
+//!   just deleted.
 //!
 //! The family's current generation ([`ChildId`]) and its clock by age are the consumer's, not the
 //! machine's: an event carries the current generation where the operation needs it, and the machine
@@ -47,7 +102,8 @@
 //! - The family moved to the peer's redundant SA ([`Input::MovedToRedundant`];
 //!   `move_to_redundant`).
 //! - The data plane gone or replaced ([`Input::DataPlaneReset`]; the controller's `attach`,
-//!   `detach`): a switch deferred in it is dropped.
+//!   `detach`): a switch deferred in it is dropped -- at once while idle, at the end of the
+//!   operation under way otherwise.
 //!
 //! Wherever another operation needs the family's next generation, a switch still pending is made
 //! first ([`SwitchProof::SlotNeeded`]).
@@ -145,8 +201,45 @@ pub struct NotPrepared {
     pub session_on: Option<(u32, u32)>,
 }
 
-/// What the consumer gives the machine: an event, taken only while it is idle, or the answer to the
-/// action the last step asked for.
+/// Why a switch asked for was not made ([`Input::Switched`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotSwitched {
+    /// The data plane refused it; the new SA withdrawn.
+    Refused,
+    /// No data plane runs any more that the switch could be made in (the controller's
+    /// `switch_pending` with no pump: dropped). Told apart only for the deferred switch
+    /// ([`Action::Switch`]). For the switch at once ([`Action::SwitchAtOnce`]) the controller has no
+    /// such branch -- it holds its data plane for the whole renewal --, and the machine takes it as
+    /// [`Refused`](Self::Refused).
+    NoDataPlane,
+}
+
+/// What came of a move to the peer's redundant SA in the data plane ([`Input::Moved`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Moved {
+    /// The pending switch, if one was asked, was refused.
+    pub pending_refused: bool,
+    /// The promotion, if one was asked, was made; not read when none was.
+    pub promoted: Result<(), ()>,
+}
+
+/// No data plane runs any more for the action asked (the controller's `move_to_redundant` with no
+/// pump).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoDataPlane;
+
+/// What an answer says came to exist outside the machine ([`Input::brought`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Brought<T> {
+    /// A CHILD SA negotiated on the wire, of SPIs `new` `(local, peer)`.
+    Child { new: (u32, u32) },
+    /// An SA put in the data plane, of this name.
+    InPlane(T),
+}
+
+/// What the consumer gives the machine: an event, taken only while it is idle (but
+/// [`DataPlaneReset`](Self::DataPlaneReset), taken anywhere), or the answer to the action the last
+/// step asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Input<T> {
     /// Event: renew the family's current SA by volume if it is due (the controller's
@@ -179,16 +272,26 @@ pub enum Input<T> {
     /// Event: the data plane a deferred switch was in is gone, or another took its place: a switch
     /// deferred in it has nothing to switch, and is dropped (the controller's `attach` and `detach`,
     /// which take every record's switch and log nothing). Nothing else of the record changes.
+    ///
+    /// Taken in every phase. While an operation is under way it is deferred to the operation's end
+    /// ([`FamilyMachine::reset_pending`]): the step asks nothing new, the pending action is still to
+    /// be answered, and the switch is dropped once the operation is over -- one the operation itself
+    /// deferred too, as it was put in the data plane that is gone. The controller never meets this:
+    /// `attach`, `detach` and every flow run under the same lock, and a flow completes against the
+    /// handle it cloned at its start. The operation's actions that touch the data plane, before and
+    /// after the reset is given, are for the data plane the operation began on; the adapter never
+    /// carries one out on a data plane that took its place, and where it no longer has that one it
+    /// answers with the refusal or "no data plane" and drops the actions that ask nothing. The wire
+    /// obligations go on as ever.
     DataPlaneReset,
     /// Answer to [`Action::ReadUse`]: `used` is what the SA asked about has moved, `(rx, tx)`, or
-    /// `None` when the data plane's current generation of the family is not that SA. `signal` and
-    /// `basis` are the consumer's volume policy over those bytes (the renewal signal, and the byte
-    /// figure the spacing is sized by); `peer_rekey_held` whether a rekey of the peer's of the family
-    /// is held unanswered.
+    /// `None` when the data plane's current generation of the family is not that SA, or there is no
+    /// data plane. `signal` and `basis` are the consumer's volume policy over those bytes (the
+    /// renewal signal, and the byte figure the spacing is sized by); `peer_rekey_held` whether a
+    /// rekey of the peer's of the family is held unanswered.
     Use { used: Option<(u64, u64)>, signal: Option<RenewalSignal>, basis: Option<u64>, peer_rekey_held: bool },
-    /// Answer to [`Action::Switch`] and [`Action::SwitchAtOnce`]: made, or refused (`Err`, the new
-    /// SA then withdrawn).
-    Switched(Result<(), ()>),
+    /// Answer to [`Action::Switch`] and [`Action::SwitchAtOnce`]: made, or not ([`NotSwitched`]).
+    Switched(Result<(), NotSwitched>),
     /// Answer to [`Action::Negotiate`].
     Negotiated(Result<NewChild, Failure>),
     /// Answer to [`Action::Prepare`]: the new SA's name in the data plane, or the refusal.
@@ -211,14 +314,30 @@ pub enum Input<T> {
     Added(Result<T, ()>),
     /// Answer to [`Action::InstallAndSwitch`].
     InstalledAndSwitched(Result<(), ()>),
-    /// Answer to [`Action::MoveToRedundant`]: whether the pending switch, if one was asked, was
-    /// refused; and whether the promotion, if one was asked, was made (not read when none was).
-    Moved { pending_refused: bool, promoted: Result<(), ()> },
+    /// Answer to [`Action::MoveToRedundant`]: what came of the pending switch and the promotion, or
+    /// no data plane to make them in.
+    Moved(Result<Moved, NoDataPlane>),
 }
 
 impl<T> Input<T> {
-    /// The input's name, for [`Unexpected`].
-    fn kind(&self) -> &'static str {
+    /// Whether the input is an event, given with [`FamilyMachine::step`]; otherwise it is an answer,
+    /// given with [`FamilyMachine::answer`].
+    pub fn is_event(&self) -> bool {
+        matches!(
+            self,
+            Input::RenewByVolume { .. }
+                | Input::SwitchCheck { .. }
+                | Input::PeerDeletedReplaced { .. }
+                | Input::PeerRekeyHeld { .. }
+                | Input::PeerRekeyHeldOfRedundant { .. }
+                | Input::Replacement { .. }
+                | Input::MovedToRedundant { .. }
+                | Input::DataPlaneReset
+        )
+    }
+
+    /// The input's name, as a consumer may print a refused one.
+    pub fn kind(&self) -> &'static str {
         match self {
             Input::RenewByVolume { .. } => "RenewByVolume",
             Input::SwitchCheck { .. } => "SwitchCheck",
@@ -240,7 +359,25 @@ impl<T> Input<T> {
             Input::Released(_) => "Released",
             Input::Added(_) => "Added",
             Input::InstalledAndSwitched(_) => "InstalledAndSwitched",
-            Input::Moved { .. } => "Moved",
+            Input::Moved(_) => "Moved",
+        }
+    }
+}
+
+impl<T: Copy> Input<T> {
+    /// What the answer says came to exist outside the machine: the CHILD SA a rekey negotiated
+    /// ([`Input::Negotiated`]), or the SA a data plane took ([`Input::Prepared`],
+    /// [`Input::PreparedDeferred`], [`Input::Added`]); `None` for any other input, and for a refusal.
+    ///
+    /// A consumer whose answer was refused ([`Unexpected`]) reconciles this against its own records:
+    /// whether it is a duplicate of something it tracks or an orphan is not the machine's to decide,
+    /// as the machine never took it. A refused report of a Delete loses nothing: the Delete was
+    /// recorded as owed before it was asked (the controller's `owe_delete`), and stays owed.
+    pub fn brought(&self) -> Option<Brought<T>> {
+        match self {
+            Input::Negotiated(Ok(n)) => Some(Brought::Child { new: n.new }),
+            Input::Prepared(Ok(id)) | Input::PreparedDeferred(Ok((id, _))) | Input::Added(Ok(id)) => Some(Brought::InPlane(*id)),
+            _ => None,
         }
     }
 }
@@ -251,12 +388,14 @@ pub enum Action<T> {
     /// A line the controller logs, for the consumer to render. Asks nothing.
     Note(Note),
     /// Read what the data plane's current generation of the family has moved, if it is the SA of
-    /// `spis` `(local, peer)`. Asks [`Input::Use`].
+    /// `spis` `(local, peer)`. Asks [`Input::Use`]; with no data plane, `used: None`.
     ReadUse { spis: (u32, u32) },
     /// Make the deferred `switch` at `now`, for `proof`: outbound moves to `switch.id`, the replaced
     /// SA still accepted inbound for the consumer's term; should the data plane refuse, `switch.id`
     /// is withdrawn from it. One operation under the data plane's lock, as the controller's
-    /// `switch_in`. Asks [`Input::Switched`].
+    /// `switch_in`: a [composite action](crate::session::machine#composite-actions). Asks
+    /// [`Input::Switched`]; with no data plane, [`NotSwitched::NoDataPlane`]: the switch dropped,
+    /// nothing closed (the controller's `switch_pending`).
     Switch { switch: DeferredSwitch<T>, proof: SwitchProof, now: Instant },
     /// Negotiate a rekey of the family's current SA, with no Delete of it. Asks
     /// [`Input::Negotiated`].
@@ -266,7 +405,8 @@ pub enum Action<T> {
     KeepRedundant { now: Instant },
     /// Install the new SA of `new` `(local, peer)` as the family's next generation at `now`: inbound
     /// accepted on it from here on. On a refusal, read the family's SA in the session before anything
-    /// else ([`NotPrepared`]). Asks [`Input::Prepared`].
+    /// else ([`NotPrepared`]). Asks [`Input::Prepared`]; no data plane is that refusal (the
+    /// controller's `NoPump` takes the same way: the abandon, its Delete owed).
     Prepare { new: (u32, u32), now: Instant },
     /// Abandon the rekey whose new SA receives on `new_local_spi`, its Delete asked (`delete`). Asks
     /// [`Input::Abandoned`].
@@ -277,8 +417,10 @@ pub enum Action<T> {
     /// Switch outbound to `id`, the family's next generation, at `now` -- at once, this side being
     /// the initiator --, the replaced SA still accepted inbound for the consumer's term; should the
     /// data plane refuse, `id` is withdrawn from it. One operation under the data plane's lock, as
-    /// the switch in the controller's `renew_family`. Not a deferred switch. Asks
-    /// [`Input::Switched`].
+    /// the switch in the controller's `renew_family`: a
+    /// [composite action](crate::session::machine#composite-actions). Not a deferred switch. Asks
+    /// [`Input::Switched`]; [`NotSwitched::NoDataPlane`] is taken as [`NotSwitched::Refused`], the
+    /// controller having no such branch (it holds its data plane for the whole renewal).
     SwitchAtOnce { id: T, now: Instant },
     /// Delete the replaced SA of `spis` `(local, peer)`. Asks [`Input::Deleted`].
     DeleteChild { spis: (u32, u32) },
@@ -294,7 +436,10 @@ pub enum Action<T> {
     /// Install the new SA of `new` `(local, peer)`, of a rekey this side answers as the responder,
     /// as the family's next generation at `now` -- inbound accepted on it from here on, outbound left
     /// on the current one -- and read the SPIs of the data plane's current generation of the family,
-    /// under the same lock (the controller's `prepare_deferred`). Asks [`Input::PreparedDeferred`].
+    /// under the same lock (the controller's `prepare_deferred`): a
+    /// [composite action](crate::session::machine#composite-actions). Asks
+    /// [`Input::PreparedDeferred`]; no data plane is its refusal (the controller's `NoPump` takes
+    /// the same way: the rekey refused, or left to the consumer).
     PrepareDeferred { new: (u32, u32), now: Instant },
     /// Refuse the held rekey whose new SA receives on `new_local_spi` (`TEMPORARY_FAILURE`): the data
     /// plane cannot take it. Asks [`Input::Refused`].
@@ -306,7 +451,8 @@ pub enum Action<T> {
     /// nothing.
     Withdraw { id: T, now: Instant },
     /// Add the new SA of `new` `(local, peer)` to the data plane as a redundant generation of the
-    /// family at `now`: inbound accepted on it, never sealed with. Asks [`Input::Added`].
+    /// family at `now`: inbound accepted on it, never sealed with. Asks [`Input::Added`]; no data
+    /// plane is its refusal (the controller's `NoPump` takes the same way: the rekey refused).
     AddRedundant { new: (u32, u32), now: Instant },
     /// Close the redundant generation `id` in the data plane at `now`, still accepted inbound for
     /// the consumer's term. Asks nothing.
@@ -314,14 +460,18 @@ pub enum Action<T> {
     /// Install the new SA of `new` `(local, peer)` as the family's next generation at `now` and
     /// switch outbound to it at once, the replaced SA still accepted inbound for the consumer's
     /// term; should the switch be refused, the new SA is withdrawn. One operation under the data
-    /// plane's lock, as the controller's `install_replacement`. Asks
-    /// [`Input::InstalledAndSwitched`].
+    /// plane's lock, as the controller's `install_replacement`: a
+    /// [composite action](crate::session::machine#composite-actions). Asks
+    /// [`Input::InstalledAndSwitched`]; no data plane is its refusal (the controller's `NoPump`
+    /// takes the same way: left to the consumer).
     InstallAndSwitch { new: (u32, u32), now: Instant },
-    /// Under one lock of the data plane, at `now` (the controller's `move_to_redundant`): first the
-    /// `pending` switch, if any, made as [`Action::Switch`] does for [`SwitchProof::SlotNeeded`] (a
-    /// refusal is only reported); then the redundant generation `promote`, if any, made the
-    /// family's current one -- outbound moves to it, the SA it replaces still accepted inbound for
-    /// the consumer's term. Asks [`Input::Moved`].
+    /// Under one lock of the data plane, at `now` (the controller's `move_to_redundant`), a
+    /// [composite action](crate::session::machine#composite-actions): first the `pending` switch, if
+    /// any, made as [`Action::Switch`] does for [`SwitchProof::SlotNeeded`] (a refusal is only
+    /// reported); then the redundant generation `promote`, if any, made the family's current one --
+    /// outbound moves to it, the SA it replaces still accepted inbound for the consumer's term. Asks
+    /// [`Input::Moved`]; with no data plane, [`NoDataPlane`]: the pending switch dropped, nothing
+    /// withdrawn.
     MoveToRedundant { pending: Option<DeferredSwitch<T>>, promote: Option<T>, now: Instant },
 }
 
@@ -379,6 +529,9 @@ pub enum Note {
     /// The data plane refused a deferred switch to the SA receiving on `local_spi`: the two ends
     /// disagree, the IKE SA is closed (`switch_pending`; the error is the consumer's).
     SwitchRefused { local_spi: u32 },
+    /// No data plane runs any more for the deferred switch to the SA receiving on `local_spi`: it is
+    /// dropped (`switch_pending`).
+    SwitchDroppedNoDataPlane { local_spi: u32 },
     /// A switch to the SA receiving on `local_spi` was still pending when another was deferred: it
     /// is dropped (`defer_switch`).
     SwitchDropped { local_spi: u32 },
@@ -474,6 +627,8 @@ pub enum NotPromoted {
     NotInPlane,
     /// The data plane refused the promotion; its error is the consumer's.
     Refused,
+    /// No data plane runs ("no pump runs").
+    NoDataPlane,
 }
 
 /// How an operation ended. `T` is the consumer's name for an SA in its data plane.
@@ -525,15 +680,48 @@ pub struct Step<T> {
     pub actions: Vec<Action<T>>,
     /// `None` while the operation goes on (the last action asks); how it ended once it is over.
     pub outcome: Option<Outcome<T>>,
+    /// The ask the machine waits on, to be given with the answer ([`FamilyMachine::answer`]): `Some`
+    /// exactly when `outcome` is `None`.
+    pub ask: Option<Ask>,
 }
 
-/// An input that does not fit where the machine stands: refused, and nothing changed.
+/// One asking action of one machine: what its answer is given with ([`FamilyMachine::answer`]), so
+/// that the machine takes it for that action only. Never the same for two asking actions of a
+/// machine; never the same for two machines whose scopes differ ([`FamilyMachine::with_scope`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Unexpected {
+pub struct Ask {
+    scope: u64,
+    serial: u64,
+}
+
+/// Why an input was refused ([`Unexpected`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// An event (not [`Input::DataPlaneReset`]) given while an operation is under way.
+    Busy,
+    /// An answer given with [`FamilyMachine::step`].
+    NotAnEvent,
+    /// An answer given while nothing is asked: the machine is idle.
+    NothingAsked,
+    /// An answer given with an [`Ask`] that is not the pending one: an earlier one, one already
+    /// answered, another machine's.
+    NotTheAsk,
+    /// The pending [`Ask`], with an input that is not the answer its action asks for (an event
+    /// included).
+    NotItsAnswer,
+}
+
+/// An input that does not fit where the machine stands: refused, and nothing changed in the machine
+/// -- the pending ask, if any, can still be answered. The input comes back whole, so that nothing it
+/// carried is lost ([`Input::brought`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unexpected<T> {
     /// Where the machine stands.
     pub phase: &'static str,
+    /// Why it was refused.
+    pub why: Refusal,
     /// The input refused.
-    pub input: &'static str,
+    pub input: Input<T>,
 }
 
 /// A renewal by volume under way, once it is due: its event's instant, the SA it replaces, what that
@@ -647,6 +835,12 @@ pub struct FamilyMachine<T> {
     record: FamilyRenewal<T>,
     phase: Phase<T>,
     suspended: bool,
+    /// The consumer's number for this machine, in every [`Ask`] of it.
+    scope: u64,
+    /// The serial of the last [`Ask`] handed out; the pending one while the phase is not idle.
+    serial: u64,
+    /// A [`Input::DataPlaneReset`] came while an operation was under way: applied at its end.
+    reset_pending: bool,
 }
 
 impl<T: Copy> Default for FamilyMachine<T> {
@@ -656,9 +850,34 @@ impl<T: Copy> Default for FamilyMachine<T> {
 }
 
 impl<T: Copy> FamilyMachine<T> {
-    /// A family with nothing recorded, idle, its renewals by volume not suspended.
+    /// A family with nothing recorded, idle, its renewals by volume not suspended; its scope 0.
     pub fn new() -> Self {
-        Self { record: FamilyRenewal::new(), phase: Phase::Idle, suspended: false }
+        Self::with_scope(0)
+    }
+
+    /// As [`new`](Self::new), its asks in `scope`: a number the consumer chooses so that this
+    /// machine's asks differ from any other machine's (its connection and family).
+    pub fn with_scope(scope: u64) -> Self {
+        Self { record: FamilyRenewal::new(), phase: Phase::Idle, suspended: false, scope, serial: 0, reset_pending: false }
+    }
+
+    /// The machine's scope ([`with_scope`](Self::with_scope)).
+    pub fn scope(&self) -> u64 {
+        self.scope
+    }
+
+    /// The ask the machine waits on, the same as the last step's [`Step::ask`]: `Some` exactly while
+    /// an operation is under way.
+    pub fn asked(&self) -> Option<Ask> {
+        match self.phase {
+            Phase::Idle => None,
+            _ => Some(Ask { scope: self.scope, serial: self.serial }),
+        }
+    }
+
+    /// Whether a [`Input::DataPlaneReset`] given during the operation under way waits for its end.
+    pub fn reset_pending(&self) -> bool {
+        self.reset_pending
     }
 
     /// The family's record, read-only: only the machine's flows change it.
@@ -690,25 +909,83 @@ impl<T: Copy> FamilyMachine<T> {
         self.record.switch_due_at(policy.unproven_after)
     }
 
-    /// One step: `input` taken where the machine stands, under `policy`. An input that does not fit
-    /// -- an event while an operation is under way, an answer to an action not asked for -- is
-    /// refused: [`Unexpected`], and nothing changes.
-    pub fn step(&mut self, input: Input<T>, policy: &Policy) -> Result<Step<T>, Unexpected> {
-        let mut actions = Vec::new();
-        let out = &mut actions;
-        let flow = match (self.phase, input) {
-            (Phase::Idle, Input::RenewByVolume { now, current, session_on }) => self.renew_by_volume(now, current, session_on),
-            (Phase::Idle, Input::SwitchCheck { now, peer_sent }) => match self.record.switch_proof(peer_sent, policy.unproven_after, now) {
+    /// An event, taken under `policy`: it starts an operation, and the step says what to do for it.
+    /// Taken only while the machine is idle, but [`Input::DataPlaneReset`], taken anywhere: under way,
+    /// an operation goes on as it was and the reset waits for its end (no action, the same ask).
+    ///
+    /// Refused ([`Unexpected`]), nothing changed: an answer ([`Refusal::NotAnEvent`]), an event while
+    /// an operation is under way ([`Refusal::Busy`]).
+    pub fn step(&mut self, input: Input<T>, policy: &Policy) -> Result<Step<T>, Unexpected<T>> {
+        if !input.is_event() {
+            return Err(self.refused(Refusal::NotAnEvent, input));
+        }
+        let busy = !self.idle();
+        if busy && !matches!(input, Input::DataPlaneReset) {
+            return Err(self.refused(Refusal::Busy, input));
+        }
+        let flow = match input {
+            Input::RenewByVolume { now, current, session_on } => self.renew_by_volume(now, current, session_on),
+            Input::SwitchCheck { now, peer_sent } => match self.record.switch_proof(peer_sent, policy.unproven_after, now) {
                 Some(proof) => self.switch_first(now, proof, AfterSwitch::Done),
                 None => Flow::Done(Outcome::Nothing),
             },
-            (Phase::Idle, Input::PeerDeletedReplaced { now, local_spi }) => {
+            Input::PeerDeletedReplaced { now, local_spi } => {
                 if self.record.waits_on_delete_of(local_spi) {
                     self.switch_first(now, SwitchProof::ReplacedDeleted, AfterSwitch::Done)
                 } else {
                     Flow::Done(Outcome::Nothing)
                 }
             }
+            Input::DataPlaneReset if busy => {
+                // The controller's flows complete against the data plane they began on, and
+                // `attach` and `detach` come after them: the switch is dropped at the end.
+                self.reset_pending = true;
+                return Ok(Step { actions: Vec::new(), outcome: None, ask: self.asked() });
+            }
+            Input::DataPlaneReset => {
+                // `attach` and `detach`: dropped, not made; nothing logged.
+                let _ = self.record.take_switch();
+                Flow::Done(Outcome::Nothing)
+            }
+            Input::PeerRekeyHeld { now, current, new } => self.switch_first(now, SwitchProof::SlotNeeded, AfterSwitch::Held { now, current, new }),
+            Input::PeerRekeyHeldOfRedundant { now, new, replaces, old } => Flow::Ask(Action::AddRedundant { new, now }, Phase::RedundantAdding { now, new, replaces, old }),
+            Input::Replacement { now, new, by_peer } => self.switch_first(now, SwitchProof::SlotNeeded, AfterSwitch::Replacement { now, new, by_peer }),
+            Input::MovedToRedundant { now, current, to, replaced, in_plane, consumer_owes_install } => {
+                let pending = self.record.take_switch();
+                let promote = if consumer_owes_install { None } else { in_plane };
+                Flow::Ask(Action::MoveToRedundant { pending, promote, now }, Phase::Moving { now, current, to, replaced, in_plane, consumer_owes_install, pending })
+            }
+            Input::Use { .. }
+            | Input::Switched(_)
+            | Input::Negotiated(_)
+            | Input::Prepared(_)
+            | Input::Abandoned(_)
+            | Input::Committed(_)
+            | Input::Deleted(_)
+            | Input::PreparedDeferred(_)
+            | Input::Refused(_)
+            | Input::Released(_)
+            | Input::Added(_)
+            | Input::InstalledAndSwitched(_)
+            | Input::Moved(_) => return Err(self.refused(Refusal::NotAnEvent, input)),
+        };
+        Ok(self.finish(flow, Vec::new()))
+    }
+
+    /// The answer to the action `ask` names, taken under `policy`: the operation goes on, or ends.
+    ///
+    /// Refused ([`Unexpected`]), nothing changed and the pending ask still to be answered, in this
+    /// order: nothing asked, the machine idle ([`Refusal::NothingAsked`]); `ask` not the pending one
+    /// ([`Refusal::NotTheAsk`]); `input` not the answer the pending action asks for
+    /// ([`Refusal::NotItsAnswer`]).
+    pub fn answer(&mut self, ask: Ask, input: Input<T>, policy: &Policy) -> Result<Step<T>, Unexpected<T>> {
+        let Some(pending) = self.asked() else { return Err(self.refused(Refusal::NothingAsked, input)) };
+        if ask != pending {
+            return Err(self.refused(Refusal::NotTheAsk, input));
+        }
+        let mut actions = Vec::new();
+        let out = &mut actions;
+        let flow = match (self.phase, input) {
             (Phase::PendingUse { now, current }, Input::Use { used, signal, basis, peer_rekey_held }) => {
                 self.pending_use(now, current, used, signal, basis, peer_rekey_held, policy, out)
             }
@@ -722,21 +999,12 @@ impl<T: Copy> FamilyMachine<T> {
             (Phase::Committing(r, n, id), Input::Committed(committed)) => self.committed(r, n, id, committed, policy, out),
             (Phase::SwitchingAtOnce(r, n, report), Input::Switched(made)) => self.switched_at_once(r, n, report, made, policy, out),
             (Phase::Deleting(r, n), Input::Deleted(report)) => self.delete_reported(r, n, report, policy, out),
-            (Phase::Idle, Input::DataPlaneReset) => {
-                // `attach` and `detach`: dropped, not made; nothing logged.
-                let _ = self.record.take_switch();
-                Flow::Done(Outcome::Nothing)
-            }
-            (Phase::Idle, Input::PeerRekeyHeld { now, current, new }) => self.switch_first(now, SwitchProof::SlotNeeded, AfterSwitch::Held { now, current, new }),
             (Phase::HeldPreparing { now, current, new }, Input::PreparedDeferred(prepared)) => match prepared {
                 Ok((id, replaced)) => Flow::Ask(Action::ReleaseHeld { new_local_spi: new.0 }, Phase::HeldReleasing { now, current, new, id, replaced }),
                 Err(()) => Flow::Ask(Action::RefuseHeld { new_local_spi: new.0 }, Phase::HeldRefusing { new }),
             },
             (Phase::HeldRefusing { new }, Input::Refused(refused)) => Self::held_refused(refused, Note::HeldRefused { local_spi: new.0 }, Note::RefusingHeldFailed { local_spi: new.0 }, out),
             (Phase::HeldReleasing { now, current, new, id, replaced }, Input::Released(released)) => self.held_released(now, current, new, id, replaced, released, out),
-            (Phase::Idle, Input::PeerRekeyHeldOfRedundant { now, new, replaces, old }) => {
-                Flow::Ask(Action::AddRedundant { new, now }, Phase::RedundantAdding { now, new, replaces, old })
-            }
             (Phase::RedundantAdding { now, new, replaces, old }, Input::Added(added)) => match added {
                 Ok(id) => Flow::Ask(Action::ReleaseHeld { new_local_spi: new.0 }, Phase::RedundantReleasing { now, new, replaces, old, id }),
                 Err(()) => Flow::Ask(Action::RefuseHeld { new_local_spi: new.0 }, Phase::RedundantRefusing { replaces }),
@@ -745,7 +1013,6 @@ impl<T: Copy> FamilyMachine<T> {
                 Self::held_refused(refused, Note::RedundantHeldRefused { replaced_local_spi: replaces.0 }, Note::RefusingRedundantHeldFailed, out)
             }
             (Phase::RedundantReleasing { now, new, replaces, old, id }, Input::Released(released)) => Self::redundant_released(now, new, replaces, old, id, released, out),
-            (Phase::Idle, Input::Replacement { now, new, by_peer }) => self.switch_first(now, SwitchProof::SlotNeeded, AfterSwitch::Replacement { now, new, by_peer }),
             (Phase::ReplacementPreparing { now, new }, Input::PreparedDeferred(prepared)) => match prepared {
                 Ok((id, replaced)) => {
                     self.defer_switch(DeferredSwitch { id, local_spi: new.0, replaced, answered: now }, out);
@@ -767,28 +1034,39 @@ impl<T: Copy> FamilyMachine<T> {
                     Err(()) => Outcome::LeftToConsumer { ike_sa_over: false },
                 })
             }
-            (Phase::Idle, Input::MovedToRedundant { now, current, to, replaced, in_plane, consumer_owes_install }) => {
-                let pending = self.record.take_switch();
-                let promote = if consumer_owes_install { None } else { in_plane };
-                Flow::Ask(Action::MoveToRedundant { pending, promote, now }, Phase::Moving { now, current, to, replaced, in_plane, consumer_owes_install, pending })
+            (Phase::Moving { now, current, to, replaced, in_plane, consumer_owes_install, pending }, Input::Moved(moved)) => {
+                Self::moved(now, current, to, replaced, in_plane, consumer_owes_install, pending, moved, out)
             }
-            (Phase::Moving { now, current, to, replaced, in_plane, consumer_owes_install, pending }, Input::Moved { pending_refused, promoted }) => {
-                Self::moved(now, current, to, replaced, in_plane, consumer_owes_install, pending, pending_refused, promoted, out)
-            }
-            (phase, input) => return Err(Unexpected { phase: phase.name(), input: input.kind() }),
+            (_, input) => return Err(self.refused(Refusal::NotItsAnswer, input)),
         };
-        let outcome = match flow {
+        Ok(self.finish(flow, actions))
+    }
+
+    /// `input` refused for `why` where the machine stands; nothing changed.
+    fn refused(&self, why: Refusal, input: Input<T>) -> Unexpected<T> {
+        Unexpected { phase: self.phase.name(), why, input }
+    }
+
+    /// The step `flow` leaves, after `actions`: the action asked for, under a new ask, and the phase
+    /// that waits on its answer; or the operation over, the machine idle, and a reset given during
+    /// it applied now -- the switch deferred dropped, one the operation deferred included.
+    fn finish(&mut self, flow: Flow<T>, mut actions: Vec<Action<T>>) -> Step<T> {
+        match flow {
             Flow::Ask(action, phase) => {
                 actions.push(action);
                 self.phase = phase;
-                None
+                self.serial = self.serial.wrapping_add(1);
+                Step { actions, outcome: None, ask: self.asked() }
             }
             Flow::Done(outcome) => {
                 self.phase = Phase::Idle;
-                Some(outcome)
+                if std::mem::take(&mut self.reset_pending) {
+                    // As `attach` and `detach`, after the flow: dropped, nothing logged.
+                    let _ = self.record.take_switch();
+                }
+                Step { actions, outcome: Some(outcome), ask: None }
             }
-        };
-        Ok(Step { actions, outcome })
+        }
     }
 
     // Flow A: a renewal of ours by volume (`renew_family`).
@@ -959,10 +1237,12 @@ impl<T: Copy> FamilyMachine<T> {
         Flow::Ask(Action::SwitchAtOnce { id, now: n.now }, Phase::SwitchingAtOnce(r, n, report))
     }
 
-    /// The switch at once's answer. Refused: the attempt failed and the IKE SA is closed, the two
-    /// ends disagreeing. Made: the replaced SA's Delete is owed before it is asked; asked now if the
-    /// commit did not, else what the commit reported is what it came to.
-    fn switched_at_once(&mut self, r: Renewing, n: NewChild, report: Option<DeleteCame>, made: Result<(), ()>, policy: &Policy, out: &mut Vec<Action<T>>) -> Flow<T> {
+    /// The switch at once's answer. Not made -- refused, or no data plane, which the controller does
+    /// not tell apart here (it holds its data plane for the whole renewal) --: the attempt failed and
+    /// the IKE SA is closed, the two ends disagreeing. Made: the replaced SA's Delete is owed before
+    /// it is asked; asked now if the commit did not, else what the commit reported is what it came
+    /// to.
+    fn switched_at_once(&mut self, r: Renewing, n: NewChild, report: Option<DeleteCame>, made: Result<(), NotSwitched>, policy: &Policy, out: &mut Vec<Action<T>>) -> Flow<T> {
         if made.is_err() {
             self.attempt_failed(out);
             out.push(Action::Note(Note::SwitchAtOnceRefused { new_local_spi: n.new.0 }));
@@ -1039,9 +1319,18 @@ impl<T: Copy> FamilyMachine<T> {
         }
     }
 
-    /// The deferred switch's answer. Made: noted, then what follows. Refused -- the new SA withdrawn,
-    /// the answer gone: the two ends disagree, the IKE SA is closed.
-    fn switched(&mut self, now: Instant, switch: DeferredSwitch<T>, proof: SwitchProof, then: AfterSwitch, made: Result<(), ()>, out: &mut Vec<Action<T>>) -> Flow<T> {
+    /// The deferred switch's answer. Made: noted, then what follows. No data plane: dropped, noted,
+    /// nothing closed, then what follows -- for its own sake, nothing switched. Refused -- the new SA
+    /// withdrawn, the answer gone: the two ends disagree, the IKE SA is closed.
+    fn switched(&mut self, now: Instant, switch: DeferredSwitch<T>, proof: SwitchProof, then: AfterSwitch, made: Result<(), NotSwitched>, out: &mut Vec<Action<T>>) -> Flow<T> {
+        if made == Err(NotSwitched::NoDataPlane) {
+            // `switch_pending` with no pump: dropped, and `true`, the caller going on.
+            out.push(Action::Note(Note::SwitchDroppedNoDataPlane { local_spi: switch.local_spi }));
+            return match then {
+                AfterSwitch::Done => Flow::Done(Outcome::Nothing),
+                then @ (AfterSwitch::Renew { .. } | AfterSwitch::Held { .. } | AfterSwitch::Replacement { .. }) => self.after_switch(then),
+            };
+        }
         if made.is_err() {
             out.push(Action::Note(Note::SwitchRefused { local_spi: switch.local_spi }));
             out.push(Action::CloseIkeSa);
@@ -1133,8 +1422,9 @@ impl<T: Copy> FamilyMachine<T> {
 
     /// The move's answer: the pending switch noted as made or refused (the peer deleted its SA
     /// anyway: nothing closed); the move noted, or, the data plane not moving, the redundant SA
-    /// withdrawn if it held it and the move left to the consumer. Either way the family's clock
-    /// starts again and its current generation is the redundant SA.
+    /// withdrawn if it held it and the move left to the consumer. No data plane: the pending switch
+    /// dropped with no line, nothing withdrawn, the move left to the consumer. Either way the
+    /// family's clock starts again and its current generation is the redundant SA.
     #[allow(clippy::too_many_arguments)]
     fn moved(
         now: Instant,
@@ -1144,10 +1434,17 @@ impl<T: Copy> FamilyMachine<T> {
         in_plane: Option<T>,
         consumer_owes_install: bool,
         pending: Option<DeferredSwitch<T>>,
-        pending_refused: bool,
-        promoted: Result<(), ()>,
+        moved: Result<Moved, NoDataPlane>,
         out: &mut Vec<Action<T>>,
     ) -> Flow<T> {
+        let Ok(Moved { pending_refused, promoted }) = moved else {
+            // `move_to_redundant` with no pump: the switch taken is dropped, no line; nothing to
+            // withdraw from.
+            out.push(Action::Note(Note::NotMovedToRedundant { replaced_local_spi: replaced.0, to_local_spi: to.0, why: NotPromoted::NoDataPlane }));
+            out.push(Action::AgeClockRestart);
+            out.push(Action::BecameCurrent(next(current, to)));
+            return Flow::Done(Outcome::MovedTo { new: to, installed: false });
+        };
         if let Some(pending) = pending {
             out.push(Action::Note(if pending_refused {
                 Note::MoveSwitchRefused { local_spi: pending.local_spi }
@@ -1287,6 +1584,8 @@ mod tests {
         /// The asking action of each step but the last, with the owed Deletes the record held right
         /// after that step.
         asked: Vec<(Action<u64>, Vec<Retired>)>,
+        /// The ask of each step but the last, and the phase that waited on it.
+        asks: Vec<(Ask, &'static str)>,
     }
 
     impl Run {
@@ -1344,16 +1643,24 @@ mod tests {
         }
     }
 
-    /// `event`, then `answers` one per step, into `m` under `policy`; every step checked against the
-    /// protocol: at most one asking action, the last, and then no outcome and the machine not idle;
-    /// an outcome only with none, and the machine idle. The script must end exactly with the
-    /// operation.
+    /// `event`, then `answers` one per step, each with the ask of the step before, into `m` under
+    /// `policy`; every step checked against the protocol: at most one asking action, the last, and
+    /// then no outcome, an ask, the machine's, and the machine not idle; an outcome only with none,
+    /// no ask, and the machine idle with no reset pending. At every asking step the answer is first
+    /// given wrong ([`refuses_around`]). The script must end exactly with the operation.
     fn drive(m: &mut FamilyMachine<u64>, policy: &Policy, event: Input<u64>, answers: &[Input<u64>]) -> Run {
-        let mut inputs = std::iter::once(event).chain(answers.iter().copied());
-        let mut run = Run { actions: Vec::new(), outcome: Outcome::Nothing, asked: Vec::new() };
+        drive_reset(m, policy, event, answers, None)
+    }
+
+    /// As [`drive`], with `reset` = `Some((at, times))`: a data plane reset given `times` times right
+    /// after the step that asked the `at`-th answer (from 0) -- each taken with no action and the
+    /// same ask, nothing else changed ([`resets`]).
+    fn drive_reset(m: &mut FamilyMachine<u64>, policy: &Policy, event: Input<u64>, answers: &[Input<u64>], reset: Option<(usize, usize)>) -> Run {
+        assert!(event.is_event(), "{event:?} is not an event");
+        let mut answers = answers.iter().copied();
+        let mut run = Run { actions: Vec::new(), outcome: Outcome::Nothing, asked: Vec::new(), asks: Vec::new() };
+        let mut step = m.step(event, policy).unwrap_or_else(|e| panic!("{event:?} refused: {e:?}"));
         loop {
-            let input = inputs.next().unwrap_or_else(|| panic!("the script ran out of answers after {:?}", run.kinds()));
-            let step = m.step(input, policy).unwrap_or_else(|e| panic!("{input:?} refused: {e:?}, after {:?}", run.kinds()));
             let asking = step.actions.iter().filter(|a| a.asks()).count();
             run.actions.extend(step.actions.iter().copied());
             match step.outcome {
@@ -1362,16 +1669,57 @@ mod tests {
                     let last = *step.actions.last().unwrap();
                     assert!(last.asks(), "the asking action last: {:?}", step.actions);
                     assert!(!m.idle());
+                    let ask = step.ask.unwrap_or_else(|| panic!("no ask while the operation goes on: {:?}", step.actions));
+                    assert_eq!(m.asked(), Some(ask));
                     run.asked.push((last, m.record().owed().to_vec()));
+                    run.asks.push((ask, m.phase.name()));
+                    if let Some((at, times)) = reset {
+                        if at + 1 == run.asks.len() {
+                            resets(m, policy, ask, times);
+                        }
+                    }
+                    let answer = answers.next().unwrap_or_else(|| panic!("the script ran out of answers after {:?}", run.kinds()));
+                    refuses_around(m, policy, ask, answer);
+                    step = m.answer(ask, answer, policy).unwrap_or_else(|e| panic!("{answer:?} refused: {e:?}, after {:?}", run.kinds()));
                 }
                 Some(outcome) => {
                     assert_eq!(asking, 0, "none asks at the end: {:?}", step.actions);
-                    assert!(m.idle());
-                    assert!(inputs.next().is_none(), "answers left over after {outcome:?}");
+                    assert_eq!(step.ask, None);
+                    assert!(m.idle() && m.asked().is_none() && !m.reset_pending());
+                    assert!(answers.next().is_none(), "answers left over after {outcome:?}");
                     run.outcome = outcome;
                     return run;
                 }
             }
+        }
+    }
+
+    /// Where `m` waits on `ask`, whose answer is to be `answer`: that answer given with an earlier
+    /// ask, a later one or another machine's, or given as an event, and an event given, are each
+    /// refused, handed back whole, and change nothing.
+    fn refuses_around(m: &mut FamilyMachine<u64>, policy: &Policy, ask: Ask, answer: Input<u64>) {
+        let before = m.clone();
+        let phase = m.phase.name();
+        let others = [Ask { serial: ask.serial.wrapping_sub(1), ..ask }, Ask { serial: ask.serial.wrapping_add(1), ..ask }, Ask { scope: ask.scope.wrapping_add(1), ..ask }];
+        for wrong in others {
+            assert_eq!(m.answer(wrong, answer, policy), Err(Unexpected { phase, why: Refusal::NotTheAsk, input: answer }), "{wrong:?} in {phase}");
+            assert_eq!(*m, before, "{wrong:?} in {phase}: nothing changes");
+        }
+        assert_eq!(m.step(answer, policy), Err(Unexpected { phase, why: Refusal::NotAnEvent, input: answer }), "{answer:?} as an event in {phase}");
+        assert_eq!(*m, before, "{answer:?} as an event in {phase}: nothing changes");
+        let event = Input::SwitchCheck { now: Instant::now(), peer_sent: true };
+        assert_eq!(m.step(event, policy), Err(Unexpected { phase, why: Refusal::Busy, input: event }), "an event in {phase}");
+        assert_eq!(*m, before, "an event in {phase}: nothing changes");
+    }
+
+    /// A data plane reset given `times` times while `m` waits on `ask`: each taken with no action and
+    /// the same ask, the reset pending, nothing else changed.
+    fn resets(m: &mut FamilyMachine<u64>, policy: &Policy, ask: Ask, times: usize) {
+        let before = m.clone();
+        for _ in 0..times {
+            assert_eq!(m.step(Input::DataPlaneReset, policy), Ok(Step { actions: vec![], outcome: None, ask: Some(ask) }));
+            assert!(m.reset_pending());
+            assert_eq!(FamilyMachine { reset_pending: false, ..m.clone() }, before, "nothing else changes");
         }
     }
 
@@ -1392,10 +1740,16 @@ mod tests {
         m.record().settled().copied().collect()
     }
 
+    /// `m` with the serial of its asks at 0: what is left to compare of a machine whose operations
+    /// asked, and changed nothing else.
+    fn but_serial(m: &FamilyMachine<u64>) -> FamilyMachine<u64> {
+        FamilyMachine { serial: 0, ..m.clone() }
+    }
+
     /// The machine as it is after nothing happened to it but the operations that left it idle and
-    /// recorded nothing.
+    /// recorded nothing (their asks aside).
     fn untouched(m: &FamilyMachine<u64>) {
-        assert_eq!(*m, FamilyMachine::new());
+        assert_eq!(but_serial(m), FamilyMachine::new());
     }
 
     #[test]
@@ -1546,7 +1900,7 @@ mod tests {
         let t0 = t0();
         for committed in [Committed::OursDeleteNotAsked, Committed::Other(ACKED)] {
             let mut m = FamilyMachine::<u64>::new();
-            let run = renewal(&mut m, &POLICY, t0, committed, &[Input::Switched(Err(()))]);
+            let run = renewal(&mut m, &POLICY, t0, committed, &[Input::Switched(Err(NotSwitched::Refused))]);
             assert_eq!(run.asking(), ["ReadUse", "Negotiate", "Prepare", "Commit", "SwitchAtOnce"], "{committed:?}");
             assert_eq!(run.asked[4].0, Action::SwitchAtOnce { id: ID, now: t0 + TOOK });
             assert_eq!(run.actions[run.at("SwitchAtOnce") + 1..], [Action::AgeClockFailed, Action::Note(Note::SwitchAtOnceRefused { new_local_spi: NEW.0 }), Action::CloseIkeSa]);
@@ -1684,7 +2038,7 @@ mod tests {
             let before = m.clone();
             let run = drive(&mut m, &POLICY, renew(now, NEXT), &[answer]);
             assert_eq!((run.asking(), run.outcome, run.notes()), (vec!["ReadUse"], Outcome::NotDue, notes), "{answer:?}");
-            assert_eq!(m, before, "{answer:?}: the switch still pending, nothing recorded");
+            assert_eq!(but_serial(&m), but_serial(&before), "{answer:?}: the switch still pending, nothing recorded");
         }
     }
 
@@ -1692,7 +2046,7 @@ mod tests {
     fn a_pending_switch_refused_for_a_renewal_closes_the_ike_sa_and_starts_nothing() {
         let t0 = t0();
         let mut m = with_a_switch_pending(t0);
-        let run = drive(&mut m, &POLICY, renew(t0 + secs(1), NEXT), &[due(), Input::Switched(Err(()))]);
+        let run = drive(&mut m, &POLICY, renew(t0 + secs(1), NEXT), &[due(), Input::Switched(Err(NotSwitched::Refused))]);
         assert_eq!(run.asking(), ["ReadUse", "Switch"]);
         assert_eq!(run.actions[2..], [Action::Note(Note::SwitchRefused { local_spi: NEW.0 }), Action::CloseIkeSa]);
         assert_eq!(run.outcome, Outcome::TornDown);
@@ -1839,7 +2193,7 @@ mod tests {
         let t0 = t0();
         for event in [Input::SwitchCheck { now: t0 + secs(6), peer_sent: false }, Input::PeerDeletedReplaced { now: t0 + secs(1), local_spi: CURRENT.local_spi }] {
             let mut m = with_a_switch_pending(t0);
-            let run = drive(&mut m, &POLICY, event, &[Input::Switched(Err(()))]);
+            let run = drive(&mut m, &POLICY, event, &[Input::Switched(Err(NotSwitched::Refused))]);
             assert_eq!(run.kinds(), ["Switch", "Note", "CloseIkeSa"], "{event:?}");
             assert_eq!(run.actions[1], Action::Note(Note::SwitchRefused { local_spi: NEW.0 }));
             assert_eq!(run.outcome, Outcome::TornDown);
@@ -1881,21 +2235,63 @@ mod tests {
             Input::Released(Ok(ms(1))),
             Input::Added(Ok(ID)),
             Input::InstalledAndSwitched(Ok(())),
-            Input::Moved { pending_refused: false, promoted: Ok(()) },
+            Input::Moved(Ok(Moved { pending_refused: false, promoted: Ok(()) })),
             Input::DataPlaneReset,
         ]
     }
 
-    /// Every input but those of `fits` is refused where `m` stands, naming `phase`, and changes
-    /// nothing.
-    fn refuses_all_but(m: &mut FamilyMachine<u64>, now: Instant, phase: &'static str, fits: &[&str]) {
+    /// A machine and the ask its last step left pending: what a consumer carries from step to step.
+    struct Driven {
+        m: FamilyMachine<u64>,
+        ask: Option<Ask>,
+    }
+
+    impl Driven {
+        /// `m`, idle.
+        fn new(m: FamilyMachine<u64>) -> Self {
+            assert!(m.idle());
+            Self { m, ask: None }
+        }
+
+        /// `input` given as an event, or as the answer to the pending ask; the operation must go on.
+        fn go(&mut self, input: Input<u64>) {
+            let step = match self.ask {
+                Some(ask) if !input.is_event() => self.m.answer(ask, input, &POLICY),
+                _ => self.m.step(input, &POLICY),
+            };
+            assert_eq!(step.as_ref().map(|s| s.outcome.is_none()), Ok(true), "{input:?}");
+            self.ask = step.ok().and_then(|s| s.ask);
+        }
+    }
+
+    /// Every input but those of `fits` is refused where `d` stands, naming `phase`, handed back
+    /// whole, and changes nothing: given as an answer to the pending ask, it is not its answer, or
+    /// with none pending nothing is asked; given as an event, an answer is not one, and an event
+    /// while an operation is under way is refused -- but the data plane reset, taken with no action
+    /// and the same ask (on a copy here; its own tests follow it to the end).
+    fn refuses_all_but(d: &mut Driven, now: Instant, phase: &'static str, fits: &[&str]) {
+        let m = &mut d.m;
+        assert_eq!(m.asked(), d.ask, "{phase}");
         for input in every_input(now) {
             if fits.contains(&input.kind()) {
                 continue;
             }
             let before = m.clone();
-            assert_eq!(m.step(input, &POLICY), Err(Unexpected { phase, input: input.kind() }), "{input:?} in {phase}");
-            assert_eq!(*m, before, "{input:?} in {phase}: nothing changes");
+            let (ask, why) = match d.ask {
+                Some(ask) => (ask, Refusal::NotItsAnswer),
+                None => (Ask { scope: 0, serial: 0 }, Refusal::NothingAsked),
+            };
+            assert_eq!(m.answer(ask, input, &POLICY), Err(Unexpected { phase, why, input }), "{input:?} as an answer in {phase}");
+            assert_eq!(*m, before, "{input:?} as an answer in {phase}: nothing changes");
+            if let (Input::DataPlaneReset, Some(_)) = (input, d.ask) {
+                let mut taken = m.clone();
+                assert_eq!(taken.step(input, &POLICY), Ok(Step { actions: vec![], outcome: None, ask: d.ask }), "{phase}");
+                assert!(taken.reset_pending(), "{phase}");
+                continue;
+            }
+            let why = if input.is_event() { Refusal::Busy } else { Refusal::NotAnEvent };
+            assert_eq!(m.step(input, &POLICY), Err(Unexpected { phase, why, input }), "{input:?} as an event in {phase}");
+            assert_eq!(*m, before, "{input:?} as an event in {phase}: nothing changes");
         }
     }
 
@@ -1904,39 +2300,40 @@ mod tests {
     #[test]
     fn an_input_that_does_not_fit_is_refused_and_changes_nothing() {
         let t0 = t0();
-        let mut m = FamilyMachine::<u64>::new();
-        refuses_all_but(&mut m, t0, "idle", &EVENTS);
+        let mut d = Driven::new(FamilyMachine::new());
+        refuses_all_but(&mut d, t0, "idle", &EVENTS);
         // Every phase of a renewal of ours, and the Delete owed on the way.
-        let step = |m: &mut FamilyMachine<u64>, input: Input<u64>| assert_eq!(m.step(input, &POLICY).map(|s| s.outcome.is_none()), Ok(true), "{input:?}");
-        step(&mut m, renew(t0, CURRENT));
-        refuses_all_but(&mut m, t0, "use", &["Use"]);
-        step(&mut m, due());
-        refuses_all_but(&mut m, t0, "negotiating", &["Negotiated"]);
-        step(&mut m, negotiated(t0, NEW));
-        refuses_all_but(&mut m, t0, "preparing", &["Prepared"]);
-        step(&mut m, Input::Prepared(Ok(ID)));
-        refuses_all_but(&mut m, t0, "committing", &["Committed"]);
-        step(&mut m, Input::Committed(Committed::OursDeleteNotAsked));
-        refuses_all_but(&mut m, t0, "switching_at_once", &["Switched"]);
-        step(&mut m, Input::Switched(Ok(())));
-        refuses_all_but(&mut m, t0, "deleting", &["Deleted"]);
-        assert_eq!(m.step(Input::Deleted(ACKED), &POLICY).map(|s| s.outcome.is_some()), Ok(true));
-        refuses_all_but(&mut m, t0, "idle", &EVENTS);
+        d.go(renew(t0, CURRENT));
+        refuses_all_but(&mut d, t0, "use", &["Use"]);
+        d.go(due());
+        refuses_all_but(&mut d, t0, "negotiating", &["Negotiated"]);
+        d.go(negotiated(t0, NEW));
+        refuses_all_but(&mut d, t0, "preparing", &["Prepared"]);
+        d.go(Input::Prepared(Ok(ID)));
+        refuses_all_but(&mut d, t0, "committing", &["Committed"]);
+        d.go(Input::Committed(Committed::OursDeleteNotAsked));
+        refuses_all_but(&mut d, t0, "switching_at_once", &["Switched"]);
+        d.go(Input::Switched(Ok(())));
+        refuses_all_but(&mut d, t0, "deleting", &["Deleted"]);
+        let ask = d.ask.unwrap();
+        assert_eq!(d.m.answer(ask, Input::Deleted(ACKED), &POLICY).map(|s| s.outcome.is_some()), Ok(true));
+        d.ask = None;
+        refuses_all_but(&mut d, t0, "idle", &EVENTS);
         // The abandon.
-        let mut m = FamilyMachine::<u64>::new();
+        let mut d = Driven::new(FamilyMachine::new());
         for input in [renew(t0, CURRENT), due(), negotiated(t0, NEW), Input::Prepared(Err(NotPrepared { session_on: Some(NEW) }))] {
-            step(&mut m, input);
+            d.go(input);
         }
-        refuses_all_but(&mut m, t0, "abandoning", &["Abandoned"]);
+        refuses_all_but(&mut d, t0, "abandoning", &["Abandoned"]);
         // A switch pending: the replaced SA's use, and the switch.
-        let mut m = with_a_switch_pending(t0);
-        step(&mut m, renew(t0 + secs(1), NEXT));
-        refuses_all_but(&mut m, t0, "pending_use", &["Use"]);
-        step(&mut m, due());
-        refuses_all_but(&mut m, t0, "switching", &["Switched"]);
-        let mut m = with_a_switch_pending(t0);
-        step(&mut m, Input::SwitchCheck { now: t0, peer_sent: true });
-        refuses_all_but(&mut m, t0, "switching", &["Switched"]);
+        let mut d = Driven::new(with_a_switch_pending(t0));
+        d.go(renew(t0 + secs(1), NEXT));
+        refuses_all_but(&mut d, t0, "pending_use", &["Use"]);
+        d.go(due());
+        refuses_all_but(&mut d, t0, "switching", &["Switched"]);
+        let mut d = Driven::new(with_a_switch_pending(t0));
+        d.go(Input::SwitchCheck { now: t0, peer_sent: true });
+        refuses_all_but(&mut d, t0, "switching", &["Switched"]);
         // Flows C, C', D and E.
         for (path, phase, fits) in [
             (vec![held(t0)], "held_preparing", "PreparedDeferred"),
@@ -1949,16 +2346,16 @@ mod tests {
             (vec![Input::Replacement { now: t0, new: NEW, by_peer: false }], "replacement_installing", "InstalledAndSwitched"),
             (vec![moved_to(t0, Some(5), false)], "moving", "Moved"),
         ] {
-            let mut m = FamilyMachine::<u64>::new();
+            let mut d = Driven::new(FamilyMachine::new());
             for input in path {
-                step(&mut m, input);
+                d.go(input);
             }
-            refuses_all_but(&mut m, t0, phase, &[fits]);
+            refuses_all_but(&mut d, t0, phase, &[fits]);
         }
         for event in [held(t0 + secs(1)), Input::Replacement { now: t0 + secs(1), new: (0x31, 0x32), by_peer: false }] {
-            let mut m = with_a_switch_pending(t0);
-            step(&mut m, event);
-            refuses_all_but(&mut m, t0, "switching", &["Switched"]);
+            let mut d = Driven::new(with_a_switch_pending(t0));
+            d.go(event);
+            refuses_all_but(&mut d, t0, "switching", &["Switched"]);
         }
     }
 
@@ -2067,7 +2464,7 @@ mod tests {
         assert!(run.actions.contains(&Action::BecameCurrent(NEXT.successor(0x61, 0x62))));
 
         let mut m = with_a_switch_pending(t0);
-        let run = drive(&mut m, &POLICY, event, &[Input::Switched(Err(()))]);
+        let run = drive(&mut m, &POLICY, event, &[Input::Switched(Err(NotSwitched::Refused))]);
         assert_eq!(run.kinds(), ["Switch", "Note", "CloseIkeSa"]);
         assert_eq!(run.actions[1], Action::Note(Note::SwitchRefused { local_spi: NEW.0 }));
         assert_eq!((run.outcome, m.pending_switch()), (Outcome::TornDown, None));
@@ -2110,7 +2507,7 @@ mod tests {
             expected.push(Action::Note(Note::RedundantRekeyServed { replaced_local_spi: REDUNDANT.0, local_spi: REDUNDANT_NEW.0 }));
             assert_eq!(run.actions, expected, "{old:?}");
             assert_eq!(run.outcome, Outcome::RedundantReplaced { id: ID });
-            assert_eq!(m, before, "{old:?}: no switch, no record: the switch pending stays");
+            assert_eq!(but_serial(&m), but_serial(&before), "{old:?}: no switch, no record: the switch pending stays");
         }
         for (refused, outcome, notes) in [
             (Ok(()), Outcome::Refused, vec![Note::RedundantHeldRefused { replaced_local_spi: REDUNDANT.0 }]),
@@ -2176,7 +2573,7 @@ mod tests {
             assert!(!run.has("AgeClockRestart") && !run.has("BecameCurrent") && !run.has("AgeClockFailed"), "the consumer's hand-over did that");
 
             let mut m = with_a_switch_pending(t0);
-            let run = drive(&mut m, &POLICY, event, &[Input::Switched(Err(()))]);
+            let run = drive(&mut m, &POLICY, event, &[Input::Switched(Err(NotSwitched::Refused))]);
             assert_eq!(run.kinds(), ["Switch", "Note", "CloseIkeSa"]);
             assert_eq!(run.outcome, Outcome::LeftToConsumer { ike_sa_over: true });
             assert_eq!(m.pending_switch(), None);
@@ -2197,7 +2594,7 @@ mod tests {
             (None, true, Err(()), None, vec![not_moved(NotPromoted::NotInPlane)], false),
         ] {
             let mut m = FamilyMachine::<u64>::new();
-            let run = drive(&mut m, &POLICY, moved_to(t0, in_plane, owes), &[Input::Moved { pending_refused: false, promoted }]);
+            let run = drive(&mut m, &POLICY, moved_to(t0, in_plane, owes), &[Input::Moved(Ok(Moved { pending_refused: false, promoted }))]);
             let mut expected = vec![Action::MoveToRedundant { pending: None, promote, now: t0 }];
             expected.extend(middle);
             expected.extend(tail);
@@ -2211,7 +2608,7 @@ mod tests {
             let pending = m.pending_switch();
             let at = t0 + secs(1);
             let event = Input::MovedToRedundant { now: at, current: Some(NEXT), to: TO, replaced: NEW, in_plane: Some(5), consumer_owes_install: false };
-            let run = drive(&mut m, &POLICY, event, &[Input::Moved { pending_refused, promoted: Ok(()) }]);
+            let run = drive(&mut m, &POLICY, event, &[Input::Moved(Ok(Moved { pending_refused, promoted: Ok(()) }))]);
             assert_eq!(run.actions[0], Action::MoveToRedundant { pending, promote: Some(5), now: at });
             let switch_note = if pending_refused {
                 Note::MoveSwitchRefused { local_spi: NEW.0 }
@@ -2226,7 +2623,7 @@ mod tests {
         // A family with no current generation: the redundant SA is its first.
         let mut m = FamilyMachine::<u64>::new();
         let event = Input::MovedToRedundant { now: t0, current: None, to: TO, replaced: REPLACED, in_plane: Some(5), consumer_owes_install: false };
-        let run = drive(&mut m, &POLICY, event, &[Input::Moved { pending_refused: false, promoted: Ok(()) }]);
+        let run = drive(&mut m, &POLICY, event, &[Input::Moved(Ok(Moved { pending_refused: false, promoted: Ok(()) }))]);
         assert!(run.actions.contains(&Action::BecameCurrent(ChildId::first(TO.0, TO.1))));
     }
 
@@ -2282,16 +2679,665 @@ mod tests {
         let before = m.clone();
         let run = drive(&mut m, &POLICY, Input::DataPlaneReset, &[]);
         assert_eq!((run.outcome, run.actions, &m), (Outcome::Nothing, vec![], &before));
-        // Refused while an operation is under way: the switch pending of a held rekey stays.
+        // While an operation is under way: taken with no action and the same ask, nothing else
+        // changed until the operation's end (followed there by the tests below).
         let mut m = with_a_switch_pending(t0);
-        m.step(held(t0 + secs(1)), &POLICY).unwrap();
+        let step = m.step(held(t0 + secs(1)), &POLICY).unwrap();
         let before = m.clone();
-        assert_eq!(m.step(Input::DataPlaneReset, &POLICY), Err(Unexpected { phase: "switching", input: "DataPlaneReset" }));
-        assert_eq!(m, before);
+        assert_eq!(m.step(Input::DataPlaneReset, &POLICY), Ok(Step { actions: vec![], outcome: None, ask: step.ask }));
+        assert_eq!(FamilyMachine { reset_pending: false, ..m.clone() }, before);
+        assert!(m.reset_pending());
         let mut m = FamilyMachine::<u64>::new();
-        m.step(renew(t0, CURRENT), &POLICY).unwrap();
+        let step = m.step(renew(t0, CURRENT), &POLICY).unwrap();
         let before = m.clone();
-        assert_eq!(m.step(Input::DataPlaneReset, &POLICY), Err(Unexpected { phase: "use", input: "DataPlaneReset" }));
+        assert_eq!(m.step(Input::DataPlaneReset, &POLICY), Ok(Step { actions: vec![], outcome: None, ask: step.ask }));
+        assert_eq!(FamilyMachine { reset_pending: false, ..m.clone() }, before);
+        assert!(m.reset_pending());
+    }
+
+    // Answers correlated with the action that asked for them.
+
+    #[test]
+    fn an_old_answer_cannot_complete_a_new_operation() {
+        let t0 = t0();
+        let mut m = FamilyMachine::<u64>::new();
+        let step = m.step(renew(t0, CURRENT), &POLICY).unwrap();
+        let step = m.answer(step.ask.unwrap(), due(), &POLICY).unwrap();
+        assert_eq!(step.actions, [Action::Negotiate]);
+        let a1 = step.ask.unwrap();
+        assert_eq!(m.answer(a1, Input::Negotiated(Err(Failure::Other)), &POLICY).map(|s| s.outcome), Ok(Some(Outcome::Failed)));
+        // The next renewal, the spacing after a failure passed, waits on its own rekey.
+        let later = t0 + secs(5);
+        let step = m.step(renew(later, CURRENT), &POLICY).unwrap();
+        let step = m.answer(step.ask.unwrap(), due(), &POLICY).unwrap();
+        assert_eq!(step.actions, [Action::Negotiate]);
+        let a2 = step.ask.unwrap();
+        assert_ne!(a1, a2);
+        let late = negotiated(t0, NEW);
+        let before = m.clone();
+        assert_eq!(m.answer(a1, late, &POLICY), Err(Unexpected { phase: "negotiating", why: Refusal::NotTheAsk, input: late }));
+        assert_eq!(m, before, "nothing changes");
+        let step = m.answer(a2, negotiated(later, NEW), &POLICY).unwrap();
+        assert_eq!(step.actions, [Action::KeepRedundant { now: later + TOOK }, Action::Prepare { new: NEW, now: later + TOOK }]);
+    }
+
+    #[test]
+    fn an_answer_given_twice_is_taken_once() {
+        let t0 = t0();
+        let mut m = FamilyMachine::<u64>::new();
+        let mut ask = m.step(renew(t0, CURRENT), &POLICY).unwrap().ask.unwrap();
+        let script = [due(), negotiated(t0, NEW), Input::Prepared(Ok(ID)), Input::Committed(Committed::OursDeleteNotAsked), Input::Switched(Ok(())), Input::Deleted(ACKED)];
+        for (n, answer) in script.into_iter().enumerate() {
+            let step = m.answer(ask, answer, &POLICY).unwrap();
+            let last = n + 1 == script.len();
+            assert_eq!(step.outcome.is_some(), last, "{answer:?}");
+            let before = m.clone();
+            let (phase, why) = if last { ("idle", Refusal::NothingAsked) } else { (m.phase.name(), Refusal::NotTheAsk) };
+            assert_eq!(m.answer(ask, answer, &POLICY), Err(Unexpected { phase, why, input: answer }), "{answer:?} again");
+            assert_eq!(m, before, "{answer:?} again: nothing changes");
+            if let Some(next) = step.ask {
+                ask = next;
+            }
+        }
+        assert_eq!(settled(&m), [retired(CURRENT, Ours, Sent { acknowledged: true })], "the Delete recorded once");
+    }
+
+    #[test]
+    fn the_late_refusal_of_the_deferred_switch_is_not_taken_for_the_switch_at_once_after_it() {
+        let t0 = t0();
+        let at = t0 + secs(1);
+        let newer = (0x31, 0x32);
+        let mut m = with_a_switch_pending(t0);
+        let ask = m.step(renew(at, NEXT), &POLICY).unwrap().ask.unwrap();
+        let switch_ask = m.answer(ask, due(), &POLICY).unwrap().ask.unwrap();
+        assert_eq!(m.phase.name(), "switching");
+        let mut ask = switch_ask;
+        for answer in [Input::Switched(Ok(())), due(), negotiated(at, newer), Input::Prepared(Ok(ID + 1)), Input::Committed(Committed::OursDeleteNotAsked)] {
+            ask = m.answer(ask, answer, &POLICY).unwrap().ask.unwrap();
+        }
+        assert_eq!(m.phase.name(), "switching_at_once");
+        let late = Input::Switched(Err(NotSwitched::Refused));
+        let before = m.clone();
+        assert_eq!(m.answer(switch_ask, late, &POLICY), Err(Unexpected { phase: "switching_at_once", why: Refusal::NotTheAsk, input: late }), "no CloseIkeSa");
+        assert_eq!(m, before, "nothing changes");
+        let step = m.answer(ask, Input::Switched(Ok(())), &POLICY).unwrap();
+        assert_eq!(step.actions, [Action::DeleteChild { spis: NEW }]);
+        let step = m.answer(step.ask.unwrap(), Input::Deleted(ACKED), &POLICY).unwrap();
+        assert_eq!(step.outcome, Some(Outcome::Renewed { new: newer, deferred: false, ike_sa_over: false }));
+        assert!(!step.actions.contains(&Action::CloseIkeSa));
+    }
+
+    #[test]
+    fn another_machines_ask_is_not_the_ask() {
+        let t0 = t0();
+        let (mut a, mut b) = (FamilyMachine::<u64>::with_scope(1), FamilyMachine::<u64>::with_scope(2));
+        assert_eq!((a.scope(), b.scope(), FamilyMachine::<u64>::new().scope()), (1, 2, 0));
+        let ask_a = a.step(renew(t0, CURRENT), &POLICY).unwrap().ask.unwrap();
+        let ask_b = b.step(renew(t0, CURRENT), &POLICY).unwrap().ask.unwrap();
+        assert_eq!(ask_a.serial, ask_b.serial, "the same serial");
+        assert_ne!(ask_a, ask_b);
+        let before = a.clone();
+        assert_eq!(a.answer(ask_b, due(), &POLICY), Err(Unexpected { phase: "use", why: Refusal::NotTheAsk, input: due() }));
+        assert_eq!(a, before);
+        assert_eq!(a.answer(ask_a, due(), &POLICY).map(|s| s.actions), Ok(vec![Action::Negotiate]));
+    }
+
+    #[test]
+    fn a_wrong_answer_an_answer_as_an_event_and_an_event_while_busy_are_refused_and_handed_back_whole() {
+        let t0 = t0();
+        let mut m = FamilyMachine::<u64>::new();
+        assert_eq!(m.answer(Ask { scope: 0, serial: 0 }, due(), &POLICY), Err(Unexpected { phase: "idle", why: Refusal::NothingAsked, input: due() }));
+        assert_eq!(m.step(due(), &POLICY), Err(Unexpected { phase: "idle", why: Refusal::NotAnEvent, input: due() }));
+        untouched(&m);
+        let ask = m.step(renew(t0, CURRENT), &POLICY).unwrap().ask.unwrap();
+        let before = m.clone();
+        let wrong = negotiated(t0, NEW);
+        assert_eq!(m.answer(ask, wrong, &POLICY), Err(Unexpected { phase: "use", why: Refusal::NotItsAnswer, input: wrong }));
         assert_eq!(m, before);
+        let event = held(t0);
+        assert_eq!(m.answer(ask, event, &POLICY), Err(Unexpected { phase: "use", why: Refusal::NotItsAnswer, input: event }), "an event is no answer");
+        assert_eq!(m, before);
+        assert_eq!(m.step(due(), &POLICY), Err(Unexpected { phase: "use", why: Refusal::NotAnEvent, input: due() }));
+        assert_eq!(m, before);
+        let refused = m.step(event, &POLICY).unwrap_err();
+        assert_eq!((refused.phase, refused.why, refused.input), ("use", Refusal::Busy, event), "the event handed back as it was");
+        assert_eq!(m, before);
+        assert_eq!(m.answer(ask, due(), &POLICY).map(|s| s.actions), Ok(vec![Action::Negotiate]), "the pending ask still answered");
+    }
+
+    #[test]
+    fn what_an_answer_brought_is_handed_back_with_its_refusal() {
+        let t0 = t0();
+        let n = NewChild { new: NEW, now: t0, took: TOOK };
+        for (input, brought) in [
+            (Input::Negotiated(Ok(n)), Some(Brought::Child { new: NEW })),
+            (Input::Prepared(Ok(ID)), Some(Brought::InPlane(ID))),
+            (Input::PreparedDeferred(Ok((ID, REPLACED))), Some(Brought::InPlane(ID))),
+            (Input::Added(Ok(ID)), Some(Brought::InPlane(ID))),
+            (Input::Negotiated(Err(Failure::Other)), None),
+            (Input::Prepared(Err(NotPrepared { session_on: Some(NEW) })), None),
+            (Input::PreparedDeferred(Err(())), None),
+            (Input::Added(Err(())), None),
+        ] {
+            assert_eq!(input.brought(), brought, "{input:?}");
+        }
+        for input in every_input(t0) {
+            let brings = matches!(input, Input::Negotiated(Ok(_)) | Input::Prepared(Ok(_)) | Input::PreparedDeferred(Ok(_)) | Input::Added(Ok(_)));
+            assert_eq!(input.brought().is_some(), brings, "{input:?}");
+        }
+        // A rekey's answer refused: the child's SPIs come back, for the consumer to reconcile.
+        let mut m = FamilyMachine::<u64>::new();
+        let ask = m.step(renew(t0, CURRENT), &POLICY).unwrap().ask.unwrap();
+        let refused = m.answer(ask, negotiated(t0, NEW), &POLICY).unwrap_err();
+        assert_eq!((refused.why, refused.input.brought()), (Refusal::NotItsAnswer, Some(Brought::Child { new: NEW })));
+    }
+
+    /// One operation of every flow, from a machine with a switch pending or not (`start`): together
+    /// they reach every phase that asks, and three of them defer a switch (A with the peer's SA kept,
+    /// C served, D by the peer).
+    fn every_flow(t0: Instant) -> Vec<(bool, Input<u64>, Vec<Input<u64>>)> {
+        let at = t0 + secs(1);
+        let newer = (0x61, 0x62);
+        let renewing = |rest: &[Input<u64>]| [&up_to_commit(t0)[..], rest].concat();
+        vec![
+            (false, renew(t0, CURRENT), renewing(&[Input::Committed(Committed::OursDeleteNotAsked), Input::Switched(Ok(())), Input::Deleted(came(Ours, Unknown))])),
+            (false, renew(t0, CURRENT), renewing(&[Input::Committed(Committed::Other(ACKED)), Input::Switched(Ok(()))])),
+            (false, renew(t0, CURRENT), renewing(&[Input::Committed(Committed::PeersKept(PEERS))])),
+            (false, renew(t0, CURRENT), renewing(&[Input::Committed(Committed::OursDeleteNotAsked), Input::Switched(Err(NotSwitched::Refused))])),
+            (false, renew(t0, CURRENT), vec![due(), negotiated(t0, NEW), Input::Prepared(Err(NotPrepared { session_on: Some(NEW) })), Input::Abandoned(came(Ours, Failed))]),
+            (
+                true,
+                renew(at, NEXT),
+                vec![due(), Input::Switched(Ok(())), due(), negotiated(at, newer), Input::Prepared(Ok(ID + 1)), Input::Committed(Committed::OursDeleteNotAsked), Input::Switched(Ok(())), Input::Deleted(ACKED)],
+            ),
+            (true, Input::SwitchCheck { now: at, peer_sent: true }, vec![Input::Switched(Ok(()))]),
+            (true, Input::PeerRekeyHeld { now: at, current: Some(NEXT), new: newer }, vec![Input::Switched(Ok(())), Input::PreparedDeferred(Ok((ID + 1, NEW))), Input::Released(Ok(ms(1)))]),
+            (false, held(t0), vec![Input::PreparedDeferred(Err(())), Input::Refused(Ok(()))]),
+            (false, held(t0), vec![Input::PreparedDeferred(Ok((ID, REPLACED))), Input::Released(Err(Failure::Other))]),
+            (false, held_of_redundant(t0, Some(5)), vec![Input::Added(Ok(ID)), Input::Released(Ok(ms(2)))]),
+            (false, held_of_redundant(t0, Some(5)), vec![Input::Added(Err(())), Input::Refused(Ok(()))]),
+            (false, Input::Replacement { now: t0, new: NEW, by_peer: true }, vec![Input::PreparedDeferred(Ok((ID, REPLACED)))]),
+            (true, Input::Replacement { now: at, new: newer, by_peer: false }, vec![Input::Switched(Ok(())), Input::InstalledAndSwitched(Ok(()))]),
+            (
+                true,
+                Input::MovedToRedundant { now: at, current: Some(NEXT), to: TO, replaced: NEW, in_plane: Some(5), consumer_owes_install: false },
+                vec![Input::Moved(Ok(Moved { pending_refused: false, promoted: Ok(()) }))],
+            ),
+        ]
+    }
+
+    /// The machine a flow of `every_flow` starts from.
+    fn start(t0: Instant, switch_pending: bool) -> FamilyMachine<u64> {
+        if switch_pending {
+            with_a_switch_pending(t0)
+        } else {
+            FamilyMachine::new()
+        }
+    }
+
+    const ASKING_PHASES: [&str; 18] = [
+        "pending_use",
+        "switching",
+        "use",
+        "negotiating",
+        "preparing",
+        "abandoning",
+        "committing",
+        "switching_at_once",
+        "deleting",
+        "held_preparing",
+        "held_refusing",
+        "held_releasing",
+        "redundant_adding",
+        "redundant_refusing",
+        "redundant_releasing",
+        "replacement_preparing",
+        "replacement_installing",
+        "moving",
+    ];
+
+    #[test]
+    fn at_every_asking_phase_of_every_flow_another_ask_an_answer_as_an_event_and_an_event_are_refused() {
+        // `drive` gives them at every step that asks (`refuses_around`); here, every phase that asks
+        // is reached.
+        let t0 = t0();
+        let mut reached = std::collections::BTreeSet::new();
+        for (pending, event, answers) in every_flow(t0) {
+            let run = drive(&mut start(t0, pending), &POLICY, event, &answers);
+            reached.extend(run.asks.iter().map(|(_, phase)| *phase));
+        }
+        assert_eq!(reached, ASKING_PHASES.into_iter().collect());
+    }
+
+    // A data plane reset during an operation, and no data plane.
+
+    #[test]
+    fn a_data_plane_reset_during_an_operation_changes_nothing_of_it_and_drops_the_switch_deferred_at_its_end() {
+        let t0 = t0();
+        let mut deferring = 0;
+        for (pending, event, answers) in every_flow(t0) {
+            let mut plain = start(t0, pending);
+            let without = drive(&mut plain, &POLICY, event, &answers);
+            deferring += usize::from(plain.pending_switch().is_some());
+            let mut expected = plain.clone();
+            let _ = expected.record.take_switch();
+            for (at, (_, phase)) in without.asks.iter().enumerate() {
+                for times in [1, 2] {
+                    let what = format!("{event:?}, reset {times} time(s) in {phase}");
+                    let mut m = start(t0, pending);
+                    let run = drive_reset(&mut m, &POLICY, event, &answers, Some((at, times)));
+                    assert_eq!((&run.actions, run.outcome), (&without.actions, without.outcome), "{what}: the operation's own actions and outcome");
+                    assert_eq!(m.pending_switch(), None, "{what}: no switch left");
+                    assert_eq!(m, expected, "{what}: the rest as without the reset");
+                }
+            }
+        }
+        assert_eq!(deferring, 3, "the flows that defer a switch");
+    }
+
+    #[test]
+    fn no_data_plane_for_the_deferred_switch_drops_it_closes_nothing_and_what_follows_goes_on() {
+        let t0 = t0();
+        let at = t0 + secs(1);
+        let newer = (0x61, 0x62);
+        let none = Input::Switched(Err(NotSwitched::NoDataPlane));
+        let dropped = Action::Note(Note::SwitchDroppedNoDataPlane { local_spi: NEW.0 });
+        // For its own sake: nothing switched.
+        for (event, proof) in [
+            (Input::SwitchCheck { now: at, peer_sent: true }, SwitchProof::PeerSent),
+            (Input::PeerDeletedReplaced { now: at, local_spi: CURRENT.local_spi }, SwitchProof::ReplacedDeleted),
+        ] {
+            let mut m = with_a_switch_pending(t0);
+            let switch = m.pending_switch().unwrap();
+            let run = drive(&mut m, &POLICY, event, &[none]);
+            assert_eq!(run.actions, [Action::Switch { switch, proof, now: at }, dropped], "{event:?}");
+            assert_eq!((run.outcome, m.pending_switch()), (Outcome::Nothing, None), "{event:?}");
+        }
+        // Made first for another operation: it goes on as after a switch made, and what it asks of
+        // the data plane is answered as with none (`used: None`, the refusals).
+        let no_use = Input::Use { used: None, signal: Some(SIGNAL), basis: BASIS, peer_rekey_held: false };
+        let not_installed = Action::Note(Note::ReplacementNotInstalled { local_spi: newer.0 });
+        for (event, answers, then, outcome) in [
+            (renew(at, NEXT), vec![due(), none, no_use], vec![Action::ReadUse { spis: NEW }], Outcome::NotDue),
+            (
+                Input::PeerRekeyHeld { now: at, current: Some(NEXT), new: newer },
+                vec![none, Input::PreparedDeferred(Err(())), Input::Refused(Ok(()))],
+                vec![Action::PrepareDeferred { new: newer, now: at }, Action::RefuseHeld { new_local_spi: newer.0 }, Action::Note(Note::HeldRefused { local_spi: newer.0 })],
+                Outcome::Refused,
+            ),
+            (
+                Input::Replacement { now: at, new: newer, by_peer: true },
+                vec![none, Input::PreparedDeferred(Err(()))],
+                vec![Action::PrepareDeferred { new: newer, now: at }, not_installed],
+                Outcome::LeftToConsumer { ike_sa_over: false },
+            ),
+            (
+                Input::Replacement { now: at, new: newer, by_peer: false },
+                vec![none, Input::InstalledAndSwitched(Err(()))],
+                vec![Action::InstallAndSwitch { new: newer, now: at }, not_installed],
+                Outcome::LeftToConsumer { ike_sa_over: false },
+            ),
+        ] {
+            let mut m = with_a_switch_pending(t0);
+            let switch = m.pending_switch().unwrap();
+            let run = drive(&mut m, &POLICY, event, &answers);
+            let made = run.at("Switch");
+            assert_eq!(run.actions[made], Action::Switch { switch, proof: SwitchProof::SlotNeeded, now: at }, "{event:?}");
+            assert_eq!(run.actions[made + 1..], [vec![dropped], then].concat(), "{event:?}");
+            assert_eq!((run.outcome, m.pending_switch()), (outcome, None), "{event:?}");
+            assert!(!run.has("CloseIkeSa"), "{event:?}");
+        }
+    }
+
+    #[test]
+    fn no_data_plane_for_the_switch_at_once_is_its_refusal() {
+        let t0 = t0();
+        for committed in [Committed::OursDeleteNotAsked, Committed::Other(ACKED)] {
+            let (mut refused, mut none) = (FamilyMachine::<u64>::new(), FamilyMachine::<u64>::new());
+            let by_refusal = renewal(&mut refused, &POLICY, t0, committed, &[Input::Switched(Err(NotSwitched::Refused))]);
+            let run = renewal(&mut none, &POLICY, t0, committed, &[Input::Switched(Err(NotSwitched::NoDataPlane))]);
+            assert_eq!(run.actions[run.at("SwitchAtOnce") + 1..], [Action::AgeClockFailed, Action::Note(Note::SwitchAtOnceRefused { new_local_spi: NEW.0 }), Action::CloseIkeSa], "{committed:?}");
+            assert_eq!((&run.actions, run.outcome), (&by_refusal.actions, by_refusal.outcome), "{committed:?}");
+            assert_eq!(run.outcome, Outcome::TornDown);
+            assert_eq!(none, refused, "{committed:?}");
+        }
+    }
+
+    #[test]
+    fn no_data_plane_for_the_move_drops_the_pending_switch_withdraws_nothing_and_leaves_the_move_to_the_consumer() {
+        let t0 = t0();
+        let at = t0 + secs(1);
+        for in_plane in [Some(5), None] {
+            let mut m = with_a_switch_pending(t0);
+            let pending = m.pending_switch();
+            let event = Input::MovedToRedundant { now: at, current: Some(NEXT), to: TO, replaced: NEW, in_plane, consumer_owes_install: false };
+            let run = drive(&mut m, &POLICY, event, &[Input::Moved(Err(NoDataPlane))]);
+            assert_eq!(
+                run.actions,
+                [
+                    Action::MoveToRedundant { pending, promote: in_plane, now: at },
+                    Action::Note(Note::NotMovedToRedundant { replaced_local_spi: NEW.0, to_local_spi: TO.0, why: NotPromoted::NoDataPlane }),
+                    Action::AgeClockRestart,
+                    Action::BecameCurrent(NEXT.successor(TO.0, TO.1)),
+                ],
+                "{in_plane:?}"
+            );
+            assert_eq!((run.outcome, m.pending_switch()), (Outcome::MovedTo { new: TO, installed: false }, None), "{in_plane:?}");
+        }
+    }
+
+    #[test]
+    fn a_renewal_whose_install_is_refused_after_a_reset_still_owes_and_asks_the_abandons_delete() {
+        let t0 = t0();
+        let new_sa = Retired { spis: NEW, generation: None, deleted_by: Ours, stand: NotSent };
+        let mut m = FamilyMachine::<u64>::new();
+        let answers = [due(), negotiated(t0, NEW), Input::Prepared(Err(NotPrepared { session_on: Some(NEW) })), Input::Abandoned(came(Ours, Unknown))];
+        // The reset given while the install is asked: the data plane it was asked of is gone.
+        let run = drive_reset(&mut m, &POLICY, renew(t0, CURRENT), &answers, Some((2, 1)));
+        assert_eq!(run.asks[2].1, "preparing");
+        assert_eq!(run.asking(), ["ReadUse", "Negotiate", "Prepare", "Abandon"]);
+        assert_eq!(run.asked[3].0, Action::Abandon { new_local_spi: NEW.0, delete: true });
+        assert_eq!(run.owed_at("Abandon"), [new_sa], "owed at the step that asks the abandon");
+        assert_eq!(m.record().owed(), [Retired { stand: Unknown, ..new_sa }], "still owed");
+        assert_eq!(run.outcome, Outcome::Failed);
+    }
+
+    // The composite actions, carried out on a model of a data plane.
+
+    /// A model of a data plane, for these tests only: not any real data plane, and nothing of one
+    /// but what the composite actions touch. One family: the generation outbound is sealed with, an
+    /// optional next one, redundant ones (inbound only) and previous ones (inbound only, for a term),
+    /// each a name and its SPIs. Switches can be made to refuse.
+    #[derive(Debug, Default)]
+    struct Model {
+        last: u64,
+        current: Option<(u64, (u32, u32))>,
+        next: Option<(u64, (u32, u32))>,
+        redundant: Vec<(u64, (u32, u32))>,
+        previous: Vec<(u64, (u32, u32))>,
+        refuse_switch: bool,
+    }
+
+    impl Model {
+        /// Sealing with `spis`.
+        fn on(spis: (u32, u32)) -> Self {
+            Self { last: 1, current: Some((1, spis)), ..Self::default() }
+        }
+
+        fn named(&mut self, spis: (u32, u32)) -> (u64, (u32, u32)) {
+            self.last += 1;
+            (self.last, spis)
+        }
+
+        /// `spis` installed as the next generation, if there is none.
+        fn prepare_next(&mut self, spis: (u32, u32)) -> Result<u64, ()> {
+            if self.next.is_some() {
+                return Err(());
+            }
+            let next = self.named(spis);
+            self.next = Some(next);
+            Ok(next.0)
+        }
+
+        /// Outbound moved to the next generation `id`, the current one kept as a previous one.
+        fn switch(&mut self, id: u64) -> Result<(), ()> {
+            match self.next {
+                Some(next) if next.0 == id && !self.refuse_switch => {
+                    self.next = None;
+                    self.previous.extend(self.current.replace(next));
+                    Ok(())
+                }
+                _ => Err(()),
+            }
+        }
+
+        fn withdraw(&mut self, id: u64) {
+            self.next = self.next.filter(|next| next.0 != id);
+            self.redundant.retain(|r| r.0 != id);
+        }
+
+        fn add_redundant(&mut self, spis: (u32, u32)) -> u64 {
+            let redundant = self.named(spis);
+            self.redundant.push(redundant);
+            redundant.0
+        }
+
+        /// Outbound moved to the redundant generation `id`, the current one kept as a previous one.
+        fn promote_redundant(&mut self, id: u64) -> Result<(), ()> {
+            let at = self.redundant.iter().position(|r| r.0 == id).ok_or(())?;
+            let promoted = self.redundant.remove(at);
+            self.previous.extend(self.current.replace(promoted));
+            Ok(())
+        }
+
+        fn close_redundant(&mut self, id: u64) {
+            if let Some(at) = self.redundant.iter().position(|r| r.0 == id) {
+                let closed = self.redundant.remove(at);
+                self.previous.push(closed);
+            }
+        }
+
+        fn name_of(&self, spis: (u32, u32)) -> Option<u64> {
+            self.redundant.iter().chain(&self.next).chain(&self.current).find(|g| g.1 == spis).map(|g| g.0)
+        }
+    }
+
+    /// How an executor carries a composite action out: as one change of the model, or split into
+    /// its parts, the model let go of between them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Carry {
+        Whole,
+        Split,
+    }
+
+    /// An adapter over the model: it drives a machine, answers what touches the data plane from the
+    /// model and what goes on the wire from a script, and looks at the model wherever it lets go of
+    /// it -- after every action, and between the parts of a composite one when it splits them.
+    #[derive(Debug)]
+    struct Executor {
+        model: Model,
+        carry: Carry,
+        /// The peer's SAs of crossed rekeys the session kept, for the next `KeepRedundant`.
+        keep: Vec<(u32, u32)>,
+        /// The SA a move to the redundant SA moves off, the peer having deleted it.
+        deleted: Option<u64>,
+        /// A composite's switch refused, its next generation not withdrawn yet.
+        refused: bool,
+        /// How many times the model was looked at, and what was found broken.
+        observed: usize,
+        broken: Vec<&'static str>,
+    }
+
+    impl Executor {
+        fn new(carry: Carry) -> Self {
+            Self { model: Model::on(CURRENT.spis()), carry, keep: vec![], deleted: None, refused: false, observed: 0, broken: vec![] }
+        }
+
+        /// The invariants, wherever the model is let go of.
+        fn observe(&mut self) {
+            self.observed += 1;
+            let m = &self.model;
+            let others = m.next.iter().chain(&m.redundant).chain(&m.previous).map(|g| g.0).collect::<Vec<_>>();
+            if !m.current.is_some_and(|c| !others.contains(&c.0)) {
+                self.broken.push("outbound not on exactly one generation");
+            }
+            if self.refused && m.next.is_some() {
+                self.broken.push("a next generation left behind by a refused switch");
+            }
+            if self.deleted.is_some() && m.current.map(|c| c.0) == self.deleted {
+                self.broken.push("outbound on the SA the peer deleted");
+            }
+        }
+
+        /// Between the parts of a composite action.
+        fn between(&mut self) {
+            if self.carry == Carry::Split {
+                self.observe();
+            }
+        }
+
+        /// A composite's switch to the next generation `id`, withdrawn if refused.
+        fn switch_or_withdraw(&mut self, id: u64) -> Result<(), ()> {
+            let switched = self.model.switch(id);
+            if switched.is_err() {
+                self.refused = true;
+                self.between();
+                self.model.withdraw(id);
+                self.refused = false;
+            }
+            switched
+        }
+
+        /// `action` carried out; the answer it asks for, from the model or from `wire`.
+        fn carry_out(&mut self, action: Action<u64>, wire: &mut dyn Iterator<Item = Input<u64>>) -> Option<Input<u64>> {
+            let switched = |made: Result<(), ()>| Input::Switched(made.map_err(|()| NotSwitched::Refused));
+            match action {
+                Action::Note(_) | Action::CloseIkeSa | Action::AgeClockFailed | Action::AgeClockRestart | Action::BecameCurrent(_) => None,
+                Action::Negotiate | Action::Abandon { .. } | Action::Commit { .. } | Action::DeleteChild { .. } | Action::RefuseHeld { .. } | Action::ReleaseHeld { .. } => {
+                    Some(wire.next().unwrap_or_else(|| panic!("no wire answer for {action:?}")))
+                }
+                Action::ReadUse { spis } => {
+                    let used = self.model.current.is_some_and(|c| c.1 == spis).then_some(USED);
+                    Some(Input::Use { used, signal: Some(SIGNAL), basis: BASIS, peer_rekey_held: false })
+                }
+                Action::Switch { switch, .. } => Some(switched(self.switch_or_withdraw(switch.id))),
+                Action::SwitchAtOnce { id, .. } => Some(switched(self.switch_or_withdraw(id))),
+                Action::KeepRedundant { .. } => {
+                    for spis in std::mem::take(&mut self.keep) {
+                        self.model.add_redundant(spis);
+                    }
+                    None
+                }
+                Action::Prepare { new, .. } => Some(Input::Prepared(self.model.prepare_next(new).map_err(|()| NotPrepared { session_on: Some(new) }))),
+                Action::PrepareDeferred { new, .. } => {
+                    let current = self.model.current.map(|c| c.1);
+                    let prepared = self.model.prepare_next(new);
+                    self.between();
+                    let replaced = self.model.current.map_or((0, 0), |c| c.1);
+                    if Some(replaced) != current {
+                        self.broken.push("the SPIs answered not those of the generation current at the install");
+                    }
+                    Some(Input::PreparedDeferred(prepared.map(|id| (id, replaced))))
+                }
+                Action::Withdraw { id, .. } => {
+                    self.model.withdraw(id);
+                    None
+                }
+                Action::AddRedundant { new, .. } => Some(Input::Added(Ok(self.model.add_redundant(new)))),
+                Action::CloseRedundant { id, .. } => {
+                    self.model.close_redundant(id);
+                    None
+                }
+                Action::InstallAndSwitch { new, .. } => {
+                    let installed = self.model.prepare_next(new).and_then(|id| {
+                        self.between();
+                        self.switch_or_withdraw(id)
+                    });
+                    Some(Input::InstalledAndSwitched(installed))
+                }
+                Action::MoveToRedundant { pending, promote, .. } => {
+                    let mut pending_refused = false;
+                    if let Some(pending) = pending {
+                        if promote.is_some() {
+                            self.deleted = Some(pending.id);
+                        }
+                        pending_refused = self.switch_or_withdraw(pending.id).is_err();
+                        self.between();
+                    }
+                    let promoted = promote.map_or(Err(()), |id| self.model.promote_redundant(id));
+                    Some(Input::Moved(Ok(Moved { pending_refused, promoted })))
+                }
+            }
+        }
+
+        /// `event` and all that follows it carried out for `m`, the wire answering from `wire` in
+        /// order; the model looked at after every action. How the operation ended.
+        fn run(&mut self, m: &mut FamilyMachine<u64>, event: Input<u64>, wire: &[Input<u64>]) -> Outcome<u64> {
+            let mut wire = wire.iter().copied();
+            let mut step = m.step(event, &POLICY).unwrap_or_else(|e| panic!("{e:?}"));
+            loop {
+                let mut answer = None;
+                for action in step.actions {
+                    answer = self.carry_out(action, &mut wire);
+                    self.observe();
+                }
+                match (step.outcome, step.ask, answer) {
+                    (Some(outcome), None, None) => {
+                        assert!(wire.next().is_none(), "wire answers left over after {outcome:?}");
+                        return outcome;
+                    }
+                    (None, Some(ask), Some(answer)) => step = m.answer(ask, answer, &POLICY).unwrap_or_else(|e| panic!("{e:?}")),
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+    }
+
+    /// The flows with composite actions, each from a fresh machine and model, carried out as `carry`
+    /// says, their outcomes checked: the executors after, by name.
+    fn composite_flows(carry: Carry) -> Vec<(&'static str, Executor)> {
+        let t0 = t0();
+        let at = t0 + secs(1);
+        let peers_kept = (vec![negotiated(t0, NEW), Input::Committed(Committed::PeersKept(PEERS))], Outcome::Renewed { new: NEW, deferred: true, ike_sa_over: false });
+        let ours = [negotiated(t0, NEW), Input::Committed(Committed::OursDeleteNotAsked)];
+        let replacement = |by_peer| Input::Replacement { now: t0, new: NEW, by_peer };
+        let left = Outcome::LeftToConsumer { ike_sa_over: false };
+        let script = [
+            ("A ours kept", false, vec![(renew(t0, CURRENT), [&ours[..], &[Input::Deleted(ACKED)]].concat(), Outcome::Renewed { new: NEW, deferred: false, ike_sa_over: false })]),
+            ("A peer's kept, then B", false, vec![(renew(t0, CURRENT), peers_kept.0.clone(), peers_kept.1), (Input::SwitchCheck { now: at, peer_sent: true }, vec![], Outcome::Switched)]),
+            ("A switch at once refused", true, vec![(renew(t0, CURRENT), ours.to_vec(), Outcome::TornDown)]),
+            ("C served", false, vec![(held(t0), vec![Input::Released(Ok(ms(1)))], Outcome::Served { new: NEW })]),
+            ("D by the peer", false, vec![(replacement(true), vec![], Outcome::Installed { deferred: true })]),
+            ("D ours", false, vec![(replacement(false), vec![], Outcome::Installed { deferred: false })]),
+            ("D ours refused", true, vec![(replacement(false), vec![], left)]),
+        ];
+        let mut flows = vec![];
+        for (name, refuse_switch, operations) in script {
+            let (mut x, mut m) = (Executor::new(carry), FamilyMachine::new());
+            x.model.refuse_switch = refuse_switch;
+            for (event, wire, outcome) in operations {
+                assert_eq!(x.run(&mut m, event, &wire), outcome, "{name}");
+            }
+            flows.push((name, x));
+        }
+        // B refused: the deferred switch refused by the data plane.
+        let (mut x, mut m) = (Executor::new(carry), FamilyMachine::new());
+        assert_eq!(x.run(&mut m, renew(t0, CURRENT), &peers_kept.0), peers_kept.1);
+        x.model.refuse_switch = true;
+        assert_eq!(x.run(&mut m, Input::SwitchCheck { now: at, peer_sent: true }, &[]), Outcome::TornDown);
+        flows.push(("B refused", x));
+        // E: the peer's redundant SA put in by a renewal that kept the peer's SA, whose switch is
+        // pending; then the peer deletes that SA, and the family moves to the redundant one.
+        let (mut x, mut m) = (Executor::new(carry), FamilyMachine::new());
+        x.keep = vec![TO];
+        assert_eq!(x.run(&mut m, renew(t0, CURRENT), &peers_kept.0), peers_kept.1);
+        let in_plane = x.model.name_of(TO);
+        assert!(in_plane.is_some() && m.pending_switch().is_some());
+        let event = Input::MovedToRedundant { now: at, current: Some(NEXT), to: TO, replaced: NEW, in_plane, consumer_owes_install: false };
+        assert_eq!(x.run(&mut m, event, &[]), Outcome::MovedTo { new: TO, installed: true });
+        assert_eq!(x.model.current.map(|c| c.1), Some(TO));
+        flows.push(("E", x));
+        flows
+    }
+
+    #[test]
+    fn carried_out_as_one_change_the_composite_actions_leave_the_data_plane_whole_at_every_point() {
+        for (name, x) in composite_flows(Carry::Whole) {
+            assert!(x.observed > 0, "{name}");
+            assert_eq!(x.broken, Vec::<&str>::new(), "{name}");
+        }
+    }
+
+    #[test]
+    fn split_into_their_parts_the_composite_actions_are_seen_broken_in_between() {
+        let flows = composite_flows(Carry::Split);
+        let broken = |name: &str| flows.iter().find(|(n, _)| *n == name).map(|(_, x)| x.broken.clone()).unwrap_or_else(|| panic!("no flow {name}"));
+        assert_eq!(broken("E"), ["outbound on the SA the peer deleted"]);
+        for name in ["A switch at once refused", "B refused", "D ours refused"] {
+            assert_eq!(broken(name), ["a next generation left behind by a refused switch"], "{name}");
+        }
+        for name in ["A ours kept", "A peer's kept, then B", "C served", "D by the peer", "D ours"] {
+            assert_eq!(broken(name), Vec::<&str>::new(), "{name}: nothing seen between parts that all went through");
+        }
     }
 }

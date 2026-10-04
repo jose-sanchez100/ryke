@@ -30,10 +30,34 @@
 //! answered with, its own figures (the term a replaced SA is still accepted inbound for, the bound
 //! of owed Deletes it renders with) -- it adds.
 //!
+//! # The flows
+//!
+//! - A renewal of ours by volume ([`Input::RenewByVolume`]; the controller's `renew_family`):
+//!   decided on what the SA in use moved, under the spacing of attempts and the bound of owed
+//!   Deletes, negotiated with no Delete, installed as the next generation, committed, switched to
+//!   at once -- or, the peer's SA of a crossed rekey kept, its switch deferred --, and only then the
+//!   replaced SA's Delete asked, owed before it is.
+//! - The deferred switch ([`Input::SwitchCheck`], [`Input::PeerDeletedReplaced`]; the
+//!   controller's `switch_when_proven`, `replaced_closed`): made on the first proof that the peer
+//!   has the new SA, or without one once the wait is over.
+//! - A rekey of the peer's held unanswered, of the family's current SA ([`Input::PeerRekeyHeld`];
+//!   `serve_held`) or of its redundant SA ([`Input::PeerRekeyHeldOfRedundant`];
+//!   `serve_held_redundant`): the new SA in the data plane before the answer is released.
+//! - A replacement already complete on the wire ([`Input::Replacement`]; `install_one`).
+//! - The family moved to the peer's redundant SA ([`Input::MovedToRedundant`];
+//!   `move_to_redundant`).
+//! - The data plane gone or replaced ([`Input::DataPlaneReset`]; the controller's `attach`,
+//!   `detach`): a switch deferred in it is dropped.
+//!
+//! Wherever another operation needs the family's next generation, a switch still pending is made
+//! first ([`SwitchProof::SlotNeeded`]).
+//!
 //! # What stays the consumer's
 //!
 //! Everything that holds keys or touches the wire or the data plane is done by the consumer, as an
-//! action says. So are: which family an event is of; whether there is a data plane at all and
+//! action says. So are: which family an event is of, and which of the two held-rekey events a held
+//! rekey is (`serve_held`'s look at the redundant SAs); whether a replacement handed over is already
+//! installed (`install_one`'s first check); whether there is a data plane at all and
 //! whether the tunnel is already torn down (the controller's `peer_torn_down`, which an outcome may
 //! add to but never clears); the volume figures a renewal signal is computed from
 //! ([`limits`](super::limits)); the event inbox and its ordering (`take_peer_children`,
@@ -135,6 +159,27 @@ pub enum Input<T> {
     /// Event: the peer's Delete of the SA that receives on `local_spi` was answered (the
     /// controller's `replaced_closed`).
     PeerDeletedReplaced { now: Instant, local_spi: u32 },
+    /// Event: a rekey of the peer's of the family's current SA is held unanswered (the controller's
+    /// `serve_held`); its new SA's SPIs are `new` `(local, peer)`, `current` is the consumer's current
+    /// generation of the family.
+    PeerRekeyHeld { now: Instant, current: Option<ChildId>, new: (u32, u32) },
+    /// Event: a rekey of the peer's of the family's redundant SA of SPIs `replaces`, held unanswered
+    /// (the controller's `serve_held_redundant`); its new SA's SPIs are `new`, and `old` is the
+    /// redundant SA's name in the data plane, if the data plane holds it.
+    PeerRekeyHeldOfRedundant { now: Instant, new: (u32, u32), replaces: (u32, u32), old: Option<T> },
+    /// Event: a replacement of the family's current SA, already complete on the wire, of SPIs `new`
+    /// (the controller's `install_one`, for one not installed yet): a rekey of the peer's this side
+    /// answered (`by_peer`), or one of ours or an SA created anew.
+    Replacement { now: Instant, new: (u32, u32), by_peer: bool },
+    /// Event: the peer deleted the family's current SA, `replaced`, and the family is on its
+    /// redundant SA `to` now (the controller's `move_to_redundant`). `in_plane` is `to`'s name in
+    /// the data plane, if the data plane holds it; `consumer_owes_install` whether the consumer's
+    /// daemon owes an install the old way (the order rule), which keeps the data plane from moving.
+    MovedToRedundant { now: Instant, current: Option<ChildId>, to: (u32, u32), replaced: (u32, u32), in_plane: Option<T>, consumer_owes_install: bool },
+    /// Event: the data plane a deferred switch was in is gone, or another took its place: a switch
+    /// deferred in it has nothing to switch, and is dropped (the controller's `attach` and `detach`,
+    /// which take every record's switch and log nothing). Nothing else of the record changes.
+    DataPlaneReset,
     /// Answer to [`Action::ReadUse`]: `used` is what the SA asked about has moved, `(rx, tx)`, or
     /// `None` when the data plane's current generation of the family is not that SA. `signal` and
     /// `basis` are the consumer's volume policy over those bytes (the renewal signal, and the byte
@@ -154,6 +199,21 @@ pub enum Input<T> {
     Committed(Committed),
     /// Answer to [`Action::DeleteChild`]: what the replaced SA's Delete came to.
     Deleted(DeleteCame),
+    /// Answer to [`Action::PrepareDeferred`]: the new SA's name in the data plane and the SPIs
+    /// `(local, peer)` of the data plane's current generation of the family, or the refusal.
+    PreparedDeferred(Result<(T, (u32, u32)), ()>),
+    /// Answer to [`Action::RefuseHeld`].
+    Refused(Result<(), Failure>),
+    /// Answer to [`Action::ReleaseHeld`]: released, with how long the answer was held as the
+    /// consumer reads it at the release (the controller's `since.elapsed()`), or the error.
+    Released(Result<Duration, Failure>),
+    /// Answer to [`Action::AddRedundant`]: the new SA's name in the data plane, or the refusal.
+    Added(Result<T, ()>),
+    /// Answer to [`Action::InstallAndSwitch`].
+    InstalledAndSwitched(Result<(), ()>),
+    /// Answer to [`Action::MoveToRedundant`]: whether the pending switch, if one was asked, was
+    /// refused; and whether the promotion, if one was asked, was made (not read when none was).
+    Moved { pending_refused: bool, promoted: Result<(), ()> },
 }
 
 impl<T> Input<T> {
@@ -163,6 +223,11 @@ impl<T> Input<T> {
             Input::RenewByVolume { .. } => "RenewByVolume",
             Input::SwitchCheck { .. } => "SwitchCheck",
             Input::PeerDeletedReplaced { .. } => "PeerDeletedReplaced",
+            Input::PeerRekeyHeld { .. } => "PeerRekeyHeld",
+            Input::PeerRekeyHeldOfRedundant { .. } => "PeerRekeyHeldOfRedundant",
+            Input::Replacement { .. } => "Replacement",
+            Input::MovedToRedundant { .. } => "MovedToRedundant",
+            Input::DataPlaneReset => "DataPlaneReset",
             Input::Use { .. } => "Use",
             Input::Switched(_) => "Switched",
             Input::Negotiated(_) => "Negotiated",
@@ -170,6 +235,12 @@ impl<T> Input<T> {
             Input::Abandoned(_) => "Abandoned",
             Input::Committed(_) => "Committed",
             Input::Deleted(_) => "Deleted",
+            Input::PreparedDeferred(_) => "PreparedDeferred",
+            Input::Refused(_) => "Refused",
+            Input::Released(_) => "Released",
+            Input::Added(_) => "Added",
+            Input::InstalledAndSwitched(_) => "InstalledAndSwitched",
+            Input::Moved { .. } => "Moved",
         }
     }
 }
@@ -220,6 +291,38 @@ pub enum Action<T> {
     AgeClockRestart,
     /// The family's current generation is this one from now on. Asks nothing.
     BecameCurrent(ChildId),
+    /// Install the new SA of `new` `(local, peer)`, of a rekey this side answers as the responder,
+    /// as the family's next generation at `now` -- inbound accepted on it from here on, outbound left
+    /// on the current one -- and read the SPIs of the data plane's current generation of the family,
+    /// under the same lock (the controller's `prepare_deferred`). Asks [`Input::PreparedDeferred`].
+    PrepareDeferred { new: (u32, u32), now: Instant },
+    /// Refuse the held rekey whose new SA receives on `new_local_spi` (`TEMPORARY_FAILURE`): the data
+    /// plane cannot take it. Asks [`Input::Refused`].
+    RefuseHeld { new_local_spi: u32 },
+    /// Release the held answer to the rekey whose new SA receives on `new_local_spi`, its SA now in
+    /// the data plane. Asks [`Input::Released`].
+    ReleaseHeld { new_local_spi: u32 },
+    /// Take `id`, a generation that will not be used, back out of the data plane at `now`. Asks
+    /// nothing.
+    Withdraw { id: T, now: Instant },
+    /// Add the new SA of `new` `(local, peer)` to the data plane as a redundant generation of the
+    /// family at `now`: inbound accepted on it, never sealed with. Asks [`Input::Added`].
+    AddRedundant { new: (u32, u32), now: Instant },
+    /// Close the redundant generation `id` in the data plane at `now`, still accepted inbound for
+    /// the consumer's term. Asks nothing.
+    CloseRedundant { id: T, now: Instant },
+    /// Install the new SA of `new` `(local, peer)` as the family's next generation at `now` and
+    /// switch outbound to it at once, the replaced SA still accepted inbound for the consumer's
+    /// term; should the switch be refused, the new SA is withdrawn. One operation under the data
+    /// plane's lock, as the controller's `install_replacement`. Asks
+    /// [`Input::InstalledAndSwitched`].
+    InstallAndSwitch { new: (u32, u32), now: Instant },
+    /// Under one lock of the data plane, at `now` (the controller's `move_to_redundant`): first the
+    /// `pending` switch, if any, made as [`Action::Switch`] does for [`SwitchProof::SlotNeeded`] (a
+    /// refusal is only reported); then the redundant generation `promote`, if any, made the
+    /// family's current one -- outbound moves to it, the SA it replaces still accepted inbound for
+    /// the consumer's term. Asks [`Input::Moved`].
+    MoveToRedundant { pending: Option<DeferredSwitch<T>>, promote: Option<T>, now: Instant },
 }
 
 impl<T> Action<T> {
@@ -233,10 +336,21 @@ impl<T> Action<T> {
             | Action::Abandon { .. }
             | Action::Commit { .. }
             | Action::SwitchAtOnce { .. }
-            | Action::DeleteChild { .. } => true,
-            Action::Note(_) | Action::KeepRedundant { .. } | Action::CloseIkeSa | Action::AgeClockFailed | Action::AgeClockRestart | Action::BecameCurrent(_) => {
-                false
-            }
+            | Action::DeleteChild { .. }
+            | Action::PrepareDeferred { .. }
+            | Action::RefuseHeld { .. }
+            | Action::ReleaseHeld { .. }
+            | Action::AddRedundant { .. }
+            | Action::InstallAndSwitch { .. }
+            | Action::MoveToRedundant { .. } => true,
+            Action::Note(_)
+            | Action::KeepRedundant { .. }
+            | Action::CloseIkeSa
+            | Action::AgeClockFailed
+            | Action::AgeClockRestart
+            | Action::BecameCurrent(_)
+            | Action::Withdraw { .. }
+            | Action::CloseRedundant { .. } => false,
         }
     }
 }
@@ -298,11 +412,73 @@ pub enum Note {
     /// `replaced_local_spi`) until the peer is known to have the new one; the replaced SA's Delete
     /// came to `delete` (`None`: the peer's to delete) (`renew_family`, its last line).
     Renewed { rx: u64, tx: u64, at_bytes: u64, new_local_spi: u32, negotiated_ms: u128, replaced_local_spi: u32, deferred: bool, delete: Option<DeleteCame> },
+    /// The peer's held rekey (its new SA receiving on `local_spi`) refused, `TEMPORARY_FAILURE`: the
+    /// data plane cannot take the new SA; the SA in use stays (`serve_held`; the data plane's error
+    /// is the consumer's).
+    HeldRefused { local_spi: u32 },
+    /// Refusing the peer's held rekey (its new SA receiving on `local_spi`) failed (`serve_held`; both
+    /// errors are the consumer's).
+    RefusingHeldFailed { local_spi: u32 },
+    /// The IKE SA of the peer's held rekey is over: its new SA (receiving on `local_spi`) withdrawn
+    /// from the data plane (`serve_held`).
+    HeldOver { local_spi: u32 },
+    /// The peer's held rekey was not released: its new SA (receiving on `local_spi`) withdrawn from
+    /// the data plane; the SA in use stays (`serve_held`; the error is the consumer's).
+    HeldNotReleased { local_spi: u32 },
+    /// The peer's rekey served in the data plane (its new SA receiving on `local_spi`), its answer
+    /// held `held_ms`: outbound stays on the replaced SA (receiving on `replaced_local_spi`) until the
+    /// peer is known to have the new one (`serve_held`).
+    HeldServed { local_spi: u32, held_ms: u128, replaced_local_spi: u32 },
+    /// The peer's held rekey of its redundant SA (receiving on `replaced_local_spi`) refused,
+    /// `TEMPORARY_FAILURE` (`serve_held_redundant`; the data plane's error is the consumer's).
+    RedundantHeldRefused { replaced_local_spi: u32 },
+    /// Refusing the peer's held rekey of its redundant SA failed (`serve_held_redundant`; both errors
+    /// are the consumer's).
+    RefusingRedundantHeldFailed,
+    /// The peer's held rekey of its redundant SA was not released: its new SA (receiving on
+    /// `local_spi`) withdrawn from the data plane (`serve_held_redundant`; the error is the
+    /// consumer's).
+    RedundantHeldNotReleased { local_spi: u32 },
+    /// The peer's rekey of its redundant SA (receiving on `replaced_local_spi`) served: its new SA
+    /// (receiving on `local_spi`) kept in its place, inbound only (`serve_held_redundant`).
+    RedundantRekeyServed { replaced_local_spi: u32, local_spi: u32 },
+    /// The peer's rekey answered without being held (its new SA receiving on `local_spi`) installed:
+    /// outbound stays on the replaced SA (receiving on `replaced_local_spi`) until the peer is known
+    /// to have the new one (`install_one`).
+    PeerReplacementInstalled { local_spi: u32, replaced_local_spi: u32 },
+    /// The replacement (receiving on `local_spi`) could not be put in the data plane: left to the
+    /// consumer to install as before (`install_one`, both ways; the error is the consumer's).
+    ReplacementNotInstalled { local_spi: u32 },
+    /// The replacement (receiving on `local_spi`) installed: outbound moved to it, the replaced SA
+    /// still accepted inbound (`install_one`).
+    ReplacementInstalled { local_spi: u32 },
+    /// The switch pending to the SA receiving on `local_spi` was refused by the data plane on the
+    /// move to the redundant SA -- the peer deleted that SA anyway (`move_to_redundant`; the error is
+    /// the consumer's).
+    MoveSwitchRefused { local_spi: u32 },
+    /// The peer deleted the SA in use (receiving on `replaced_local_spi`) and kept its redundant one
+    /// (receiving on `to_local_spi`): outbound moved to it, nothing renegotiated
+    /// (`move_to_redundant`).
+    MovedToRedundant { replaced_local_spi: u32, to_local_spi: u32 },
+    /// As [`MovedToRedundant`](Self::MovedToRedundant), but the data plane does not move to it, for
+    /// `why`: left to the consumer to install as before (`move_to_redundant`).
+    NotMovedToRedundant { replaced_local_spi: u32, to_local_spi: u32, why: NotPromoted },
 }
 
-/// How an operation ended.
+/// Why the data plane did not move to the peer's redundant SA ([`Note::NotMovedToRedundant`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
+pub enum NotPromoted {
+    /// The consumer's daemon owes an install ("the daemon owes an install").
+    ConsumerOwesInstall,
+    /// The data plane does not hold the redundant SA ("the pump does not hold it").
+    NotInPlane,
+    /// The data plane refused the promotion; its error is the consumer's.
+    Refused,
+}
+
+/// How an operation ended. `T` is the consumer's name for an SA in its data plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome<T> {
     /// Flow A: nothing to renew, or not yet (not due, the spacing, the peer's held rekey, suspended,
     /// the data plane not on the SA); no attempt counted, nothing sent.
     NotDue,
@@ -315,10 +491,30 @@ pub enum Outcome {
     /// rekey was kept, outbound waits on a proof. `ike_sa_over`: the replaced SA's Delete reported
     /// the IKE SA over -- renewed all the same, the tunnel torn down.
     Renewed { new: (u32, u32), deferred: bool, ike_sa_over: bool },
-    /// Flow B: no switch is proven or due, or none waits on that Delete.
+    /// Flow B: no switch is proven or due, or none waits on that Delete. Also the end of
+    /// [`Input::DataPlaneReset`]: any switch deferred dropped, nothing else done.
     Nothing,
     /// Flow B: the deferred switch was made.
     Switched,
+    /// Flows C and C': the peer's held rekey refused, or the refusal failed; the SA in use stays.
+    Refused,
+    /// Flows C and C': the held answer not released; its new SA withdrawn, the SA in use stays.
+    NotReleased,
+    /// Flow C: the peer's held rekey served, its new SA of SPIs `new` the family's current one, its
+    /// switch deferred.
+    Served { new: (u32, u32) },
+    /// Flow C': the peer's held rekey of its redundant SA served: the new SA, `id` in the data plane,
+    /// stands in the redundant one's place.
+    RedundantReplaced { id: T },
+    /// Flow D: installed in the data plane; `deferred`, a rekey of the peer's whose switch waits on a
+    /// proof, else switched to.
+    Installed { deferred: bool },
+    /// Flow D: not installed in the data plane, left to the consumer to install as before;
+    /// `ike_sa_over`, the IKE SA closed as a switch pending first was refused.
+    LeftToConsumer { ike_sa_over: bool },
+    /// Flow E: the family is on the redundant SA of SPIs `new`; `installed`, outbound moved to it in
+    /// the data plane, else left to the consumer to install as before.
+    MovedTo { new: (u32, u32), installed: bool },
 }
 
 /// One step of the machine: the actions to carry out, in order, and, once the operation is over,
@@ -328,7 +524,7 @@ pub struct Step<T> {
     /// What the consumer is to do, in order. At most one asks for an answer, and it is the last.
     pub actions: Vec<Action<T>>,
     /// `None` while the operation goes on (the last action asks); how it ended once it is over.
-    pub outcome: Option<Outcome>,
+    pub outcome: Option<Outcome<T>>,
 }
 
 /// An input that does not fit where the machine stands: refused, and nothing changed.
@@ -358,6 +554,10 @@ enum AfterSwitch {
     Renew { now: Instant, current: ChildId },
     /// Flow B: nothing; the switch was the operation.
     Done,
+    /// Flow C: the held rekey's new SA installed as the next generation.
+    Held { now: Instant, current: Option<ChildId>, new: (u32, u32) },
+    /// Flow D: the replacement installed.
+    Replacement { now: Instant, new: (u32, u32), by_peer: bool },
 }
 
 /// Where the machine stands.
@@ -383,6 +583,25 @@ enum Phase<T> {
     SwitchingAtOnce(Renewing, NewChild, Option<DeleteCame>),
     /// Flow A: the replaced SA's Delete asked for.
     Deleting(Renewing, NewChild),
+    /// Flow C: the held rekey's new SA asked to be installed as the next generation.
+    HeldPreparing { now: Instant, current: Option<ChildId>, new: (u32, u32) },
+    /// Flow C: the held rekey's refusal asked for.
+    HeldRefusing { new: (u32, u32) },
+    /// Flow C: the held answer's release asked for; the new SA is `id`, the data plane's current
+    /// generation `replaced`.
+    HeldReleasing { now: Instant, current: Option<ChildId>, new: (u32, u32), id: T, replaced: (u32, u32) },
+    /// Flow C': the held rekey's new SA asked to be added as a redundant generation.
+    RedundantAdding { now: Instant, new: (u32, u32), replaces: (u32, u32), old: Option<T> },
+    /// Flow C': the held rekey's refusal asked for.
+    RedundantRefusing { replaces: (u32, u32) },
+    /// Flow C': the held answer's release asked for; the new SA is `id`.
+    RedundantReleasing { now: Instant, new: (u32, u32), replaces: (u32, u32), old: Option<T>, id: T },
+    /// Flow D: the peer's replacement asked to be installed as the next generation.
+    ReplacementPreparing { now: Instant, new: (u32, u32) },
+    /// Flow D: our replacement asked to be installed and switched to.
+    ReplacementInstalling { new: (u32, u32) },
+    /// Flow E: the move asked for.
+    Moving { now: Instant, current: Option<ChildId>, to: (u32, u32), replaced: (u32, u32), in_plane: Option<T>, consumer_owes_install: bool, pending: Option<DeferredSwitch<T>> },
 }
 
 impl<T> Phase<T> {
@@ -399,15 +618,25 @@ impl<T> Phase<T> {
             Phase::Committing(..) => "committing",
             Phase::SwitchingAtOnce(..) => "switching_at_once",
             Phase::Deleting(..) => "deleting",
+            Phase::HeldPreparing { .. } => "held_preparing",
+            Phase::HeldRefusing { .. } => "held_refusing",
+            Phase::HeldReleasing { .. } => "held_releasing",
+            Phase::RedundantAdding { .. } => "redundant_adding",
+            Phase::RedundantRefusing { .. } => "redundant_refusing",
+            Phase::RedundantReleasing { .. } => "redundant_releasing",
+            Phase::ReplacementPreparing { .. } => "replacement_preparing",
+            Phase::ReplacementInstalling { .. } => "replacement_installing",
+            Phase::Moving { .. } => "moving",
         }
     }
 }
 
 /// Where a step leaves the operation: an action asked for and the phase that waits on its answer, or
-/// the operation over.
+/// the operation over. Returned once per step and taken apart at once: not worth a box.
+#[allow(clippy::large_enum_variant)]
 enum Flow<T> {
     Ask(Action<T>, Phase<T>),
-    Done(Outcome),
+    Done(Outcome<T>),
 }
 
 /// The renewals of one family of CHILD SAs: its record ([`FamilyRenewal`]), where the operation
@@ -493,6 +722,59 @@ impl<T: Copy> FamilyMachine<T> {
             (Phase::Committing(r, n, id), Input::Committed(committed)) => self.committed(r, n, id, committed, policy, out),
             (Phase::SwitchingAtOnce(r, n, report), Input::Switched(made)) => self.switched_at_once(r, n, report, made, policy, out),
             (Phase::Deleting(r, n), Input::Deleted(report)) => self.delete_reported(r, n, report, policy, out),
+            (Phase::Idle, Input::DataPlaneReset) => {
+                // `attach` and `detach`: dropped, not made; nothing logged.
+                let _ = self.record.take_switch();
+                Flow::Done(Outcome::Nothing)
+            }
+            (Phase::Idle, Input::PeerRekeyHeld { now, current, new }) => self.switch_first(now, SwitchProof::SlotNeeded, AfterSwitch::Held { now, current, new }),
+            (Phase::HeldPreparing { now, current, new }, Input::PreparedDeferred(prepared)) => match prepared {
+                Ok((id, replaced)) => Flow::Ask(Action::ReleaseHeld { new_local_spi: new.0 }, Phase::HeldReleasing { now, current, new, id, replaced }),
+                Err(()) => Flow::Ask(Action::RefuseHeld { new_local_spi: new.0 }, Phase::HeldRefusing { new }),
+            },
+            (Phase::HeldRefusing { new }, Input::Refused(refused)) => Self::held_refused(refused, Note::HeldRefused { local_spi: new.0 }, Note::RefusingHeldFailed { local_spi: new.0 }, out),
+            (Phase::HeldReleasing { now, current, new, id, replaced }, Input::Released(released)) => self.held_released(now, current, new, id, replaced, released, out),
+            (Phase::Idle, Input::PeerRekeyHeldOfRedundant { now, new, replaces, old }) => {
+                Flow::Ask(Action::AddRedundant { new, now }, Phase::RedundantAdding { now, new, replaces, old })
+            }
+            (Phase::RedundantAdding { now, new, replaces, old }, Input::Added(added)) => match added {
+                Ok(id) => Flow::Ask(Action::ReleaseHeld { new_local_spi: new.0 }, Phase::RedundantReleasing { now, new, replaces, old, id }),
+                Err(()) => Flow::Ask(Action::RefuseHeld { new_local_spi: new.0 }, Phase::RedundantRefusing { replaces }),
+            },
+            (Phase::RedundantRefusing { replaces }, Input::Refused(refused)) => {
+                Self::held_refused(refused, Note::RedundantHeldRefused { replaced_local_spi: replaces.0 }, Note::RefusingRedundantHeldFailed, out)
+            }
+            (Phase::RedundantReleasing { now, new, replaces, old, id }, Input::Released(released)) => Self::redundant_released(now, new, replaces, old, id, released, out),
+            (Phase::Idle, Input::Replacement { now, new, by_peer }) => self.switch_first(now, SwitchProof::SlotNeeded, AfterSwitch::Replacement { now, new, by_peer }),
+            (Phase::ReplacementPreparing { now, new }, Input::PreparedDeferred(prepared)) => match prepared {
+                Ok((id, replaced)) => {
+                    self.defer_switch(DeferredSwitch { id, local_spi: new.0, replaced, answered: now }, out);
+                    out.push(Action::Note(Note::PeerReplacementInstalled { local_spi: new.0, replaced_local_spi: replaced.0 }));
+                    Flow::Done(Outcome::Installed { deferred: true })
+                }
+                Err(()) => {
+                    out.push(Action::Note(Note::ReplacementNotInstalled { local_spi: new.0 }));
+                    Flow::Done(Outcome::LeftToConsumer { ike_sa_over: false })
+                }
+            },
+            (Phase::ReplacementInstalling { new }, Input::InstalledAndSwitched(installed)) => {
+                out.push(Action::Note(match installed {
+                    Ok(()) => Note::ReplacementInstalled { local_spi: new.0 },
+                    Err(()) => Note::ReplacementNotInstalled { local_spi: new.0 },
+                }));
+                Flow::Done(match installed {
+                    Ok(()) => Outcome::Installed { deferred: false },
+                    Err(()) => Outcome::LeftToConsumer { ike_sa_over: false },
+                })
+            }
+            (Phase::Idle, Input::MovedToRedundant { now, current, to, replaced, in_plane, consumer_owes_install }) => {
+                let pending = self.record.take_switch();
+                let promote = if consumer_owes_install { None } else { in_plane };
+                Flow::Ask(Action::MoveToRedundant { pending, promote, now }, Phase::Moving { now, current, to, replaced, in_plane, consumer_owes_install, pending })
+            }
+            (Phase::Moving { now, current, to, replaced, in_plane, consumer_owes_install, pending }, Input::Moved { pending_refused, promoted }) => {
+                Self::moved(now, current, to, replaced, in_plane, consumer_owes_install, pending, pending_refused, promoted, out)
+            }
             (phase, input) => return Err(Unexpected { phase: phase.name(), input: input.kind() }),
         };
         let outcome = match flow {
@@ -702,7 +984,7 @@ impl<T: Copy> FamilyMachine<T> {
 
     /// The renewal's end: the family's clock started again, its current generation the new SA, and
     /// the controller's last line.
-    fn renewed(&mut self, r: Renewing, n: NewChild, deferred: bool, delete: Option<DeleteCame>, out: &mut Vec<Action<T>>) -> Outcome {
+    fn renewed(&mut self, r: Renewing, n: NewChild, deferred: bool, delete: Option<DeleteCame>, out: &mut Vec<Action<T>>) -> Outcome<T> {
         out.push(Action::AgeClockRestart);
         out.push(Action::BecameCurrent(r.current.successor(n.new.0, n.new.1)));
         out.push(Action::Note(Note::Renewed {
@@ -763,7 +1045,11 @@ impl<T: Copy> FamilyMachine<T> {
         if made.is_err() {
             out.push(Action::Note(Note::SwitchRefused { local_spi: switch.local_spi }));
             out.push(Action::CloseIkeSa);
-            return Flow::Done(Outcome::TornDown);
+            // `install_one` leaves the replacement as it was, for the consumer, the tunnel torn down.
+            return Flow::Done(match then {
+                AfterSwitch::Replacement { .. } => Outcome::LeftToConsumer { ike_sa_over: true },
+                AfterSwitch::Renew { .. } | AfterSwitch::Done | AfterSwitch::Held { .. } => Outcome::TornDown,
+            });
         }
         let ms = now.saturating_duration_since(switch.answered).as_millis();
         out.push(Action::Note(Note::SwitchMade { local_spi: switch.local_spi, ms, proof, replaced_local_spi: switch.replaced.0 }));
@@ -775,7 +1061,119 @@ impl<T: Copy> FamilyMachine<T> {
         match then {
             AfterSwitch::Renew { now, current } => Flow::Ask(Action::ReadUse { spis: current.spis() }, Phase::Use { now, current }),
             AfterSwitch::Done => Flow::Done(Outcome::Switched),
+            AfterSwitch::Held { now, current, new } => Flow::Ask(Action::PrepareDeferred { new, now }, Phase::HeldPreparing { now, current, new }),
+            AfterSwitch::Replacement { now, new, by_peer: true } => Flow::Ask(Action::PrepareDeferred { new, now }, Phase::ReplacementPreparing { now, new }),
+            AfterSwitch::Replacement { now, new, by_peer: false } => Flow::Ask(Action::InstallAndSwitch { new, now }, Phase::ReplacementInstalling { new }),
         }
+    }
+
+    // Flows C and C': a rekey of the peer's held (`serve_held`, `serve_held_redundant`).
+
+    /// The refusal's answer: refused, noted `refused`; the IKE SA over, torn down with no line;
+    /// the refusal failed, noted `failed`. The SA in use stays.
+    fn held_refused(refused: Result<(), Failure>, noted: Note, failed: Note, out: &mut Vec<Action<T>>) -> Flow<T> {
+        match refused {
+            Ok(()) => out.push(Action::Note(noted)),
+            Err(Failure::IkeSaOver) => return Flow::Done(Outcome::TornDown),
+            Err(Failure::Other) => out.push(Action::Note(failed)),
+        }
+        Flow::Done(Outcome::Refused)
+    }
+
+    /// The release's answer, flow C. Released: the switch deferred until the peer is known to have
+    /// the new SA, the family's clock started again and its current generation the new SA. Not: the
+    /// new SA withdrawn, the SA in use stays -- torn down if the IKE SA is over.
+    #[allow(clippy::too_many_arguments)]
+    fn held_released(&mut self, now: Instant, current: Option<ChildId>, new: (u32, u32), id: T, replaced: (u32, u32), released: Result<Duration, Failure>, out: &mut Vec<Action<T>>) -> Flow<T> {
+        match released {
+            Ok(held) => {
+                self.defer_switch(DeferredSwitch { id, local_spi: new.0, replaced, answered: now }, out);
+                out.push(Action::AgeClockRestart);
+                out.push(Action::BecameCurrent(next(current, new)));
+                out.push(Action::Note(Note::HeldServed { local_spi: new.0, held_ms: held.as_millis(), replaced_local_spi: replaced.0 }));
+                Flow::Done(Outcome::Served { new })
+            }
+            Err(Failure::IkeSaOver) => {
+                out.push(Action::Withdraw { id, now });
+                out.push(Action::Note(Note::HeldOver { local_spi: new.0 }));
+                Flow::Done(Outcome::TornDown)
+            }
+            Err(Failure::Other) => {
+                out.push(Action::Withdraw { id, now });
+                out.push(Action::Note(Note::HeldNotReleased { local_spi: new.0 }));
+                Flow::Done(Outcome::NotReleased)
+            }
+        }
+    }
+
+    /// The release's answer, flow C'. Released: the redundant SA it replaces closed in the data plane
+    /// if it held it, the new one in its place. Not: the new SA withdrawn -- torn down if the IKE SA
+    /// is over. No switch, no clock, no generation: the family's current SA is not touched.
+    fn redundant_released(now: Instant, new: (u32, u32), replaces: (u32, u32), old: Option<T>, id: T, released: Result<Duration, Failure>, out: &mut Vec<Action<T>>) -> Flow<T> {
+        match released {
+            Ok(_) => {
+                if let Some(old) = old {
+                    out.push(Action::CloseRedundant { id: old, now });
+                }
+                out.push(Action::Note(Note::RedundantRekeyServed { replaced_local_spi: replaces.0, local_spi: new.0 }));
+                Flow::Done(Outcome::RedundantReplaced { id })
+            }
+            Err(failure) => {
+                out.push(Action::Withdraw { id, now });
+                out.push(Action::Note(Note::RedundantHeldNotReleased { local_spi: new.0 }));
+                Flow::Done(match failure {
+                    Failure::IkeSaOver => Outcome::TornDown,
+                    Failure::Other => Outcome::NotReleased,
+                })
+            }
+        }
+    }
+
+    // Flow E: the move to the peer's redundant SA (`move_to_redundant`).
+
+    /// The move's answer: the pending switch noted as made or refused (the peer deleted its SA
+    /// anyway: nothing closed); the move noted, or, the data plane not moving, the redundant SA
+    /// withdrawn if it held it and the move left to the consumer. Either way the family's clock
+    /// starts again and its current generation is the redundant SA.
+    #[allow(clippy::too_many_arguments)]
+    fn moved(
+        now: Instant,
+        current: Option<ChildId>,
+        to: (u32, u32),
+        replaced: (u32, u32),
+        in_plane: Option<T>,
+        consumer_owes_install: bool,
+        pending: Option<DeferredSwitch<T>>,
+        pending_refused: bool,
+        promoted: Result<(), ()>,
+        out: &mut Vec<Action<T>>,
+    ) -> Flow<T> {
+        if let Some(pending) = pending {
+            out.push(Action::Note(if pending_refused {
+                Note::MoveSwitchRefused { local_spi: pending.local_spi }
+            } else {
+                let ms = now.saturating_duration_since(pending.answered).as_millis();
+                Note::SwitchMade { local_spi: pending.local_spi, ms, proof: SwitchProof::SlotNeeded, replaced_local_spi: pending.replaced.0 }
+            }));
+        }
+        let why = match (in_plane, consumer_owes_install, promoted) {
+            (None, _, _) => Some(NotPromoted::NotInPlane),
+            (Some(_), true, _) => Some(NotPromoted::ConsumerOwesInstall),
+            (Some(_), false, Err(())) => Some(NotPromoted::Refused),
+            (Some(_), false, Ok(())) => None,
+        };
+        match why {
+            None => out.push(Action::Note(Note::MovedToRedundant { replaced_local_spi: replaced.0, to_local_spi: to.0 })),
+            Some(why) => {
+                if let Some(id) = in_plane {
+                    out.push(Action::Withdraw { id, now });
+                }
+                out.push(Action::Note(Note::NotMovedToRedundant { replaced_local_spi: replaced.0, to_local_spi: to.0, why }));
+            }
+        }
+        out.push(Action::AgeClockRestart);
+        out.push(Action::BecameCurrent(next(current, to)));
+        Flow::Done(Outcome::MovedTo { new: to, installed: why.is_none() })
     }
 
     /// The controller's `defer_switch`: `switch` deferred; one still pending is dropped, noted.
@@ -784,6 +1182,13 @@ impl<T: Copy> FamilyMachine<T> {
             out.push(Action::Note(Note::SwitchDropped { local_spi: earlier.local_spi }));
         }
     }
+}
+
+/// The SA of SPIs `new` `(local, peer)` put in `current`'s place: its successor, or the first
+/// generation of a family that had none (the controller's `CurrentChild::next`; at `u64::MAX` the
+/// generation stays there rather than wrap).
+fn next(current: Option<ChildId>, new: (u32, u32)) -> ChildId {
+    current.map_or(ChildId::first(new.0, new.1), |current| current.successor(new.0, new.1))
 }
 
 #[cfg(test)]
@@ -878,7 +1283,7 @@ mod tests {
     struct Run {
         /// Every action of every step, in order.
         actions: Vec<Action<u64>>,
-        outcome: Outcome,
+        outcome: Outcome<u64>,
         /// The asking action of each step but the last, with the owed Deletes the record held right
         /// after that step.
         asked: Vec<(Action<u64>, Vec<Retired>)>,
@@ -928,6 +1333,14 @@ mod tests {
             Action::AgeClockFailed => "AgeClockFailed",
             Action::AgeClockRestart => "AgeClockRestart",
             Action::BecameCurrent(_) => "BecameCurrent",
+            Action::PrepareDeferred { .. } => "PrepareDeferred",
+            Action::RefuseHeld { .. } => "RefuseHeld",
+            Action::ReleaseHeld { .. } => "ReleaseHeld",
+            Action::Withdraw { .. } => "Withdraw",
+            Action::AddRedundant { .. } => "AddRedundant",
+            Action::CloseRedundant { .. } => "CloseRedundant",
+            Action::InstallAndSwitch { .. } => "InstallAndSwitch",
+            Action::MoveToRedundant { .. } => "MoveToRedundant",
         }
     }
 
@@ -1459,6 +1872,17 @@ mod tests {
             Input::Abandoned(ACKED),
             Input::Committed(Committed::OursDeleteNotAsked),
             Input::Deleted(ACKED),
+            held(now),
+            held_of_redundant(now, Some(5)),
+            Input::Replacement { now, new: NEW, by_peer: true },
+            moved_to(now, Some(5), false),
+            Input::PreparedDeferred(Ok((ID, REPLACED))),
+            Input::Refused(Ok(())),
+            Input::Released(Ok(ms(1))),
+            Input::Added(Ok(ID)),
+            Input::InstalledAndSwitched(Ok(())),
+            Input::Moved { pending_refused: false, promoted: Ok(()) },
+            Input::DataPlaneReset,
         ]
     }
 
@@ -1475,7 +1899,7 @@ mod tests {
         }
     }
 
-    const EVENTS: [&str; 3] = ["RenewByVolume", "SwitchCheck", "PeerDeletedReplaced"];
+    const EVENTS: [&str; 8] = ["RenewByVolume", "SwitchCheck", "PeerDeletedReplaced", "PeerRekeyHeld", "PeerRekeyHeldOfRedundant", "Replacement", "MovedToRedundant", "DataPlaneReset"];
 
     #[test]
     fn an_input_that_does_not_fit_is_refused_and_changes_nothing() {
@@ -1513,6 +1937,29 @@ mod tests {
         let mut m = with_a_switch_pending(t0);
         step(&mut m, Input::SwitchCheck { now: t0, peer_sent: true });
         refuses_all_but(&mut m, t0, "switching", &["Switched"]);
+        // Flows C, C', D and E.
+        for (path, phase, fits) in [
+            (vec![held(t0)], "held_preparing", "PreparedDeferred"),
+            (vec![held(t0), Input::PreparedDeferred(Err(()))], "held_refusing", "Refused"),
+            (vec![held(t0), Input::PreparedDeferred(Ok((ID, REPLACED)))], "held_releasing", "Released"),
+            (vec![held_of_redundant(t0, None)], "redundant_adding", "Added"),
+            (vec![held_of_redundant(t0, None), Input::Added(Err(()))], "redundant_refusing", "Refused"),
+            (vec![held_of_redundant(t0, None), Input::Added(Ok(ID))], "redundant_releasing", "Released"),
+            (vec![Input::Replacement { now: t0, new: NEW, by_peer: true }], "replacement_preparing", "PreparedDeferred"),
+            (vec![Input::Replacement { now: t0, new: NEW, by_peer: false }], "replacement_installing", "InstalledAndSwitched"),
+            (vec![moved_to(t0, Some(5), false)], "moving", "Moved"),
+        ] {
+            let mut m = FamilyMachine::<u64>::new();
+            for input in path {
+                step(&mut m, input);
+            }
+            refuses_all_but(&mut m, t0, phase, &[fits]);
+        }
+        for event in [held(t0 + secs(1)), Input::Replacement { now: t0 + secs(1), new: (0x31, 0x32), by_peer: false }] {
+            let mut m = with_a_switch_pending(t0);
+            step(&mut m, event);
+            refuses_all_but(&mut m, t0, "switching", &["Switched"]);
+        }
     }
 
     #[test]
@@ -1542,5 +1989,309 @@ mod tests {
             assert!(!m.suspended() && !m.record().in_flight(), "{n}");
         }
         assert_eq!(current.generation, 1000);
+    }
+
+    // Flows C, C', D and E.
+
+    /// The data plane's current generation when a rekey of `CURRENT` is served: `CURRENT` itself.
+    const REPLACED: (u32, u32) = (0x11, 0x12);
+
+    /// A rekey of `CURRENT` to `NEW` by the peer, held.
+    fn held(now: Instant) -> Input<u64> {
+        Input::PeerRekeyHeld { now, current: Some(CURRENT), new: NEW }
+    }
+
+    /// The peer's redundant SA of a crossed rekey, its SPIs, and the peer's rekey of it.
+    const REDUNDANT: (u32, u32) = (0x31, 0x32);
+    const REDUNDANT_NEW: (u32, u32) = (0x41, 0x42);
+
+    fn held_of_redundant(now: Instant, old: Option<u64>) -> Input<u64> {
+        Input::PeerRekeyHeldOfRedundant { now, new: REDUNDANT_NEW, replaces: REDUNDANT, old }
+    }
+
+    /// The peer deleted `CURRENT` and the family moved to its redundant SA.
+    const TO: (u32, u32) = (0x51, 0x52);
+
+    fn moved_to(now: Instant, in_plane: Option<u64>, consumer_owes_install: bool) -> Input<u64> {
+        Input::MovedToRedundant { now, current: Some(CURRENT), to: TO, replaced: REPLACED, in_plane, consumer_owes_install }
+    }
+
+    #[test]
+    fn a_held_rekey_of_the_peers_is_installed_before_its_answer_goes_and_its_switch_waits_on_a_proof() {
+        let t0 = t0();
+        let mut m = FamilyMachine::<u64>::new();
+        let run = drive(&mut m, &POLICY, held(t0), &[Input::PreparedDeferred(Ok((ID, REPLACED))), Input::Released(Ok(ms(7)))]);
+        assert_eq!(
+            run.actions,
+            [
+                Action::PrepareDeferred { new: NEW, now: t0 },
+                Action::ReleaseHeld { new_local_spi: NEW.0 },
+                Action::AgeClockRestart,
+                Action::BecameCurrent(NEXT),
+                Action::Note(Note::HeldServed { local_spi: NEW.0, held_ms: 7, replaced_local_spi: 0x11 }),
+            ]
+        );
+        assert_eq!(run.outcome, Outcome::Served { new: NEW });
+        assert_eq!(m.pending_switch(), Some(DeferredSwitch { id: ID, local_spi: NEW.0, replaced: REPLACED, answered: t0 }));
+        assert_eq!((m.record().last_attempt(), m.record().owed().len(), m.record().settled().len()), (None, 0, 0), "no renewal of ours, nothing retired");
+        // No switch before a proof.
+        let run = drive(&mut m, &POLICY, Input::SwitchCheck { now: t0 + WAIT - Duration::from_nanos(1), peer_sent: false }, &[]);
+        assert_eq!(run.outcome, Outcome::Nothing);
+        let run = drive(&mut m, &POLICY, Input::PeerDeletedReplaced { now: t0, local_spi: REPLACED.0 }, &[Input::Switched(Ok(()))]);
+        assert_eq!(run.actions[0], Action::Switch { switch: m_switch(ID, REPLACED, t0), proof: SwitchProof::ReplacedDeleted, now: t0 });
+        // A family with no current generation: the new SA is its first.
+        let mut m = FamilyMachine::<u64>::new();
+        let event = Input::PeerRekeyHeld { now: t0, current: None, new: NEW };
+        let run = drive(&mut m, &POLICY, event, &[Input::PreparedDeferred(Ok((ID, REPLACED))), Input::Released(Ok(ms(7)))]);
+        assert!(run.actions.contains(&Action::BecameCurrent(ChildId::first(NEW.0, NEW.1))));
+    }
+
+    /// The switch deferred for `NEW` as `id` in the data plane, outbound left on `replaced`.
+    fn m_switch(id: u64, replaced: (u32, u32), answered: Instant) -> DeferredSwitch<u64> {
+        DeferredSwitch { id, local_spi: NEW.0, replaced, answered }
+    }
+
+    #[test]
+    fn a_held_rekey_makes_a_switch_still_pending_first_and_one_refused_closes_the_ike_sa() {
+        let t0 = t0();
+        let at = t0 + secs(1);
+        let newer = (0x61, 0x62);
+        let mut m = with_a_switch_pending(t0);
+        let pending = m.pending_switch().unwrap();
+        let event = Input::PeerRekeyHeld { now: at, current: Some(NEXT), new: newer };
+        let run = drive(&mut m, &POLICY, event, &[Input::Switched(Ok(())), Input::PreparedDeferred(Ok((ID + 1, NEW))), Input::Released(Ok(ms(1)))]);
+        assert_eq!(run.asking(), ["Switch", "PrepareDeferred", "ReleaseHeld"]);
+        assert_eq!(run.asked[0].0, Action::Switch { switch: pending, proof: SwitchProof::SlotNeeded, now: at });
+        assert_eq!(run.notes(), [Note::SwitchMade { local_spi: NEW.0, ms: 990, proof: SwitchProof::SlotNeeded, replaced_local_spi: 0x11 }, Note::HeldServed { local_spi: 0x61, held_ms: 1, replaced_local_spi: NEW.0 }], "none dropped");
+        assert_eq!(m.pending_switch(), Some(DeferredSwitch { id: ID + 1, local_spi: 0x61, replaced: NEW, answered: at }));
+        assert!(run.actions.contains(&Action::BecameCurrent(NEXT.successor(0x61, 0x62))));
+
+        let mut m = with_a_switch_pending(t0);
+        let run = drive(&mut m, &POLICY, event, &[Input::Switched(Err(()))]);
+        assert_eq!(run.kinds(), ["Switch", "Note", "CloseIkeSa"]);
+        assert_eq!(run.actions[1], Action::Note(Note::SwitchRefused { local_spi: NEW.0 }));
+        assert_eq!((run.outcome, m.pending_switch()), (Outcome::TornDown, None));
+    }
+
+    #[test]
+    fn a_held_rekey_the_data_plane_cannot_take_is_refused_and_one_not_released_is_withdrawn() {
+        let t0 = t0();
+        for (refused, outcome, notes) in [
+            (Ok(()), Outcome::Refused, vec![Note::HeldRefused { local_spi: NEW.0 }]),
+            (Err(Failure::IkeSaOver), Outcome::TornDown, vec![]),
+            (Err(Failure::Other), Outcome::Refused, vec![Note::RefusingHeldFailed { local_spi: NEW.0 }]),
+        ] {
+            let mut m = FamilyMachine::<u64>::new();
+            let run = drive(&mut m, &POLICY, held(t0), &[Input::PreparedDeferred(Err(())), Input::Refused(refused)]);
+            assert_eq!(run.asked.iter().map(|(a, _)| *a).collect::<Vec<_>>(), [Action::PrepareDeferred { new: NEW, now: t0 }, Action::RefuseHeld { new_local_spi: NEW.0 }]);
+            assert_eq!((run.outcome, run.notes(), run.has("ReleaseHeld")), (outcome, notes, false), "{refused:?}");
+            untouched(&m);
+        }
+        for (failure, outcome, note) in [(Failure::IkeSaOver, Outcome::TornDown, Note::HeldOver { local_spi: NEW.0 }), (Failure::Other, Outcome::NotReleased, Note::HeldNotReleased { local_spi: NEW.0 })] {
+            let mut m = FamilyMachine::<u64>::new();
+            let run = drive(&mut m, &POLICY, held(t0), &[Input::PreparedDeferred(Ok((ID, REPLACED))), Input::Released(Err(failure))]);
+            assert_eq!(run.actions[2..], [Action::Withdraw { id: ID, now: t0 }, Action::Note(note)], "{failure:?}");
+            assert_eq!(run.outcome, outcome);
+            untouched(&m);
+        }
+    }
+
+    #[test]
+    fn a_held_rekey_of_the_peers_redundant_sa_puts_the_new_one_in_its_place_and_touches_nothing_else() {
+        let t0 = t0();
+        for old in [Some(5), None] {
+            let mut m = with_a_switch_pending(t0);
+            let before = m.clone();
+            let run = drive(&mut m, &POLICY, held_of_redundant(t0 + secs(1), old), &[Input::Added(Ok(ID)), Input::Released(Ok(ms(2)))]);
+            let mut expected = vec![Action::AddRedundant { new: REDUNDANT_NEW, now: t0 + secs(1) }, Action::ReleaseHeld { new_local_spi: REDUNDANT_NEW.0 }];
+            if let Some(old) = old {
+                expected.push(Action::CloseRedundant { id: old, now: t0 + secs(1) });
+            }
+            expected.push(Action::Note(Note::RedundantRekeyServed { replaced_local_spi: REDUNDANT.0, local_spi: REDUNDANT_NEW.0 }));
+            assert_eq!(run.actions, expected, "{old:?}");
+            assert_eq!(run.outcome, Outcome::RedundantReplaced { id: ID });
+            assert_eq!(m, before, "{old:?}: no switch, no record: the switch pending stays");
+        }
+        for (refused, outcome, notes) in [
+            (Ok(()), Outcome::Refused, vec![Note::RedundantHeldRefused { replaced_local_spi: REDUNDANT.0 }]),
+            (Err(Failure::IkeSaOver), Outcome::TornDown, vec![]),
+            (Err(Failure::Other), Outcome::Refused, vec![Note::RefusingRedundantHeldFailed]),
+        ] {
+            let mut m = FamilyMachine::<u64>::new();
+            let run = drive(&mut m, &POLICY, held_of_redundant(t0, Some(5)), &[Input::Added(Err(())), Input::Refused(refused)]);
+            assert_eq!(run.asking(), ["AddRedundant", "RefuseHeld"]);
+            assert_eq!(run.asked[1].0, Action::RefuseHeld { new_local_spi: REDUNDANT_NEW.0 });
+            assert_eq!((run.outcome, run.notes()), (outcome, notes), "{refused:?}");
+            untouched(&m);
+        }
+        for (failure, outcome) in [(Failure::IkeSaOver, Outcome::TornDown), (Failure::Other, Outcome::NotReleased)] {
+            let mut m = FamilyMachine::<u64>::new();
+            let run = drive(&mut m, &POLICY, held_of_redundant(t0, Some(5)), &[Input::Added(Ok(ID)), Input::Released(Err(failure))]);
+            assert_eq!(run.actions[2..], [Action::Withdraw { id: ID, now: t0 }, Action::Note(Note::RedundantHeldNotReleased { local_spi: REDUNDANT_NEW.0 })], "{failure:?}");
+            assert_eq!(run.outcome, outcome);
+            assert!(!run.has("CloseRedundant"));
+            untouched(&m);
+        }
+    }
+
+    #[test]
+    fn a_replacement_complete_on_the_wire_is_installed_its_switch_deferred_if_the_peers_and_at_once_if_ours() {
+        let t0 = t0();
+        let mut m = FamilyMachine::<u64>::new();
+        let run = drive(&mut m, &POLICY, Input::Replacement { now: t0, new: NEW, by_peer: true }, &[Input::PreparedDeferred(Ok((ID, REPLACED)))]);
+        assert_eq!(run.actions, [Action::PrepareDeferred { new: NEW, now: t0 }, Action::Note(Note::PeerReplacementInstalled { local_spi: NEW.0, replaced_local_spi: 0x11 })]);
+        assert_eq!(run.outcome, Outcome::Installed { deferred: true });
+        assert_eq!(m.pending_switch(), Some(m_switch(ID, REPLACED, t0)), "no switch before a proof");
+        let mut m = FamilyMachine::<u64>::new();
+        let run = drive(&mut m, &POLICY, Input::Replacement { now: t0, new: NEW, by_peer: true }, &[Input::PreparedDeferred(Err(()))]);
+        assert_eq!(run.notes(), [Note::ReplacementNotInstalled { local_spi: NEW.0 }]);
+        assert_eq!(run.outcome, Outcome::LeftToConsumer { ike_sa_over: false });
+        untouched(&m);
+        for (installed, outcome, note) in [
+            (Ok(()), Outcome::Installed { deferred: false }, Note::ReplacementInstalled { local_spi: NEW.0 }),
+            (Err(()), Outcome::LeftToConsumer { ike_sa_over: false }, Note::ReplacementNotInstalled { local_spi: NEW.0 }),
+        ] {
+            let mut m = FamilyMachine::<u64>::new();
+            let run = drive(&mut m, &POLICY, Input::Replacement { now: t0, new: NEW, by_peer: false }, &[Input::InstalledAndSwitched(installed)]);
+            assert_eq!(run.actions, [Action::InstallAndSwitch { new: NEW, now: t0 }, Action::Note(note)], "{installed:?}");
+            assert_eq!(run.outcome, outcome);
+            untouched(&m);
+        }
+    }
+
+    #[test]
+    fn a_replacement_makes_a_switch_still_pending_first_and_one_refused_leaves_it_to_the_consumer_the_ike_sa_closed() {
+        let t0 = t0();
+        let at = t0 + secs(1);
+        let newer = (0x61, 0x62);
+        for by_peer in [true, false] {
+            let mut m = with_a_switch_pending(t0);
+            let pending = m.pending_switch().unwrap();
+            let event = Input::Replacement { now: at, new: newer, by_peer };
+            let answer = if by_peer { Input::PreparedDeferred(Ok((ID + 1, NEW))) } else { Input::InstalledAndSwitched(Ok(())) };
+            let run = drive(&mut m, &POLICY, event, &[Input::Switched(Ok(())), answer]);
+            assert_eq!(run.asked[0].0, Action::Switch { switch: pending, proof: SwitchProof::SlotNeeded, now: at });
+            assert_eq!(run.asking()[1], if by_peer { "PrepareDeferred" } else { "InstallAndSwitch" });
+            assert_eq!(run.outcome, Outcome::Installed { deferred: by_peer });
+            assert!(!run.has("AgeClockRestart") && !run.has("BecameCurrent") && !run.has("AgeClockFailed"), "the consumer's hand-over did that");
+
+            let mut m = with_a_switch_pending(t0);
+            let run = drive(&mut m, &POLICY, event, &[Input::Switched(Err(()))]);
+            assert_eq!(run.kinds(), ["Switch", "Note", "CloseIkeSa"]);
+            assert_eq!(run.outcome, Outcome::LeftToConsumer { ike_sa_over: true });
+            assert_eq!(m.pending_switch(), None);
+        }
+    }
+
+    #[test]
+    fn a_move_to_the_peers_redundant_sa_makes_the_pending_switch_and_the_promotion_as_one_action() {
+        let t0 = t0();
+        let to = ChildId { generation: 8, local_spi: TO.0, peer_spi: TO.1 };
+        let tail = [Action::AgeClockRestart, Action::BecameCurrent(to)];
+        let not_moved = |why| Action::Note(Note::NotMovedToRedundant { replaced_local_spi: 0x11, to_local_spi: TO.0, why });
+        for (in_plane, owes, promoted, promote, middle, installed) in [
+            (Some(5), false, Ok(()), Some(5), vec![Action::Note(Note::MovedToRedundant { replaced_local_spi: 0x11, to_local_spi: TO.0 })], true),
+            (Some(5), false, Err(()), Some(5), vec![Action::Withdraw { id: 5, now: t0 }, not_moved(NotPromoted::Refused)], false),
+            (Some(5), true, Err(()), None, vec![Action::Withdraw { id: 5, now: t0 }, not_moved(NotPromoted::ConsumerOwesInstall)], false),
+            (None, false, Err(()), None, vec![not_moved(NotPromoted::NotInPlane)], false),
+            (None, true, Err(()), None, vec![not_moved(NotPromoted::NotInPlane)], false),
+        ] {
+            let mut m = FamilyMachine::<u64>::new();
+            let run = drive(&mut m, &POLICY, moved_to(t0, in_plane, owes), &[Input::Moved { pending_refused: false, promoted }]);
+            let mut expected = vec![Action::MoveToRedundant { pending: None, promote, now: t0 }];
+            expected.extend(middle);
+            expected.extend(tail);
+            assert_eq!(run.actions, expected, "{in_plane:?} {owes}");
+            assert_eq!(run.outcome, Outcome::MovedTo { new: TO, installed });
+            untouched(&m);
+        }
+        // A switch pending is made first, in the same action; a refusal only noted.
+        for pending_refused in [false, true] {
+            let mut m = with_a_switch_pending(t0);
+            let pending = m.pending_switch();
+            let at = t0 + secs(1);
+            let event = Input::MovedToRedundant { now: at, current: Some(NEXT), to: TO, replaced: NEW, in_plane: Some(5), consumer_owes_install: false };
+            let run = drive(&mut m, &POLICY, event, &[Input::Moved { pending_refused, promoted: Ok(()) }]);
+            assert_eq!(run.actions[0], Action::MoveToRedundant { pending, promote: Some(5), now: at });
+            let switch_note = if pending_refused {
+                Note::MoveSwitchRefused { local_spi: NEW.0 }
+            } else {
+                Note::SwitchMade { local_spi: NEW.0, ms: 990, proof: SwitchProof::SlotNeeded, replaced_local_spi: 0x11 }
+            };
+            assert_eq!(run.notes(), [switch_note, Note::MovedToRedundant { replaced_local_spi: NEW.0, to_local_spi: TO.0 }]);
+            assert!(!run.has("CloseIkeSa"), "the peer deleted that SA anyway");
+            assert!(run.actions.contains(&Action::BecameCurrent(NEXT.successor(TO.0, TO.1))));
+            assert_eq!((run.outcome, m.pending_switch()), (Outcome::MovedTo { new: TO, installed: true }, None));
+        }
+        // A family with no current generation: the redundant SA is its first.
+        let mut m = FamilyMachine::<u64>::new();
+        let event = Input::MovedToRedundant { now: t0, current: None, to: TO, replaced: REPLACED, in_plane: Some(5), consumer_owes_install: false };
+        let run = drive(&mut m, &POLICY, event, &[Input::Moved { pending_refused: false, promoted: Ok(()) }]);
+        assert!(run.actions.contains(&Action::BecameCurrent(ChildId::first(TO.0, TO.1))));
+    }
+
+    #[test]
+    fn suspended_with_a_switch_pending_from_a_held_rekey_no_switch_is_made_and_the_peers_rekeys_are_still_served() {
+        let t0 = t0();
+        let mut m = FamilyMachine::<u64>::new();
+        let mut current = CURRENT;
+        for n in 0..3u32 {
+            current = renewed_with(&mut m, &POLICY, t0 + secs(n.into()), current, (0x100 + n, 0x200 + n), Unknown);
+        }
+        let held_new = (0x300, 0x301);
+        let at = t0 + secs(3);
+        let run = drive(&mut m, &POLICY, Input::PeerRekeyHeld { now: at, current: Some(current), new: held_new }, &[Input::PreparedDeferred(Ok((ID, current.spis()))), Input::Released(Ok(ms(1)))]);
+        assert_eq!(run.outcome, Outcome::Served { new: held_new });
+        let pending = m.pending_switch();
+        assert!(pending.is_some());
+        let served = current.successor(held_new.0, held_new.1);
+        for n in 0..3 {
+            let run = drive(&mut m, &POLICY, renew(at + secs(1 + n), served), &[due()]);
+            assert_eq!(run.asked[0].0, Action::ReadUse { spis: current.spis() }, "the replaced SA's use");
+            assert_eq!(run.asking(), ["ReadUse"], "no Switch for a renewal that will not start");
+            assert_eq!(run.notes(), if n == 0 { vec![Note::Suspended { owed: 3 }] } else { vec![] });
+            assert_eq!((run.outcome, m.pending_switch()), (Outcome::NotDue, pending));
+        }
+        // The peer's next rekey of the family is served all the same, and makes the switch.
+        let run = drive(&mut m, &POLICY, Input::PeerRekeyHeld { now: at + secs(5), current: Some(served), new: (0x400, 0x401) }, &[Input::Switched(Ok(())), Input::PreparedDeferred(Ok((ID + 1, held_new))), Input::Released(Ok(ms(1)))]);
+        assert_eq!(run.outcome, Outcome::Served { new: (0x400, 0x401) });
+        assert_eq!(m.record().owed().len(), 3, "and owes nothing new");
+    }
+
+    #[test]
+    fn a_data_plane_reset_drops_the_deferred_switch_and_nothing_else() {
+        let t0 = t0();
+        // A Delete owed, a settled SA, a failed last attempt, suspended, then a switch deferred.
+        let mut m = FamilyMachine::<u64>::new();
+        let current = renewed_with(&mut m, &owing(2), t0, ChildId { generation: 6, local_spi: 0x01, peer_spi: 0x02 }, CURRENT.spis(), Failed);
+        renewal(&mut m, &owing(2), t0 + secs(1), Committed::PeersKept(PEERS), &[]);
+        assert_eq!(current, CURRENT);
+        drive(&mut m, &owing(1), renew(t0 + secs(2), NEXT), &[due()]);
+        assert!(m.suspended() && m.pending_switch().is_some() && !m.record().owed().is_empty() && m.record().settled().len() > 0);
+        let before = m.clone();
+        let run = drive(&mut m, &POLICY, Input::DataPlaneReset, &[]);
+        assert_eq!((run.outcome, run.actions), (Outcome::Nothing, vec![]), "no action, no note");
+        assert_eq!((m.pending_switch(), m.switch_due_at(&POLICY)), (None, None));
+        let mut expected = before.clone();
+        let _ = expected.record.take_switch();
+        assert_eq!(m, expected, "the rest of the record, the suspension and the phase as before");
+        assert_eq!((m.record().owed(), m.record().last_attempt(), m.suspended()), (before.record().owed(), before.record().last_attempt(), true));
+        let run = drive(&mut m, &POLICY, Input::SwitchCheck { now: t0 + secs(3600), peer_sent: false }, &[]);
+        assert_eq!((run.outcome, run.actions), (Outcome::Nothing, vec![]), "nothing left to switch, past the wait");
+        // None pending: nothing changes.
+        let before = m.clone();
+        let run = drive(&mut m, &POLICY, Input::DataPlaneReset, &[]);
+        assert_eq!((run.outcome, run.actions, &m), (Outcome::Nothing, vec![], &before));
+        // Refused while an operation is under way: the switch pending of a held rekey stays.
+        let mut m = with_a_switch_pending(t0);
+        m.step(held(t0 + secs(1)), &POLICY).unwrap();
+        let before = m.clone();
+        assert_eq!(m.step(Input::DataPlaneReset, &POLICY), Err(Unexpected { phase: "switching", input: "DataPlaneReset" }));
+        assert_eq!(m, before);
+        let mut m = FamilyMachine::<u64>::new();
+        m.step(renew(t0, CURRENT), &POLICY).unwrap();
+        let before = m.clone();
+        assert_eq!(m.step(Input::DataPlaneReset, &POLICY), Err(Unexpected { phase: "use", input: "DataPlaneReset" }));
+        assert_eq!(m, before);
     }
 }

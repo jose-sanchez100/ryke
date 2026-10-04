@@ -494,6 +494,129 @@ impl DeleteReport {
     }
 }
 
+/// Why the session sent, of itself, the Delete of a CHILD SA no call of the
+/// caller's asked for -- see [`InternalChildDelete`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InternalDeleteCause {
+    /// Our SA of a rekey of ours that the peer's rekey of the same SA crossed
+    /// (RFC 7296 §2.8.1), the one created with the lowest nonce: redundant,
+    /// and ours to close. From [`LivenessSession::negotiate_rekey`],
+    /// [`LivenessSession::rekey_child`] and [`LivenessSession::rekey_child_ipv6`]
+    /// (and their `_settled` forms) alike.
+    CrossedLoser,
+    /// The SA a rekey of ours by [`LivenessSession::rekey_child`] or
+    /// [`LivenessSession::rekey_child_ipv6`] (or their `_settled` forms)
+    /// replaced, ours to delete once the rekey stood (RFC 7296 §2.8). Never
+    /// from [`LivenessSession::negotiate_rekey`]: its commit sends that
+    /// Delete, and reports it ([`DeleteReport`]).
+    RekeyedAway,
+    /// The SA the peer made answering a `CREATE_CHILD_SA` of ours -- a rekey or
+    /// a brand-new SA -- for traffic selectors outside those we proposed (RFC
+    /// 7296 §2.9): never used, deleted.
+    TsOutsideOffer,
+    /// The SA the peer made answering a rekey of ours with traffic selectors
+    /// narrower than those of the SA it replaces (RFC 7296 §2.9.2): never
+    /// used, deleted.
+    TsNarrowed,
+    /// The SA [`LivenessSession::create_child_ipv6`] negotiated, which the
+    /// peer granted no IPv6 selector: never used, deleted.
+    NoIpv6Granted,
+    /// The oldest redundant SA of its family kept by
+    /// [`LivenessSession::keep_redundant_children`], closed for one more than
+    /// [`REDUNDANT_CHILDREN_KEPT`] (also told as
+    /// [`PeerChildEvent::RedundantClosed`], with no outcome).
+    RedundantBound,
+}
+
+/// What came of a Delete the session sent of itself -- see
+/// [`InternalChildDelete`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InternalDeleteOutcome {
+    /// Sent, and the peer answered it (an answer of `INVALID_SYNTAX` is not
+    /// this, see [`Self::SentTunnelEnded`]).
+    Answered,
+    /// Sent, retransmissions included, and no answer came within the wait
+    /// (a few attempts of 500 ms). The peer may have it or not.
+    Unanswered,
+    /// Sent, and the wait for its answer ended with the tunnel
+    /// ([`Liveness::PeerTornDown`]): a request of the peer's answered
+    /// meanwhile tore it down, or the peer answered `INVALID_SYNTAX`, which
+    /// ends the IKE SA (RFC 7296 §2.21.3). Whether the peer acted on the
+    /// Delete is not known.
+    SentTunnelEnded,
+    /// Not sent: the IKE SA it would have gone on is over (an
+    /// `INVALID_SYNTAX` ended it). Its Delete is the IKE SA's end.
+    IkeSaOver,
+    /// Not sent: it failed before anything went on the wire -- no Message ID
+    /// left ([`LivenessSession::message_ids_exhausted`]), or building or
+    /// sealing the request failed. The error, as text.
+    NotSent(String),
+    /// The send or the wait for the answer failed with an I/O error: whether
+    /// the request went out -- the first send may be what failed, or a later
+    /// read -- is not known. The error, as text.
+    Unknown(String),
+}
+
+/// A Delete of a CHILD SA that the session sent of itself, inside a call of
+/// the caller's that asked for no such Delete -- what each
+/// [`InternalDeleteCause`] says -- reported with what came of it, once
+/// [`LivenessSession::report_internal_deletes`] is on
+/// ([`LivenessSession::take_internal_deletes`]).
+///
+/// These are the Deletes the session *knows* it owed: of SAs it knows were
+/// made, by an exchange whose answer it read. A negotiation whose answer was
+/// lost -- a `CREATE_CHILD_SA` of ours the peer answered, the answer never
+/// read -- may leave on the gateway an SA the session never knew of, and no
+/// report covers it: this register does not bound what the gateway may hold.
+///
+/// Never here: a Delete [`LivenessSession::commit_rekey`],
+/// [`LivenessSession::abandon_rekey`] or [`LivenessSession::delete_child`]
+/// sends, which their [`DeleteReport`] reports; and the Delete of the CHILD
+/// SA a refused unified offer was recovered with at connect time, granted no
+/// IPv4 (`recover_child_after_rejection`), sent before any caller holds the
+/// session and so before reporting can be on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalChildDelete {
+    /// The family the SA was made for: the one being rekeyed, or created
+    /// ([`LivenessSession::create_child_ipv6`] for IPv6,
+    /// [`LivenessSession::create_child_primary`] for the primary), or of the
+    /// redundant SA closed. Always known where these Deletes are sent.
+    pub kind: ChildKind,
+    /// The SA's (local, peer) SPIs; the Delete named the local one (RFC 7296
+    /// §3.11). For [`InternalDeleteCause::TsOutsideOffer`] the peer SPI is
+    /// read from the answer; `0` if it could not be, which does not happen
+    /// for an answer the session took that far (the same SA payload was read
+    /// already), or if the peer chose `0` itself.
+    pub spis: (u32, u32),
+    pub cause: InternalDeleteCause,
+    pub outcome: InternalDeleteOutcome,
+    /// The (initiator, responder) SPIs of the IKE SA the Delete went on (or
+    /// would have): the current one when it was sent.
+    pub ike_spis: (u64, u64),
+}
+
+/// What [`LivenessSession::delete_child_sa`] came to, before what it drops.
+enum DeleteAttempt {
+    /// Nothing sent: the IKE SA is over.
+    IkeSaOver,
+    /// Nothing sent: no Message ID, or the request could not be built.
+    NotSent(DriverError),
+    /// Sent (or at least tried): what the wait for its answer came to.
+    Waited(Result<Liveness, DriverError>),
+}
+
+impl DeleteAttempt {
+    /// What [`LivenessSession::delete_child_sa`] returns for it: an error
+    /// when nothing was sent, `Ok` once it was tried.
+    fn into_result(self) -> Result<(), DriverError> {
+        match self {
+            DeleteAttempt::IkeSaOver => Err(IkeError::PeerTornDown.into()),
+            DeleteAttempt::NotSent(e) => Err(e),
+            DeleteAttempt::Waited(_) => Ok(()),
+        }
+    }
+}
+
 /// How long a CHILD SA the peer rekeyed away stays recognisable: the peer
 /// deletes it right after the exchange, and that Delete is answered with ours.
 const SUPERSEDED_CHILD_TTL: Duration = Duration::from_secs(60);
@@ -588,6 +711,13 @@ struct PeerChildState {
     /// on: their Delete is told ([`PeerChildEvent::ReplacedClosed`]). A
     /// redundant SA a rekey replaced is not among them.
     replaced_current: Vec<u32>,
+    /// Whether the Deletes the session sends of itself are reported
+    /// ([`LivenessSession::report_internal_deletes`]).
+    report_internal: bool,
+    /// Those reported, not yet collected
+    /// ([`LivenessSession::take_internal_deletes`]); only ever filled with
+    /// `report_internal` on.
+    internal_deletes: Vec<InternalChildDelete>,
 }
 
 /// A rekey of the peer's held unanswered ([`LivenessSession::hold_peer_rekeys`]):
@@ -1217,7 +1347,7 @@ impl LivenessSession {
         // A unified SA keeps being proposed as one: rekeying it IPv4-only would
         // silently drop IPv6 at the first rekey.
         let ts = if self.child_carries_ipv6 { TrafficSelectors::unified_full_tunnel() } else { TrafficSelectors::ipv4_full_tunnel() };
-        let (child, tsr, _, by_peer) = self.child_exchange(Some((ChildKind::Primary, old)), &ts, "rekey", timeout)?;
+        let (child, tsr, _, by_peer) = self.child_exchange(ChildKind::Primary, Some(old), &ts, "rekey", timeout)?;
         if self.child_carries_ipv6 && !tsr.as_ref().is_some_and(|t| t.has_ipv6()) {
             ike_debug!("CREATE_CHILD_SA (rekey): the unified CHILD SA's rekey came back without IPv6 (TSr={tsr:?})");
         }
@@ -1246,14 +1376,14 @@ impl LivenessSession {
         if self.child_carries_ipv6 {
             return Err(IkeError::Crypto("the tunnel's CHILD SA already carries IPv6").into());
         }
-        let (child, tsr, granted, _) = self.child_exchange(None, &TrafficSelectors::ipv6_full_tunnel(), "new IPv6 CHILD SA", timeout)?;
+        let (child, tsr, granted, _) = self.child_exchange(ChildKind::Ipv6, None, &TrafficSelectors::ipv6_full_tunnel(), "new IPv6 CHILD SA", timeout)?;
         let granted_subnets6 = granted_subnets_v6(tsr.as_ref(), &self.cfg_subnets6);
         // The CFG ranges alone don't prove the gateway granted this SA any
         // IPv6: it has to have granted an IPv6 selector too.
         let granted_ipv6_ts = tsr.as_ref().is_some_and(|ts| ts.selectors.iter().any(|s| s.to_ipv6_cidr().is_some()));
         if granted_subnets6.is_empty() || !granted_ipv6_ts {
             ike_debug!("CREATE_CHILD_SA (new IPv6 CHILD SA): reply granted no IPv6 traffic selector (TSr={tsr:?}) -- deleting it");
-            if let Err(e) = self.delete_child_sa(ChildSpis::of(&child)) {
+            if let Err(e) = self.delete_child_sa_internal(ChildSpis::of(&child), ChildKind::Ipv6, InternalDeleteCause::NoIpv6Granted) {
                 ike_debug!("CREATE_CHILD_SA (new IPv6 CHILD SA): failed to delete the unwanted CHILD SA: {e}");
             }
             return Err(IkeError::PeerRejected {
@@ -1300,7 +1430,7 @@ impl LivenessSession {
         if self.primary_child_alive && !self.ike.ended {
             return Err(IkeError::Crypto("a primary CHILD SA already exists on this tunnel").into());
         }
-        let (child, _tsr, granted, _) = self.child_exchange(None, &TrafficSelectors::ipv4_full_tunnel(), "new primary CHILD SA", timeout)?;
+        let (child, _tsr, granted, _) = self.child_exchange(ChildKind::Primary, None, &TrafficSelectors::ipv4_full_tunnel(), "new primary CHILD SA", timeout)?;
         self.child_local_spi = child.local_spi;
         self.child_peer_spi = child.peer_spi;
         self.child_ts.primary = granted;
@@ -1333,7 +1463,7 @@ impl LivenessSession {
     pub fn rekey_child_ipv6_settled(&mut self, timeout: Duration) -> Result<SettledRekey, DriverError> {
         self.refuse_while_negotiated(ChildKind::Ipv6)?;
         let old = self.child6.ok_or(IkeError::Crypto("no IPv6 CHILD SA to rekey"))?;
-        let (child, _tsr, _, by_peer) = self.child_exchange(Some((ChildKind::Ipv6, old)), &TrafficSelectors::ipv6_full_tunnel(), "rekey IPv6", timeout)?;
+        let (child, _tsr, _, by_peer) = self.child_exchange(ChildKind::Ipv6, Some(old), &TrafficSelectors::ipv6_full_tunnel(), "rekey IPv6", timeout)?;
         Ok(SettledRekey { child, by_peer })
     }
 
@@ -1789,7 +1919,8 @@ impl LivenessSession {
 
     /// One `CREATE_CHILD_SA` exchange creating a CHILD SA proposing `ts` as
     /// both TSi and TSr: a rekey of `kind`'s CHILD SA `old` when `replaces` is
-    /// `Some((kind, old))`, a brand-new CHILD SA otherwise. Returns the new SA
+    /// `Some(old)`, a brand-new CHILD SA of `kind` otherwise (the family it is
+    /// made for, which an [`InternalChildDelete`] of it names). Returns the new SA
     /// the `TSr` the gateway granted, all the traffic selectors it granted,
     /// and whether that SA is the peer's, its crossed rekey of `old` kept
     /// ([`SettledRekey::by_peer`]; never for a brand-new CHILD SA).
@@ -1802,11 +1933,13 @@ impl LivenessSession {
     /// [`IkeError::Crypto`], sending nothing: it would collide with our own.
     fn child_exchange(
         &mut self,
-        replaces: Option<(ChildKind, ChildSpis)>,
+        kind: ChildKind,
+        replaces: Option<ChildSpis>,
         ts: &TrafficSelectors,
         what: &str,
         timeout: Duration,
     ) -> Result<(RekeyedChild, Option<TrafficSelectors>, Option<ChildTs>, bool), DriverError> {
+        let replaces = replaces.map(|old| (kind, old));
         if self.ike.ended {
             return Err(IkeError::PeerTornDown.into());
         }
@@ -1816,7 +1949,7 @@ impl LivenessSession {
         let op = replaces.map_or(ChildOp::Create, |(_, old)| ChildOp::Rekey(old));
         let keep = replaces.and_then(|(kind, _)| self.child_ts.get(kind).cloned());
         self.peer_child.in_flight = Some(OwnChildOp { op, crossed: None, old_deleted: false });
-        let exchanged = self.child_request(replaces.map(|(_, old)| old), keep, ts, what, timeout);
+        let exchanged = self.child_request(kind, replaces.map(|(_, old)| old), keep, ts, what, timeout);
         let own = self.peer_child.in_flight.take();
         match (replaces, own) {
             (Some((kind, old)), Some(own)) => {
@@ -1848,7 +1981,7 @@ impl LivenessSession {
         let op = OwnChildOp { op: ChildOp::Rekey(old), crossed: None, old_deleted: false };
         self.peer_child.in_flight = Some(op);
         self.peer_child.negotiating = true;
-        let exchanged = self.child_request(Some(old), keep, ts, what, timeout);
+        let exchanged = self.child_request(kind, Some(old), keep, ts, what, timeout);
         self.peer_child.negotiating = false;
         // Always there: set just above, and a Delete sent meanwhile puts back
         // what it found.
@@ -1945,7 +2078,7 @@ impl LivenessSession {
         // Best-effort: the new CHILD SA above is already valid and in use
         // regardless of whether the peer sees or acks this.
         if fate == OldFate::Ours {
-            if let Err(e) = self.delete_child_sa(old) {
+            if let Err(e) = self.delete_child_sa_internal(old, kind, InternalDeleteCause::RekeyedAway) {
                 ike_debug!(
                     "CREATE_CHILD_SA ({what}): failed to send Delete for superseded CHILD SA spi_in={:08x} (new CHILD SA unaffected): {e}",
                     old.local
@@ -1990,7 +2123,7 @@ impl LivenessSession {
                         "CREATE_CHILD_SA ({what}): the peer rekeyed the same CHILD SA -- ours (spi_in={:08x}) holds the lowest nonce, deleting it and keeping the peer's (spi_in={:08x})",
                         ours.local_spi, crossed.child.local_spi
                     );
-                    if let Err(e) = self.delete_child_sa(ChildSpis::of(&ours)) {
+                    if let Err(e) = self.delete_child_sa_internal(ChildSpis::of(&ours), kind, InternalDeleteCause::CrossedLoser) {
                         ike_debug!("CREATE_CHILD_SA ({what}): failed to send Delete for the redundant CHILD SA spi_in={:08x}: {e}", ours.local_spi);
                     }
                     return Ok((crossed.child, tsr, self.child_ts.get(kind).cloned(), OldFate::PeerDeletes));
@@ -2061,7 +2194,7 @@ impl LivenessSession {
             if self.peer_child.redundant_new.len() == queued {
                 self.peer_child.events.push(PeerChildEvent::RedundantClosed { kind, local_spi: oldest.spis.local });
             }
-            if let Err(e) = self.delete_child_sa(oldest.spis) {
+            if let Err(e) = self.delete_child_sa_internal(oldest.spis, kind, InternalDeleteCause::RedundantBound) {
                 ike_debug!("CREATE_CHILD_SA ({what}): failed to send Delete for the redundant SA spi_in={:08x}: {e}", oldest.spis.local);
             }
         }
@@ -2197,9 +2330,12 @@ impl LivenessSession {
     /// (for [`Self::settle_rekey`]) and the traffic selectors granted. `keep`
     /// is what the SA a rekey replaces carries, when known: an answer
     /// granting less is refused (RFC 7296 §2.9.2) and its SA deleted, which
-    /// leaves the old one in use.
+    /// leaves the old one in use. `kind` is the family the SA is made for,
+    /// rekeyed or created: what such a Delete is reported under
+    /// ([`Self::report_internal_deletes`]).
     fn child_request(
         &mut self,
+        kind: ChildKind,
         replaces: Option<ChildSpis>,
         keep: Option<ChildTs>,
         ts: &TrafficSelectors,
@@ -2274,7 +2410,7 @@ impl LivenessSession {
             Err(IkeError::TsOutsideOffer) => {
                 ike_debug!("CREATE_CHILD_SA ({what}): the answer's traffic selectors are not within ours -- deleting the CHILD SA spi_in={new_local_spi:08x}");
                 let peer = rekey::peer_child_spi(&self.sa, &response).unwrap_or(0);
-                if let Err(e) = self.delete_child_sa(ChildSpis { local: new_local_spi, peer }) {
+                if let Err(e) = self.delete_child_sa_internal(ChildSpis { local: new_local_spi, peer }, kind, InternalDeleteCause::TsOutsideOffer) {
                     ike_debug!("CREATE_CHILD_SA ({what}): failed to delete it: {e}");
                 }
                 return Err(IkeError::TsOutsideOffer.into());
@@ -2289,7 +2425,7 @@ impl LivenessSession {
                 ike_debug!(
                     "CREATE_CHILD_SA ({what}): the answer narrows the traffic selectors of the CHILD SA it replaces ({keep:?} -> {granted:?}) -- deleting the CHILD SA spi_in={new_local_spi:08x}"
                 );
-                if let Err(e) = self.delete_child_sa(ChildSpis::of(&rekeyed_child(&child))) {
+                if let Err(e) = self.delete_child_sa_internal(ChildSpis::of(&rekeyed_child(&child)), kind, InternalDeleteCause::TsNarrowed) {
                     ike_debug!("CREATE_CHILD_SA ({what}): failed to delete it: {e}");
                 }
                 return Err(IkeError::TsNarrowedOnRekey.into());
@@ -2329,25 +2465,70 @@ impl LivenessSession {
     /// value to report, on their own Delete, not ours). Used by
     /// [`Self::settle_rekey`] to explicitly retire the CHILD SA a rekey just
     /// replaced -- see that call site's doc for why this exists.
+    ///
+    /// Errs, sending nothing, on an IKE SA that is over
+    /// ([`IkeError::PeerTornDown`]), with no Message ID left, or when the
+    /// request cannot be built; `Ok` once it was tried, whatever came of it.
+    /// The session's own Deletes go through [`Self::delete_child_sa_internal`],
+    /// which reports that ([`Self::report_internal_deletes`]).
     fn delete_child_sa(&mut self, child: ChildSpis) -> Result<(), DriverError> {
-        if self.ike.ended {
-            return Err(IkeError::PeerTornDown.into());
+        self.attempt_child_delete(child).into_result()
+    }
+
+    /// [`Self::delete_child_sa`] of `child`, `kind`'s SA, sent by the session
+    /// of itself for `cause`: the same steps, the same result, and, with
+    /// [`Self::report_internal_deletes`] on, what came of it queued
+    /// ([`InternalChildDelete`]). Never for a Delete a [`DeleteReport`]
+    /// reports: those go through [`Self::delete_child_sa_reporting`].
+    fn delete_child_sa_internal(&mut self, child: ChildSpis, kind: ChildKind, cause: InternalDeleteCause) -> Result<(), DriverError> {
+        // The IKE SA it goes on: no rekey of it is taken on while the Delete
+        // waits (it collides, RFC 7296 §2.25.2), but read before all the same.
+        let ike_spis = (self.sa.spi_i, self.sa.spi_r);
+        let attempt = self.attempt_child_delete(child);
+        if self.peer_child.report_internal {
+            let outcome = match &attempt {
+                DeleteAttempt::IkeSaOver => InternalDeleteOutcome::IkeSaOver,
+                DeleteAttempt::NotSent(e) => InternalDeleteOutcome::NotSent(e.to_string()),
+                DeleteAttempt::Waited(Ok(Liveness::Alive)) => InternalDeleteOutcome::Answered,
+                DeleteAttempt::Waited(Ok(Liveness::NoReply)) => InternalDeleteOutcome::Unanswered,
+                DeleteAttempt::Waited(Ok(Liveness::PeerTornDown)) => InternalDeleteOutcome::SentTunnelEnded,
+                DeleteAttempt::Waited(Err(e)) => InternalDeleteOutcome::Unknown(e.to_string()),
+            };
+            self.peer_child.internal_deletes.push(InternalChildDelete { kind, spis: (child.local, child.peer), cause, outcome, ike_spis });
         }
-        let mid = self.alloc_message_id()?;
-        let mut iv = [0u8; 8];
-        OsEntropy::new()?.fill(&mut iv);
-        let del = Delete::esp(vec![child.local]);
-        let req = build_informational(&self.sa, mid, false, &[(PayloadType::Delete, del.to_bytes())], &iv)?;
+        attempt.into_result()
+    }
+
+    /// The steps of [`Self::delete_child_sa`], with what it drops: what the
+    /// wait for the answer came to.
+    fn attempt_child_delete(&mut self, child: ChildSpis) -> DeleteAttempt {
+        if self.ike.ended {
+            return DeleteAttempt::IkeSaOver;
+        }
+        let (request, mid) = match self.child_delete_request(child) {
+            Ok(built) => built,
+            Err(e) => return DeleteAttempt::NotSent(e),
+        };
         ike_debug!("INFORMATIONAL: sending ESP Delete for CHILD SA spi_in={:08x} to {}", child.local, self.dest);
-        let request = self.outgoing(OnIkeSa::Current, req)?;
         // Until it's answered, the peer's requests about this SA collide
         // with it (RFC 7296 §2.25.1).
         let outer = self.peer_child.in_flight.replace(OwnChildOp { op: ChildOp::Close(child), crossed: None, old_deleted: false });
         // Best-effort ack wait, same reasoning as `close()`: the peer may
         // consider the SA gone immediately either way.
-        let _ = self.send_and_await(&request, mid, Duration::from_millis(500));
+        let waited = self.send_and_await(&request, mid, Duration::from_millis(500));
         self.peer_child.in_flight = outer;
-        Ok(())
+        DeleteAttempt::Waited(waited)
+    }
+
+    /// The INFORMATIONAL request deleting `child`, ready for the wire, on the
+    /// Message ID it takes.
+    fn child_delete_request(&mut self, child: ChildSpis) -> Result<(Outgoing, u32), DriverError> {
+        let mid = self.alloc_message_id()?;
+        let mut iv = [0u8; 8];
+        OsEntropy::new()?.fill(&mut iv);
+        let del = Delete::esp(vec![child.local]);
+        let req = build_informational(&self.sa, mid, false, &[(PayloadType::Delete, del.to_bytes())], &iv)?;
+        Ok((self.outgoing(OnIkeSa::Current, req)?, mid))
     }
 
     /// [`Self::delete_child_sa`], reporting what came of it instead of
@@ -3598,6 +3779,32 @@ impl LivenessSession {
     /// Always empty with [`Self::keep_redundant_children`] off.
     pub fn take_peer_child_events(&mut self) -> Vec<PeerChildEvent> {
         std::mem::take(&mut self.peer_child.events)
+    }
+
+    /// Report the Deletes of CHILD SAs the session sends of itself, inside a
+    /// call that asked for none ([`InternalChildDelete`], each
+    /// [`InternalDeleteCause`]), with what came of each, for
+    /// [`Self::take_internal_deletes`]. Off unless asked for, as
+    /// [`Self::hold_peer_rekeys`] is: a caller that never drains them must not
+    /// have them pile up. Only what is reported changes: what is sent, when,
+    /// and on which Message IDs, is the same either way. Kept across a rekey
+    /// of the IKE SA. Turned off, those not collected yet stay until taken;
+    /// no new one is queued. A Delete [`Self::commit_rekey`],
+    /// [`Self::abandon_rekey`] or [`Self::delete_child`] sends is reported by
+    /// its [`DeleteReport`], never here.
+    pub fn report_internal_deletes(&mut self, on: bool) {
+        self.peer_child.report_internal = on;
+    }
+
+    /// The Deletes the session sent of itself since the last call, in the
+    /// order they went ([`Self::report_internal_deletes`]): the caller drains
+    /// it after anything that may have sent one -- a rekey of ours
+    /// ([`Self::rekey_child`], [`Self::rekey_child_ipv6`], their `_settled`
+    /// forms, [`Self::negotiate_rekey`]) or the creation of a CHILD SA
+    /// ([`Self::create_child_ipv6`], [`Self::create_child_primary`]), whether
+    /// it returned `Ok` or not. Always empty with it off.
+    pub fn take_internal_deletes(&mut self) -> Vec<InternalChildDelete> {
+        std::mem::take(&mut self.peer_child.internal_deletes)
     }
 
     /// The rekey held unanswered, if any ([`Self::hold_peer_rekeys`]): which
@@ -4886,6 +5093,7 @@ impl<E: Entropy> Ikev2Session<E> {
         }
         ike_debug!("IKE_AUTH: CHILD SA refused ({rejection}) -- keeping the IKE SA, creating the IPv4 CHILD SA with CREATE_CHILD_SA");
         let (child, tsr, granted, _) = match liveness.child_exchange(
+            ChildKind::Primary,
             None,
             &TrafficSelectors::ipv4_full_tunnel(),
             "IPv4 CHILD SA after a refused IKE_AUTH offer",
@@ -4900,6 +5108,10 @@ impl<E: Entropy> Ikev2Session<E> {
         };
         if !tsr.as_ref().is_some_and(|t| t.has_ipv4()) {
             ike_debug!("CREATE_CHILD_SA (IPv4 after a refused IKE_AUTH offer): reply granted no IPv4 traffic selector (TSr={tsr:?}) -- closing");
+            // Not one of the session's reported Deletes
+            // ([`LivenessSession::report_internal_deletes`]): this is connect
+            // time, no caller holds the session to have turned reporting on or
+            // to drain it, and the IKE SA is closed right after.
             let _ = liveness.delete_child_sa(ChildSpis::of(&child));
             let _ = liveness.close();
             return Err(IkeError::PeerRejected {
@@ -16837,5 +17049,423 @@ mod tests {
         assert_eq!(liveness.child_spis(ChildKind::Primary), Some((0xBBBB, 0xAAAA)), "back on the SA we are rekeying");
         assert!(liveness.peer_child.in_flight.as_ref().is_some_and(|own| own.crossed.is_none()), "the crossing forgotten");
         assert!(liveness.peer_child.crossed_answer.is_none() && liveness.take_peer_deleted_children().is_empty());
+    }
+
+    // The Deletes of CHILD SAs the session sends of itself, reported
+    // (`report_internal_deletes`).
+
+    /// `client` while the gateway answers what the session sends it as
+    /// `answer` says -- the messages it sends back for each, in order. What
+    /// `client` came to, and every message the session sent meanwhile.
+    fn with_gateway_script<R>(gateway: &UdpSocket, mut answer: impl FnMut(&[u8]) -> Vec<Vec<u8>> + Send, client: impl FnOnce() -> R) -> (R, Vec<Vec<u8>>) {
+        let done = std::sync::atomic::AtomicBool::new(false);
+        thread::scope(|scope| {
+            let answering = scope.spawn(|| {
+                let mut sent = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match gateway.recv_from(&mut buf) {
+                        Ok((n, from)) => {
+                            let msg = buf[..n].to_vec();
+                            for reply in answer(&msg) {
+                                gateway.send_to(&reply, from).unwrap();
+                            }
+                            sent.push(msg);
+                        }
+                        Err(_) if done.load(Ordering::SeqCst) => return sent,
+                        Err(_) => {}
+                    }
+                }
+            });
+            let came = client();
+            done.store(true, Ordering::SeqCst);
+            (came, answering.join().unwrap())
+        })
+    }
+
+    /// The gateway's answer to the client's `CREATE_CHILD_SA` `request`, its SA
+    /// on `spi`, nonce `nr`, granting `ts` as both TSi and TSr if given -- an
+    /// answer whatever the request proposed -- or what it asked for otherwise.
+    fn child_answer_granting(sa: &CompletedSaInit, request: &[u8], spi: u32, nr: &[u8], ts: Option<&TrafficSelectors>) -> Vec<u8> {
+        use crate::ikev2::message::{encode_payload_chain, first_payload_type};
+
+        let (resp, _) = rekey::responder_process_rekey_with_pfs(sa, request, spi, nr, SkCipher::Aes256Gcm, None, &[8u8; 8], None).unwrap();
+        let Some(ts) = ts else { return resp };
+        let (first, inner) = open_encrypted(sa.suite.sk_cipher(), &resp, &sa.keys.sk_er, &sa.keys.sk_ar).unwrap();
+        let answer: Vec<(PayloadType, Vec<u8>)> = payloads(first, &inner)
+            .map(|p| p.unwrap())
+            .map(|p| match p.payload_type {
+                PayloadType::TrafficSelectorInitiator | PayloadType::TrafficSelectorResponder => (p.payload_type, ts.to_bytes()),
+                t => (t, p.data.to_vec()),
+            })
+            .collect();
+        sk::build_encrypted(sa.suite.sk_cipher(), IkeHeader::parse(&resp).unwrap(), first_payload_type(&answer), &encode_payload_chain(&answer), &sa.keys.sk_er, &sa.keys.sk_ar, &[8u8; 8])
+            .unwrap()
+    }
+
+    /// An IPv6 selector that is no CIDR block (`::1`-`::3`): within `::/0`,
+    /// and no IPv6 subnet to route.
+    fn ipv6_range_no_cidr() -> TrafficSelectors {
+        let mut selector = crate::ikev2::payload::TrafficSelector::ipv6_any();
+        selector.start_addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1).octets().to_vec();
+        selector.end_addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 3).octets().to_vec();
+        TrafficSelectors { selectors: vec![selector] }
+    }
+
+    /// A Delete of the session's own, of each kind, by what leads to it.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum InternalCase {
+        /// `kind`'s CHILD SA rekeyed by `rekey_child_settled` /
+        /// `rekey_child_ipv6_settled` (both families up), the SA it replaced
+        /// then deleted: the gateway answers that Delete, or not, or tears
+        /// the tunnel down while it waits (an IKE SA Delete of its own).
+        AgeRekey(ChildKind, DeleteAnswer),
+        /// The same with one Message ID left: the rekey takes it, and its
+        /// Delete has none.
+        AgeRekeyNoMessageId,
+        /// The gateway's rekey of the primary crossing ours, ours holding the
+        /// lowest nonce: by `negotiate_rekey` (then committed) or by
+        /// `rekey_child_settled`.
+        CrossedLoser { negotiated: bool },
+        /// A rekey of the primary answered for IPv6 traffic, the gateway's
+        /// SA on `GATEWAY_CREATED_SPI`, or on SPI 0 if `peer_spi_zero`.
+        TsOutsideRekey { peer_spi_zero: bool },
+        /// `create_child_ipv6` answered for IPv4 traffic.
+        TsOutsideCreateIpv6,
+        /// `create_child_primary`, the gateway having deleted the primary,
+        /// answered for IPv6 traffic.
+        TsOutsideCreatePrimary,
+        /// A rekey of the unified primary answered IPv4 alone.
+        TsNarrowed,
+        /// `create_child_ipv6` answered with an IPv6 range that is no subnet.
+        NoIpv6Granted,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum DeleteAnswer {
+        Answered,
+        Unanswered,
+        TearsDown,
+    }
+
+    const INTERNAL_CASES: [InternalCase; 14] = [
+        InternalCase::AgeRekey(ChildKind::Primary, DeleteAnswer::Answered),
+        InternalCase::AgeRekey(ChildKind::Ipv6, DeleteAnswer::Answered),
+        InternalCase::AgeRekey(ChildKind::Primary, DeleteAnswer::Unanswered),
+        InternalCase::AgeRekey(ChildKind::Ipv6, DeleteAnswer::Unanswered),
+        InternalCase::AgeRekey(ChildKind::Primary, DeleteAnswer::TearsDown),
+        InternalCase::AgeRekeyNoMessageId,
+        InternalCase::CrossedLoser { negotiated: true },
+        InternalCase::CrossedLoser { negotiated: false },
+        InternalCase::TsOutsideRekey { peer_spi_zero: false },
+        InternalCase::TsOutsideRekey { peer_spi_zero: true },
+        InternalCase::TsOutsideCreateIpv6,
+        InternalCase::TsOutsideCreatePrimary,
+        InternalCase::TsNarrowed,
+        InternalCase::NoIpv6Granted,
+    ];
+
+    /// What [`internal_case`] came to. Our SPIs of the SAs created during the
+    /// case (random) are zeroed, on the wire, in the state and in the reports,
+    /// once checked: every Delete reported is on the wire, naming that SA. So
+    /// are the reports' IKE SPIs (random too), once checked to be the IKE SA's.
+    #[derive(Debug, PartialEq)]
+    struct InternalRun {
+        came: String,
+        wire: Vec<((ExchangeType, u32, bool), Option<u32>, Option<Delete>)>,
+        spis: [Option<(u32, u32)>; 2],
+        queued: Vec<ChildKind>,
+        next_message_id: u32,
+        reported: Vec<InternalChildDelete>,
+    }
+
+    /// The SPIs of the cases' SAs that are not random.
+    const FIXED_SPIS: [u32; 7] = [0, 0xBBBB, 0xAAAA, IPV6_UP.local, IPV6_UP.peer, GATEWAY_CREATED_SPI, GATEWAY_KEPT_SPI];
+
+    /// `case` run on a fresh session, reporting its own Deletes if `report`,
+    /// the gateway scripted for it.
+    fn internal_case(case: InternalCase, report: bool) -> InternalRun {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = match case {
+            InternalCase::AgeRekey(..) | InternalCase::AgeRekeyNoMessageId => child_sas_with_one_deleted(&gateway, init_sa, &resp_sa, None),
+            InternalCase::TsOutsideCreatePrimary => child_sas_with_one_deleted(&gateway, init_sa, &resp_sa, Some(ChildKind::Primary)),
+            _ => {
+                let liveness = session_facing(&gateway, init_sa, None);
+                gateway.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+                liveness
+            }
+        };
+        if case == InternalCase::TsNarrowed {
+            liveness.child_carries_ipv6 = true;
+            let both = TrafficSelectors::unified_full_tunnel();
+            liveness.child_ts.primary = Some(ChildTs { ours: both.clone(), theirs: both });
+        }
+        if case == InternalCase::AgeRekeyNoMessageId {
+            liveness.next_message_id = u32::MAX - MESSAGE_IDS_KEPT_FOR_ENDING - 1;
+        }
+        liveness.report_internal_deletes(report);
+        let sa = &resp_sa;
+        let mut crossed = false;
+        let script = |msg: &[u8]| -> Vec<Vec<u8>> {
+            let (exchange, _, response) = client_header(msg);
+            if response {
+                return Vec::new();
+            }
+            if exchange == ExchangeType::Informational {
+                return match case {
+                    InternalCase::AgeRekey(_, DeleteAnswer::Unanswered) => Vec::new(),
+                    InternalCase::AgeRekey(_, DeleteAnswer::TearsDown) => vec![ike_delete_request(sa, 0)],
+                    _ => vec![informational_answer(sa, msg, &[])],
+                };
+            }
+            let v4 = TrafficSelectors::ipv4_full_tunnel();
+            let v6 = TrafficSelectors::ipv6_full_tunnel();
+            let no_cidr = ipv6_range_no_cidr();
+            match case {
+                InternalCase::CrossedLoser { .. } if !crossed => {
+                    crossed = true;
+                    vec![gateway_child_rekey(sa, 0, 0xAAAA, PEER_NEW_SPI, &HIGHEST_NONCE), child_answer_granting(sa, msg, GATEWAY_KEPT_SPI, &LOWEST_NONCE, None)]
+                }
+                InternalCase::TsOutsideRekey { peer_spi_zero } => {
+                    vec![child_answer_granting(sa, msg, if peer_spi_zero { 0 } else { GATEWAY_CREATED_SPI }, &[0x99u8; 32], Some(&v6))]
+                }
+                InternalCase::TsOutsideCreateIpv6 | InternalCase::TsNarrowed => vec![child_answer_granting(sa, msg, GATEWAY_CREATED_SPI, &[0x99u8; 32], Some(&v4))],
+                InternalCase::TsOutsideCreatePrimary => vec![child_answer_granting(sa, msg, GATEWAY_CREATED_SPI, &[0x99u8; 32], Some(&v6))],
+                InternalCase::NoIpv6Granted => vec![child_answer_granting(sa, msg, GATEWAY_CREATED_SPI, &[0x99u8; 32], Some(&no_cidr))],
+                _ => vec![child_answer_granting(sa, msg, GATEWAY_CREATED_SPI, &[0x99u8; 32], None)],
+            }
+        };
+        let timeout = Duration::from_secs(2);
+        let (came, sent) = with_gateway_script(&gateway, script, || {
+            let shown = |r: Result<RekeyedChild, DriverError>| match r {
+                Ok(child) => format!("ok spi_out={:08x}", child.peer_spi),
+                Err(e) => format!("err {e}"),
+            };
+            match case {
+                InternalCase::AgeRekey(ChildKind::Ipv6, _) => shown(liveness.rekey_child_ipv6_settled(timeout).map(|s| s.child)),
+                InternalCase::CrossedLoser { negotiated: true } => match liveness.negotiate_rekey(ChildKind::Primary, timeout) {
+                    Ok(negotiated) => {
+                        let committed = liveness.commit_rekey(ChildKind::Primary, negotiated.child.local_spi, true);
+                        format!("negotiated spi_out={:08x} by_peer={}, committed {committed:?}", negotiated.child.peer_spi, negotiated.by_peer)
+                    }
+                    Err(e) => format!("err {e}"),
+                },
+                InternalCase::TsOutsideCreateIpv6 | InternalCase::NoIpv6Granted => shown(liveness.create_child_ipv6(timeout).map(|ipv6| ipv6.child)),
+                InternalCase::TsOutsideCreatePrimary => shown(liveness.create_child_primary(timeout)),
+                _ => shown(liveness.rekey_child_settled(timeout).map(|s| s.child)),
+            }
+        });
+        let mut reported = liveness.take_internal_deletes();
+        assert!(liveness.take_internal_deletes().is_empty(), "{case:?}: taken once");
+        // Every Delete reported as sent is on the wire, naming our SPI of it.
+        let deletes_sent: Vec<u32> = sent.iter().filter(|m| !client_header(m).2).filter_map(|m| delete_in(sa, m)).flat_map(|d| d.spis).collect();
+        for r in &reported {
+            let went = !matches!(r.outcome, InternalDeleteOutcome::NotSent(_) | InternalDeleteOutcome::IkeSaOver);
+            assert_eq!(deletes_sent.contains(&r.spis.0), went, "{case:?}: {r:?} on the wire: {deletes_sent:x?}");
+        }
+        let fresh = |spi: u32| if FIXED_SPIS.contains(&spi) || spi == PEER_NEW_SPI { spi } else { 0 };
+        let mut wire = child_wire_of(sa, &sent);
+        for (_, rekeys, deletes) in &mut wire {
+            *rekeys = rekeys.map(fresh);
+            if let Some(delete) = deletes {
+                delete.spis.iter_mut().for_each(|spi| *spi = fresh(*spi));
+            }
+        }
+        for r in &mut reported {
+            assert_eq!(r.ike_spis, (sa.spi_i, sa.spi_r), "{case:?}: on the IKE SA it went on");
+            r.ike_spis = (0, 0);
+            r.spis.0 = fresh(r.spis.0);
+        }
+        let spis = both_child_spis(&liveness).map(|spis| spis.map(|(local, peer)| (fresh(local), peer)));
+        InternalRun { came, wire, spis, queued: liveness.peer_child.deleted.clone(), next_message_id: liveness.next_message_id, reported }
+    }
+
+    /// What each [`InternalCase`] reports, our random SPI of an SA created
+    /// zeroed: the family, the SAs' SPIs, the cause, the outcome (the IKE SA,
+    /// checked by [`internal_case`], zeroed).
+    fn internal_case_reported(case: InternalCase) -> Vec<InternalChildDelete> {
+        let primary = (0xBBBB, 0xAAAA);
+        let (kind, spis, cause, outcome) = match case {
+            InternalCase::AgeRekey(kind, answer) => {
+                let spis = if kind == ChildKind::Primary { primary } else { (IPV6_UP.local, IPV6_UP.peer) };
+                let outcome = match answer {
+                    DeleteAnswer::Answered => InternalDeleteOutcome::Answered,
+                    DeleteAnswer::Unanswered => InternalDeleteOutcome::Unanswered,
+                    DeleteAnswer::TearsDown => InternalDeleteOutcome::SentTunnelEnded,
+                };
+                (kind, spis, InternalDeleteCause::RekeyedAway, outcome)
+            }
+            InternalCase::AgeRekeyNoMessageId => (
+                ChildKind::Primary,
+                primary,
+                InternalDeleteCause::RekeyedAway,
+                InternalDeleteOutcome::NotSent(DriverError::from(IkeError::MessageIdsExhausted).to_string()),
+            ),
+            InternalCase::CrossedLoser { .. } => (ChildKind::Primary, (0, GATEWAY_KEPT_SPI), InternalDeleteCause::CrossedLoser, InternalDeleteOutcome::Answered),
+            InternalCase::TsOutsideRekey { peer_spi_zero } => (
+                ChildKind::Primary,
+                (0, if peer_spi_zero { 0 } else { GATEWAY_CREATED_SPI }),
+                InternalDeleteCause::TsOutsideOffer,
+                InternalDeleteOutcome::Answered,
+            ),
+            InternalCase::TsOutsideCreateIpv6 => (ChildKind::Ipv6, (0, GATEWAY_CREATED_SPI), InternalDeleteCause::TsOutsideOffer, InternalDeleteOutcome::Answered),
+            InternalCase::TsOutsideCreatePrimary => (ChildKind::Primary, (0, GATEWAY_CREATED_SPI), InternalDeleteCause::TsOutsideOffer, InternalDeleteOutcome::Answered),
+            InternalCase::TsNarrowed => (ChildKind::Primary, (0, GATEWAY_CREATED_SPI), InternalDeleteCause::TsNarrowed, InternalDeleteOutcome::Answered),
+            InternalCase::NoIpv6Granted => (ChildKind::Ipv6, (0, GATEWAY_CREATED_SPI), InternalDeleteCause::NoIpv6Granted, InternalDeleteOutcome::Answered),
+        };
+        vec![InternalChildDelete { kind, spis, cause, outcome, ike_spis: (0, 0) }]
+    }
+
+    /// Every Delete the session sends of itself, inside a call that asked for
+    /// none, is reported once asked ([`LivenessSession::report_internal_deletes`])
+    /// -- exactly one per case: the family, both SPIs of the SA (the gateway's
+    /// as it chose it, SPI 0 included), why, what came of it (answered,
+    /// unanswered, the tunnel torn down meanwhile, no Message ID left), and
+    /// the IKE SA it went on -- and taken once. Off, nothing is reported. On
+    /// or off, the session sends the same (exchanges, Message IDs, the SAs
+    /// rekeyed and deleted), returns the same and is left the same as the
+    /// control session: reporting changes nothing else.
+    #[test]
+    fn the_sessions_own_child_sa_deletes_are_reported_only_when_asked_and_change_nothing_else() {
+        for case in INTERNAL_CASES {
+            let control = internal_case(case, false);
+            assert!(control.reported.is_empty(), "{case:?}: nothing reported unless asked: {:?}", control.reported);
+            let mut reporting = internal_case(case, true);
+            assert_eq!(reporting.reported, internal_case_reported(case), "{case:?}: {}", reporting.came);
+            reporting.reported.clear();
+            assert_eq!(reporting, control, "{case:?}: as the control session");
+        }
+    }
+
+    /// What the control runs of [`INTERNAL_CASES`] came to, to pin the cases
+    /// down: each Delete is where the case says, on the Message ID after the
+    /// exchange's, and the calls come to what they always did.
+    #[test]
+    fn the_cases_of_the_sessions_own_deletes_send_what_they_always_did() {
+        let came: Vec<(InternalCase, String, Vec<((ExchangeType, u32, bool), Option<u32>, Option<Delete>)>)> =
+            [InternalCase::AgeRekey(ChildKind::Ipv6, DeleteAnswer::Answered), InternalCase::CrossedLoser { negotiated: true }, InternalCase::TsOutsideRekey { peer_spi_zero: true }, InternalCase::NoIpv6Granted]
+                .into_iter()
+                .map(|case| {
+                    let run = internal_case(case, true);
+                    (case, run.came, run.wire)
+                })
+                .collect();
+        let rekey = (ExchangeType::CreateChildSa, 2, false);
+        let delete = (ExchangeType::Informational, 3, false);
+        assert_eq!(came[0].1, format!("ok spi_out={GATEWAY_CREATED_SPI:08x}"));
+        assert_eq!(came[0].2, [(rekey, Some(IPV6_UP.local), None), (delete, None, Some(Delete::esp(vec![IPV6_UP.local])))]);
+        assert_eq!(
+            came[1].1,
+            format!("negotiated spi_out={PEER_NEW_SPI:08x} by_peer=true, committed {:?}", Ok::<_, DriverError>(DeleteReport { outcome: ChildDeleteOutcome::NotOwed("peer_deletes"), liveness: Liveness::Alive, replaced: None }))
+        );
+        assert_eq!(
+            came[1].2,
+            [(rekey, Some(0xBBBB), None), ((ExchangeType::CreateChildSa, 0, true), None, None), (delete, None, Some(Delete::esp(vec![0])))],
+            "our rekey, our answer to the gateway's, the Delete of ours; the commit sends nothing"
+        );
+        assert_eq!(came[2].1, format!("err {}", DriverError::from(IkeError::TsOutsideOffer)));
+        assert_eq!(came[2].2, [(rekey, Some(0xBBBB), None), (delete, None, Some(Delete::esp(vec![0])))]);
+        assert!(came[3].1.starts_with("err "), "{}", came[3].1);
+        assert_eq!(came[3].2, [((ExchangeType::CreateChildSa, 2, false), None, None), (delete, None, Some(Delete::esp(vec![0])))]);
+    }
+
+    /// A Delete [`LivenessSession::commit_rekey`], [`LivenessSession::abandon_rekey`]
+    /// or [`LivenessSession::delete_child`] sends is reported by its
+    /// [`DeleteReport`] and never as one of the session's own, reporting on.
+    #[test]
+    fn a_delete_a_delete_report_reports_is_never_reported_as_the_sessions_own() {
+        for call in ["commit", "abandon", "delete_child"] {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let (mut liveness, kind, old, new) = pending_rekey_facing(&gateway, init_sa, AbandonFamily::Ipv4, OldFate::Ours, false);
+            liveness.report_internal_deletes(true);
+            let (report, sent) = with_child_requests_answered(&gateway, &resp_sa, || match call {
+                "commit" => liveness.commit_rekey(kind, new.local, true).unwrap(),
+                "abandon" => liveness.abandon_rekey(kind, new.local, true).unwrap(),
+                _ => liveness.delete_child(0x4242, 0x4343).unwrap(),
+            });
+            assert_eq!(report.outcome, ChildDeleteOutcome::Sent { acknowledged: true }, "{call}");
+            let named = match call {
+                "commit" => old.local,
+                "abandon" => new.local,
+                _ => 0x4242,
+            };
+            assert_eq!(child_wire_of(&resp_sa, &sent), [((ExchangeType::Informational, 2, false), None, Some(Delete::esp(vec![named])))], "{call}");
+            assert!(liveness.take_internal_deletes().is_empty(), "{call}: reported once, by its DeleteReport");
+        }
+    }
+
+    /// The bound on redundant SAs ([`REDUNDANT_CHILDREN_KEPT`]): the oldest
+    /// closed by the negotiation that kept one more is reported once, with
+    /// both its SPIs and its Delete answered -- next to its
+    /// [`PeerChildEvent::RedundantClosed`] -- and nothing else is: each
+    /// commit's Delete of the SA both rekeys replaced is its report's.
+    #[test]
+    fn the_redundant_sa_the_bound_closes_is_reported_with_its_outcome() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let ike_spis = (init_sa.spi_i, init_sa.spi_r);
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        liveness.keep_redundant_children(true);
+        liveness.report_internal_deletes(true);
+        let mut rekeyed = 0xAAAA;
+        let mut kept = Vec::new();
+        for k in 0..=REDUNDANT_CHILDREN_KEPT as u32 {
+            let deletes = if k == REDUNDANT_CHILDREN_KEPT as u32 { 2 } else { 1 };
+            crossed_and_committed(&mut liveness, &gateway, &resp_sa, ChildKind::Primary, k, rekeyed, 0xE700_0001 + k, 0xE800_0001 + k, deletes);
+            rekeyed = 0xE800_0001 + k;
+            kept.extend(liveness.take_redundant_children().into_iter().map(|r| r.child.local_spi));
+        }
+        assert_eq!(liveness.take_peer_child_events(), [PeerChildEvent::RedundantClosed { kind: ChildKind::Primary, local_spi: kept[0] }]);
+        assert_eq!(
+            liveness.take_internal_deletes(),
+            [InternalChildDelete {
+                kind: ChildKind::Primary,
+                spis: (kept[0], 0xE700_0001),
+                cause: InternalDeleteCause::RedundantBound,
+                outcome: InternalDeleteOutcome::Answered,
+                ike_spis
+            }]
+        );
+    }
+
+    /// The Delete the session would send of itself on an IKE SA that is over
+    /// (an `INVALID_SYNTAX` ended it) is not sent, as ever, and is reported
+    /// so -- [`InternalDeleteOutcome::IkeSaOver`] -- the SA closed all the same.
+    #[test]
+    fn the_sessions_own_delete_on_an_ike_sa_that_is_over_is_reported_and_nothing_goes_out() {
+        let (init_sa, _) = liveness_sa_pair();
+        let ike_spis = (init_sa.spi_i, init_sa.spi_r);
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        gateway.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        liveness.keep_redundant_children(true);
+        liveness.report_internal_deletes(true);
+        let child = |k: u32| RekeyedChild {
+            local_spi: 0xC100_0000 + k,
+            peer_spi: 0xC200_0000 + k,
+            key_out: ChildKeyMaterial { cipher: SkCipher::Aes256Gcm, enc: vec![k as u8; 36], integ: Vec::new() },
+            key_in: ChildKeyMaterial { cipher: SkCipher::Aes256Gcm, enc: vec![!k as u8; 36], integ: Vec::new() },
+        };
+        for k in 0..REDUNDANT_CHILDREN_KEPT as u32 {
+            liveness.keep_redundant_child(ChildKind::Primary, child(k), None, "test");
+        }
+        liveness.take_redundant_children();
+        liveness.ike.ended = true;
+        liveness.keep_redundant_child(ChildKind::Primary, child(REDUNDANT_CHILDREN_KEPT as u32), None, "test");
+        assert_eq!(
+            liveness.take_internal_deletes(),
+            [InternalChildDelete {
+                kind: ChildKind::Primary,
+                spis: (0xC100_0000, 0xC200_0000),
+                cause: InternalDeleteCause::RedundantBound,
+                outcome: InternalDeleteOutcome::IkeSaOver,
+                ike_spis
+            }]
+        );
+        assert_eq!(liveness.take_peer_child_events(), [PeerChildEvent::RedundantClosed { kind: ChildKind::Primary, local_spi: 0xC100_0000 }], "closed all the same");
+        let sent = all_sent_to(&gateway);
+        assert!(sent.is_empty(), "nothing sent: {sent:x?}");
     }
 }

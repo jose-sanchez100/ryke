@@ -1191,7 +1191,13 @@ impl LivenessSession {
     /// until it is abandoned), as `negotiate_rekey` itself is: this would
     /// rekey, and then delete, the SA that rekey negotiated, under a caller
     /// that may not run on it yet, and leave that rekey pending on an SA no
-    /// longer current. The same for [`Self::rekey_child_ipv6`].
+    /// longer current. The same for [`Self::rekey_child_ipv6`]. Refused the
+    /// same way, sending nothing and using no Message ID, while there is no
+    /// primary CHILD SA -- the peer deleted it and [`Self::create_child_primary`]
+    /// has not replaced it yet ([`Self::take_peer_deleted_children`]), as
+    /// [`Self::negotiate_rekey`] is: its `REKEY_SA` would name an SA the peer
+    /// no longer has, by SPIs left stale. Once the IKE SA is over it fails with
+    /// [`IkeError::PeerTornDown`] as it always did, whether or not there is one.
     pub fn rekey_child(&mut self, timeout: Duration) -> Result<RekeyedChild, DriverError> {
         self.rekey_child_settled(timeout).map(|settled| settled.child)
     }
@@ -1200,6 +1206,10 @@ impl LivenessSession {
     /// and was kept (RFC 7296 §2.8.1, [`SettledRekey::by_peer`]).
     pub fn rekey_child_settled(&mut self, timeout: Duration) -> Result<SettledRekey, DriverError> {
         self.refuse_while_negotiated(ChildKind::Primary)?;
+        // Once the IKE SA is over, that is what `child_exchange` says, primary or not.
+        if !self.primary_child_alive && !self.ike.ended {
+            return Err(IkeError::Crypto("no primary CHILD SA to rekey").into());
+        }
         let old = ChildSpis { local: self.child_local_spi, peer: self.child_peer_spi };
         // A unified SA keeps being proposed as one: rekeying it IPv4-only would
         // silently drop IPv6 at the first rekey.
@@ -9118,6 +9128,264 @@ mod tests {
             let request = sent_to(&gateway).expect("the other family's rekey went out");
             assert_eq!(client_header(&request), (ExchangeType::CreateChildSa, 2, false), "{family:?}");
             assert_eq!(rekey::rekey_sa_spi(&resp_sa, &request), Some(rekeyed), "{family:?}: naming the other family's SA");
+        }
+    }
+
+    /// The IPv6 CHILD SA next to [`session_facing`]'s primary one, in the
+    /// tests of a CHILD SA the gateway deleted.
+    const IPV6_UP: ChildSpis = ChildSpis { local: 0x5656, peer: 0x5757 };
+
+    /// The gateway's SPI of every CHILD SA [`with_child_requests_answered`] grants.
+    const GATEWAY_CREATED_SPI: u32 = 0xE300_0001;
+
+    /// A session facing `gateway` with both CHILD SAs up -- the primary of
+    /// [`session_facing`] and [`IPV6_UP`] -- after which the gateway deleted
+    /// `deleted`'s, if any (RFC 7296 §1.4.1: that SA alone, the IKE SA and the
+    /// other family still up): the Delete answered and taken in, the family
+    /// without a CHILD SA and queued for its recreation
+    /// ([`LivenessSession::take_peer_deleted_children`]).
+    fn child_sas_with_one_deleted(gateway: &UdpSocket, init_sa: CompletedSaInit, resp_sa: &CompletedSaInit, deleted: Option<ChildKind>) -> LivenessSession {
+        let mut liveness = session_facing(gateway, init_sa, Some(IPV6_UP));
+        gateway.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        if let Some(kind) = deleted {
+            let named = match kind {
+                ChildKind::Primary => 0xAAAA,
+                ChildKind::Ipv6 => IPV6_UP.peer,
+            };
+            assert_eq!(deliver(&mut liveness, gateway, &gateway_deletes_children(resp_sa, 0, &[named])), Liveness::Alive, "{kind:?}: the other family is still up");
+            drain(gateway);
+            assert_eq!(liveness.child_spis(kind), None, "{kind:?}: gone");
+            assert_eq!(liveness.peer_child.deleted, [kind], "{kind:?}: queued for its recreation");
+        }
+        liveness
+    }
+
+    /// `client` while the gateway answers every request the session sends it
+    /// on `sa`: a `CREATE_CHILD_SA` granting what it asks for, its SA on
+    /// [`GATEWAY_CREATED_SPI`] (a rekey or a brand-new SA alike), an
+    /// INFORMATIONAL empty. What `client` came to, and every message the
+    /// session sent meanwhile, in order.
+    fn with_child_requests_answered<R>(gateway: &UdpSocket, sa: &CompletedSaInit, client: impl FnOnce() -> R) -> (R, Vec<Vec<u8>>) {
+        let done = std::sync::atomic::AtomicBool::new(false);
+        thread::scope(|scope| {
+            let answering = scope.spawn(|| {
+                let mut sent = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match gateway.recv_from(&mut buf) {
+                        Ok((n, from)) => {
+                            let msg = buf[..n].to_vec();
+                            match client_header(&msg) {
+                                (ExchangeType::Informational, _, false) => {
+                                    gateway.send_to(&informational_answer(sa, &msg, &[]), from).unwrap();
+                                }
+                                (ExchangeType::CreateChildSa, _, false) => {
+                                    let (answer, _) =
+                                        rekey::responder_process_rekey_with_pfs(sa, &msg, GATEWAY_CREATED_SPI, &[0x99u8; 32], SkCipher::Aes256Gcm, None, &[4u8; 8], None).unwrap();
+                                    gateway.send_to(&answer, from).unwrap();
+                                }
+                                _ => {}
+                            }
+                            sent.push(msg);
+                        }
+                        Err(_) if done.load(Ordering::SeqCst) => return sent,
+                        Err(_) => {}
+                    }
+                }
+            });
+            let came = client();
+            done.store(true, Ordering::SeqCst);
+            (came, answering.join().unwrap())
+        })
+    }
+
+    /// `sent` as the gateway reads it: each message's exchange, Message ID and
+    /// Response flag, the SA a `CREATE_CHILD_SA` request of ours rekeys
+    /// (`REKEY_SA`, none for a brand-new SA), and the Delete an INFORMATIONAL
+    /// request of ours carries, if any.
+    fn child_wire_of(sa: &CompletedSaInit, sent: &[Vec<u8>]) -> Vec<((ExchangeType, u32, bool), Option<u32>, Option<Delete>)> {
+        sent.iter()
+            .map(|m| {
+                let header = client_header(m);
+                let rekeys = if header.0 == ExchangeType::CreateChildSa && !header.2 { rekey::rekey_sa_spi(sa, m) } else { None };
+                let deletes = if header.0 == ExchangeType::Informational && !header.2 { delete_in(sa, m) } else { None };
+                (header, rekeys, deletes)
+            })
+            .collect()
+    }
+
+    /// What [`recreate_deleted_child`] comes to.
+    #[derive(Debug, PartialEq)]
+    struct Recreated {
+        /// What [`LivenessSession::take_peer_deleted_children`] handed over.
+        taken: Vec<ChildKind>,
+        /// The gateway's SPI of the SA created.
+        created_peer_spi: u32,
+        /// Both families' SAs after, our (random) SPI of the one created
+        /// zeroed once checked to be that SA's.
+        spis: [Option<(u32, u32)>; 2],
+        /// The liveness check after.
+        probed: Liveness,
+        wire: Vec<((ExchangeType, u32, bool), Option<u32>, Option<Delete>)>,
+        next_message_id: u32,
+    }
+
+    /// What `liveness` comes to from here, the gateway having deleted
+    /// `kind`'s CHILD SA: the family taken from the queue and its CHILD SA
+    /// created again ([`LivenessSession::create_child_primary`],
+    /// [`LivenessSession::create_child_ipv6`]), as the worker does, then a
+    /// liveness check; the gateway answering every request meanwhile.
+    fn recreate_deleted_child(liveness: &mut LivenessSession, gateway: &UdpSocket, resp_sa: &CompletedSaInit, kind: ChildKind) -> Recreated {
+        let ((taken, created, probed), sent) = with_child_requests_answered(gateway, resp_sa, || {
+            let taken = liveness.take_peer_deleted_children();
+            let timeout = Duration::from_secs(2);
+            let created = match kind {
+                ChildKind::Primary => liveness.create_child_primary(timeout).unwrap(),
+                ChildKind::Ipv6 => liveness.create_child_ipv6(timeout).unwrap().child,
+            };
+            (taken, created, liveness.probe(Duration::from_millis(500)).unwrap())
+        });
+        let mut spis = both_child_spis(liveness);
+        let slot = own_rekey_slot(kind);
+        assert_eq!(spis[slot], Some((created.local_spi, created.peer_spi)), "{kind:?}: the SA created is the family's");
+        spis[slot] = Some((0, created.peer_spi));
+        Recreated { taken, created_peer_spi: created.peer_spi, spis, probed, wire: child_wire_of(resp_sa, &sent), next_message_id: liveness.next_message_id }
+    }
+
+    /// The gateway deleted the primary CHILD SA (RFC 7296 §1.4.1, the IPv6
+    /// one and the IKE SA still up), and it is not created again yet: a rekey
+    /// of it by [`LivenessSession::rekey_child`] or
+    /// [`LivenessSession::rekey_child_settled`] is refused with
+    /// [`IkeError::Crypto`], as [`LivenessSession::negotiate_rekey`] of it is.
+    /// It used to go out: a `CREATE_CHILD_SA` whose `REKEY_SA` names the SA the
+    /// gateway deleted, by its stale SPIs, using a Message ID. The same for the
+    /// IPv6 CHILD SA the gateway deleted, the primary up -- refused already, by
+    /// [`LivenessSession::rekey_child_ipv6`], its `_settled` form and
+    /// `negotiate_rekey`. Nothing is sent, no Message ID is used, both
+    /// families stay as they are, and the family is still queued for its
+    /// recreation.
+    #[test]
+    fn a_rekey_of_a_child_sa_the_gateway_deleted_is_refused_sending_nothing() {
+        let timeout = Duration::from_millis(50);
+        for kind in [ChildKind::Primary, ChildKind::Ipv6] {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut liveness = child_sas_with_one_deleted(&gateway, init_sa, &resp_sa, Some(kind));
+            let spis = both_child_spis(&liveness);
+            let calls: [(&str, Result<(u32, u32), DriverError>); 3] = match kind {
+                ChildKind::Primary => [
+                    ("rekey_child", liveness.rekey_child(timeout).map(|c| (c.local_spi, c.peer_spi))),
+                    ("rekey_child_settled", liveness.rekey_child_settled(timeout).map(|s| (s.child.local_spi, s.child.peer_spi))),
+                    ("negotiate_rekey", liveness.negotiate_rekey(kind, timeout).map(|n| (n.child.local_spi, n.child.peer_spi))),
+                ],
+                ChildKind::Ipv6 => [
+                    ("rekey_child_ipv6", liveness.rekey_child_ipv6(timeout).map(|c| (c.local_spi, c.peer_spi))),
+                    ("rekey_child_ipv6_settled", liveness.rekey_child_ipv6_settled(timeout).map(|s| (s.child.local_spi, s.child.peer_spi))),
+                    ("negotiate_rekey", liveness.negotiate_rekey(kind, timeout).map(|n| (n.child.local_spi, n.child.peer_spi))),
+                ],
+            };
+            let sent = child_wire_of(&resp_sa, &all_sent_to(&gateway));
+            for (call, result) in calls {
+                let shown = format!("{result:?}");
+                assert!(refused_crypto(result), "{kind:?}: {call} is refused, came to {shown}; sent {sent:x?}");
+            }
+            assert!(sent.is_empty(), "{kind:?}: nothing sent: {sent:x?}");
+            assert_eq!(liveness.next_message_id, 2, "{kind:?}: no Message ID used");
+            assert_eq!(both_child_spis(&liveness), spis, "{kind:?}: nothing moved");
+            assert_eq!(liveness.peer_child.deleted, [kind], "{kind:?}: still queued for its recreation");
+        }
+    }
+
+    /// After the refused rekeys of
+    /// [`a_rekey_of_a_child_sa_the_gateway_deleted_is_refused_sending_nothing`],
+    /// the family's CHILD SA is created again
+    /// ([`LivenessSession::create_child_primary`],
+    /// [`LivenessSession::create_child_ipv6`]) and a liveness check follows
+    /// exactly as in the same session without the refused calls: the family
+    /// handed over, a brand-new SA (no `REKEY_SA`) on Message ID 2, the
+    /// check on 3, both families' SAs, and nothing else on the wire.
+    #[test]
+    fn a_refused_rekey_of_a_child_sa_the_gateway_deleted_leaves_its_recreation_as_without_it() {
+        let timeout = Duration::from_millis(50);
+        for kind in [ChildKind::Primary, ChildKind::Ipv6] {
+            let control = {
+                let (init_sa, resp_sa) = liveness_sa_pair();
+                let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+                let mut liveness = child_sas_with_one_deleted(&gateway, init_sa, &resp_sa, Some(kind));
+                recreate_deleted_child(&mut liveness, &gateway, &resp_sa, kind)
+            };
+            let other = match kind {
+                ChildKind::Primary => Some((IPV6_UP.local, IPV6_UP.peer)),
+                ChildKind::Ipv6 => Some((0xBBBB, 0xAAAA)),
+            };
+            let mut spis = [other; 2];
+            spis[own_rekey_slot(kind)] = Some((0, GATEWAY_CREATED_SPI));
+            let expected = Recreated {
+                taken: vec![kind],
+                created_peer_spi: GATEWAY_CREATED_SPI,
+                spis,
+                probed: Liveness::Alive,
+                wire: vec![((ExchangeType::CreateChildSa, 2, false), None, None), ((ExchangeType::Informational, 3, false), None, None)],
+                next_message_id: 4,
+            };
+            assert_eq!(control, expected, "{kind:?}: the control session");
+
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut liveness = child_sas_with_one_deleted(&gateway, init_sa, &resp_sa, Some(kind));
+            match kind {
+                ChildKind::Primary => {
+                    let _ = liveness.rekey_child(timeout);
+                    let _ = liveness.rekey_child_settled(timeout);
+                }
+                ChildKind::Ipv6 => {
+                    let _ = liveness.rekey_child_ipv6(timeout);
+                    let _ = liveness.rekey_child_ipv6_settled(timeout);
+                }
+            }
+            let _ = liveness.negotiate_rekey(kind, timeout);
+            assert_eq!(recreate_deleted_child(&mut liveness, &gateway, &resp_sa, kind), control, "{kind:?}: as without the refused calls");
+        }
+    }
+
+    /// A CHILD SA the gateway has not deleted is rekeyed as it always was --
+    /// both up, or the other family's deleted: one `CREATE_CHILD_SA` naming
+    /// it in `REKEY_SA` (Message ID 2), answered, then the Delete of the SA
+    /// it replaced (3); the family on the new SA, the other as it was.
+    #[test]
+    fn a_rekey_of_a_child_sa_the_gateway_did_not_delete_goes_out_as_before() {
+        let timeout = Duration::from_secs(2);
+        let primary = ChildSpis { local: 0xBBBB, peer: 0xAAAA };
+        for (kind, deleted) in [
+            (ChildKind::Primary, None),
+            (ChildKind::Ipv6, None),
+            (ChildKind::Primary, Some(ChildKind::Ipv6)),
+            (ChildKind::Ipv6, Some(ChildKind::Primary)),
+        ] {
+            let case = format!("{kind:?}, deleted {deleted:?}");
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut liveness = child_sas_with_one_deleted(&gateway, init_sa, &resp_sa, deleted);
+            let (old, other) = match kind {
+                ChildKind::Primary => (primary, liveness.child_spis(ChildKind::Ipv6)),
+                ChildKind::Ipv6 => (IPV6_UP, liveness.child_spis(ChildKind::Primary)),
+            };
+            let (rekeyed, sent) = with_child_requests_answered(&gateway, &resp_sa, || match kind {
+                ChildKind::Primary => liveness.rekey_child_settled(timeout),
+                ChildKind::Ipv6 => liveness.rekey_child_ipv6_settled(timeout),
+            });
+            let rekeyed = rekeyed.unwrap_or_else(|e| panic!("{case}: {e}"));
+            assert!(!rekeyed.by_peer, "{case}");
+            assert_eq!(rekeyed.child.peer_spi, GATEWAY_CREATED_SPI, "{case}");
+            assert_eq!(
+                child_wire_of(&resp_sa, &sent),
+                [((ExchangeType::CreateChildSa, 2, false), Some(old.local), None), ((ExchangeType::Informational, 3, false), None, Some(Delete::esp(vec![old.local])))],
+                "{case}"
+            );
+            assert_eq!(liveness.child_spis(kind), Some((rekeyed.child.local_spi, GATEWAY_CREATED_SPI)), "{case}: on the new SA");
+            let other_kind = if kind == ChildKind::Primary { ChildKind::Ipv6 } else { ChildKind::Primary };
+            assert_eq!(liveness.child_spis(other_kind), other, "{case}: the other family as it was");
+            assert_eq!(liveness.peer_child.deleted, deleted.into_iter().collect::<Vec<_>>(), "{case}: still queued, if deleted");
         }
     }
 

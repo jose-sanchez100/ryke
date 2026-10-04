@@ -227,10 +227,10 @@ pub use ikev2::natt::{
 };
 pub use ikev2::informational::{build_informational, dpd_request, open_informational};
 pub use ikev2::session::{
-    default_esp_offer, default_ike_offer, ike_port, ChildDeleteOutcome, ChildKind, ConnectedTunnel, DeleteReport,
-    EapCreds, HeldPeerRekey, Ikev2Session, InternalChildDelete, InternalDeleteCause, InternalDeleteOutcome, Ipv6Child,
-    Liveness, LivenessSession, NegotiatedRekey, PeerChildEvent, PeerRekeyedChild, RedundantChild, ReplacedDelete,
-    SettledRekey, REDUNDANT_CHILDREN_KEPT,
+    default_esp_offer, default_ike_offer, ike_port, ChildDeleteOutcome, ChildKind, ConnectedTunnel, DeleteAttribution,
+    DeleteReport, EapCreds, HeldPeerRekey, Ikev2Session, InternalChildDelete, InternalDeleteCause, InternalDeleteOutcome,
+    Ipv6Child, KnownRole, Liveness, LivenessSession, NegotiatedRekey, PeerChildDeleted, PeerChildEvent, PeerRekeyedChild,
+    RedundantChild, ReplacedDelete, SettledRekey, REDUNDANT_CHILDREN_KEPT,
 };
 pub use ikev2::rekey::responder_process_rekey;
 pub use ikev2::ike_rekey::{is_ike_sa_rekey, responder_process_ike_rekey};

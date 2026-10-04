@@ -595,6 +595,87 @@ pub struct InternalChildDelete {
     pub ike_spis: (u64, u64),
 }
 
+/// What a CHILD SA the session tracks is to it, for [`DeleteAttribution::Known`].
+/// An SA that is more than one of these at once (the SA a rekey of ours in
+/// flight rekeys is also its family's current one, say) is given the first
+/// that applies, in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownRole {
+    /// An SA whose Delete of ours is on its way, its answer awaited: the
+    /// peer's Delete crossed ours (RFC 7296 §2.25.1).
+    Closing,
+    /// The SA a `CREATE_CHILD_SA` rekey of ours is rekeying, its answer
+    /// awaited.
+    Rekeying,
+    /// The peer's SA of its rekey that crossed one of ours still awaiting its
+    /// answer (RFC 7296 §2.8.1).
+    CrossedInFlight,
+    /// The SA a rekey of ours of this family negotiated
+    /// ([`LivenessSession::negotiate_rekey`]) that the peer deleted already,
+    /// the rekey awaiting its abandon.
+    NegotiatedDeletedByPeer(ChildKind),
+    /// The SA a rekey of ours of this family negotiated, not committed or
+    /// abandoned yet.
+    NegotiatedNew(ChildKind),
+    /// The SA such a rekey replaces.
+    NegotiatedReplaced(ChildKind),
+    /// The family's current SA.
+    Current(ChildKind),
+    /// A redundant SA of a crossed rekey kept for this family
+    /// ([`LivenessSession::keep_redundant_children`]).
+    Redundant(ChildKind),
+    /// An SA a rekey of the peer's replaced, the peer's to delete, still
+    /// remembered (for a minute).
+    Superseded,
+    /// The new SA of a rekey of the peer's whose answer is held
+    /// ([`LivenessSession::hold_peer_rekeys`]): the peer does not have it yet.
+    HeldRekeyNew(ChildKind),
+}
+
+/// Which CHILD SA the session tracks under the SPI a Delete of the peer's
+/// names -- see [`PeerChildDeleted`]. A Delete names the SPI its sender
+/// expects on inbound packets (RFC 7296 §3.11): the peer's, our `peer_spi`
+/// of the SA; it is never matched against our own (local) SPIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteAttribution {
+    /// Exactly one SA the session tracks has that peer SPI: its SPIs, and
+    /// what it is to the session.
+    Known { local_spi: u32, peer_spi: u32, role: KnownRole },
+    /// Two or more SAs the session tracks share that peer SPI: their (local,
+    /// peer) SPIs, in the order of [`KnownRole`]. Which one the peer meant
+    /// is not known.
+    Ambiguous { candidates: Vec<(u32, u32)> },
+    /// No SA the session tracks has that peer SPI. The caller's own records
+    /// may: the session keeps none of an SA once it is done with it.
+    Untracked,
+}
+
+/// One SPI an authenticated Delete of the peer's named, for an ESP CHILD SA,
+/// reported once the session answered the request carrying it
+/// ([`LivenessSession::report_peer_deletes`],
+/// [`LivenessSession::take_peer_child_deletes`]). What the session tracked
+/// under it ([`DeleteAttribution`]) is as it was when the request came,
+/// before the session acted on it; how it acted on it is what it always
+/// was, reporting or not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerChildDeleted {
+    /// Which request of the peer's carrying ESP Deletes this was: one more
+    /// for each such request answered, whether reported or not -- all of the
+    /// SPIs of one request share it. See [`LivenessSession::peer_delete_seq`].
+    pub seq: u64,
+    /// The (initiator, responder) SPIs of the IKE SA the request came on.
+    pub ike_spis: (u64, u64),
+    /// Whether that is the current IKE SA. `false`: the one a rekey of the
+    /// IKE SA retired, on which a Delete of CHILD SAs is answered and not
+    /// acted on, the CHILD SAs having moved to the new one.
+    pub on_current_ike_sa: bool,
+    /// The request's Message ID.
+    pub message_id: u32,
+    /// The SPI named.
+    pub peer_spi: u32,
+    pub attribution: DeleteAttribution,
+}
+
 /// What [`LivenessSession::delete_child_sa`] came to, before what it drops.
 enum DeleteAttempt {
     /// Nothing sent: the IKE SA is over.
@@ -718,6 +799,16 @@ struct PeerChildState {
     /// ([`LivenessSession::take_internal_deletes`]); only ever filled with
     /// `report_internal` on.
     internal_deletes: Vec<InternalChildDelete>,
+    /// Whether the peer's Deletes of CHILD SAs are reported
+    /// ([`LivenessSession::report_peer_deletes`]).
+    report_peer_deletes: bool,
+    /// Those reported, not yet collected
+    /// ([`LivenessSession::take_peer_child_deletes`]); only ever filled with
+    /// `report_peer_deletes` on.
+    peer_deletes: Vec<PeerChildDeleted>,
+    /// How many requests of the peer's carrying ESP Deletes were answered
+    /// ([`LivenessSession::peer_delete_seq`]), reporting or not.
+    peer_delete_seq: u64,
 }
 
 /// A rekey of the peer's held unanswered ([`LivenessSession::hold_peer_rekeys`]):
@@ -3011,6 +3102,11 @@ impl LivenessSession {
     /// that the Delete leaves alone, is not lost: it moves to that SA (the
     /// most recently created, [`PeerChildEvent::MovedToRedundant`]), is not
     /// queued for renegotiation, and counts as still up for the tunnel's end.
+    ///
+    /// With [`Self::report_peer_deletes`] on, each ESP SPI named is reported
+    /// once the answer is sent, with what the session tracked under it before
+    /// any of the above ([`PeerChildDeleted`]); in every branch, the early
+    /// one included. That changes none of the above.
     fn answer_peer_informational(
         &mut self,
         on: OnIkeSa,
@@ -3021,6 +3117,9 @@ impl LivenessSession {
     ) -> Result<bool, DriverError> {
         let ike_deleted = deletes.iter().any(|d| d.protocol_id == protocol_id::IKE);
         let named: Vec<u32> = deletes.iter().filter(|d| d.protocol_id == protocol_id::ESP).flat_map(|d| d.spis.iter().copied()).collect();
+        // What the session tracks under each SPI named, before anything
+        // changes; reported once the request is answered.
+        let peer_deletes = self.attribute_peer_deletes(&named);
 
         if on == OnIkeSa::Retired || ike_deleted {
             let ack = self.outgoing(on, build_informational(self.ike_sa(on), header.message_id, true, &[], iv)?)?;
@@ -3032,6 +3131,7 @@ impl LivenessSession {
                 self.peer_requests_on(on).gone = true;
             }
             self.respond(on, header, msg, ack, tears_down);
+            self.record_peer_deletes(on, header, peer_deletes);
             if tears_down {
                 ike_debug!("INFORMATIONAL: peer deleted the IKE SA -- tunnel torn down by the gateway");
             }
@@ -3225,10 +3325,108 @@ impl LivenessSession {
             }
         }
         self.respond(on, header, msg, ack, tears_down);
+        self.record_peer_deletes(on, header, peer_deletes);
         if tears_down {
             ike_debug!("INFORMATIONAL: peer deleted the tunnel's CHILD SAs -- tunnel torn down by the gateway");
         }
         Ok(tears_down)
+    }
+
+    /// For [`Self::answer_peer_informational`], before it changes anything:
+    /// `None` when `named`, the ESP SPIs a request's Delete payloads name, is
+    /// empty -- nothing to count or report -- and otherwise each SPI named
+    /// once, in the order named, with what the session tracks under it
+    /// ([`DeleteAttribution`]), or none of them with
+    /// [`Self::report_peer_deletes`] off (only counted then).
+    fn attribute_peer_deletes(&self, named: &[u32]) -> Option<Vec<(u32, DeleteAttribution)>> {
+        if named.is_empty() {
+            return None;
+        }
+        if !self.peer_child.report_peer_deletes {
+            return Some(Vec::new());
+        }
+        let tracked = self.tracked_children();
+        let mut attributed: Vec<(u32, DeleteAttribution)> = Vec::new();
+        for &peer_spi in named {
+            if attributed.iter().any(|(spi, _)| *spi == peer_spi) {
+                continue;
+            }
+            let mut found: Vec<(ChildSpis, KnownRole)> = Vec::new();
+            for &(spis, role) in tracked.iter().filter(|(spis, _)| spis.peer == peer_spi) {
+                if !found.iter().any(|(seen, _)| *seen == spis) {
+                    found.push((spis, role));
+                }
+            }
+            let attribution = match found.as_slice() {
+                [] => DeleteAttribution::Untracked,
+                [(spis, role)] => DeleteAttribution::Known { local_spi: spis.local, peer_spi: spis.peer, role: *role },
+                _ => DeleteAttribution::Ambiguous { candidates: found.iter().map(|(spis, _)| (spis.local, spis.peer)).collect() },
+            };
+            attributed.push((peer_spi, attribution));
+        }
+        Some(attributed)
+    }
+
+    /// Every CHILD SA this session tracks, with what it is to it, in the
+    /// order of [`KnownRole`] -- an SA that is more than one of these is
+    /// listed under each.
+    fn tracked_children(&self) -> Vec<(ChildSpis, KnownRole)> {
+        let mut tracked = Vec::new();
+        if let Some(own) = &self.peer_child.in_flight {
+            match own.op {
+                ChildOp::Close(closing) => tracked.push((closing, KnownRole::Closing)),
+                ChildOp::Rekey(old) => tracked.push((old, KnownRole::Rekeying)),
+                ChildOp::Create => {}
+            }
+            if let Some(crossed) = &own.crossed {
+                tracked.push((ChildSpis::of(&crossed.child), KnownRole::CrossedInFlight));
+            }
+        }
+        for kind in [ChildKind::Primary, ChildKind::Ipv6] {
+            if let Some(deleted) = &self.peer_child.deleted_rekeys[own_rekey_slot(kind)] {
+                tracked.push((deleted.new, KnownRole::NegotiatedDeletedByPeer(kind)));
+            }
+        }
+        for kind in [ChildKind::Primary, ChildKind::Ipv6] {
+            if let Some(rekey) = &self.peer_child.own_rekeys[own_rekey_slot(kind)] {
+                tracked.push((rekey.new, KnownRole::NegotiatedNew(kind)));
+            }
+        }
+        for kind in [ChildKind::Primary, ChildKind::Ipv6] {
+            if let Some(rekey) = &self.peer_child.own_rekeys[own_rekey_slot(kind)] {
+                tracked.push((rekey.old, KnownRole::NegotiatedReplaced(kind)));
+            }
+        }
+        for kind in [ChildKind::Primary, ChildKind::Ipv6] {
+            if let Some((local, peer)) = self.child_spis(kind) {
+                tracked.push((ChildSpis { local, peer }, KnownRole::Current(kind)));
+            }
+        }
+        tracked.extend(self.peer_child.redundant.iter().map(|r| (r.spis, KnownRole::Redundant(r.kind))));
+        tracked.extend(self.peer_child.superseded.iter().map(|s| (ChildSpis { local: s.local_spi, peer: s.peer_spi }, KnownRole::Superseded)));
+        tracked.extend(self.peer_child.held.iter().map(|held| (held.new, KnownRole::HeldRekeyNew(held.kind))));
+        tracked
+    }
+
+    /// The request `header` on the IKE SA `on`, carrying ESP Deletes, was
+    /// answered: counted ([`Self::peer_delete_seq`]) and, with
+    /// [`Self::report_peer_deletes`] on, each SPI it named reported as
+    /// [`Self::attribute_peer_deletes`] found it. `None`: it named none.
+    fn record_peer_deletes(&mut self, on: OnIkeSa, header: &IkeHeader, attributed: Option<Vec<(u32, DeleteAttribution)>>) {
+        let Some(attributed) = attributed else { return };
+        self.peer_child.peer_delete_seq += 1;
+        let seq = self.peer_child.peer_delete_seq;
+        let ike = self.ike_sa(on);
+        let ike_spis = (ike.spi_i, ike.spi_r);
+        let on_current_ike_sa = on == OnIkeSa::Current;
+        self.peer_child.peer_deletes.extend(attributed.into_iter().map(|(peer_spi, attribution)| PeerChildDeleted {
+            seq,
+            ike_spis,
+            on_current_ike_sa,
+            message_id: header.message_id,
+            peer_spi,
+            attribution,
+        }));
     }
 
     /// The peer deleted the current IKE SA: whether that ends the tunnel. It
@@ -3805,6 +4003,49 @@ impl LivenessSession {
     /// it returned `Ok` or not. Always empty with it off.
     pub fn take_internal_deletes(&mut self) -> Vec<InternalChildDelete> {
         std::mem::take(&mut self.peer_child.internal_deletes)
+    }
+
+    /// Report the peer's Deletes of CHILD SAs: each ESP SPI an authenticated
+    /// INFORMATIONAL of the peer's names, once the session has answered it,
+    /// with what the session tracked under it when it came
+    /// ([`PeerChildDeleted`], [`DeleteAttribution`]), for
+    /// [`Self::take_peer_child_deletes`]. Off unless asked for, as
+    /// [`Self::report_internal_deletes`] is. Only what is reported changes:
+    /// which SAs a Delete acts on, how, and what is answered are the same
+    /// either way. Kept across a rekey of the IKE SA.
+    ///
+    /// Reported only once the answer went: a request whose answer could not
+    /// be built reports nothing. On the IKE SA a rekey of it retired, too
+    /// ([`PeerChildDeleted::on_current_ike_sa`] `false`), and along with a
+    /// Delete of the IKE SA itself, though the session acts on neither's ESP
+    /// SPIs. Not reported, and not counted ([`Self::peer_delete_seq`]): a
+    /// retransmission of a request already answered (its answer is sent
+    /// again, nothing is acted on again), a request that does not
+    /// authenticate, one outside the receive window or on an IKE SA that is
+    /// over, one whose payloads are malformed (answered with an error, acted
+    /// on in nothing), and Deletes of other protocols than ESP. An SPI named
+    /// twice in one request is reported once.
+    pub fn report_peer_deletes(&mut self, on: bool) {
+        self.peer_child.report_peer_deletes = on;
+    }
+
+    /// The peer's Deletes of CHILD SAs reported since the last call, in the
+    /// order they were answered ([`Self::report_peer_deletes`]): the caller
+    /// drains it after anything that may have answered a request of the
+    /// peer's ([`Self::peek`], [`Self::probe`], any exchange of ours). Always
+    /// empty with it off.
+    pub fn take_peer_child_deletes(&mut self) -> Vec<PeerChildDeleted> {
+        std::mem::take(&mut self.peer_child.peer_deletes)
+    }
+
+    /// How many requests of the peer's carrying ESP Deletes the session has
+    /// answered, reporting on or off: the [`PeerChildDeleted::seq`] of the
+    /// last one, `0` before any. A Delete reported with a `seq` above the
+    /// value read at some point was answered after it -- for a caller to tell
+    /// a Delete that came after something of its own from one that came
+    /// before.
+    pub fn peer_delete_seq(&self) -> u64 {
+        self.peer_child.peer_delete_seq
     }
 
     /// The rekey held unanswered, if any ([`Self::hold_peer_rekeys`]): which
@@ -17467,5 +17708,230 @@ mod tests {
         assert_eq!(liveness.take_peer_child_events(), [PeerChildEvent::RedundantClosed { kind: ChildKind::Primary, local_spi: 0xC100_0000 }], "closed all the same");
         let sent = all_sent_to(&gateway);
         assert!(sent.is_empty(), "nothing sent: {sent:x?}");
+    }
+
+    // The gateway's Deletes of CHILD SAs, reported (`report_peer_deletes`).
+
+    /// A session facing `gateway`, reporting the gateway's Deletes.
+    fn reporting_peer_deletes(gateway: &UdpSocket, init_sa: CompletedSaInit, child6: Option<ChildSpis>) -> LivenessSession {
+        let mut liveness = session_facing(gateway, init_sa, child6);
+        gateway.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        liveness.report_peer_deletes(true);
+        liveness
+    }
+
+    /// The one report of a Delete on the current IKE SA `sa`, request `mid`,
+    /// `seq`-th of its kind, naming `peer_spi`.
+    fn peer_deleted(sa: &CompletedSaInit, seq: u64, mid: u32, peer_spi: u32, attribution: DeleteAttribution) -> PeerChildDeleted {
+        PeerChildDeleted { seq, ike_spis: (sa.spi_i, sa.spi_r), on_current_ike_sa: true, message_id: mid, peer_spi, attribution }
+    }
+
+    /// The gateway's Delete is reported once answered -- its answer on the
+    /// wire when the report is there -- with the IKE SA and the Message ID it
+    /// came with; an SPI the session tracks nothing under is
+    /// [`DeleteAttribution::Untracked`]. Its retransmission gets the same
+    /// answer again and is neither reported nor counted again; the next
+    /// request carrying a Delete is the next `seq`, an SPI named twice in it
+    /// reported once, and a Delete of an AH SA is neither.
+    #[test]
+    fn a_gateway_delete_is_reported_once_answered_and_once_for_its_retransmission() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = reporting_peer_deletes(&gateway, init_sa, None);
+        assert_eq!(liveness.peer_delete_seq(), 0);
+        let request = gateway_deletes_children(&resp_sa, 0, &[0x4242]);
+        assert_eq!(deliver(&mut liveness, &gateway, &request), Liveness::Alive);
+        let answer = sent_to(&gateway).expect("answered");
+        assert_eq!(client_header(&answer), (ExchangeType::Informational, 0, true));
+        assert_eq!(liveness.take_peer_child_deletes(), [peer_deleted(&resp_sa, 1, 0, 0x4242, DeleteAttribution::Untracked)]);
+        assert_eq!(liveness.peer_delete_seq(), 1);
+
+        assert_eq!(deliver(&mut liveness, &gateway, &request), Liveness::Alive);
+        assert_eq!(sent_to(&gateway), Some(answer), "the same answer again");
+        assert!(liveness.take_peer_child_deletes().is_empty(), "the retransmission is not reported");
+        assert_eq!(liveness.peer_delete_seq(), 1, "nor counted");
+
+        let ah = [&[protocol_id::AH, 4, 0, 1][..], &0x1234u32.to_be_bytes()].concat();
+        let request = build_informational(&resp_sa, 1, false, &[(PayloadType::Delete, ah)], &[7u8; 8]).unwrap();
+        assert_eq!(deliver(&mut liveness, &gateway, &request), Liveness::Alive);
+        assert!(sent_to(&gateway).is_some(), "answered");
+        assert!(liveness.take_peer_child_deletes().is_empty(), "AH: not reported");
+        assert_eq!(liveness.peer_delete_seq(), 1, "AH: not counted");
+
+        assert_eq!(deliver(&mut liveness, &gateway, &gateway_deletes_children(&resp_sa, 2, &[0x4343, 0x4343, 0x4444])), Liveness::Alive);
+        assert!(sent_to(&gateway).is_some(), "answered");
+        assert_eq!(
+            liveness.take_peer_child_deletes(),
+            [peer_deleted(&resp_sa, 2, 2, 0x4343, DeleteAttribution::Untracked), peer_deleted(&resp_sa, 2, 2, 0x4444, DeleteAttribution::Untracked)]
+        );
+    }
+
+    /// A Delete that does not authenticate, or whose Delete payload is badly
+    /// formatted (answered `INVALID_SYNTAX`, acting on nothing), is neither
+    /// reported nor counted.
+    #[test]
+    fn an_unauthenticated_or_malformed_gateway_delete_reports_nothing() {
+        for case in ["unauthenticated", "malformed"] {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut liveness = reporting_peer_deletes(&gateway, init_sa, None);
+            let request = match case {
+                "unauthenticated" => tampered(gateway_deletes_children(&resp_sa, 0, &[0xAAAA])),
+                _ => {
+                    let body = [&[protocol_id::ESP, 4, 0, 2][..], &0xAAAAu32.to_be_bytes()].concat();
+                    build_informational(&resp_sa, 0, false, &[(PayloadType::Delete, body)], &[7u8; 8]).unwrap()
+                }
+            };
+            deliver(&mut liveness, &gateway, &request);
+            assert!(liveness.take_peer_child_deletes().is_empty(), "{case}: nothing reported");
+            assert_eq!(liveness.peer_delete_seq(), 0, "{case}: nothing counted");
+        }
+    }
+
+    /// The gateway's Delete of the SA whose own Delete of ours is on its way
+    /// (RFC 7296 §2.25.1) -- an SA the session otherwise knows nothing of,
+    /// sent by [`LivenessSession::delete_child`] -- is that SA,
+    /// [`KnownRole::Closing`], both SPIs; reported once the session answered
+    /// it, inside the call.
+    #[test]
+    fn a_gateway_delete_crossing_ours_is_attributed_to_the_sa_we_are_closing() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = reporting_peer_deletes(&gateway, init_sa, None);
+        let sa = &resp_sa;
+        let (report, sent) = with_gateway_script(
+            &gateway,
+            |msg| match client_header(msg) {
+                (ExchangeType::Informational, _, false) => vec![gateway_deletes_children(sa, 0, &[0x4343]), informational_answer(sa, msg, &[])],
+                _ => Vec::new(),
+            },
+            || liveness.delete_child(0x4242, 0x4343).unwrap(),
+        );
+        assert_eq!(report.outcome, ChildDeleteOutcome::Sent { acknowledged: true });
+        let answered = sent.iter().find(|m| client_header(m) == (ExchangeType::Informational, 0, true)).expect("the gateway's Delete answered");
+        assert!(esp_spis_deleted(sa, answered).is_empty(), "with no Delete of ours: ours is on its way");
+        assert_eq!(
+            liveness.take_peer_child_deletes(),
+            [peer_deleted(sa, 1, 0, 0x4343, DeleteAttribution::Known { local_spi: 0x4242, peer_spi: 0x4343, role: KnownRole::Closing })]
+        );
+    }
+
+    /// What the gateway's Delete of one SPI is attributed to, in a session
+    /// `setup` leaves as it says: the family's current SA, the IPv6 one, a
+    /// rekey of ours negotiated (its new SA and the one it replaces), an SA
+    /// a rekey of the gateway's replaced, a redundant SA kept. Two SAs sharing
+    /// the peer SPI -- the IPv6 CHILD SA given the primary's, by hand -- are
+    /// [`DeleteAttribution::Ambiguous`], both of them. A value that is one of
+    /// our own (local) SPIs, and no peer SPI, is
+    /// [`DeleteAttribution::Untracked`]: a Delete is never matched by our SPI.
+    #[test]
+    fn a_gateway_delete_is_attributed_to_what_the_session_tracks_under_its_peer_spi() {
+        let ipv6 = ChildSpis { local: 0x6666, peer: 0x7777 };
+        let cases: [(&str, u32, DeleteAttribution); 9] = [
+            ("current", 0xAAAA, DeleteAttribution::Known { local_spi: 0xBBBB, peer_spi: 0xAAAA, role: KnownRole::Current(ChildKind::Primary) }),
+            ("ipv6", ipv6.peer, DeleteAttribution::Known { local_spi: ipv6.local, peer_spi: ipv6.peer, role: KnownRole::Current(ChildKind::Ipv6) }),
+            (
+                "negotiated_new",
+                OURS_NEGOTIATED.peer,
+                DeleteAttribution::Known { local_spi: OURS_NEGOTIATED.local, peer_spi: OURS_NEGOTIATED.peer, role: KnownRole::NegotiatedNew(ChildKind::Primary) },
+            ),
+            (
+                "negotiated_replaced",
+                OURS_REPLACED.peer,
+                DeleteAttribution::Known { local_spi: OURS_REPLACED.local, peer_spi: OURS_REPLACED.peer, role: KnownRole::NegotiatedReplaced(ChildKind::Primary) },
+            ),
+            ("superseded", 0x7171, DeleteAttribution::Known { local_spi: 0x7070, peer_spi: 0x7171, role: KnownRole::Superseded }),
+            ("redundant", 0x7373, DeleteAttribution::Known { local_spi: 0x7272, peer_spi: 0x7373, role: KnownRole::Redundant(ChildKind::Primary) }),
+            ("ambiguous", 0xAAAA, DeleteAttribution::Ambiguous { candidates: vec![(0xBBBB, 0xAAAA), (ipv6.local, 0xAAAA)] }),
+            ("our_local_spi", 0xBBBB, DeleteAttribution::Untracked),
+            ("our_ipv6_local_spi", ipv6.local, DeleteAttribution::Untracked),
+        ];
+        for (case, named, attribution) in cases {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut liveness = match case {
+                "negotiated_new" | "negotiated_replaced" => {
+                    let (mut liveness, _, _, _) = pending_rekey_facing(&gateway, init_sa, AbandonFamily::Ipv4, OldFate::Ours, false);
+                    liveness.report_peer_deletes(true);
+                    liveness
+                }
+                "ambiguous" => reporting_peer_deletes(&gateway, init_sa, Some(ChildSpis { local: ipv6.local, peer: 0xAAAA })),
+                _ => reporting_peer_deletes(&gateway, init_sa, Some(ipv6)),
+            };
+            liveness.peer_child.superseded.push(SupersededChild { local_spi: 0x7070, peer_spi: 0x7171, since: Instant::now() });
+            liveness.peer_child.redundant.push(RedundantSa { kind: ChildKind::Primary, spis: ChildSpis { local: 0x7272, peer: 0x7373 }, ts: None, since: Instant::now() });
+            deliver(&mut liveness, &gateway, &gateway_deletes_children(&resp_sa, 0, &[named]));
+            assert!(sent_to(&gateway).is_some(), "{case}: answered");
+            assert_eq!(liveness.take_peer_child_deletes(), [peer_deleted(&resp_sa, 1, 0, named, attribution)], "{case}");
+        }
+    }
+
+    /// On the IKE SA a rekey of the gateway's retired, a Delete of CHILD SAs
+    /// is answered and not acted on, as ever -- and reported so: on that IKE
+    /// SA's SPIs, `on_current_ike_sa` false, attributed as the session tracks
+    /// the SPI (the CHILD SAs moved to the new IKE SA). The new IKE SA's own
+    /// Delete is then reported on it.
+    #[test]
+    fn a_gateway_delete_on_the_retired_ike_sa_is_reported_as_such() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = reporting_peer_deletes(&gateway, init_sa, None);
+        let ni = [0x55u8; 32];
+        assert_eq!(deliver(&mut liveness, &gateway, &gateway_ike_rekey(&resp_sa, 0, &ni)), Liveness::Alive);
+        let new_sa = gateway_ike_rekey_done(&resp_sa, &ni, &sent_to(&gateway).expect("the IKE SA rekey is answered"));
+
+        assert_eq!(deliver(&mut liveness, &gateway, &gateway_deletes_children(&resp_sa, 1, &[0xAAAA])), Liveness::Alive);
+        assert!(sent_to(&gateway).is_some(), "answered on the retired IKE SA");
+        assert_eq!(liveness.child_spis(ChildKind::Primary), Some((0xBBBB, 0xAAAA)), "not acted on");
+        let current = DeleteAttribution::Known { local_spi: 0xBBBB, peer_spi: 0xAAAA, role: KnownRole::Current(ChildKind::Primary) };
+        assert_eq!(
+            liveness.take_peer_child_deletes(),
+            [PeerChildDeleted { seq: 1, ike_spis: (resp_sa.spi_i, resp_sa.spi_r), on_current_ike_sa: false, message_id: 1, peer_spi: 0xAAAA, attribution: current.clone() }]
+        );
+
+        assert_eq!(deliver(&mut liveness, &gateway, &gateway_deletes_children(&new_sa, 0, &[0xAAAA])), Liveness::PeerTornDown, "the only CHILD SA");
+        assert_eq!(liveness.take_peer_child_deletes(), [peer_deleted(&new_sa, 2, 0, 0xAAAA, current)]);
+    }
+
+    /// Reporting the gateway's Deletes on or off, the session answers them
+    /// the same and is left the same -- both families' SAs, what it queued
+    /// for the caller, its events, and its count -- over a run of Deletes:
+    /// of an SPI it does not track, of an SA a rekey of the gateway's
+    /// replaced, of a redundant SA, of the IPv6 CHILD SA, and of the last
+    /// one, which tears the tunnel down.
+    #[test]
+    fn reporting_the_gateways_deletes_changes_nothing_on_the_wire_nor_in_the_session() {
+        let run = |report: bool| {
+            let (init_sa, resp_sa) = liveness_sa_pair();
+            let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut liveness = session_facing(&gateway, init_sa, Some(ChildSpis { local: 0x6666, peer: 0x7777 }));
+            gateway.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+            liveness.keep_redundant_children(true);
+            liveness.report_peer_deletes(report);
+            liveness.peer_child.superseded.push(SupersededChild { local_spi: 0x7070, peer_spi: 0x7171, since: Instant::now() });
+            liveness.peer_child.redundant.push(RedundantSa { kind: ChildKind::Primary, spis: ChildSpis { local: 0x7272, peer: 0x7373 }, ts: None, since: Instant::now() });
+            let mut came = Vec::new();
+            for (mid, named) in [&[0x4242u32][..], &[0x7171], &[0x7373], &[0x7777], &[0xAAAA]].into_iter().enumerate() {
+                let liveness_seen = deliver(&mut liveness, &gateway, &gateway_deletes_children(&resp_sa, mid as u32, named));
+                let answer = sent_to(&gateway).expect("answered");
+                came.push((liveness_seen, client_header(&answer), esp_spis_deleted(&resp_sa, &answer)));
+            }
+            let state = (
+                both_child_spis(&liveness),
+                liveness.peer_child.deleted.clone(),
+                liveness.take_peer_child_events(),
+                liveness.peer_child.superseded.len(),
+                liveness.peer_child.redundant.len(),
+                liveness.peer_delete_seq(),
+            );
+            (came, state, liveness.take_peer_child_deletes().len())
+        };
+        let (control_wire, control_state, none) = run(false);
+        assert_eq!(none, 0, "nothing reported unless asked");
+        let (wire, state, reported) = run(true);
+        assert_eq!(reported, 5, "one per Delete");
+        assert_eq!(wire, control_wire, "the same answers");
+        assert_eq!(state, control_state, "the same session after");
+        assert_eq!(control_state.5, 5, "counted either way");
     }
 }

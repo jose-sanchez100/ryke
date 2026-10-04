@@ -229,7 +229,7 @@ pub use ikev2::informational::{build_informational, dpd_request, open_informatio
 pub use ikev2::session::{
     default_esp_offer, default_ike_offer, ike_port, ChildDeleteOutcome, ChildKind, ConnectedTunnel, DeleteReport,
     EapCreds, HeldPeerRekey, Ikev2Session, Ipv6Child, Liveness, LivenessSession, NegotiatedRekey, PeerChildEvent,
-    PeerRekeyedChild, RedundantChild, REDUNDANT_CHILDREN_KEPT,
+    PeerRekeyedChild, RedundantChild, SettledRekey, REDUNDANT_CHILDREN_KEPT,
 };
 pub use ikev2::rekey::responder_process_rekey;
 pub use ikev2::ike_rekey::{is_ike_sa_rekey, responder_process_ike_rekey};

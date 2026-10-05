@@ -8733,6 +8733,35 @@ mod tests {
         assert_eq!(wire_of(&resp_sa, &sent), [((ExchangeType::Informational, 2, false), Some(Delete::esp(vec![unknown.local])))]);
     }
 
+    /// Records a defect: this is the behaviour as it is, pending a decision,
+    /// not the behaviour wanted. A request whose first send fails at the
+    /// socket -- here `send_to` an IPv6 address from the session's IPv4
+    /// socket, so nothing leaves the host -- still uses up its Message ID:
+    /// the Delete is reported `NotSent`, yet `next_message_id` moved on by
+    /// one, and the next request goes out under the ID after the skipped one.
+    /// A gateway with a receive window of one (RFC 7296 §2.3), still
+    /// expecting the skipped ID, would drop it and every request after it;
+    /// the scripted gateway here answers any Message ID.
+    #[test]
+    fn records_defect_a_failed_first_send_consumes_its_message_id_and_the_next_request_skips_it() {
+        let (init_sa, resp_sa) = liveness_sa_pair();
+        let gateway = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut liveness = session_facing(&gateway, init_sa, None);
+        let (dest, next) = (liveness.dest, liveness.next_message_id);
+        // An IPv4 socket cannot send to an IPv6 address: `send_to` fails, unprivileged.
+        liveness.dest = "[::1]:500".parse().unwrap();
+        let unknown = ChildSpis { local: 0x7E7E, peer: 0x7F7F };
+        let report = liveness.delete_child(unknown.local, unknown.peer).unwrap();
+        assert!(matches!(report.outcome, ChildDeleteOutcome::NotSent(_)), "{report:?}");
+        assert!(all_sent_to(&gateway).is_empty(), "nothing reached the gateway");
+        assert_eq!(liveness.next_message_id, next + 1, "the Message ID is used up all the same");
+
+        liveness.dest = dest;
+        let (probed, sent) = with_informationals_answered(&gateway, &resp_sa, || liveness.probe(Duration::from_millis(300)).unwrap());
+        assert_eq!(probed, Liveness::Alive);
+        assert_eq!(wire_of(&resp_sa, &sent), [((ExchangeType::Informational, next + 1, false), None)], "the next request skips {next}");
+    }
+
     /// Which rekey of the gateway's a session of
     /// [`session_holding_a_gateway_rekey`] holds unanswered.
     #[derive(Clone, Copy, Debug, PartialEq)]

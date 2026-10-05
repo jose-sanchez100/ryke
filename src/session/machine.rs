@@ -201,6 +201,11 @@
 //! - [`Input::DeleteRetry`]: one more try of an owed Delete on the driver's word, up to
 //!   [`Driving::delete_tries`] in all; never of one sent and unanswered, nor of an abandoned rekey's
 //!   ([`Outcome::NoRetry`]). A rekey awaiting the driver awaits it still after.
+//! - [`Input::GatewayDeleted`]: the gateway itself deleted one exact CHILD SA, by SPIs and generation,
+//!   in an authenticated Delete the driver saw processed after this side's Delete of it was owed. It
+//!   discharges that owed Delete only -- settled as the gateway's, its tries dropped -- and nothing
+//!   else: no other owed entry, no settled one, not the rekey awaiting the driver, which awaits it
+//!   still after ([`Outcome::GatewayDeleted`]).
 //!
 //! A Delete sent and unanswered stays owed ([`DeleteStand::Sent`] `{ acknowledged: false }`): it is
 //! no confirmation. One that can no longer be sent because the IKE SA is over, as the consumer reports
@@ -348,7 +353,7 @@ pub enum Order {
     /// negotiated and handed to the driver, which installs the new SA and switches outbound first;
     /// only on its word is the rekey committed, the replaced SA's Delete going with the commit if the
     /// driver asks for it -- or abandoned, the new SA's Delete only if the driver asks for it. Its
-    /// events are [`Input::RenewDue`] to [`Input::DeleteRetry`]; those of
+    /// events are [`Input::RenewDue`] to [`Input::GatewayDeleted`]; those of
     /// [`CommitThenSwitch`](Self::CommitThenSwitch) are refused.
     DriverFirst,
 }
@@ -472,6 +477,21 @@ pub enum WhyNoRetry {
     TriesExhausted,
 }
 
+/// What the gateway's own Delete of a CHILD SA, as the driver reported it ([`Input::GatewayDeleted`]),
+/// came to in the record ([`Outcome::GatewayDeleted`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayDeletion {
+    /// The owed Delete of exactly that SA -- its SPIs, both, and its generation -- is discharged: out
+    /// of the owed ones, kept last among the settled ones as the gateway's
+    /// ([`Party::Peers`], [`DeleteStand::NotOwed`]`("gateway_deleted")`), its count of tries dropped. A
+    /// later [`Input::DeleteRetry`] of it sends nothing.
+    Settled,
+    /// No owed Delete of exactly that SA: another generation of the same SPIs, one SPI of the pair
+    /// only, an SA settled already, the SA in use, either SA of the rekey awaiting the driver, or
+    /// nothing the record knows. Nothing changed: never settled by a coincidence of SPIs.
+    NoSuchObligation,
+}
+
 /// What an answer says came to exist outside the machine ([`Input::brought`]). What identifies it
 /// beyond this is the consumer's to keep ([Refused inputs](crate::session::machine#refused-inputs)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -585,6 +605,21 @@ pub enum Input<T> {
     /// Event, [`Order::DriverFirst`]: the driver asks for one more try of the Delete of the retired SA
     /// `named` (its attempt is not looked at: the record of retired SAs keeps none).
     DeleteRetry { named: DriverRef },
+    /// Event, [`Order::DriverFirst`]: the gateway itself deleted the CHILD SA of `spis` `(local, peer)`
+    /// in `generation` of the family's line, by an authenticated Delete of its own that the protocol
+    /// processed after this side's Delete of that SA was owed. The driver vouches for all of it --
+    /// that the Delete names that one SA and no other, and that it came after the obligation (the
+    /// protocol's [`crate::PeerChildDeleted`], its attribution and its sequence number): the
+    /// machine checks none of it, and guesses nothing.
+    ///
+    /// Only an owed Delete is discharged, and only the owed entry of exactly those SPIs, both, in
+    /// exactly that generation ([`GatewayDeletion::Settled`]). Anything else -- another generation of
+    /// the same SPIs, one SPI of the pair matching, a settled entry, the SA in use, the replaced or the
+    /// new SA of a rekey awaiting the driver (that operation is never touched), an entry whose
+    /// generation is not known -- is [`GatewayDeletion::NoSuchObligation`], nothing changed. Taken idle
+    /// or while a rekey awaits the driver, which awaits it still after; refused while an action is
+    /// asked ([`Refusal::Busy`]).
+    GatewayDeleted { spis: (u32, u32), generation: u64 },
     /// Answer to [`Action::Commit`], [`Order::DriverFirst`] only: the protocol refused the commit.
     NotCommitted(NotCommitted),
 }
@@ -608,13 +643,17 @@ impl<T> Input<T> {
                 | Input::DriverNotUsed { .. }
                 | Input::DriverSilent
                 | Input::DeleteRetry { .. }
+                | Input::GatewayDeleted { .. }
         )
     }
 
     /// Whether the input is an event only [`Order::DriverFirst`] takes ([`Input::RenewDue`] to
-    /// [`Input::DeleteRetry`]).
+    /// [`Input::GatewayDeleted`]).
     pub fn is_drivers(&self) -> bool {
-        matches!(self, Input::RenewDue { .. } | Input::DriverInstalled { .. } | Input::DriverNotUsed { .. } | Input::DriverSilent | Input::DeleteRetry { .. })
+        matches!(
+            self,
+            Input::RenewDue { .. } | Input::DriverInstalled { .. } | Input::DriverNotUsed { .. } | Input::DriverSilent | Input::DeleteRetry { .. } | Input::GatewayDeleted { .. }
+        )
     }
 
     /// Whether the input is an event only [`Order::CommitThenSwitch`] takes ([`Input::RenewByVolume`]
@@ -652,6 +691,7 @@ impl<T> Input<T> {
             Input::DriverNotUsed { .. } => "DriverNotUsed",
             Input::DriverSilent => "DriverSilent",
             Input::DeleteRetry { .. } => "DeleteRetry",
+            Input::GatewayDeleted { .. } => "GatewayDeleted",
             Input::NotCommitted(_) => "NotCommitted",
         }
     }
@@ -989,6 +1029,10 @@ pub enum Outcome<T> {
     DeleteRetried { ike_sa_over: bool },
     /// [`Order::DriverFirst`]: the Delete the driver asked for was not tried, for this reason.
     NoRetry(WhyNoRetry),
+    /// [`Order::DriverFirst`]: what the gateway's own Delete the driver reported
+    /// ([`Input::GatewayDeleted`]) came to -- the owed Delete it names settled, or none such, nothing
+    /// changed. Nothing was asked; a rekey awaiting the driver awaits it still.
+    GatewayDeleted(GatewayDeletion),
 }
 
 /// One step of the machine: the actions to carry out, in order, and, once the operation is over,
@@ -1394,6 +1438,7 @@ impl<T: Copy> FamilyMachine<T> {
             | Input::DriverNotUsed { .. }
             | Input::DriverSilent
             | Input::DeleteRetry { .. }
+            | Input::GatewayDeleted { .. }
             | Input::NotCommitted(_) => return Err(self.refused(Refusal::NotAnEvent, input)),
         };
         Ok(self.finish(flow, Vec::new()))
@@ -1522,7 +1567,8 @@ impl<T: Copy> FamilyMachine<T> {
     /// driver's word: [`Input::RenewDue`] only idle (one negotiation per SA); a word of the driver's
     /// only for the rekey awaiting it, named whole ([`HandedOver::named_by`]) -- anything else is
     /// [`Outcome::NotPending`], nothing changed --; the driver's silence only for a rekey awaiting it;
-    /// a retry of a Delete either way, the rekey awaiting the driver, if any, still awaiting it after.
+    /// a retry of a Delete, and the gateway's own Delete of an SA, either way, the rekey awaiting the
+    /// driver, if any, still awaiting it after.
     fn driver_event(&mut self, input: Input<T>, policy: &Policy) -> Result<Step<T>, Unexpected<T>> {
         if self.asked().is_some() {
             if matches!(input, Input::DataPlaneReset) {
@@ -1563,6 +1609,7 @@ impl<T: Copy> FamilyMachine<T> {
                 None => Flow::Done(Outcome::Nothing),
             },
             Input::DeleteRetry { named: n } => self.retry(n, awaiting),
+            Input::GatewayDeleted { spis, generation } => rest(awaiting, Outcome::GatewayDeleted(self.gateway_deleted(spis, generation, policy))),
             Input::DataPlaneReset => {
                 // No switch is ever deferred in this order: nothing to drop, nothing else changes.
                 let _ = self.record.take_switch();
@@ -1698,6 +1745,24 @@ impl<T: Copy> FamilyMachine<T> {
         }
         self.prune_tries();
         rest(then, Outcome::DeleteRetried { ike_sa_over: report.ike_sa_over })
+    }
+
+    /// The gateway's own Delete of the SA of `spis` in `generation`, as the driver reported it: the
+    /// owed entry of exactly that SA, if there is one, settled as the gateway's -- the words the
+    /// consumer's mapping gives an abandon's or a commit's report of it (`gateway_deleted`, the
+    /// peer's) -- and its count of tries dropped with the debt. With none, nothing changes: an SA
+    /// that is not owed is never recorded, nor is an entry of the same SPIs in another generation, a
+    /// settled entry, or the rekey awaiting the driver touched.
+    fn gateway_deleted(&mut self, spis: (u32, u32), generation: u64, policy: &Policy) -> GatewayDeletion {
+        let generation = Some(generation);
+        if !self.owes(spis, generation) {
+            return GatewayDeletion::NoSuchObligation;
+        }
+        // Owed, by exactly that SA; and the peer's to delete is owed nothing (`Retired::owed`): the
+        // update settles it -- the oldest such entry, as every update of the record.
+        let _ = self.record.update(Retired { spis, generation, deleted_by: Party::Peers, stand: DeleteStand::NotOwed("gateway_deleted") }, policy.retired);
+        self.prune_tries();
+        GatewayDeletion::Settled
     }
 
     /// Whether the record owes the Delete of the SA of `spis` in `generation`.
@@ -4163,8 +4228,8 @@ mod tests {
     }
 
     /// Where `m` waits on `ask` for `answer`: that answer with another ask, as an event, the driver's
-    /// renewal, the other order's event, and an answer that is not its own are each refused, handed
-    /// back whole, and change nothing.
+    /// renewal, the gateway's own Delete of an SA, the other order's event, and an answer that is not
+    /// its own are each refused, handed back whole, and change nothing.
     fn out_of_turn(m: &mut FamilyMachine<u64>, ask: Ask, answer: Input<u64>) {
         let before = m.clone();
         let phase = m.phase.name();
@@ -4174,6 +4239,8 @@ mod tests {
         assert_eq!(m.step(answer, &POLICY), Err(Unexpected { phase, why: Refusal::NotAnEvent, input: answer }), "{phase}");
         let renewal = due_for(Instant::now(), REQUESTED, 99);
         assert_eq!(m.step(renewal, &POLICY), Err(Unexpected { phase, why: Refusal::Busy, input: renewal }), "{phase}");
+        let gone = gateway_deleted(CURRENT);
+        assert_eq!(m.step(gone, &POLICY), Err(Unexpected { phase, why: Refusal::Busy, input: gone }), "{phase}");
         let windows = Input::SwitchCheck { now: Instant::now(), peer_sent: true };
         assert_eq!(m.step(windows, &POLICY), Err(Unexpected { phase, why: Refusal::NotAnEvent, input: windows }), "{phase}");
         let other = if matches!(answer, Input::Deleted(_)) { Input::Abandoned(ACKED) } else { Input::Deleted(ACKED) };
@@ -4204,6 +4271,11 @@ mod tests {
         Step { actions: vec![], outcome: Some(outcome), ask: None }
     }
 
+    /// The driver's report of the gateway's own Delete of `c`, by its SPIs and its generation.
+    fn gateway_deleted(c: ChildId) -> Input<u64> {
+        Input::GatewayDeleted { spis: c.spis(), generation: c.generation }
+    }
+
     #[test]
     fn the_default_is_the_commit_then_switch_order_and_any_machine_of_that_order_steps_every_flow_as_before() {
         assert_eq!(FamilyMachine::<u64>::new().driving(), Driving::COMMIT_THEN_SWITCH);
@@ -4231,6 +4303,7 @@ mod tests {
             Input::DriverNotUsed { named: named(&h), send_delete: true },
             Input::DriverSilent,
             Input::DeleteRetry { named: named_retired(CURRENT) },
+            gateway_deleted(CURRENT),
         ];
         // The default order: idle, and with a renewal under way.
         let mut idle = FamilyMachine::<u64>::new();
@@ -4611,5 +4684,187 @@ mod tests {
         }
         assert_eq!(m.record().owed().len(), 4);
         assert!(!m.suspended());
+    }
+
+    /// The gateway's own Delete as the consumer's mapping words it in an abandon's or a commit's report.
+    const GATEWAYS: DeleteCame = came(Peers, NotOwed("gateway_deleted"));
+
+    /// A driven machine whose renewal of `CURRENT` to `NEW` was committed with the replaced SA's Delete
+    /// reported as `came`; idle after.
+    fn committed_with(t0: Instant, came: DeleteCame) -> FamilyMachine<u64> {
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        let (_, outcome) = go(&mut m, Input::DriverInstalled { named: named(&h), delete_replaced: true }, &[Input::Committed(Committed::Other(came))]);
+        assert_eq!(outcome, Outcome::Renewed { new: NEW, deferred: false, ike_sa_over: false });
+        m
+    }
+
+    /// `m`, `CURRENT` renewed already, with the renewal of `NEXT` to `(0x31, 0x32)` handed to the driver.
+    fn next_handed(m: &mut FamilyMachine<u64>, t0: Instant) -> HandedOver {
+        let next = Input::RenewDue { now: t0 + secs(1), current: NEXT, causes: REQUESTED, attempt: 2 };
+        let (_, outcome) = go(m, next, &[negotiated(t0 + secs(1), (0x31, 0x32))]);
+        let Outcome::HandedToDriver(h) = outcome else { panic!("{outcome:?}") };
+        h
+    }
+
+    #[test]
+    fn the_gateways_own_delete_settles_exactly_the_owed_delete_it_names_as_the_gateways_and_drops_its_tries() {
+        let t0 = t0();
+        // The commit's own Delete not known to have gone: owed, one try had.
+        let mut m = committed_with(t0, came(Ours, Unknown));
+        assert_eq!((m.record().owed(), m.delete_tries(CURRENT.spis(), Some(CURRENT.generation))), (&[retired(CURRENT, Ours, Unknown)][..], 1));
+        assert_eq!(take(&mut m, gateway_deleted(CURRENT)), over(Outcome::GatewayDeleted(GatewayDeletion::Settled)), "nothing asked, nothing sent");
+        assert!(m.idle());
+        assert_eq!((m.record().owed(), settled(&m)), (&[][..], vec![retired(CURRENT, Peers, NotOwed("gateway_deleted"))]), "settled as the gateway's");
+        assert!(m.tries.is_empty(), "the count goes with the debt");
+        assert_eq!(m.delete_tries(CURRENT.spis(), Some(CURRENT.generation)), 0);
+        // The very machine whose commit reported the gateway's Delete of that SA: the same words, nothing else differs.
+        assert_eq!(m, committed_with(t0, GATEWAYS), "the whole state, as if the commit had reported it");
+        // A later retry of it sends nothing; the same report again finds no debt.
+        let before = m.clone();
+        assert_eq!(take(&mut m, Input::DeleteRetry { named: named_retired(CURRENT) }), over(Outcome::NoRetry(WhyNoRetry::Settled)));
+        assert_eq!(take(&mut m, gateway_deleted(CURRENT)), over(Outcome::GatewayDeleted(GatewayDeletion::NoSuchObligation)), "settled already");
+        assert_eq!(m, before);
+        // Each way of being owed is discharged alike: not tried, failed, not known to have gone, sent with no answer.
+        for stand in [NotSent, Failed, Unknown, Sent { acknowledged: false }] {
+            let mut m = committed_with(t0, came(Ours, stand));
+            assert_eq!(m.record().owed(), [retired(CURRENT, Ours, stand)], "{stand:?}");
+            assert_eq!(take(&mut m, gateway_deleted(CURRENT)), over(Outcome::GatewayDeleted(GatewayDeletion::Settled)), "{stand:?}");
+            assert_eq!(m, committed_with(t0, GATEWAYS), "{stand:?}");
+        }
+    }
+
+    #[test]
+    fn the_gateways_own_delete_of_the_same_spis_in_another_generation_or_of_one_spi_of_the_pair_settles_nothing() {
+        let t0 = t0();
+        let mut m = committed_with(t0, came(Ours, Unknown));
+        let (local, peer, generation) = (CURRENT.local_spi, CURRENT.peer_spi, CURRENT.generation);
+        let wrong = [
+            ("the same SPIs, the next generation", (local, peer), generation + 1),
+            ("the same SPIs, the generation before", (local, peer), generation - 1),
+            ("the local SPI only", (local, 0x99), generation),
+            ("the peer SPI only", (0x99, peer), generation),
+            ("the SPIs crossed", (peer, local), generation),
+            ("the SA in use", NEXT.spis(), NEXT.generation),
+            ("the SA in use's SPIs, the owed one's generation", NEXT.spis(), generation),
+            ("nothing the record knows", (0x77, 0x78), 3),
+        ];
+        let before = m.clone();
+        for (what, spis, generation) in wrong {
+            assert_eq!(take(&mut m, Input::GatewayDeleted { spis, generation }), over(Outcome::GatewayDeleted(GatewayDeletion::NoSuchObligation)), "{what}");
+            assert_eq!(m, before, "{what}: nothing changes, the debt and its try kept");
+        }
+        // Its retry still goes; the right name settles it.
+        assert_eq!(m.delete_tries(CURRENT.spis(), Some(generation)), 1);
+        assert_eq!(take(&mut m, gateway_deleted(CURRENT)), over(Outcome::GatewayDeleted(GatewayDeletion::Settled)));
+    }
+
+    #[test]
+    fn of_two_owed_deletes_the_gateways_own_delete_settles_only_the_one_it_names_and_the_others_retry_still_goes() {
+        let t0 = t0();
+        // CURRENT, then NEXT, each committed with no Delete asked: both owed, never tried.
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        go(&mut m, Input::DriverInstalled { named: named(&h), delete_replaced: false }, &[Input::Committed(Committed::OursDeleteNotAsked)]);
+        let h2 = next_handed(&mut m, t0);
+        go(&mut m, Input::DriverInstalled { named: named(&h2), delete_replaced: false }, &[Input::Committed(Committed::OursDeleteNotAsked)]);
+        assert_eq!(m.record().owed(), [retired(CURRENT, Ours, NotSent), retired(NEXT, Ours, NotSent)]);
+        assert_eq!(take(&mut m, gateway_deleted(NEXT)), over(Outcome::GatewayDeleted(GatewayDeletion::Settled)));
+        assert_eq!((m.record().owed(), settled(&m)), (&[retired(CURRENT, Ours, NotSent)][..], vec![retired(NEXT, Peers, NotOwed("gateway_deleted"))]), "only the one named");
+        // The other's retry goes, and its answer settles it as ours; the one the gateway deleted is never tried.
+        let (actions, outcome) = go(&mut m, Input::DeleteRetry { named: named_retired(CURRENT) }, &[Input::Deleted(ACKED)]);
+        assert_eq!((actions, outcome), (vec![Action::DeleteChild { spis: CURRENT.spis() }], Outcome::DeleteRetried { ike_sa_over: false }));
+        assert_eq!(take(&mut m, Input::DeleteRetry { named: named_retired(NEXT) }), over(Outcome::NoRetry(WhyNoRetry::Settled)));
+        assert_eq!((m.record().owed(), settled(&m)), (&[][..], vec![retired(NEXT, Peers, NotOwed("gateway_deleted")), retired(CURRENT, Ours, Sent { acknowledged: true })]));
+    }
+
+    #[test]
+    fn while_a_rekey_awaits_the_driver_the_gateways_own_delete_settles_the_owed_one_and_the_rekey_awaits_still_untouched() {
+        let t0 = t0();
+        let mut m = committed_with(t0, came(Ours, Unknown));
+        let h2 = next_handed(&mut m, t0);
+        let pending = m.record().pending();
+        assert_eq!(take(&mut m, gateway_deleted(CURRENT)), over(Outcome::GatewayDeleted(GatewayDeletion::Settled)));
+        assert_eq!((m.awaiting_driver(), m.record().pending(), m.asked()), (Some(h2), pending, None), "awaiting still, the rekey as it was");
+        assert_eq!((m.record().owed(), settled(&m)), (&[][..], vec![retired(CURRENT, Peers, NotOwed("gateway_deleted"))]));
+        // The whole state: as if the commit had reported the gateway's Delete, the next rekey handed over after.
+        let mut control = committed_with(t0, GATEWAYS);
+        assert_eq!(next_handed(&mut control, t0), h2);
+        assert_eq!(m, control);
+        // The driver's word on the rekey is taken as ever.
+        let (_, outcome) = go(&mut m, Input::DriverInstalled { named: named(&h2), delete_replaced: true }, &[Input::Committed(Committed::Other(ACKED))]);
+        assert_eq!(outcome, Outcome::Renewed { new: (0x31, 0x32), deferred: false, ike_sa_over: false });
+    }
+
+    #[test]
+    fn the_gateways_own_delete_of_either_sa_of_the_rekey_awaiting_the_driver_settles_nothing_and_leaves_it_awaiting() {
+        let t0 = t0();
+        // Nothing owed: the replaced SA in use, the new one handed to the driver.
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        let new = ChildId { generation: h.generation, local_spi: NEW.0, peer_spi: NEW.1 };
+        let before = m.clone();
+        for c in [h.replaces, new] {
+            assert_eq!(take(&mut m, gateway_deleted(c)), over(Outcome::GatewayDeleted(GatewayDeletion::NoSuchObligation)), "{c:?}");
+            assert_eq!(m, before, "{c:?}: the rekey awaiting untouched, nothing recorded");
+        }
+        // With a debt owed beside it: the rekey's SAs settle nothing still, the debt stays.
+        let mut m = committed_with(t0, came(Ours, Unknown));
+        let h2 = next_handed(&mut m, t0);
+        let before = m.clone();
+        for c in [h2.replaces, ChildId { generation: h2.generation, local_spi: h2.new.0, peer_spi: h2.new.1 }] {
+            assert_eq!(take(&mut m, gateway_deleted(c)), over(Outcome::GatewayDeleted(GatewayDeletion::NoSuchObligation)), "{c:?}");
+            assert_eq!(m, before, "{c:?}");
+        }
+        assert_eq!(m.awaiting_driver(), Some(h2));
+    }
+
+    #[test]
+    fn the_gateways_own_delete_is_refused_busy_while_an_action_is_asked_and_not_an_event_under_the_other_order_changing_nothing() {
+        let t0 = t0();
+        let gone = gateway_deleted(CURRENT);
+        assert!(gone.is_event() && gone.is_drivers() && gone.brought().is_none());
+        assert_eq!(gone.kind(), "GatewayDeleted");
+        // Each action the driver's order asks: the rekey, the commit, the abandon, a retry. The debt of CURRENT owed in the last two.
+        let mut asking = Vec::new();
+        let mut m = driven();
+        let _ = take(&mut m, due_for(t0, REQUESTED, 1));
+        asking.push(m);
+        let mut m = driven();
+        let h = handed(&mut m, t0);
+        let _ = take(&mut m, Input::DriverInstalled { named: named(&h), delete_replaced: true });
+        asking.push(m);
+        let mut m = committed_with(t0, came(Ours, Unknown));
+        let h2 = next_handed(&mut m, t0);
+        let _ = take(&mut m, Input::DriverNotUsed { named: named(&h2), send_delete: true });
+        asking.push(m);
+        let mut m = committed_with(t0, came(Ours, Unknown));
+        let _ = take(&mut m, Input::DeleteRetry { named: named_retired(CURRENT) });
+        asking.push(m);
+        let phases: Vec<&str> = asking.iter().map(|m| m.phase.name()).collect();
+        assert_eq!(phases, ["driver_negotiating", "driver_committing", "driver_abandoning", "retrying"]);
+        for m in &mut asking {
+            let (before, phase, ask) = (m.clone(), m.phase.name(), m.asked().unwrap());
+            assert_eq!(m.step(gone, &POLICY), Err(Unexpected { phase, why: Refusal::Busy, input: gone }), "{phase}");
+            assert_eq!(m.answer(ask, gone, &POLICY), Err(Unexpected { phase, why: Refusal::NotItsAnswer, input: gone }), "{phase}: no answer");
+            assert_eq!(*m, before, "{phase}: nothing changes, the ask still pending");
+        }
+        // The retry's own answer is still taken, and settles the debt as ours.
+        let m = &mut asking[3];
+        let step = m.answer(m.asked().unwrap(), Input::Deleted(ACKED), &POLICY).unwrap();
+        assert_eq!(step.outcome, Some(Outcome::DeleteRetried { ike_sa_over: false }));
+        assert_eq!(settled(m), [retired(CURRENT, Ours, Sent { acknowledged: true })]);
+        // The other order: idle, and with a renewal under way; an owed Delete there too.
+        let mut idle = FamilyMachine::<u64>::new();
+        let mut busy = FamilyMachine::<u64>::new();
+        let _ = take(&mut busy, renew(t0, CURRENT));
+        let mut owing = FamilyMachine::<u64>::new();
+        let run = renewal(&mut owing, &POLICY, t0, Committed::OursDeleteNotAsked, &[Input::Switched(Ok(())), Input::Deleted(came(Ours, Unknown))]);
+        assert_eq!((run.outcome, owing.record().owed()), (Outcome::Renewed { new: NEW, deferred: false, ike_sa_over: false }, &[retired(CURRENT, Ours, Unknown)][..]));
+        for m in [&mut idle, &mut busy, &mut owing] {
+            let (before, phase) = (m.clone(), m.phase.name());
+            assert_eq!(m.step(gone, &POLICY), Err(Unexpected { phase, why: Refusal::NotAnEvent, input: gone }), "{phase}");
+            assert_eq!(*m, before, "{phase}: nothing changes");
+        }
     }
 }

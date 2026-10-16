@@ -90,7 +90,7 @@ pub mod id_type {
     pub const IPV4_ADDR_SUBNET: u8 = 4;
     pub const IPV6_ADDR: u8 = 5;
     /// Payload data: 16-byte network address + 16-byte netmask (RFC 2407
-    /// §4.6.2.1), the IPv6 twin of `IPV4_ADDR_SUBNET`.
+    /// §4.6.2.7), the IPv6 twin of `IPV4_ADDR_SUBNET`.
     pub const IPV6_ADDR_SUBNET: u8 = 6;
     pub const KEY_ID: u8 = 11;
     /// A certificate's own Subject DN, DER-encoded — see
@@ -202,7 +202,7 @@ impl Attribute {
     /// The value as a u32 -- the shape `LIFE_DURATION` (always sent via
     /// [`Attribute::long_u32`]) comes back as, needed to read a peer's
     /// possibly-shortened SA lifetime back out of its own response (RFC 2407
-    /// §4.5: the responder isn't bound to the proposer's offered duration and
+    /// §4.5.4: the responder isn't bound to the proposer's offered duration and
     /// may unilaterally pick a shorter one for its own copy of the SA).
     pub fn as_u32(&self) -> Option<u32> {
         match &self.value {
@@ -266,7 +266,7 @@ impl Transform {
     /// Whether `self` (a transform a peer claims to have chosen) is exactly
     /// the one `offered` proposed -- same `transform_id` and every attribute
     /// equal, except the types listed in `ignore` (typically `LIFE_TYPE`/
-    /// `LIFE_DURATION`, which RFC 2407 §4.5 lets a responder unilaterally
+    /// `LIFE_DURATION`, which RFC 2407 §4.5.4 lets a responder unilaterally
     /// shorten). This crate's IKEv1 initiator always proposes a single
     /// transform, so there is exactly one legitimate answer -- mirrors
     /// `ikev2::negotiate::ChosenSuite::matches_offer`'s exact rationale:

@@ -15,7 +15,8 @@
 //!   XAUTH-PSK proposal, but no XAUTH exchange follows it;
 //! - a message repeated bitwise identical gets the answer already sent, and a
 //!   repeated last message of an exchange is dropped. Nothing is taken twice
-//!   (RFC 2409 §5: no state moves on for a retransmission), and a late
+//!   (RFC 2409 §10 says a receiver SHOULD NOT update its running IV for a
+//!   retransmission; this side moves no state on for one), and a late
 //!   repeat of a message 1 opens no second ISAKMP SA;
 //! - a message that fails its checks leaves the exchange where it was;
 //! - Quick Mode is taken only once Phase 1 has authenticated the peer, each

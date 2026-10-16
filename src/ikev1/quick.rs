@@ -56,7 +56,7 @@
 //! **Phase 2, as an initiator**, offers one seconds pair and nothing else, so it
 //! never asks the peer to hold it to a volume. A kilobytes pair in the answer is
 //! the peer's own limit on the SA (RFC 2407 §4.5.4: a responder may complete the
-//! negotiation "using a shorter lifetime than what was offered"), and it is held,
+//! negotiation but "use a shorter lifetime than what was offered"), and it is held,
 //! not dropped: [`QuickInitiator::complete_with_lifetime`],
 //! [`rekey_child_with_lifetime`] and its IPv6 counterparts, and
 //! `Established::p2_lifetime_kilobytes` return it beside the seconds. It is never
@@ -70,8 +70,9 @@
 //! `a_rekey_or_a_new_ipv6_child_sa_hands_over_the_volume_limit_the_gateway_states`).
 //!
 //! The responder may state its limits in a **RESPONDER-LIFETIME** Notify
-//! instead (RFC 2407 §4.5.4 says it SHOULD when it shortens them, §4.6.3.1
-//! gives the format), and a FortiGate states its volume limit only that way,
+//! instead (RFC 2407 §4.5.4 says it SHOULD, if it wishes to notify the initiator
+//! of a shorter lifetime; §4.6.3.1 gives the format), and a FortiGate states its
+//! volume limit only that way,
 //! its transform stating seconds alone. Message 2's Notifies are read once
 //! HASH(2) has proved them the peer's, and before message 3 is built: each
 //! unit a well-formed one states shortens the one the transform left us with,
@@ -90,8 +91,11 @@
 //! and hands it over: the answer's transform carries its seconds pair (the
 //! offer's, or its own 3600 when the offer states none) followed by the
 //! kilobytes pair, and [`QuickResponder::negotiated_lifetime`] returns both. It
-//! never lengthens what it was offered (RFC 2407 §4.5.4: a responder may only
-//! complete "using a shorter lifetime than what was offered"), a limit of its own
+//! never lengthens what it was offered (RFC 2409 §5 is the only RFC text
+//! against a responder changing an offer, "Responders MUST NOT modify attributes
+//! of any offer, attribute encoding excepted"; RFC 2407 §4.5.4 carves out the
+//! shorter lifetime, "a shorter lifetime than what was offered"; "never longer"
+//! is this side's reading of the two together), a limit of its own
 //! ([`respond_quick_capped`]) shortens the granted volume, and is stated even when
 //! the offer had none. So an offer that includes a volume limit is no longer taken
 //! as though it had none, and no limit is accepted in order to be forgotten: the
@@ -186,9 +190,10 @@ mod esp_attr {
     pub const LIFE_DURATION: u16 = 2;
     /// PFS group -- present on the ESP proposal transform only when PFS is
     /// wanted; its mere presence is the signal both `initiate_quick_with_pfs`
-    /// and `respond_quick` key off of. Same attribute number as the IKE DOI's
-    /// own Phase-1 `GROUP_DESC` (see `phase1::attr::GROUP_DESC`) -- RFC 2407
-    /// §4.5 and RFC 2409 §5 happen to share attribute type 3 for this.
+    /// and `respond_quick` key off of. The two RFCs number this attribute
+    /// differently: RFC 2407 §4.5 gives Group Description as type 3, RFC 2409
+    /// Appendix A as type 4 (the Phase-1 `GROUP_DESC`, `payloads::attr::GROUP_DESC`,
+    /// is 4). Quick Mode here sends and reads 3 on the wire.
     pub const GROUP_DESC: u16 = 3;
     pub const ENCAP_MODE: u16 = 4;
     pub const KEY_LENGTH: u16 = 6;
@@ -197,8 +202,9 @@ mod esp_attr {
     pub const AUTH_ALGORITHM: u16 = 5;
 }
 const ENCAP_TUNNEL: u16 = 1;
-/// UDP-encapsulated tunnel mode (RFC 3947 §4.3.1's final IANA value, as
-/// opposed to the legacy private-range 61443 some pre-RFC drafts used) --
+/// UDP-encapsulated tunnel mode (RFC 3947 §5.1's UDP-Encapsulated-Tunnel, 3,
+/// registered in §9, as opposed to the legacy private-range 61443 some pre-RFC
+/// drafts used) --
 /// used instead of `ENCAP_TUNNEL` whenever `Phase1State::floated` is `true`,
 /// mirroring isakmpd's own `ike_quick_mode.c` switch (confirmed by reading
 /// it: it selects the RFC-final value there too, never the draft one, since
@@ -321,7 +327,7 @@ fn stated_lifetime_in(attributes: &[Attribute]) -> Result<StatedLifetime, IkeErr
 }
 
 /// The lifetime an already-validated answer (`ps`, see [`check_answer`]) leaves
-/// us with. RFC 2407 §4.5.4: the responder may complete the negotiation "using a
+/// us with. RFC 2407 §4.5.4: the responder may complete the negotiation but "use a
 /// shorter lifetime than what was offered" -- so its seconds pair (28800
 /// seconds, the DOI default, when it states none) counts, but never beyond
 /// `offered`: what we offered is our own limit, and a longer answer only says
@@ -345,9 +351,10 @@ const RESPONDER_LIFETIME: u16 = 24576;
 
 /// The lifetime the RESPONDER-LIFETIME Notifies of an authentic message 2
 /// (`ps`) state for the SA it answers, each unit `None` when none states it.
-/// RFC 2407 §4.5.4: a responder that shortens the lifetime "SHOULD" send one
-/// in the exchange carrying its SA payload, and a FortiGate states its volume
-/// limit this way only, its transform stating seconds alone. Per §4.6.3.1 the
+/// RFC 2407 §4.5.4: a responder that shortens the lifetime and wishes to notify
+/// the initiator "SHOULD" send one in the exchange carrying its SA payload, and a
+/// FortiGate states its volume limit this way only, its transform stating
+/// seconds alone. Per §4.6.3.1 the
 /// Notify's DOI is the IPsec DOI, its Protocol ID that of the chosen SA (ESP,
 /// the only one offered), its SPI "the sender's inbound IPSEC SPI" -- the
 /// `peer_spi` this answer chose -- "or the ISAKMP cookies" (16 octets, those
@@ -434,8 +441,9 @@ fn shortened(negotiated: SaLifetime, stated: StatedLifetime) -> SaLifetime {
     }
 }
 
-/// The one SA payload of a Quick Mode message (RFC 2409 §5.5 carries exactly
-/// one): a message with none is `MissingPayload`, with several `NoProposalChosen`
+/// The one SA payload of a Quick Mode message (RFC 2409 §5.5 also shows a Quick
+/// Mode negotiating several SAs, SA0 and SA1; exactly one is this side's own
+/// rule): a message with none is `MissingPayload`, with several `NoProposalChosen`
 /// -- which of them was meant is not ours to guess.
 fn single_sa(ps: &[Payload]) -> Result<SaPayload, IkeError> {
     let mut sas = ps.iter().filter(|p| p.payload_type == payload::SA);
@@ -490,7 +498,8 @@ fn esp_transform(num: u8, cipher: SkCipher, pfs_group: Option<DhGroup>, encap_mo
 
 /// [`esp_transform`] that also states a volume limit of `kilobytes` -- a second
 /// lifetime pair after the seconds one (RFC 2407 §4.5.2), the SA ending at
-/// whichever is reached first. Only a responder states one (what it grants, see
+/// whichever is reached first (the usual reading, not RFC text). Only a
+/// responder states one (what it grants, see
 /// [`respond_quick_capped`]): an offer of ours never does.
 fn esp_transform_limited(num: u8, cipher: SkCipher, pfs_group: Option<DhGroup>, encap_mode: u16, life_duration: u32, kilobytes: Option<u32>) -> Transform {
     let mut attributes = vec![
@@ -547,7 +556,7 @@ fn ts_id(addr: [u8; 4], mask: [u8; 4]) -> Vec<u8> {
 }
 
 /// An ID payload body for an IPv6 subnet traffic selector: network address +
-/// netmask, 16 bytes each (RFC 2407 §4.6.2.1) -- the IPv6 twin of [`ts_id`].
+/// netmask, 16 bytes each (RFC 2407 §4.6.2.7) -- the IPv6 twin of [`ts_id`].
 /// A host selector is `prefix_len` 128, same convention as the IPv4 side's
 /// `/32` narrowing to the assigned address.
 fn ts_id_v6(addr: Ipv6Addr, prefix_len: u8) -> Vec<u8> {
@@ -654,9 +663,11 @@ fn select_offer(ps: &[Payload]) -> Result<Selection, IkeError> {
 }
 
 /// Whether the identity a responder answered (`answered`, an ID payload body) names the selector this side
-/// offered (`offered`). RFC 2409 §5.5 has the responder echo the initiator's identities, and RFC 2407 §4.6.2.1
-/// gives one address two encodings: ID_IPV4_ADDR / ID_IPV6_ADDR, or a subnet whose mask covers only that
-/// address. This side offers its assigned address as a /32 (/128) subnet; a gateway that writes a single
+/// offered (`offered`). RFC 2409 §5.5 has the responder echo the initiator's identities. One address has two
+/// encodings here: ID_IPV4_ADDR / ID_IPV6_ADDR, or a subnet whose mask covers only that address. RFC 2407
+/// defines them as separate ID types (§4.6.2.2 and §4.6.2.6 for a single address, §4.6.2.5 and §4.6.2.7 for a
+/// subnet) and does not say they are the same selector, so equating them is interop policy, not RFC text.
+/// This side offers its assigned address as a /32 (/128) subnet; a gateway that writes a single
 /// address in the first form answers it that way (strongSwan does, observed live 2026-09-29), which a byte
 /// comparison refused as an SA "not offered".
 ///
@@ -817,7 +828,7 @@ pub struct QuickInitiator {
     /// private key, needed once the response's KE payload arrives.
     pfs: Option<(DhGroup, [u8; 32])>,
     /// The ESP SA lifetime we offered -- needed by [`QuickInitiator::complete`]
-    /// to read back what the responder actually negotiated (RFC 2407 §4.5;
+    /// to read back what the responder actually negotiated (RFC 2407 §4.5.4;
     /// see `negotiated_p2_lifetime`'s doc).
     life_duration: u32,
     /// The IDci/IDcr payload bodies we offered -- [`QuickInitiator::complete`]
@@ -955,7 +966,7 @@ fn initiate_quick_with_ids(
 impl QuickInitiator {
     /// Process message 2 (`HASH(2), SA, Nr, [KE]`): verify `HASH(2)`, and
     /// return message 3 (`HASH(3)`), the established ESP CHILD SA, and the
-    /// actually-negotiated lifetime (RFC 2407 §4.5 -- see
+    /// actually-negotiated lifetime (RFC 2407 §4.5.4 -- see
     /// `negotiated_p2_lifetime`'s doc).
     pub fn complete(self, msg2: &[u8]) -> Result<(Vec<u8>, ChildSa, u32), IkeError> {
         self.complete_with_lifetime(msg2).map(|(msg3, child, lifetime)| (msg3, child, lifetime.seconds))
@@ -1049,9 +1060,11 @@ pub struct QuickResponder {
 }
 
 /// The volume limit a responder grants: what the offer states, shortened to its
-/// own `cap` when it has one -- never lengthened (RFC 2407 §4.5.4: a responder
-/// may complete the negotiation "using a shorter lifetime than what was
-/// offered"), and its own limit when the offer states none.
+/// own `cap` when it has one -- never lengthened (RFC 2409 §5 is the only RFC
+/// text against a responder changing an offer; RFC 2407 §4.5.4 carves out the
+/// shorter lifetime; "never longer" is this side's reading of the two together),
+/// and its own limit when the
+/// offer states none.
 fn granted_volume(offered: Option<u32>, cap: Option<u32>) -> Option<u32> {
     match (offered, cap) {
         (Some(offered), Some(cap)) => Some(offered.min(cap)),
@@ -1176,10 +1189,10 @@ impl QuickResponder {
 /// Rekey the CHILD SA identified by `old_local_spi` via a fresh Quick Mode
 /// exchange (RFC 2409 §5.5) run at any point while the Phase-1 SA (`st`)
 /// stays live -- IKEv1's equivalent of IKEv2's CREATE_CHILD_SA rekey (RFC
-/// 7296 §2.18). Drives the full three-message exchange over `sock` itself
+/// 7296 §1.3.3, §2.8). Drives the full three-message exchange over `sock` itself
 /// (NAT-T floated per `st.floated`, mirroring
 /// `ikev1::client::Client::send_step`/`recv_matching`'s own floating logic),
-/// then best-effort sends an explicit Delete (RFC 7296 §3.10 / RFC 2408) for
+/// then best-effort sends an explicit Delete (RFC 7296 §3.11 / RFC 2408) for
 /// `old_local_spi` -- the SA just superseded -- naming our own inbound SPI,
 /// same as `Established::close_message` does at full teardown. A failure to
 /// send (or to get any reply to) that closing Delete never fails the rekey
@@ -1384,9 +1397,11 @@ fn send_ike(sock: &dyn IkeSocket, st: &Phase1State, peer: SocketAddr, msg: &[u8]
 /// When `datagram` (already stripped of the non-ESP marker, if any) is, bit for
 /// bit, a peer message that one of our final messages answered -- the peer
 /// repeating its message 2 because our message 3 never reached it (RFC 2408
-/// §3.1, Commit Bit NOTE) -- sends that final message again, untouched. Nothing
+/// §3.1, Commit Bit NOTE, which proposes this and calls the handling "not
+/// standardized") -- sends that final message again, untouched. Nothing
 /// else moves: the retained bytes are sent as they were, so no IV or exchange
-/// state advances for a retransmission (RFC 2409 §5). Any other datagram is left
+/// state advances for a retransmission (RFC 2409 §10 says it of the running IV,
+/// as a SHOULD NOT). Any other datagram is left
 /// to the caller, and so is a repeat, which it drops like any message that is
 /// not the one it waits for (the repeat is another exchange's, by Message ID or
 /// by exchange type).
@@ -1666,10 +1681,11 @@ mod tests {
 
         let (qm1, _qi) = initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, ts, ts, 3600).unwrap();
 
-        // RFC 2408 §3.1: every Phase 2 (Quick Mode) message must carry a
-        // nonzero Message-ID -- tamper it down to 0 (the Phase-1 sentinel)
-        // and confirm the responder rejects it outright, before touching
-        // any crypto.
+        // RFC 2408 §3.1 has a Phase 1 Message ID be 0 and a Phase 2 one a unique,
+        // randomly generated value; this responder refuses a Phase 2 (Quick Mode)
+        // message with Message-ID 0 -- tamper it down to 0 (the Phase-1 value)
+        // and confirm the responder rejects it outright, before touching any
+        // crypto.
         let mut hdr = IsakmpHeader::parse(&qm1).unwrap();
         hdr.message_id = 0;
         let mut tampered = hdr.to_bytes();
@@ -1775,7 +1791,8 @@ mod tests {
 
     #[test]
     fn quick_mode_complete_accepts_a_host_offered_as_a_slash_32_and_answered_as_a_single_address() {
-        // RFC 2407 §4.6.2.1 writes one address either as ID_IPV4_ADDR or as a subnet covering only it. This side
+        // One address is written either as ID_IPV4_ADDR or as a subnet covering only it (RFC 2407 defines them as
+        // separate ID types, §4.6.2.2 and §4.6.2.5, and does not equate them: interop policy). This side
         // offers its assigned address as a /32 subnet; strongSwan answers it as ID_IPV4_ADDR. The exchange must
         // complete, and the child SA must be the one that was negotiated.
         let (istate, rstate, mut ie, mut re) = phase1_pair(0x5151, 0x5252, "10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
@@ -2087,7 +2104,7 @@ mod tests {
     }
 
     /// [`negotiated_p2_lifetime`] must prefer the responder's own chosen
-    /// value (RFC 2407 §4.5: the responder may unilaterally shorten the
+    /// value (RFC 2407 §4.5.4: the responder may shorten the
     /// initiator's offer) and fall back to `offered` only when the
     /// responder's ESP SA payload carries no `LIFE_DURATION` attribute at
     /// all -- the ESP-DOI counterpart to `phase1`'s
@@ -2119,13 +2136,13 @@ mod tests {
     }
 
     /// End-to-end confirmation that `rekey_child` -- the IKEv1 counterpart to
-    /// IKEv2's CREATE_CHILD_SA rekey (RFC 7296 §2.18 / RFC 2409 §5.5's second
+    /// IKEv2's CREATE_CHILD_SA rekey (RFC 7296 §1.3.3, §2.8 / RFC 2409 §5.5's second
     /// Quick Mode exchange) -- interoperates over real loopback sockets with
     /// a live responder: it negotiates a fresh ESP CHILD SA under the
     /// already-established Phase-1 SA, the negotiated lifetime comes back
     /// correctly, the rekeyed key material actually interoperates, and its
     /// trailing best-effort step (an explicit ESP Delete naming the
-    /// just-superseded CHILD SA's local SPI -- RFC 7296 §3.10 / RFC 2408)
+    /// just-superseded CHILD SA's local SPI -- RFC 7296 §3.11 / RFC 2408)
     /// actually reaches the peer.
     #[test]
     fn rekey_child_over_loopback_interoperates_with_a_live_responder() {
@@ -3030,8 +3047,8 @@ mod tests {
     /// RFC 2408 §4.2: the answer is one Proposal with one Transform (the
     /// receiver "MUST select a single transform for each protocol"), the ones
     /// we offered (Proposal # and Transform # are retained), in the IPsec DOI
-    /// and for ESP -- the protocol we asked about. RFC 2409 §5.5: one SA
-    /// payload.
+    /// and for ESP -- the protocol we asked about. One SA payload (RFC 2409 §5.5
+    /// shows a Quick Mode may carry several; one is this side's own rule).
     #[test]
     fn quick_mode_initiator_refuses_an_answer_with_the_wrong_shape() {
         // The control for the whole list: the very same builder, unedited.
@@ -3068,8 +3085,10 @@ mod tests {
     /// RFC 2407 §4.5: "SA Life Duration MUST always follow an SA Life Type
     /// which describes the units"; §4.5.2: a list may carry several
     /// Type/Duration pairs (100 MB *or* 24 h), which MUST be parsed; default
-    /// 28800 seconds; §4.5.4: a responder may shorten the lifetime, never
-    /// lengthen it. What we use for the rekey schedule is the *seconds* pair --
+    /// 28800 seconds; §4.5.4: a responder may shorten the lifetime (it gives
+    /// nothing longer -- this side's reading, since RFC 2409 §5 is the only RFC
+    /// text against a responder changing an offer). What we use for the rekey
+    /// schedule is the *seconds* pair --
     /// a kilobytes duration read as seconds (as `negotiated_p2_lifetime` did:
     /// first LIFE_DURATION, whatever its Type) is an SA that "lives" 4.6
     /// million seconds.
@@ -3731,9 +3750,9 @@ mod tests {
     /// comes in a RESPONDER-LIFETIME Notify after the identities -- these are
     /// the Notify's bytes from a FortiGate's own debug log, but for its SPI,
     /// which is the gateway's inbound one (0x6003972F there). RFC 2407 §4.5.4:
-    /// a responder that shortens the lifetime "SHOULD" say so this way, and
-    /// §4.6.3.1: the Notify's SPI is "the sender's inbound IPSEC SPI". The
-    /// limit is held beside the seconds, as when the transform states it.
+    /// a responder that shortens the lifetime and wishes to notify "SHOULD" say
+    /// so this way, and §4.6.3.1: the Notify's SPI is "the sender's inbound IPSEC
+    /// SPI". The limit is held beside the seconds, as when the transform states it.
     #[test]
     fn a_responder_lifetime_notify_hands_over_the_volume_limit_a_fortigate_states_outside_the_transform() {
         let held = held_with_notifies(vec![life_type(1), life_dur(3600)], |n| {
@@ -3746,7 +3765,9 @@ mod tests {
         assert_eq!(held_with_notifies(vec![life_type(1), life_dur(3600)], |_| vec![]), Ok(SaLifetime { seconds: 3600, kilobytes: None }), "without the Notify");
     }
 
-    /// A RESPONDER-LIFETIME only ever shortens (RFC 2407 §4.5.4): each unit on
+    /// A RESPONDER-LIFETIME only ever shortens (RFC 2407 §4.5.4 has it sent when
+    /// the offered lifetime is longer than the responder will accept; that a
+    /// longer value is never taken is this side's own rule): each unit on
     /// its own, the lower of what the transform leaves us with and what the
     /// Notify states; a limit the transform has none of is added; seconds
     /// beyond what was offered stay what was offered; a received RX and TX
@@ -3921,8 +3942,11 @@ mod tests {
     }
 
     /// A responder with a volume limit of its own ([`respond_quick_capped`])
-    /// shortens what it grants and never lengthens it (RFC 2407 §4.5.4): the
-    /// offer's limit when that is the shorter, its own when it is, and its own
+    /// shortens what it grants and never lengthens it (RFC 2409 §5 is the only
+    /// RFC text against a responder changing an offer; RFC 2407 §4.5.4 carves
+    /// out the shorter lifetime; "never longer" is this side's reading of the
+    /// two together): the offer's limit when that is the shorter, its own when
+    /// it is, and its own
     /// even when the offer states none. The seconds are not touched by it, and
     /// what is handed over is what the answer states.
     #[test]
@@ -3989,7 +4013,8 @@ mod tests {
     /// While a rekey waits for its message 2, the gateway repeats the message 2
     /// of the exchange before it (our message 3 for that one was lost): that
     /// message 3 is sent again, byte for byte, and the wait goes on for the
-    /// message 2 it is really waiting for (RFC 2408 §3.1, RFC 2409 §5).
+    /// message 2 it is really waiting for (RFC 2408 §3.1, Commit Bit NOTE, a
+    /// proposal; RFC 2409 §10).
     #[test]
     fn a_rekey_waiting_for_message_2_answers_a_repeat_of_the_previous_message_2() {
         let (cky_i, cky_r) = ([0xAA; 8], [0xBB; 8]);

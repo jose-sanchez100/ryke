@@ -1,5 +1,6 @@
 //! IKEv1 Mode-Config (draft-dukes-ike-mode-cfg) address assignment — an
-//! ISAKMP Transaction exchange (RFC 2408 exchange type 6, same framing as
+//! ISAKMP Transaction exchange (exchange type 6 (Transaction; not defined by
+//! RFC 2408), same framing as
 //! [`super::xauth`]) run after XAUTH (if any) and before Quick Mode, when the
 //! caller wants an assigned inner IPv4. Unlike XAUTH, the **client** drives
 //! this exchange:

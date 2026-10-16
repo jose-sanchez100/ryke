@@ -5,7 +5,10 @@
 
 use crate::error::IkeError;
 
-/// IKEv1 exchange types (RFC 2408 §3.1 / the DOI).
+/// IKEv1 exchange types: Main (2, RFC 2408's Identity Protection), Aggressive (4)
+/// and Informational (5) are RFC 2408 §3.1's; Quick Mode (32) is RFC 2409
+/// Appendix A's; 6 is not in RFC 2408, whose §3.1 lists it only inside "ISAKMP
+/// Future Use 6 - 31".
 pub mod exchange {
     pub const MAIN: u8 = 2;
     pub const AGGRESSIVE: u8 = 4;
@@ -22,7 +25,8 @@ pub mod flags {
     pub const AUTH_ONLY: u8 = 0x04;
 }
 
-/// IKEv1 payload type numbers (RFC 2408 §3.1) — note these differ from IKEv2.
+/// IKEv1 payload type numbers (RFC 2408 §3.1 for 0 - 13) — note these differ from
+/// IKEv2.
 pub mod payload {
     pub const NONE: u8 = 0;
     pub const SA: u8 = 1;
@@ -38,7 +42,8 @@ pub mod payload {
     pub const NOTIFY: u8 = 11;
     pub const DELETE: u8 = 12;
     pub const VENDOR_ID: u8 = 13;
-    /// ISAKMP-CFG / Attribute payload (Xauth + Mode-Config).
+    /// ISAKMP-CFG / Attribute payload (Xauth + Mode-Config). Not in RFC 2408,
+    /// whose §3.1 has 14 - 127 as RESERVED.
     pub const ATTRIBUTE: u8 = 14;
     pub const NAT_D: u8 = 20; // RFC 3947
     pub const NAT_OA: u8 = 21;

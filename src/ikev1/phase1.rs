@@ -67,7 +67,7 @@ pub const NATT_RFC_VENDOR_ID: [u8; 16] = [
     0x4a, 0x13, 0x1c, 0x81, 0x07, 0x03, 0x58, 0x45, 0x5c, 0x57, 0x28, 0xf2, 0x0e, 0x95, 0x45, 0x2f,
 ];
 
-/// `HASH(CKY-I | CKY-R | IP | Port)` (RFC 3947 §4.2) -- the NAT-D payload's
+/// `HASH(CKY-I | CKY-R | IP | Port)` (RFC 3947 §3.2) -- the NAT-D payload's
 /// content, one for the sender's own claimed address, one for the address it
 /// believes the peer is at. Uses the *negotiated Phase-1 PRF's plain hash*
 /// (not HMAC-keyed, unlike every other `crypto1` formula in this file) --
@@ -128,7 +128,8 @@ fn peer_offers_natt(ps: &[isakmp::Payload]) -> bool {
     ps.iter().any(|p| p.payload_type == payload::VENDOR_ID && p.data == NATT_RFC_VENDOR_ID)
 }
 
-/// Whether this exchange should float to UDP 4500 (RFC 3947 §5), given the
+/// Whether this exchange should float to UDP 4500 (RFC 3947 §3.2 for detecting
+/// NAT, §4 for the port change), given the
 /// NAT-D payloads seen in `ps` and whether the peer advertised
 /// [`NATT_RFC_VENDOR_ID`] at all (`peer_offers_natt` -- a separate parameter,
 /// not re-derived from `ps`, because Main Mode carries the VID in messages
@@ -320,14 +321,15 @@ pub struct Phase1State {
 /// The final message of an exchange -- Aggressive Mode message 3, the XAUTH
 /// ACK, Quick Mode message 3 -- is answered by nothing, so a peer that never
 /// received it can only say so by repeating the message before it. RFC 2408
-/// §3.1 (Commit Bit NOTE) describes that recovery: "retransmit the last
+/// §3.1 (Commit Bit NOTE) proposes that recovery, saying that handling of the
+/// situation "is not standardized": "retransmit the last
 /// ISAKMP message to force the other entity to retransmit the final message".
 /// This keeps each such pair (the peer's message, our final answer to it, both
 /// exactly as they were on the wire) so the answer can be sent again untouched:
-/// no IV, cookie or exchange state moves for a retransmission (RFC 2409 §5,
-/// end: implementations "SHOULD NOT update their running IV until the decrypted
-/// message ... has been determined to actually advance the IKE state machine --
-/// i.e. it is not a retransmission").
+/// no IV, cookie or exchange state moves for a retransmission (RFC 2409 §10, on
+/// the running IV: implementations "SHOULD NOT update their running IV until the
+/// decrypted message ... has been determined to actually advance the IKE state
+/// machine -- i.e. it is not a retransmission").
 ///
 /// What is kept is bounded three ways, so that a session that lives for weeks
 /// cannot grow it and a peer cannot make it grow: at most [`Self::KEPT`] pairs,
@@ -591,8 +593,9 @@ fn p1_life(t: &Transform) -> Result<(Option<u32>, Option<u32>), IkeError> {
 
 /// The Phase-1 SA lifetime, in seconds, that the transform the responder chose
 /// leaves us with. RFC 2409 has no rule for a responder that answers with another
-/// lifetime; RFC 2407 §4.5.4 lets the responder of an IPsec SA go on "using a
-/// shorter lifetime than what was offered", and that is taken to hold for the
+/// lifetime; RFC 2407 §4.5.4 lets the responder of an IPsec SA complete the
+/// negotiation but "use a shorter lifetime than what was offered", and that is
+/// taken to hold for the
 /// ISAKMP SA too (by analogy: its §4.6.3.1 RESPONDER-LIFETIME can name an ISAKMP
 /// SA by its cookies) -- so the answer's seconds pair counts, but never
 /// beyond `offered`: what we offered is our own limit, and a longer answer only
@@ -1553,13 +1556,13 @@ pub struct MainIdSent {
 }
 
 /// [`MainIdSent::complete_id`]'s error case: the responder's AUTH did not
-/// verify, but SKEYID_a/SKEYID_e were already derived from the DH exchange
-/// alone (RFC 2409 App. B -- Main Mode's own identity-protection property is
-/// that messages 5/6 are encrypted *before* either side's identity is
-/// checked), so this side can still send a real, correctly authenticated and
-/// encrypted ISAKMP Delete for the cookie pair it just rejected, instead of
-/// silently vanishing and leaving the gateway to notice only once its own
-/// DPD/lifetime timer expires.
+/// verify, but SKEYID_a/SKEYID_e were already derived (RFC 2409 §5.1/§5.4
+/// (messages 5 and 6 are HDR*) and §5 for SKEYID_a/SKEYID_e -- Main Mode's own
+/// identity-protection property is that messages 5/6 are encrypted *before*
+/// either side's identity is checked), so this side can still send a real,
+/// correctly authenticated and encrypted ISAKMP Delete for the cookie pair it
+/// just rejected, instead of silently vanishing and leaving the gateway to
+/// notice only once its own DPD/lifetime timer expires.
 #[derive(Debug)]
 pub struct AuthFailure {
     pub error: IkeError,
@@ -2757,8 +2760,9 @@ mod tests {
         let (msg2, _r1) = respond_main(&rcfg, &msg1, &mut re, "192.168.0.1:500".parse().unwrap(), "10.1.1.1:500".parse().unwrap()).unwrap();
 
         // A responder (or an attacker) that echoes back the wrong CKY-I in
-        // message 2 must be rejected -- RFC 2408 §3.1 requires both cookies
-        // to match on every message, not just the last one seen.
+        // message 2 must be rejected -- RFC 2408 §5.2 (step 1) has the receiver
+        // verify both cookies of every message it receives, not just the last
+        // one seen, and discard one whose cookies fail.
         let mut hdr = IsakmpHeader::parse(&msg2).unwrap();
         hdr.init_cookie[0] ^= 0xff;
         let mut tampered = hdr.to_bytes();

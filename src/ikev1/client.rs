@@ -19,7 +19,8 @@
 //! detected. See `phase1.rs`'s own NAT-T doc comments for the detection
 //! details; this module only owns the transport-switching side of it.
 //!
-//! Retransmissions and duplicates (RFC 2408 §3.1, §5.1, RFC 2409 §5): every
+//! Retransmissions and duplicates (RFC 2408 §3.1's Commit Bit NOTE, a proposal,
+//! and §5.1; RFC 2409 §10): every
 //! request is sent again, the same bytes, when its answer does not come
 //! (`Client::send_and_await`), at longer and longer intervals and never more
 //! than `MAX_RETRANSMITS` times -- more, up to seven, once the intervals follow a
@@ -38,7 +39,7 @@
 //! again, untouched, when the gateway repeats that message -- on the port the
 //! exchange floated to, and also on port 500 while it waits after a floated
 //! Aggressive Mode third message, which is where a gateway that never saw it
-//! (and so has not floated) repeats its second (RFC 3947 §5.3). What is kept is
+//! (and so has not floated) repeats its second (RFC 3947 §4). What is kept is
 //! bounded -- at most eight pairs, 32 KiB in all, and no pair beyond two minutes
 //! from when it was kept, which covers a gateway's own retransmission schedule --
 //! so a repeat that comes after that is a stray datagram like any other. A
@@ -171,11 +172,11 @@ struct Awaiting<'a> {
     msg_id: Option<u32>,
     floated: bool,
     /// Peer messages this handshake already took: a bit-for-bit repeat of one
-    /// is dropped, never read as the next message (RFC 2409 §5).
+    /// is dropped, never read as the next message (RFC 2409 §10).
     handled: &'a [Vec<u8>],
     /// Once Phase 1 exists: the state retaining our final messages, and the
     /// gateway to send them to. A repeat of the peer message one of them
-    /// answered gets it sent again (RFC 2408 §3.1, Commit Bit NOTE).
+    /// answered gets it sent again (RFC 2408 §3.1, Commit Bit NOTE: a proposal).
     resend: Option<(&'a Phase1State, SocketAddr)>,
     /// What measures this exchange's round trip, and what its retransmission timer
     /// follows (RFC 2408 §5.1), when its answer depends on nothing but the path:
@@ -332,9 +333,10 @@ impl<E: Entropy> Client<E> {
     ///
     /// - a peer message that one of our final messages answered (the gateway
     ///   repeating its Aggressive Mode message 2 or its XAUTH SET because our
-    ///   message 3, or our ACK, never arrived: RFC 2408 §3.1, Commit Bit NOTE)
-    ///   gets that final message sent again, byte for byte -- no IV or state
-    ///   advances for a retransmission (RFC 2409 §5);
+    ///   message 3, or our ACK, never arrived: RFC 2408 §3.1, Commit Bit NOTE, a
+    ///   proposal) gets that final message sent again, byte for byte -- no IV or
+    ///   state advances for a retransmission (RFC 2409 §10: the running IV is not
+    ///   updated for one);
     /// - a bit-for-bit repeat of a message in `handled` is dropped: taken for
     ///   the awaited one, a repeated Main Mode message 2 (while awaiting message
     ///   4) or XAUTH REQUEST (while awaiting the SET) fails the handshake.
@@ -411,10 +413,11 @@ impl<E: Entropy> Client<E> {
     /// One look at the well-known port while the exchange has floated to 4500 and
     /// a final message of ours is waiting to be asked for: the gateway that never
     /// saw our Aggressive Mode message 3 has not floated (it learns of NAT from
-    /// that very message, RFC 3947 §5.3), so it repeats its message 2 *there*
-    /// (RFC 2408 §3.1, Commit Bit NOTE), and nothing else would read it. What it
-    /// repeats, bit for bit, is answered with the retained final message, sent as
-    /// the exchange is now sent (floated); anything else on that port is dropped.
+    /// that very message, RFC 3947 §3.2, §4), so it repeats its message 2 *there*
+    /// (RFC 2408 §3.1, Commit Bit NOTE: a proposal), and nothing else would read
+    /// it. What it repeats, bit for bit, is answered with the retained final
+    /// message, sent as the exchange is now sent (floated); anything else on that
+    /// port is dropped.
     /// The socket is read without blocking beyond a poll (at most
     /// [`Self::PORT_500_LOOK_MAX`] datagrams), and its read timeout is left as found.
     fn answer_repeats_on_port_500(&self, want: &Awaiting) -> Result<(), DriverError> {
@@ -560,7 +563,8 @@ impl<E: Entropy> Client<E> {
     /// single, unacknowledged UDP send with no recovery if that one datagram
     /// (or its reply) is dropped -- the whole handshake just times out. This
     /// covers exactly that case. Each resend is the same bytes (nothing is
-    /// rebuilt, no IV advances: RFC 2409 §5), and each wait is absolute (see
+    /// rebuilt, no IV advances; RFC 2409 §10 asks a receiver not to update its
+    /// running IV for a retransmission), and each wait is absolute (see
     /// [`Self::recv_matching`]), so stray datagrams cannot hold the
     /// retransmission off, nor stretch the total. A socket with no read timeout
     /// waits for ever, as before, and so never retransmits.
@@ -948,10 +952,10 @@ mod tests {
     }
 
     /// A message this handshake already took must not be taken again when the
-    /// gateway repeats it (RFC 2409 §5: a retransmission does not advance the
-    /// exchange). Here it is the first thing to arrive, ahead of the real next
-    /// message, carrying the same cookies and exchange type: without `handled`
-    /// it would be returned as if it were that next message.
+    /// gateway repeats it (RFC 2409 §10: a retransmission does not advance the
+    /// IKE state machine). Here it is the first thing to arrive, ahead of the
+    /// real next message, carrying the same cookies and exchange type: without
+    /// `handled` it would be returned as if it were that next message.
     #[test]
     fn recv_matching_drops_a_bit_for_bit_repeat_of_a_message_already_handled() {
         let client = Client { transport: UdpTransport::bind("127.0.0.1:0").unwrap(), natt_transport: None, entropy: SeedEntropy::new(1) };
@@ -1426,8 +1430,9 @@ mod tests {
         }
     }
 
-    /// RFC 2408 §3.1 with RFC 3947 §5.3: the gateway that never saw our Aggressive
-    /// Mode message 3 has not floated, and repeats its message 2 to port 500. A
+    /// RFC 2408 §3.1 (Commit Bit NOTE, a proposal) with RFC 3947 §4: the gateway
+    /// that never saw our Aggressive Mode message 3 has not floated, and repeats
+    /// its message 2 to port 500. A
     /// wait on port 4500 hears it there and sends the retained final message
     /// again -- floated, untouched, while the wait goes on for what it really
     /// awaits -- and leaves the sockets' timeouts as it found them.

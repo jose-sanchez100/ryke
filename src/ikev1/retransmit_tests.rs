@@ -1,7 +1,7 @@
 //! The initiator's handling of lost final messages and of duplicates (RFC 2408
-//! §3.1 Commit-Bit NOTE, RFC 2409 §5) against a scripted gateway: the real
-//! responder steps over one UDP socket, with a script deciding which datagrams
-//! the gateway never sees, repeats, or sends twice.
+//! §3.1 Commit-Bit NOTE, a proposal; RFC 2409 §10) against a scripted gateway:
+//! the real responder steps over one UDP socket, with a script deciding which
+//! datagrams the gateway never sees, repeats, or sends twice.
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -54,7 +54,7 @@ struct Script {
     /// The gateway also serves a Mode-Config round (after XAUTH, before Quick Mode).
     mode_cfg: bool,
     /// The client forces NAT traversal, so both sides float to port 4500 with
-    /// Aggressive Mode's message 3 (RFC 3947 §5.3): the gateway has a socket on
+    /// Aggressive Mode's message 3 (RFC 3947 §4): the gateway has a socket on
     /// port 4500 of its own address, and everything from message 3 on goes
     /// there, with the non-ESP marker. A gateway that never saw message 3 has not
     /// floated yet, so what it repeats -- message 2 -- still goes to port 500.
@@ -182,7 +182,7 @@ impl Gateway {
 
     /// The gateway repeating `own` because the client's answer never came. On
     /// the well-known port while the gateway has not floated: it has not seen
-    /// the message that would have told it the client did (RFC 3947 §5.3).
+    /// the message that would have told it the client did (RFC 3947 §4).
     fn send_repeat(&self, own: &[u8]) {
         if self.natt.is_some() && self.on_4500 && self.repeats_on_500 {
             self.sock.send_to(own, self.peer.expect("the client has written by now")).unwrap();
@@ -402,9 +402,9 @@ fn aggressive_mode_survives_every_gateway_reply_arriving_twice() {
     assert_eq!(est.child.inbound.spi(), report.child.outbound.spi());
 }
 
-/// RFC 2408 §3.1: the gateway that never received message 3 repeats message
-/// 2, and the initiator answers it with the same message 3 -- RFC 2409 §5: no
-/// IV or state advance for a retransmission.
+/// RFC 2408 §3.1 (Commit Bit NOTE, a proposal): the gateway that never received
+/// message 3 repeats message 2, and the initiator answers it with the same
+/// message 3 -- RFC 2409 §10: the running IV is not updated for a retransmission.
 #[test]
 fn aggressive_mode_message_3_is_sent_again_when_the_gateway_repeats_message_2() {
     let run = connect(Script { lose_am_msg3: true, ..Script::default() });
@@ -440,8 +440,9 @@ fn a_floated_handshake_reports_the_port_its_nat_t_socket_is_really_bound_to() {
     assert_eq!(est.local_addr.port(), bound, "reported {} but the NAT-T socket is on {bound}", est.local_addr);
 }
 
-/// RFC 2408 §3.1 with RFC 3947 §5.3: message 3 goes out on port 4500, the
-/// gateway never sees it, and it has not floated yet, so it repeats message 2
+/// RFC 2408 §3.1 (Commit Bit NOTE, a proposal) with RFC 3947 §4: message 3 goes
+/// out on port 4500, the gateway never sees it, and it has not floated yet, so
+/// it repeats message 2
 /// to port 500 -- where the initiator, now listening on 4500, must still hear
 /// it and send the same message 3 again.
 #[test]

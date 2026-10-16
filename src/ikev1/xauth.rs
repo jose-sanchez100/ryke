@@ -1,5 +1,6 @@
 //! IKEv1 XAUTH (draft-beaulieu-ike-xauth) — an ISAKMP Transaction exchange
-//! (RFC 2408 exchange type 6) run after Phase 1 and before Quick Mode, when
+//! (exchange type 6 (Transaction; not defined by RFC 2408)) run after Phase 1
+//! and before Quick Mode, when
 //! the negotiated auth method was XAUTH-PSK (`InitiatorConfig::xauth`). Unlike
 //! Phase 1 / Quick Mode, the **gateway** drives this exchange — it sends the
 //! first message asking for credentials, not the client:

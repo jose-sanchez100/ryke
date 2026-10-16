@@ -128,7 +128,7 @@ pub(crate) fn parse_delete(body: &[u8]) -> Option<(u8, &[u8])> {
     Some((protocol_id, spi))
 }
 
-/// RFC 3706 §2 Notify Message Types.
+/// RFC 3706 §5.2 Notify Message Types.
 pub(crate) mod notify_type {
     pub const R_U_THERE: u16 = 36136;
     pub const R_U_THERE_ACK: u16 = 36137;
@@ -154,9 +154,9 @@ fn build_single_informational(st: &Phase1State, entropy: &mut impl Entropy, payl
     Ok(msg)
 }
 
-/// This ISAKMP SA's cookie pair, in the `SPI` shape RFC 2408 §2.5.3 uses to
-/// identify the whole Phase-1 SA in a Delete or Notify payload (SPI Size 16,
-/// one SPI = `cky_i | cky_r`).
+/// This ISAKMP SA's cookie pair, in the `SPI` shape RFC 2408 §3.15 uses to
+/// identify the whole Phase-1 SA in a Delete payload and RFC 3706 §5.3 gives
+/// a DPD Notify (SPI Size 16, one SPI = `cky_i | cky_r`).
 fn isakmp_spi(st: &Phase1State) -> Vec<u8> {
     [st.cky_i.as_slice(), st.cky_r.as_slice()].concat()
 }
@@ -182,11 +182,13 @@ pub fn build_r_u_there_ack(st: &Phase1State, entropy: &mut impl Entropy, seq: u3
 /// [`crate::esp::EspSa::spi`] holds; per-vendor convention each side reports
 /// the SPI *it* generated, since that's the value the peer uses when sending
 /// ESP to us), then the whole ISAKMP (Phase 1) SA, identified by the cookie
-/// pair (RFC 2408 §2.5.3 — SPI Size 16, one SPI = `cky_i | cky_r`) — same
+/// pair (RFC 2408 §3.15 — SPI Size 16, one SPI = `cky_i | cky_r`) — same
 /// order and same two-separate-exchanges shape strongSwan's IKEv1 task
 /// manager uses (see this module's doc comment). The ESP delete is
-/// technically redundant on its own (deleting the ISAKMP SA implicitly tears
-/// down every Phase-2 SA under it, RFC 2408 §1.4) but sent anyway, matching
+/// technically redundant on its own (deleting the ISAKMP SA is taken to tear
+/// down every Phase-2 SA under it -- RFC 7296 §1.4.1 says so for an IKE SA,
+/// while RFC 2408 §3.15 and §5.15 speak only of the SAs a Delete lists, so for
+/// IKEv1 it is practice, not RFC text) but sent anyway, matching
 /// real-world implementations, for compatibility with gateways that key
 /// teardown logging/policy off the explicit ESP delete directly.
 pub fn build_delete(st: &Phase1State, entropy: &mut impl Entropy, esp_spi: u32) -> Result<(Vec<u8>, Vec<u8>), IkeError> {
@@ -215,7 +217,7 @@ pub fn build_isakmp_delete(st: &Phase1State, entropy: &mut impl Entropy) -> Resu
 }
 
 /// Send `msg` to `peer` exactly as given, prefixed with the non-ESP marker
-/// when `st` floated to UDP 4500 (RFC 3947/3948 §2.2): a datagram on 4500
+/// when `st` floated to UDP 4500 (RFC 3947 §4, RFC 3948 §2.2): a datagram on 4500
 /// without it reads as ESP to the gateway, which drops it -- so an unmarked
 /// R-U-THERE or ACK never arrived and the gateway's DPD tore the tunnel down.
 /// `peer` is the caller's already-correct destination (the 4500 address once
@@ -271,12 +273,15 @@ pub enum Liveness {
     /// The peer deleted just one Quick Mode SA outright (no rekey, no
     /// replacement offered) while the ISAKMP SA -- and, for
     /// [`ChildFamily::Primary`], the separate IPv6 Quick Mode SA -- stayed
-    /// up. RFC 2408 treats Phase 2 SAs as independent of Phase 1 and of each
-    /// other (only a Delete naming Protocol-ID ISAKMP takes down the parent
-    /// and everything under it, never the reverse), so this does not tear
-    /// down the tunnel: the caller drops its own local state for that family
-    /// and renegotiates a replacement from scratch. Only possible when the
-    /// caller passed a `current_peer_spi_ipv6` to [`peek`]/[`probe`] (i.e.
+    /// up. This code reads Phase 2 SAs as independent of Phase 1 and of each
+    /// other (an inference, not RFC text: RFC 2408 §3.15 and §5.15 have a Delete
+    /// cover only the SAs it lists, and no sentence links the end of a Phase 2
+    /// SA to the ISAKMP SA's; only a Delete naming Protocol-ID ISAKMP is taken
+    /// to take down the parent and everything under it, never the reverse), so
+    /// this does not tear down the tunnel: the caller drops its own local state
+    /// for that family and renegotiates a replacement from scratch. Only
+    /// possible when the caller passed a `current_peer_spi_ipv6` to
+    /// [`peek`]/[`probe`] (i.e.
     /// the tunnel actually has a separate IPv6 Quick Mode SA) -- a
     /// single-stack tunnel's primary Delete is [`Liveness::PeerTornDown`],
     /// unchanged.
@@ -924,9 +929,10 @@ mod tests {
     /// the ISAKMP SA both stayed up), and this side used to silently ignore
     /// it entirely -- `current_peer_spi` only ever compared against the
     /// primary's SPI, so an ESP Delete naming the IPv6 one matched nothing
-    /// and IPv6 stayed permanently dead with no recovery. RFC 2408 treats
-    /// Phase 2 SAs as independent (deleting one never implies deleting the
-    /// ISAKMP SA or any other Phase 2 SA under it), so this must be
+    /// and IPv6 stayed permanently dead with no recovery. This code reads
+    /// Phase 2 SAs as independent (an inference from RFC 2408 §3.15 and §5.15,
+    /// where a Delete covers only the SAs it lists: deleting one never implies
+    /// deleting the ISAKMP SA or any other Phase 2 SA under it), so this must be
     /// [`Liveness::ChildDeleted`], not ignored and not a full teardown.
     #[test]
     fn peek_reports_child_deleted_when_only_the_ipv6_sa_is_deleted() {
@@ -948,7 +954,8 @@ mod tests {
     /// (IPv4) Quick Mode SA while the IPv6 one and the ISAKMP SA both stayed
     /// up. This side used to misread `current_peer_spi` matching as "the
     /// tunnel is down" and tore down everything, including the still-good
-    /// IPv6 CHILD SA and the ISAKMP SA itself -- wrong per RFC 2408, and
+    /// IPv6 CHILD SA and the ISAKMP SA itself -- wrong, since a Delete covers only
+    /// the SAs it lists (RFC 2408 §3.15, §5.15), and
     /// worse than the IPv6 case since it killed a working tunnel instead of
     /// just leaving one family dead.
     #[test]
@@ -1177,7 +1184,7 @@ mod tests {
         assert_eq!(peek(&io, &client_st, &mut e, gw_addr, std::time::Duration::from_secs(2), 0x77, None).unwrap(), Liveness::PeerTornDown);
     }
 
-    // --- Quick Mode message 3 recovery (RFC 2408 §3.1, Commit Bit NOTE). The liveness checks are what
+    // --- Quick Mode message 3 recovery (RFC 2408 §3.1, Commit Bit NOTE: a proposal). The liveness checks are what
     // reads the socket between the exchanges we start -- the daemon's own upkeep sends them, with or
     // without anyone asking for statistics -- so a message 2 the gateway repeats while nothing else is
     // going on must get our message 3 again from here, and nothing else must.

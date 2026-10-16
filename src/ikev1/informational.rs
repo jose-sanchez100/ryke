@@ -491,7 +491,10 @@ fn watch(
 /// (confirmed live against a real FortiGate -- see [`crate::error::IkeError::PeerTornDown`]'s doc).
 /// Anything else (a different SA, a message that doesn't decrypt or fails
 /// HASH(1), a Notify, an ESP Delete) is `false`, same best-effort stance
-/// [`watch`] takes.
+/// [`watch`] takes. Only the wait of a passive exchange table asks it: with
+/// the table on, [`table::classify`] reads every Delete payload of the
+/// message, and any of them of Protocol-Id ISAKMP, whatever SPI it names,
+/// ends the wait.
 pub(crate) fn is_isakmp_sa_delete(st: &Phase1State, datagram: &[u8]) -> bool {
     let Ok(header) = IsakmpHeader::parse(datagram) else { return false };
     if header.exchange_type != exchange::INFORMATIONAL || header.init_cookie != st.cky_i || header.resp_cookie != st.cky_r {
@@ -513,6 +516,9 @@ pub(crate) fn is_isakmp_sa_delete(st: &Phase1State, datagram: &[u8]) -> bool {
 /// caller waiting on message 2 can fail at once with the real reason instead
 /// of running out its timeout. Anything else -- a different SA, a message that
 /// doesn't decrypt or fails HASH(1), a status Notify, a Delete -- is `None`.
+/// Only the wait of a passive exchange table asks it, and takes any error
+/// Notify for the verdict on its own exchange: with the table on, the wait
+/// takes only one that is about it ([`table::ExchangeTable::attribute_error_notify`]).
 pub(crate) fn peer_error_notify(st: &Phase1State, msg: &[u8]) -> Option<(u16, &'static str)> {
     let header = IsakmpHeader::parse(msg).ok()?;
     if header.exchange_type != exchange::INFORMATIONAL || header.init_cookie != st.cky_i || header.resp_cookie != st.cky_r {
@@ -616,9 +622,9 @@ pub fn probe(
 
 // ---- Once the exchange table is on: one classification for every reader ----
 
-/// What [`serve_datagram`] did with one datagram.
+/// What [`serve_classified`] did with one datagram.
 #[derive(Default)]
-struct Served {
+pub(crate) struct Served {
     ack_matched: bool,
     acked: usize,
     new_quick: usize,
@@ -650,15 +656,22 @@ fn answer_r_u_there(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl E
 /// table or dropped there; a Quick Mode message for an exchange of ours that nobody waits on here is
 /// dropped.
 fn serve_datagram(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, datagram: &[u8], expect_ack_seq: Option<u32>) -> Served {
+    serve_classified(sock, st, entropy, peer, &table::classify(st, datagram, expect_ack_seq))
+}
+
+/// The answers [`serve_datagram`] sends for a datagram [`table::classify`] read as `classified`, for a
+/// reader that looks at what it is first: the wait of a Quick Mode of ours takes the messages under its
+/// own id out before it hands the rest here.
+pub(crate) fn serve_classified(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, classified: &Classified) -> Served {
     let mut served = Served::default();
-    match table::classify(st, datagram, expect_ack_seq) {
-        Classified::ResendFinal(final_message) => super::quick::send_final_again(sock, st, peer, &final_message),
+    match classified {
+        Classified::ResendFinal(final_message) => super::quick::send_final_again(sock, st, peer, final_message),
         Classified::RouteToOwn { msgid, .. } => {
             ike_debug!("QUICK: a message under msgid={msgid:08x}, an exchange of ours that nothing waits on here -- dropped");
         }
         Classified::PeerQuick { .. } => served.new_quick += 1,
         Classified::Informational(seen) => {
-            for seq in seen.r_u_there {
+            for &seq in &seen.r_u_there {
                 if answer_r_u_there(sock, st, entropy, peer, seq) {
                     served.acked += 1;
                 }

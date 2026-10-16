@@ -50,6 +50,11 @@
 //! state: an R-U-THERE-ACK, and a final message of ours sent again for the peer message it answered,
 //! repeated bit for bit. A passive table is never asked: those readers keep the code they had before
 //! the table existed.
+//!
+//! The wait of a Quick Mode of ours for its message 2 is a reader like the others, and keeps
+//! everything they keep while it waits: a message under its Message ID is handed to it
+//! ([`Classified::RouteToOwn`]) and is its answer only once its HASH(2) verifies, and an error Notify
+//! ends it only when [`ExchangeTable::attribute_error_notify`] tells that the Notify is about it.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -246,6 +251,28 @@ impl fmt::Debug for PeerEvent {
     }
 }
 
+/// One error Notify of an authenticated Informational as the message carried it -- what a
+/// [`PeerEvent::ErrorNotify`] says, without the time -- for the reader that waits on an exchange and has
+/// to tell which exchange it is about ([`ExchangeTable::attribute_error_notify`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ErrorNotice {
+    /// The Notify Message Type (RFC 2408 §3.14.1: an error is 1 to 16383).
+    pub msg_type: u16,
+    /// The Protocol-Id it names.
+    pub protocol: u8,
+    /// The SPI it names; the empty one for Protocol-Id ISAKMP (see [`PeerEvent::ErrorNotify`]).
+    pub spi: PeerSpi,
+    /// The Message ID of the Informational that carried it.
+    pub msgid: u32,
+}
+
+impl ErrorNotice {
+    /// The event this is, for a message that arrived at `arrived`.
+    fn event(&self, arrived: Instant) -> PeerEvent {
+        PeerEvent::ErrorNotify { msg_type: self.msg_type, protocol: self.protocol, spi: self.spi, msgid: self.msgid, arrived }
+    }
+}
+
 /// An authenticated message 1 of a Quick Mode the peer started (its HASH(1) verified, RFC 2409
 /// §5.5), as the inbox keeps it for the responder: nothing of it has been validated beyond that,
 /// and nothing has been answered.
@@ -355,6 +382,28 @@ struct Books {
     inbox: Inbox,
     /// The cookie pairs of other ISAKMP SAs already traced, oldest first.
     foreign: VecDeque<[u8; 16]>,
+    /// The responder exchanges registered, oldest first ([`ExchangeTable::register_responder`]).
+    responders: VecDeque<ResponderEntry>,
+    /// Quick Mode messages under the id of an exchange of ours being waited for that did not authenticate
+    /// as its message 2 ([`ExchangeTable::count_unauthenticated_reply`]).
+    unauthenticated_replies: u64,
+}
+
+/// The most responder exchanges [`ExchangeTable::register_responder`] keeps (POLICY): the responder
+/// answers one gateway Quick Mode per family at a time and keeps a concluded one a while for the copies
+/// of its message 1 that may still come; beyond this many the oldest gives way.
+const RESPONDERS_KEPT: usize = 4;
+
+/// What the readers know of one responder exchange of this side: what an error Notify of the peer's can
+/// name it by besides its Message ID, and whether one did.
+struct ResponderEntry {
+    msgid: u32,
+    /// The SPI this side chose for its inbound SA in the exchange's message 2: the SPI a refusal of that
+    /// message names (RFC 2408 §3.14: "The receiving entity's SPI").
+    inbound_spi: u32,
+    /// The type of the first error Notify the peer refused the exchange with
+    /// ([`ExchangeTable::note_responder_rejected`]).
+    peer_rejected: Option<u16>,
 }
 
 struct Shared {
@@ -618,13 +667,11 @@ impl ExchangeTable {
     }
 
     /// [`MessageIdLedger::finish`]. Passive: `false`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     pub(crate) fn finish(&self, id: u32, now: Instant, end: MidEnd) -> bool {
         self.ledger(false, |ids| ids.finish(id, now, end))
     }
 
     /// [`MessageIdLedger::set_deadline`]. Passive: `false`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     pub(crate) fn set_deadline(&self, id: u32, now: Instant, deadline: Instant) -> bool {
         self.ledger(false, |ids| ids.set_deadline(id, now, deadline))
     }
@@ -677,6 +724,187 @@ impl ExchangeTable {
     pub(crate) fn ids_held(&self) -> usize {
         self.books().ids.len()
     }
+
+    /// Counts a Quick Mode message under the id of the exchange of ours being waited for that does not
+    /// authenticate as its message 2 (its HASH(2), RFC 2409 §5.5): dropped by the waiting reader, which
+    /// goes on waiting. Returns how many there were since the ISAKMP SA began. Passive: 0, nothing counted.
+    pub(crate) fn count_unauthenticated_reply(&self) -> u64 {
+        if !self.is_enabled() {
+            return 0;
+        }
+        let mut books = self.books();
+        books.unauthenticated_replies += 1;
+        books.unauthenticated_replies
+    }
+
+    /// How many messages [`Self::count_unauthenticated_reply`] counted.
+    #[cfg(test)]
+    pub(crate) fn unauthenticated_replies(&self) -> u64 {
+        self.books().unauthenticated_replies
+    }
+
+    /// Registers the responder exchange `msgid`, whose message 2 gives `inbound_spi` as this side's
+    /// inbound SPI, so that an error Notify naming either is told to be about it
+    /// ([`Self::attribute_error_notify`]). Registering an id again replaces its entry; beyond
+    /// [`RESPONDERS_KEPT`] the oldest gives way. Passive: nothing.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
+    pub(crate) fn register_responder(&self, msgid: u32, inbound_spi: u32) {
+        if !self.is_enabled() {
+            return;
+        }
+        let responders = &mut self.books().responders;
+        responders.retain(|entry| entry.msgid != msgid);
+        if responders.len() >= RESPONDERS_KEPT {
+            responders.pop_front();
+        }
+        responders.push_back(ResponderEntry { msgid, inbound_spi, peer_rejected: None });
+    }
+
+    /// Records that the peer refused the responder exchange `msgid` with an error Notify of `msg_type`
+    /// ([`Attribution::Responder`]); the first such Notify is the one kept. `false`, and nothing recorded,
+    /// when no responder exchange of that id is registered: a peer Quick Mode the responder has not taken
+    /// up, say, whose Notify only the mailbox keeps. Passive: `false`.
+    pub(crate) fn note_responder_rejected(&self, msgid: u32, msg_type: u16) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        match self.books().responders.iter_mut().find(|entry| entry.msgid == msgid) {
+            Some(entry) => {
+                entry.peer_rejected.get_or_insert(msg_type);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The error Notify type recorded for the responder exchange `msgid`, if it is registered and has one.
+    #[cfg(test)]
+    pub(crate) fn responder_rejected(&self, msgid: u32) -> Option<u16> {
+        self.books().responders.iter().find(|entry| entry.msgid == msgid).and_then(|entry| entry.peer_rejected)
+    }
+
+    /// Which exchange of this ISAKMP SA the error Notify `notice` is about, for a reader of an enabled
+    /// table; `read_before` is [`InformationalSeen::read_before`] of the message that carried it, and
+    /// `awaited` the Quick Mode of ours that reader waits on, if it waits on one.
+    ///
+    /// RFC 2408 §3.14: "Notification which occurs during, or is concerned with, a Phase 2 negotiation
+    /// is identified by the Initiator and Responder cookie pair in the ISAKMP Header and the Message ID
+    /// and SPI associated with the current negotiation", the SPI being "The receiving entity's SPI"
+    /// (and, for Protocol-Id ISAKMP, "If the SPI Size is non-zero, the content of the SPI field MUST be
+    /// ignored"); and RFC 2409 §5.7 gives the Informational that carries it a Message ID that "MUST NOT
+    /// be the same as the message ID of another phase 2 exchange which generated this informational
+    /// exchange". A peer may therefore name the exchange by its Message ID, by an SPI, or by neither.
+    /// The rules, in this order, the first that applies deciding (POLICY):
+    /// 1. The Message ID is that of an exchange in progress: `awaited` ([`Attribution::OwnExchange`]); a
+    ///    Quick Mode of the peer's in progress in the ledger ([`Attribution::Responder`]); or another
+    ///    exchange of ours in progress, which nobody waits on here ([`Attribution::None`]).
+    /// 2. It is about ESP and names, as a 4-octet SPI, the SPI this side offered in `awaited`'s message 1,
+    ///    or the inbound SPI of a registered responder exchange ([`Self::register_responder`]).
+    /// 3. Nothing in it names an exchange, and exactly one exchange is in progress -- `awaited` and the
+    ///    Quick Modes the ledger holds in progress, of either side, each counted once: that one. Nothing
+    ///    names an exchange when the ledger holds its Message ID as no exchange (as the peer's
+    ///    Informational, or not at all), it names no SPI (its Protocol-Id is ISAKMP, or its SPI is
+    ///    empty), and its message is no copy or replay of one read before. So this rule never gives an
+    ///    exchange a Notify under the id of an exchange not in progress, of ours (our own message
+    ///    reflected, or about that exchange) or of the peer's (a Quick Mode over or parked: about that
+    ///    exchange, or reusing its id against RFC 2409 §5.7); one that names an SPI rules 1 and 2 do not
+    ///    know (of an SA retired, say); or a copy or a replay, which is about what was in progress when
+    ///    its first copy came.
+    /// 4. None: traced, and ignored by a waiting reader (the event is in the mailbox all the same).
+    ///
+    /// Rule 3 takes only a Notify with no discriminator, never one whose discriminator the rules before did
+    /// not know: a peer that puts an unrelated SPI or Message ID in a real refusal of our Quick Mode makes
+    /// the waiting reader run to its timeout instead of failing at once, which is the safer way to fail --
+    /// the other way, a Notify about something else ends an exchange it is not about. The ledger is read
+    /// at the table's clock, swept first. Passive: [`Attribution::None`] -- the readers of a passive table
+    /// keep their own rule, that any error Notify ends the wait.
+    pub(crate) fn attribute_error_notify(&self, notice: &ErrorNotice, read_before: bool, awaited: Option<AwaitedQuick>) -> Attribution {
+        if !self.is_enabled() {
+            return Attribution::None;
+        }
+        let now = self.now();
+        let mut guard = self.books();
+        let books = &mut *guard;
+        books.ids.sweep(now);
+        let msgid = notice.msgid;
+        let is_awaited = |id: u32| awaited.is_some_and(|own| own.msgid == id);
+        let unattributed = |why: &str| {
+            ike_debug!(
+                "INFORMATIONAL: error Notify {} ({}) under msgid={msgid:08x} is about no exchange that can be told ({why}) -- ignored here, kept for the reader",
+                error_notify_name(notice.msg_type),
+                notice.msg_type
+            );
+            Attribution::None
+        };
+        // 1. The Message ID of an exchange in progress.
+        if is_awaited(msgid) {
+            return Attribution::OwnExchange;
+        }
+        let record = books.ids.record(msgid);
+        if let Some(MidRecord { origin, kind, state: MidState::Active { .. }, .. }) = record {
+            return match (origin, kind) {
+                (Origin::Peer, MidKind::Quick) => Attribution::Responder(msgid),
+                _ => unattributed("its Message ID is an exchange in progress that nothing waits on here"),
+            };
+        }
+        // 2. The ESP SPI it names.
+        if let (protocol::ESP, Some(spi)) = (notice.protocol, notice.spi.esp()) {
+            if awaited.is_some_and(|own| own.offered_spi == spi) {
+                return Attribution::OwnExchange;
+            }
+            if let Some(entry) = books.responders.iter().find(|entry| entry.inbound_spi == spi) {
+                return Attribution::Responder(entry.msgid);
+            }
+        }
+        // 3. The only exchange in progress -- only for a Notify that names none.
+        match record {
+            Some(MidRecord { origin: Origin::Local, .. }) => return unattributed("its Message ID is one of ours, of an exchange that is over"),
+            Some(MidRecord { kind: MidKind::Quick | MidKind::ModeConfig, .. }) => {
+                return unattributed("its Message ID is that of an exchange of the peer's that is not in progress")
+            }
+            Some(MidRecord { kind: MidKind::Informational, .. }) | None => {}
+        }
+        if notice.protocol != protocol::ISAKMP && !notice.spi.as_bytes().is_empty() {
+            return unattributed("it names an SPI that no exchange in progress has");
+        }
+        if read_before {
+            return unattributed("its message is a copy or a replay of one read before");
+        }
+        let mut outstanding: Vec<u32> = awaited.map(|own| own.msgid).into_iter().collect();
+        for id in books.ids.in_progress(MidKind::Quick, now, 2) {
+            if !outstanding.contains(&id) {
+                outstanding.push(id);
+            }
+        }
+        match outstanding.as_slice() {
+            [only] if is_awaited(*only) => Attribution::OwnExchange,
+            [only] if books.ids.origin_of(*only) == Some(Origin::Peer) => Attribution::Responder(*only),
+            [] => unattributed("no exchange is in progress"),
+            [_] => unattributed("the only exchange in progress is one of ours that nothing waits on here"),
+            _ => unattributed("more than one exchange is in progress"),
+        }
+    }
+}
+
+/// The Quick Mode of ours a reader waits on, as [`ExchangeTable::attribute_error_notify`] needs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AwaitedQuick {
+    /// Its Message ID.
+    pub msgid: u32,
+    /// The SPI this side offered in its message 1 -- its own inbound SPI for the SA -- which a refusal of
+    /// the offer names (RFC 2408 §3.14: "The receiving entity's SPI").
+    pub offered_spi: u32,
+}
+
+/// Which exchange an error Notify is about ([`ExchangeTable::attribute_error_notify`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Attribution {
+    /// The Quick Mode of ours the reader waits on: the peer refused it.
+    OwnExchange,
+    /// The responder exchange of this side under this Message ID.
+    Responder(u32),
+    /// No exchange that can be told: the waiting reader ignores it.
+    None,
 }
 
 /// What [`ExchangeTable::responder_exchange`] knows of an id.
@@ -902,6 +1130,20 @@ pub(crate) struct InformationalSeen {
     pub ack_matched: bool,
     /// How many events it added to the mailbox (a fact the mailbox holds already adds none).
     pub events_pushed: usize,
+    /// The error Notifies it carried, in its order, whether or not the mailbox held the same facts
+    /// already: what a reader waiting on an exchange attributes ([`ExchangeTable::attribute_error_notify`]).
+    pub error_notifies: Vec<ErrorNotice>,
+    /// Whether one of its Delete payloads is of Protocol-Id ISAKMP, whatever SPI it names: the meaning
+    /// the passive wait gives a Delete ([`super::informational::is_isakmp_sa_delete`]), not a check of
+    /// the cookie pair.
+    pub isakmp_deleted: bool,
+    /// Whether the ledger held its Message ID already as an exchange of the peer's that is over
+    /// ([`Admission::FinishedSame`] or [`Admission::Replay`]): a copy or a replay of an Informational
+    /// read before -- whose id "is unique to this exchange" (RFC 2409 §5.7) -- or a message under the
+    /// id of a Quick Mode of the peer's that is over. `false` for a first read, and for a copy the
+    /// ledger cannot tell: under Message ID 0 or not shaped as an Informational (neither is recorded),
+    /// or under an id it had no room to record or has let go of since.
+    pub read_before: bool,
 }
 
 impl InformationalSeen {
@@ -946,7 +1188,9 @@ impl InformationalSeen {
                     return;
                 };
                 ike_debug!("INFORMATIONAL: peer sent error Notify {} ({msg_type}) under msgid={:08x} -- kept for the reader", error_notify_name(msg_type), self.msgid);
-                self.keep(st, PeerEvent::ErrorNotify { msg_type, protocol: notify.protocol, spi, msgid: self.msgid, arrived: now });
+                let notice = ErrorNotice { msg_type, protocol: notify.protocol, spi, msgid: self.msgid };
+                self.error_notifies.push(notice);
+                self.keep(st, notice.event(now));
             }
             (msg_type, _) => ike_debug!("INFORMATIONAL: ignoring a status Notify of type {msg_type}"),
         }
@@ -983,7 +1227,8 @@ pub(crate) enum Classified {
     ResendFinal(Vec<u8>),
     /// A Quick Mode message under the id of an exchange of ours in progress, for whoever waits on
     /// that exchange, untouched (the ISAKMP message, without the non-ESP marker). Nothing of it was
-    /// decrypted or checked.
+    /// decrypted or checked: the reader that waits on the exchange takes it as its answer only once
+    /// its HASH(2) verifies.
     RouteToOwn { msgid: u32, message: Vec<u8> },
     /// An authenticated message 1 of a Quick Mode the peer started, now in the inbox.
     PeerQuick { msgid: u32 },
@@ -1034,7 +1279,8 @@ pub(crate) enum Classified {
 ///    is to be answered ([`InformationalSeen::r_u_there`], at most [`ACKS_PER_MESSAGE`] distinct
 ///    sequence numbers), an R-U-THERE-ACK of `expect_ack_seq` matches, an error Notify becomes a
 ///    [`PeerEvent::ErrorNotify`], and any other Notify (CONNECTED, the other status types) is traced
-///    and ignored.
+///    and ignored. What the message said is also returned as read, mailbox or no mailbox: its error
+///    Notifies and whether it deleted the ISAKMP SA, for a reader that waits on an exchange of ours.
 /// 4. Any other exchange type: a bit-exact repeat a final message of ours answered (Aggressive Mode
 ///    message 2, an XAUTH request) is [`Classified::ResendFinal`]; anything else is set aside.
 pub(crate) fn classify(st: &Phase1State, datagram: &[u8], expect_ack_seq: Option<u32>) -> Classified {
@@ -1195,18 +1441,23 @@ fn classify_informational(st: &Phase1State, header: &IsakmpHeader, message: &[u8
     // authenticates as an Informational: read, its id is not recorded, or the message 1 itself
     // would find its id taken.
     let shaped = payloads.iter().all(|p| matches!(p.payload_type, payload::HASH | payload::NOTIFY | payload::DELETE));
-    if !shaped {
+    let read_before = if !shaped {
         ike_debug!("INFORMATIONAL: msgid={msgid:08x} carries a payload other than a Notify or a Delete -- read, its id not recorded");
+        false
     } else if msgid != 0 {
-        // Only so that no id of ours repeats it (the id of an Informational "is unique to this
-        // exchange", RFC 2409 §5.7); whatever the ledger answers, the message is read: a copy, a
-        // replay or no room changes nothing below.
-        let _ = st.exchanges.record_authenticated(msgid, MidKind::Informational, msgid::fingerprint(msgid, &payloads), now, now);
-    }
-    let mut seen = InformationalSeen { msgid, ..InformationalSeen::default() };
+        // So that no id of ours repeats it (the id of an Informational "is unique to this exchange",
+        // RFC 2409 §5.7); whatever the ledger answers, the message is read: a copy, a replay or no room
+        // changes nothing below but `read_before`.
+        let admission = st.exchanges.record_authenticated(msgid, MidKind::Informational, msgid::fingerprint(msgid, &payloads), now, now);
+        matches!(admission, Admission::FinishedSame | Admission::Replay)
+    } else {
+        false
+    };
+    let mut seen = InformationalSeen { msgid, read_before, ..InformationalSeen::default() };
     let deletes = parse_deletes(&payloads);
     deletes.trace();
     for named in &deletes.named {
+        seen.isakmp_deleted |= named.protocol == protocol::ISAKMP;
         seen.keep(st, named.event(now));
     }
     for notify in payloads.iter().filter(|p| p.payload_type == payload::NOTIFY) {
@@ -2691,5 +2942,272 @@ mod tests {
         assert!(!shown.to_lowercase().contains("b7b7"), "{shown}");
         let quick = format!("{:?}", PeerQuick { msgid: 0x10, datagram: vec![0xB7; 40], fingerprint: [0xB7; 32], commit_flag: false, commit_seen: false, arrived: at });
         assert!(quick.contains("<40 bytes>") && !quick.to_lowercase().contains("b7"), "{quick}");
+    }
+
+    // ---- Which exchange an error Notify is about ----
+
+    /// An error Notify of type 14 under `msgid`, about `protocol_id`, naming `spi`.
+    fn notice(msgid: u32, protocol_id: u8, spi: &[u8]) -> ErrorNotice {
+        ErrorNotice { msg_type: 14, protocol: protocol_id, spi: PeerSpi::new(spi).unwrap(), msgid }
+    }
+
+    /// Which exchange an error Notify is about: by its Message ID first (our Quick Mode waited on, a
+    /// gateway Quick Mode in progress, another exchange of ours nobody waits on), then by the ESP SPI it
+    /// names (the one we offered, a registered responder exchange's), then the only exchange in progress
+    /// when nothing in the Notify names one -- never under the id of an exchange that is over, of either
+    /// side, never when it names an SPI nobody has, never for a copy or a replay -- and otherwise none
+    /// (RFC 2408 §3.14, RFC 2409 §5.7). Each row is decided by the rule its name gives; asking changes
+    /// nothing in the ledger.
+    #[test]
+    fn an_error_notify_is_given_to_the_exchange_it_names_and_otherwise_to_the_only_one_in_progress() {
+        const OFFERED: u32 = 0x5150_0001;
+        const RESPONDER_SPI: u32 = 0x7E57_0001;
+        const FRESH: u32 = 0x7000_0000;
+        const PEER: u32 = 0x4000_0000;
+        const RESPONDER: u32 = 0x4000_0002;
+        const PEER_INFORMATIONAL: u32 = 0x6000_0000;
+        const PEER_MODE_CONFIG: u32 = 0x6000_0002;
+        /// RFC 2407 §4.4.1: PROTO_IPSEC_AH, a protocol no SA of this side is negotiated for.
+        const AH: u8 = 2;
+        /// Whether the Informational that carried the Notify is a copy or a replay of one read before.
+        const FIRST: bool = false;
+        const COPY: bool = true;
+        /// What the table holds besides the exchanges that are over (of ours: an Informational and a
+        /// Quick Mode; of the peer's: an Informational and a Mode-Config exchange).
+        #[derive(Clone, Copy, Default)]
+        struct Held {
+            ours: bool,
+            peer: bool,
+            /// The gateway Quick Mode `peer` adds is parked.
+            parked: bool,
+            other_own: bool,
+            responder: bool,
+        }
+        struct World {
+            table: ExchangeTable,
+            ours: u32,
+            other_own: u32,
+            informational: u32,
+            finished: u32,
+        }
+        let world = |held: Held| {
+            let clock = TestClock::new();
+            let table = clock.exchanges();
+            table.enable();
+            let now = clock.now();
+            let mut e = SeedEntropy::new(0xA77);
+            let informational = table.fresh_message_id(MidKind::Informational, &mut e).unwrap();
+            let finished = table.fresh_message_id(MidKind::Quick, &mut e).unwrap();
+            assert!(table.finish(finished, now, MidEnd::Done));
+            assert_eq!(table.record_authenticated(PEER_INFORMATIONAL, MidKind::Informational, [4; 32], now, now), Admission::New);
+            assert_eq!(table.record_authenticated(PEER_MODE_CONFIG, MidKind::ModeConfig, [5; 32], now, now), Admission::New);
+            let ours = if held.ours { table.fresh_message_id(MidKind::Quick, &mut e).unwrap() } else { 0x0101_0101 };
+            let other_own = if held.other_own { table.fresh_message_id(MidKind::Quick, &mut e).unwrap() } else { 0x0303_0303 };
+            if held.peer {
+                assert_eq!(table.record_authenticated(PEER, MidKind::Quick, [1; 32], now, now + PEER_QUICK_WAIT), Admission::New);
+            }
+            if held.parked {
+                assert!(table.park(PEER, now, now + PEER_QUICK_WAIT));
+            }
+            if held.responder {
+                assert_eq!(table.record_authenticated(RESPONDER, MidKind::Quick, [2; 32], now, now + PEER_QUICK_WAIT), Admission::New);
+                table.register_responder(RESPONDER, RESPONDER_SPI);
+            }
+            (World { table, ours, other_own, informational, finished }, clock)
+        };
+        let ours = Held { ours: true, ..Held::default() };
+        let ours_and_peer = Held { peer: true, ..ours };
+        let esp = |spi: u32| (protocol::ESP, spi.to_be_bytes().to_vec());
+        let isakmp = (protocol::ISAKMP, Vec::new());
+        let at_once = Duration::ZERO;
+        type Pick = fn(&World) -> u32;
+        type Want = fn(&World) -> Attribution;
+        let (fresh, our_id): (Pick, Pick) = (|_| FRESH, |w| w.ours);
+        let (own, none): (Want, Want) = (|_| Attribution::OwnExchange, |_| Attribution::None);
+        // (rule and case, what is held, the Message ID, (Protocol-Id, SPI), whether its message was read
+        // before, whether ours is waited on, how far the clock moves first, the answer)
+        type Case = (&'static str, Held, Pick, (u8, Vec<u8>), bool, bool, Duration, Want);
+        let cases: Vec<Case> = vec![
+            ("1: our Message ID, a gateway Quick Mode in progress too", ours_and_peer, our_id, esp(0x0BAD_0001), FIRST, true, at_once, own),
+            ("1: our Message ID past the ledger's deadline for it", ours_and_peer, our_id, isakmp.clone(), FIRST, true, Duration::from_secs(21), own),
+            ("1: a gateway Quick Mode's Message ID", ours_and_peer, |_| PEER, isakmp.clone(), FIRST, true, at_once, |_| Attribution::Responder(PEER)),
+            ("1: another Quick Mode of ours in progress, though the SPI is ours", Held { other_own: true, ..ours }, |w| w.other_own, esp(OFFERED), FIRST, true, at_once, none),
+            ("1 holds for a copy: our Message ID", ours, our_id, isakmp.clone(), COPY, true, at_once, own),
+            ("1 holds for a copy: a gateway Quick Mode's Message ID", ours_and_peer, |_| PEER, isakmp.clone(), COPY, true, at_once, |_| Attribution::Responder(PEER)),
+            ("2: the SPI we offered", ours_and_peer, fresh, esp(OFFERED), FIRST, true, at_once, own),
+            ("2: a registered responder exchange's inbound SPI", Held { responder: true, ..ours }, fresh, esp(RESPONDER_SPI), FIRST, true, at_once, |_| Attribution::Responder(RESPONDER)),
+            ("2: the SPI we offered, under one of our Informational ids", ours_and_peer, |w| w.informational, esp(OFFERED), FIRST, true, at_once, own),
+            ("2 holds for a copy: the SPI we offered", ours, fresh, esp(OFFERED), COPY, true, at_once, own),
+            ("2 is for ESP only", ours_and_peer, fresh, (protocol::ISAKMP, OFFERED.to_be_bytes().to_vec()), FIRST, true, at_once, none),
+            ("2 reads a 4-octet SPI only", ours_and_peer, fresh, (protocol::ESP, [OFFERED.to_be_bytes(), [0; 4]].concat()), FIRST, true, at_once, none),
+            ("3: the only exchange in progress", ours, fresh, isakmp.clone(), FIRST, true, at_once, own),
+            ("3: the only one, an ESP Notify that names no SPI", ours, fresh, (protocol::ESP, Vec::new()), FIRST, true, at_once, own),
+            ("3: the only one, the SPI of an ISAKMP Notify is ignored", ours, fresh, (protocol::ISAKMP, vec![0xC0; 16]), FIRST, true, at_once, own),
+            ("3: under the id the gateway's Informational took", ours, |_| PEER_INFORMATIONAL, isakmp.clone(), FIRST, true, at_once, own),
+            ("3: a gateway Quick Mode, nobody waiting", Held { peer: true, ..Held::default() }, fresh, isakmp.clone(), FIRST, false, at_once, |_| Attribution::Responder(PEER)),
+            ("3: one of ours that nobody waits on", ours, fresh, isakmp.clone(), FIRST, false, at_once, none),
+            ("3: a gateway Quick Mode past its deadline is not in progress", ours_and_peer, fresh, isakmp.clone(), FIRST, true, Duration::from_secs(9), own),
+            ("3 never when it names an ESP SPI of nobody's", ours, fresh, esp(0x0DEA_D001), FIRST, true, at_once, none),
+            ("3 never when it names an SPI of another length under ESP", ours, fresh, (protocol::ESP, [OFFERED.to_be_bytes(), [0; 4]].concat()), FIRST, true, at_once, none),
+            ("3 never when it names an SPI of another protocol", ours, fresh, (AH, OFFERED.to_be_bytes().to_vec()), FIRST, true, at_once, none),
+            ("3 never under one of our Informational ids", ours, |w| w.informational, isakmp.clone(), FIRST, true, at_once, none),
+            ("3 never under the id of a Quick Mode of ours that is over", ours, |w| w.finished, isakmp.clone(), FIRST, true, at_once, none),
+            ("3 never under the id of a gateway Quick Mode past its deadline", ours_and_peer, |_| PEER, isakmp.clone(), FIRST, true, Duration::from_secs(9), none),
+            ("3 never under the id of a parked gateway Quick Mode", Held { parked: true, ..ours_and_peer }, |_| PEER, isakmp.clone(), FIRST, true, at_once, none),
+            ("3 never under the id of a gateway Mode-Config exchange", ours, |_| PEER_MODE_CONFIG, isakmp.clone(), FIRST, true, at_once, none),
+            ("3 never for a copy", ours, fresh, isakmp.clone(), COPY, true, at_once, none),
+            ("3 never for a copy under the id the gateway's Informational took", ours, |_| PEER_INFORMATIONAL, isakmp.clone(), COPY, true, at_once, none),
+            ("3 never for a copy, nobody waiting", Held { peer: true, ..Held::default() }, fresh, isakmp.clone(), COPY, false, at_once, none),
+            ("4: two exchanges in progress", ours_and_peer, fresh, isakmp.clone(), FIRST, true, at_once, none),
+            ("4: two of ours in progress", Held { other_own: true, ..ours }, fresh, isakmp.clone(), FIRST, true, at_once, none),
+            ("4: nothing in progress, nothing waited on", Held::default(), fresh, isakmp.clone(), FIRST, false, at_once, none),
+        ];
+        let mut wrong = Vec::new();
+        for (name, held, pick, (protocol_id, spi), read_before, waits, advance, want) in cases {
+            let (w, clock) = world(held);
+            clock.advance(advance);
+            let awaited = waits.then_some(AwaitedQuick { msgid: w.ours, offered_spi: OFFERED });
+            let held_before = w.table.ids_held();
+            let got = w.table.attribute_error_notify(&notice(pick(&w), protocol_id, &spi), read_before, awaited);
+            if got != want(&w) {
+                wrong.push(format!("{name}: {got:?}, wanted {:?}", want(&w)));
+            }
+            assert_eq!(w.table.ids_held(), held_before, "{name}: asking records nothing");
+        }
+        assert!(wrong.is_empty(), "error Notifies attributed wrongly:\n{}", wrong.join("\n"));
+        let passive = ExchangeTable::passive();
+        let mine = AwaitedQuick { msgid: 0x11, offered_spi: OFFERED };
+        assert_eq!(passive.attribute_error_notify(&notice(0x11, protocol::ESP, &OFFERED.to_be_bytes()), FIRST, Some(mine)), Attribution::None, "passive: never asked");
+    }
+
+    /// A responder exchange is known by its Message ID and its inbound SPI; registered again under its id it
+    /// replaces its entry, and beyond four the oldest gives way. The first refusal recorded on it is the one
+    /// kept; nothing is recorded for an id not registered, and a passive table registers nothing.
+    #[test]
+    fn responder_exchanges_are_known_by_id_and_spi_and_keep_the_first_refusal() {
+        let table = ExchangeTable::enabled();
+        let naming = |spi: u32| notice(0x7000_0000, protocol::ESP, &spi.to_be_bytes());
+        for n in 0..5u32 {
+            table.register_responder(0x100 + 2 * n, 0xA000 + n);
+        }
+        assert_eq!(table.attribute_error_notify(&naming(0xA000), false, None), Attribution::None, "the oldest gave way");
+        assert_eq!(table.attribute_error_notify(&naming(0xA004), false, None), Attribution::Responder(0x108));
+        table.register_responder(0x108, 0xB000);
+        assert_eq!(table.attribute_error_notify(&naming(0xA004), false, None), Attribution::None, "registered again under another SPI");
+        assert_eq!(table.attribute_error_notify(&naming(0xB000), false, None), Attribution::Responder(0x108));
+        assert!(table.note_responder_rejected(0x108, 14));
+        assert!(table.note_responder_rejected(0x108, 18));
+        assert_eq!(table.responder_rejected(0x108), Some(14), "the first refusal stays");
+        assert_eq!(table.responder_rejected(0x102), None);
+        assert!(!table.note_responder_rejected(0x100, 14), "the oldest is gone");
+        let passive = ExchangeTable::passive();
+        passive.register_responder(0x108, 0xB000);
+        assert!(!passive.note_responder_rejected(0x108, 14));
+        assert_eq!(passive.responder_rejected(0x108), None);
+        assert_eq!(passive.attribute_error_notify(&naming(0xB000), false, None), Attribution::None);
+    }
+
+    /// The messages under our waited-on id that fail HASH(2) are counted by an enabled table only, by every
+    /// clone together.
+    #[test]
+    fn replies_that_fail_hash_2_are_counted_only_by_an_enabled_table() {
+        let table = ExchangeTable::passive();
+        assert_eq!(table.count_unauthenticated_reply(), 0);
+        assert_eq!(table.unauthenticated_replies(), 0);
+        table.enable();
+        assert_eq!((table.count_unauthenticated_reply(), table.clone().count_unauthenticated_reply()), (1, 2));
+        assert_eq!(table.unauthenticated_replies(), 2);
+    }
+
+    /// What an Informational said comes back as read, whatever the mailbox held already: its error Notifies
+    /// in their order (the ISAKMP one with the empty SPI), and whether any of its Delete payloads named the
+    /// ISAKMP SA.
+    #[test]
+    fn an_informational_tells_its_error_notifies_and_an_isakmp_delete_as_read_every_time() {
+        let (client, gateway, _clock) = enabled_pair();
+        let mut cookies = [0u8; 16];
+        cookies[..8].copy_from_slice(&gateway.cky_i);
+        cookies[8..].copy_from_slice(&gateway.cky_r);
+        let message = informational(
+            &gateway,
+            0x3001,
+            &[
+                notify(protocol::ESP, &[0, 0, 0x0E, 0x01], 14, &[]),
+                as_pair(esp_delete(&[0x0E01])),
+                as_pair(isakmp_delete(cookies)),
+                notify(protocol::ISAKMP, &[0xAB; 16], 18, &[]),
+            ],
+        );
+        let read = [
+            ErrorNotice { msg_type: 14, protocol: protocol::ESP, spi: PeerSpi::new(&[0, 0, 0x0E, 0x01]).unwrap(), msgid: 0x3001 },
+            ErrorNotice { msg_type: 18, protocol: protocol::ISAKMP, spi: PeerSpi::EMPTY, msgid: 0x3001 },
+        ];
+        for (round, pushed, read_before) in [(1, 4, false), (2, 0, true)] {
+            let Classified::Informational(seen) = classify(&client, &message, None) else { panic!("round {round}: not read") };
+            assert_eq!((seen.error_notifies, seen.isakmp_deleted, seen.events_pushed), (read.to_vec(), true, pushed), "round {round}");
+            assert_eq!(seen.read_before, read_before, "round {round}");
+        }
+        let esp_only = informational(&gateway, 0x3003, &[as_pair(esp_delete(&[0x0E02])), as_pair(esp_delete(&[0x0E03]))]);
+        let Classified::Informational(seen) = classify(&client, &esp_only, None) else { panic!("not read") };
+        assert!(!seen.isakmp_deleted && seen.error_notifies.is_empty(), "{seen:?}");
+    }
+
+    /// An Informational is read before when the ledger held its Message ID already as an exchange of the
+    /// peer's that is over: a copy of one read before, another message under its id (a replay), or one
+    /// under the id of a gateway Quick Mode that is over. Never for a first read, under the id of a gateway
+    /// Quick Mode in progress or of one of ours (rule 1 and the Message ID decide those), nor for what the
+    /// ledger does not record: Message ID 0, or a message with a payload an Informational does not carry.
+    #[test]
+    fn an_informational_is_read_before_when_the_ledger_held_its_id_as_a_peer_exchange_that_is_over() {
+        #[derive(Clone, Copy)]
+        enum Held {
+            Nothing,
+            GatewayQuickOver,
+            GatewayQuickInProgress,
+            OurInformational,
+        }
+        let refusal = |msg_type: u16| notify(protocol::ISAKMP, &[], msg_type, &[]);
+        let nonce = (payload::NONCE, vec![0x5E; 16]);
+        // (case, what the ledger holds under the id first, the payloads of each message in turn, whether
+        // each was read before)
+        type Case = (&'static str, Held, Vec<Vec<(u8, Vec<u8>)>>, Vec<bool>);
+        let cases: Vec<Case> = vec![
+            ("a first read, then a copy of it", Held::Nothing, vec![vec![refusal(14)], vec![refusal(14)]], vec![false, true]),
+            ("another message under the id of one read before", Held::Nothing, vec![vec![refusal(14)], vec![refusal(18)]], vec![false, true]),
+            ("under the id of a gateway Quick Mode that is over", Held::GatewayQuickOver, vec![vec![refusal(14)]], vec![true]),
+            ("under the id of a gateway Quick Mode in progress", Held::GatewayQuickInProgress, vec![vec![refusal(14)], vec![refusal(14)]], vec![false, false]),
+            ("under one of our Informational ids", Held::OurInformational, vec![vec![refusal(14)], vec![refusal(14)]], vec![false, false]),
+            ("a payload no Informational carries: not recorded", Held::Nothing, vec![vec![refusal(14), nonce.clone()], vec![refusal(14), nonce.clone()]], vec![false, false]),
+        ];
+        for (name, held, messages, want) in cases {
+            let (client, gateway, clock) = enabled_pair();
+            let now = clock.now();
+            let msgid = match held {
+                Held::Nothing => 0x3101,
+                Held::GatewayQuickOver | Held::GatewayQuickInProgress => {
+                    assert_eq!(client.exchanges.record_authenticated(0x3103, MidKind::Quick, [3; 32], now, now + PEER_QUICK_WAIT), Admission::New);
+                    if matches!(held, Held::GatewayQuickOver) {
+                        assert!(client.exchanges.finish(0x3103, now, MidEnd::Done));
+                    }
+                    0x3103
+                }
+                Held::OurInformational => client.fresh_message_id(MidKind::Informational, &mut SeedEntropy::new(0x3105)).unwrap(),
+            };
+            let got: Vec<bool> = messages
+                .iter()
+                .map(|payloads| match classify(&client, &informational(&gateway, msgid, payloads), None) {
+                    Classified::Informational(seen) => seen.read_before,
+                    other => panic!("{name}: not read as an Informational: {other:?}"),
+                })
+                .collect();
+            assert_eq!(got, want, "{name}");
+        }
+        // Message ID 0 is never recorded, so a copy under it is not told from a first read.
+        let (client, gateway, _clock) = enabled_pair();
+        let under_zero = informational(&gateway, 0, &[refusal(14)]);
+        for round in 1..=2 {
+            let Classified::Informational(seen) = classify(&client, &under_zero, None) else { panic!("round {round}: not read") };
+            assert!(!seen.read_before, "round {round}");
+        }
     }
 }

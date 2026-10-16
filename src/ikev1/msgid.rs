@@ -79,8 +79,10 @@ pub(crate) const MID_DRAWS: usize = 8;
 /// How long an exchange of ours stays Active (POLICY). A Quick Mode of ours on an established
 /// ISAKMP SA (`quick`'s rekeys and re-creations) waits for its answer no longer than three of its
 /// caller's timeouts (`QUICK_MODE_ATTEMPTS`), 15 s with the 5 s the worker passes; this is that
-/// and a margin. A Mode-Config request gets the same: past it the record is still known as ours
-/// ([`MessageIdLedger::origin_of`]), only no longer kept from being forgotten.
+/// and a margin, and a Quick Mode whose caller waits longer moves its own deadline as far
+/// ([`MessageIdLedger::set_deadline`]), then ends its record when it ends
+/// ([`MessageIdLedger::finish`]). A Mode-Config request gets the same: past it the record is still
+/// known as ours ([`MessageIdLedger::origin_of`]), only no longer kept from being forgotten.
 pub(crate) const LOCAL_QUICK_DEADLINE: Duration = Duration::from_secs(20);
 
 /// How many times a peer Quick Mode that failed before its answer left may be taken up again
@@ -132,23 +134,22 @@ pub(crate) enum MidState {
     /// of ours waits on it), and so is one of ours.
     Done,
     /// Over: this side refused it.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     Refused,
     /// A peer Quick Mode that failed for a passing reason before its answer left, and may be taken
     /// up again when the peer repeats it, from `not_before` and before `until`
     /// ([`MessageIdLedger::reconsider`]). From `until` on it reads as Done.
     Parked { not_before: Instant, until: Instant },
     /// Over: a later message of the peer replaced it.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     Superseded,
 }
 
 /// How a caller ends an exchange ([`MessageIdLedger::finish`]).
-#[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MidEnd {
     Done,
+    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     Refused,
+    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     Superseded,
 }
 
@@ -487,6 +488,20 @@ impl MessageIdLedger {
         admission
     }
 
+    /// The ids of up to `at_most` exchanges of `kind` in progress at `now` (after the sweep), the
+    /// soonest deadline first.
+    pub(crate) fn in_progress(&mut self, kind: MidKind, now: Instant, at_most: usize) -> Vec<u32> {
+        self.sweep(now);
+        let records = &self.records;
+        self.orders
+            .deadlines
+            .iter()
+            .map(|&(_, _, id)| id)
+            .filter(|id| records.get(id).is_some_and(|record| record.kind == kind))
+            .take(at_most)
+            .collect()
+    }
+
     /// Who drew `id`, while the ledger holds it.
     pub(crate) fn origin_of(&self, id: u32) -> Option<Origin> {
         self.records.get(&id).map(|record| record.origin)
@@ -503,7 +518,6 @@ impl MessageIdLedger {
     /// Active one -- after the sweep, so not one whose deadline has come, which ended Done then,
     /// swept or not -- or a Parked one before its `until`. `false`, and nothing changed, for any
     /// other, or an id the ledger does not hold.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     pub(crate) fn finish(&mut self, id: u32, now: Instant, end: MidEnd) -> bool {
         self.sweep(now);
         let live = self.records.get(&id).is_some_and(|record| match record.state {
@@ -525,7 +539,6 @@ impl MessageIdLedger {
     /// Moves the deadline of the Active record of `id` to `deadline`, at `now`; `false`, and nothing
     /// changed, for any other. The sweep comes first, so an exchange whose deadline has come is not
     /// brought back, whether or not anything swept the ledger since.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     pub(crate) fn set_deadline(&mut self, id: u32, now: Instant, deadline: Instant) -> bool {
         self.sweep(now);
         let active = self.records.get(&id).is_some_and(|record| matches!(record.state, MidState::Active { .. }));
@@ -1330,6 +1343,32 @@ mod tests {
             fresh.remember_ni(ChildFamily::Ipv6, &[n; 16]);
         }
         assert!(fresh.seen_ni(ChildFamily::Ipv6, &[0xF0; 16]), "the oldest of sixteen distinct nonces is still known");
+    }
+
+    /// The exchanges in progress of a kind are the Active records of that kind and of no other, the
+    /// soonest deadline first, as many as asked at most, and none whose deadline has come: a parked or a
+    /// finished exchange is not one, nor an Informational.
+    #[test]
+    fn the_exchanges_in_progress_are_the_active_records_of_the_kind_asked_soonest_deadline_first() {
+        let at = Instant::now();
+        let mut ids = MessageIdLedger::default();
+        let mut e = Scripted::new(&[0x11, 0x21, 0x31]);
+        let ours = ids.fresh(MidKind::Quick, &mut e, at).unwrap();
+        let mode_cfg = ids.fresh(MidKind::ModeConfig, &mut e, at).unwrap();
+        ids.fresh(MidKind::Informational, &mut e, at).unwrap();
+        peer_quick(&mut ids, 0x40, 1, at, at + secs(8));
+        peer_quick(&mut ids, 0x42, 2, at, at + secs(30));
+        peer_quick(&mut ids, 0x44, 3, at, at + secs(60));
+        peer_quick(&mut ids, 0x46, 4, at, at + secs(60));
+        assert!(ids.park(0x44, at, at + secs(60)));
+        assert!(ids.finish(0x46, at, MidEnd::Done));
+        assert_eq!(ids.in_progress(MidKind::Quick, at, 10), [0x40, ours, 0x42], "deadlines 8 s, 20 s, 30 s");
+        assert_eq!(ids.in_progress(MidKind::Quick, at, 2), [0x40, ours]);
+        assert_eq!(ids.in_progress(MidKind::ModeConfig, at, 10), [mode_cfg]);
+        assert!(ids.in_progress(MidKind::Informational, at, 10).is_empty());
+        assert_eq!(ids.in_progress(MidKind::Quick, at + secs(8), 10), [ours, 0x42], "one whose deadline has come is over");
+        assert!(ids.in_progress(MidKind::Quick, at + secs(30), 10).is_empty());
+        ids.check();
     }
 
     #[test]

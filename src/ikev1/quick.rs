@@ -110,9 +110,10 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use super::crypto1::{self, Prf};
+use super::exchange::{self as table, Attribution, AwaitedQuick, Classified};
 use super::informational;
 use super::isakmp::{self, exchange, payload, IsakmpHeader, Payload};
-use super::msgid::MidKind;
+use super::msgid::{MidEnd, MidKind, MidRecord, MidState};
 use super::payloads::{
     id_type, life, life_duration_value, parse_attributes, protocol, AttrValue, Attribute, Id, Proposal, SaPayload, Transform, IPSEC_DOI,
     SIT_IDENTITY_ONLY,
@@ -978,21 +979,7 @@ impl QuickInitiator {
         let (_hdr, ps, iv2) = phase2::decrypt_payloads(msg2, &self.enc_key, self.enc_block, &self.iv1)?;
         let nr = find(&ps, payload::NONCE).ok_or(IkeError::MissingPayload("NONCE"))?.data.clone();
         isakmp::check_nonce_len(&nr)?;
-
-        // Verify HASH(2) = prf(SKEYID_a, M-ID | Ni_b | <payloads after HASH>).
-        let got = find(&ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
-        let after: Vec<(u8, Vec<u8>)> = ps
-            .iter()
-            .filter(|p| p.payload_type != payload::HASH)
-            .map(|p| (p.payload_type, p.data.clone()))
-            .collect();
-        let (_first, body) = isakmp::encode_payloads(&after);
-        let mut hi = self.msgid.to_be_bytes().to_vec();
-        hi.extend_from_slice(&self.ni);
-        hi.extend_from_slice(&body);
-        if got != self.prf.mac(&self.skeyid_a, &hi) {
-            return Err(IkeError::AuthFailed);
-        }
+        self.check_hash2(&ps)?;
 
         // An authentic HASH(2) only proves message 2 wasn't tampered with in
         // transit -- it doesn't prove the responder actually chose the one
@@ -1023,6 +1010,33 @@ impl QuickInitiator {
         };
         let negotiated_lifetime = shortened(negotiated_p2_lifetime(&ps, self.life_duration), responder_stated);
         Ok((msg3, child, negotiated_lifetime))
+    }
+
+    /// Verify `HASH(2) = prf(SKEYID_a, M-ID | Ni_b | <payloads after HASH>)` over the decrypted
+    /// payloads `ps` of message 2 (RFC 2409 §5.5).
+    fn check_hash2(&self, ps: &[Payload]) -> Result<(), IkeError> {
+        let got = find(ps, payload::HASH).ok_or(IkeError::MissingPayload("HASH"))?.data.clone();
+        let after: Vec<(u8, Vec<u8>)> = ps
+            .iter()
+            .filter(|p| p.payload_type != payload::HASH)
+            .map(|p| (p.payload_type, p.data.clone()))
+            .collect();
+        let (_first, body) = isakmp::encode_payloads(&after);
+        let mut hi = self.msgid.to_be_bytes().to_vec();
+        hi.extend_from_slice(&self.ni);
+        hi.extend_from_slice(&body);
+        if got != self.prf.mac(&self.skeyid_a, &hi) {
+            return Err(IkeError::AuthFailed);
+        }
+        Ok(())
+    }
+
+    /// Whether `msg2`, a Quick Mode message under this exchange's Message ID, is the peer's: it
+    /// decrypts under the IV that follows message 1 and its HASH(2) verifies -- the authentication
+    /// [`Self::complete_with_lifetime`] starts with, and nothing more. What an authentic message says is
+    /// not looked at here: one the offer does not accept is the peer's answer all the same.
+    fn authenticates(&self, msg2: &[u8]) -> bool {
+        phase2::decrypt_payloads(msg2, &self.enc_key, self.enc_block, &self.iv1).is_ok_and(|(_hdr, ps, _iv2)| self.check_hash2(&ps).is_ok())
     }
 }
 
@@ -1241,7 +1255,7 @@ pub fn rekey_child_with_lifetime(
     old_local_spi: u32,
 ) -> Result<(RekeyedChild, SaLifetime), DriverError> {
     let (msg1, qi) = initiate_quick_with_pfs(st, entropy, cipher, ts_local, ts_remote, pfs_group, life_duration)?;
-    let out = quick_exchange(sock, st, peer, timeout, msg1, qi, "IPv4 rekey")?;
+    let out = quick_exchange(sock, st, entropy, peer, timeout, msg1, qi, "IPv4 rekey")?;
     delete_superseded(sock, st, entropy, peer, old_local_spi);
     Ok(out)
 }
@@ -1267,7 +1281,7 @@ pub fn create_child_with_lifetime(
     timeout: Duration,
 ) -> Result<(RekeyedChild, SaLifetime), DriverError> {
     let (msg1, qi) = initiate_quick_with_pfs(st, entropy, cipher, ts_local, ts_remote, pfs_group, life_duration)?;
-    quick_exchange(sock, st, peer, timeout, msg1, qi, "IPv4 CHILD SA")
+    quick_exchange(sock, st, entropy, peer, timeout, msg1, qi, "IPv4 CHILD SA")
 }
 
 /// Create the tunnel's additional **IPv6** CHILD SA: one more Quick Mode
@@ -1333,7 +1347,7 @@ fn quick_ipv6(
     what: &str,
 ) -> Result<(RekeyedChild, SaLifetime), DriverError> {
     let (msg1, qi) = initiate_quick_ipv6(st, entropy, cipher, ts_local, ts_remote, pfs_group, life_duration)?;
-    quick_exchange(sock, st, peer, timeout, msg1, qi, what)
+    quick_exchange(sock, st, entropy, peer, timeout, msg1, qi, what)
 }
 
 /// [`rekey_child`] for the IPv6 CHILD SA created by [`create_child_ipv6`]:
@@ -1462,15 +1476,26 @@ const QUICK_MODE_ATTEMPTS: u32 = 3;
 /// [`informational::peek`] / [`informational::probe`]) sends the same message 3
 /// again ([`resend_final_if_repeat`]). Until then the gateway has no
 /// established Quick Mode SA, and nothing here notices.
+///
+/// All of the above is what a **passive** exchange table gets, which every
+/// state starts with; once the table is on
+/// ([`Phase1State::enable_gateway_quick_mode`]) the exchange is
+/// [`quick_exchange_enabled`]'s, and `entropy` answers the R-U-THEREs read
+/// while it waits.
+#[allow(clippy::too_many_arguments)]
 fn quick_exchange(
     sock: &dyn IkeSocket,
     st: &Phase1State,
+    entropy: &mut impl Entropy,
     peer: SocketAddr,
     timeout: Duration,
     msg1: Vec<u8>,
     qi: QuickInitiator,
     what: &str,
 ) -> Result<(RekeyedChild, SaLifetime), DriverError> {
+    if st.exchanges.is_enabled() {
+        return quick_exchange_enabled(sock, st, entropy, peer, timeout, msg1, qi, what);
+    }
     let msgid = IsakmpHeader::parse(&msg1)?.message_id;
     let msg2 = rtt::exchange(
         Some(&st.rtt),
@@ -1519,7 +1544,8 @@ fn quick_exchange(
 /// Wait up to `timeout` for message 2 of the Quick Mode `msgid`, for
 /// [`quick_exchange`]: `None` when none came in time. A peer message that an
 /// earlier exchange's final message answered (a repeated message 2 of the last
-/// rekey) gets that final message sent again on the way.
+/// rekey) gets that final message sent again on the way. The wait of a passive
+/// exchange table; an enabled one waits in [`await_quick_reply_enabled`].
 fn await_quick_reply(
     sock: &dyn IkeSocket,
     st: &Phase1State,
@@ -1578,6 +1604,186 @@ fn await_quick_reply(
         return Ok(Some(msg));
     }
 }
+
+/// How long past its own patience a Quick Mode of ours stays in progress in the Message-ID ledger of
+/// an enabled exchange table (POLICY): the margin `LOCAL_QUICK_DEADLINE` has over three of the
+/// worker's 5 s timeouts.
+const LEDGER_MARGIN: Duration = Duration::from_secs(5);
+
+/// [`quick_exchange`] once the exchange table is on: the same sends after the same waits, the same
+/// message 3 kept in [`Phase1State::finals`], the same results and errors -- but each wait is
+/// [`await_quick_reply_enabled`]'s, which keeps what the peer says meanwhile and takes for the answer
+/// only a message 2 that authenticates. The Message ID, which the ledger holds as ours in progress from
+/// the moment it was drawn, stays so for as long as the exchange may wait ([`keep_in_progress`]) and
+/// is ended (`Done`) when the exchange ends, however it ends: answered, refused, torn down, timed out,
+/// or unable to send.
+#[allow(clippy::too_many_arguments)]
+fn quick_exchange_enabled(
+    sock: &dyn IkeSocket,
+    st: &Phase1State,
+    entropy: &mut impl Entropy,
+    peer: SocketAddr,
+    timeout: Duration,
+    msg1: Vec<u8>,
+    qi: QuickInitiator,
+    what: &str,
+) -> Result<(RekeyedChild, SaLifetime), DriverError> {
+    let msgid = IsakmpHeader::parse(&msg1)?.message_id;
+    keep_in_progress(st, msgid, timeout);
+    let outcome = (|| -> Result<(RekeyedChild, SaLifetime), DriverError> {
+        let msg2 = rtt::exchange(
+            Some(&st.rtt),
+            Some((timeout, QUICK_MODE_ATTEMPTS)),
+            &Instant::now,
+            |sent| {
+                if sent == 0 {
+                    ike_debug!("Quick Mode ({what}): sending msg1 to {peer} (msgid={msgid:08x})");
+                } else {
+                    ike_debug!("Quick Mode ({what}): no reply, retransmitting msg1 (send {} of it)", sent + 1);
+                }
+                send_ike(sock, st, peer, &msg1).map_err(DriverError::from)
+            },
+            |wait| await_quick_reply_enabled(sock, st, entropy, peer, &qi, wait.unwrap_or(timeout), what),
+        )?;
+        let Some(msg2) = msg2 else {
+            ike_debug!("Quick Mode ({what}): no reply to msgid={msgid:08x}, retransmissions included");
+            return Err(IkeError::Crypto("Quick Mode: timed out waiting for the Quick Mode reply").into());
+        };
+
+        let (msg3, child, negotiated_lifetime) = qi.complete_with_lifetime(&msg2)?;
+        st.finals.retain(&msg2, &msg3);
+        send_ike(sock, st, peer, &msg3)?;
+
+        let key_out = ChildKeyMaterial {
+            cipher: child.outbound.cipher(),
+            enc: child.outbound.enc_material(),
+            integ: child.outbound.integ_key().to_vec(),
+        };
+        let key_in = ChildKeyMaterial {
+            cipher: child.inbound.cipher(),
+            enc: child.inbound.enc_material(),
+            integ: child.inbound.integ_key().to_vec(),
+        };
+        let rekeyed = RekeyedChild { local_spi: child.inbound.spi(), peer_spi: child.outbound.spi(), key_out, key_in };
+        ike_debug!(
+            "Quick Mode ({what}): complete -- spi_in={:08x} spi_out={:08x}, lifetime {}s{}",
+            rekeyed.local_spi,
+            rekeyed.peer_spi,
+            negotiated_lifetime.seconds,
+            negotiated_lifetime.kilobytes.map(|kb| format!(" / {kb} KB")).unwrap_or_default()
+        );
+        Ok((rekeyed, negotiated_lifetime))
+    })();
+    if !st.exchanges.finish(msgid, st.exchanges.now(), MidEnd::Done) {
+        ike_debug!("Quick Mode ({what}): msgid={msgid:08x} was no longer in progress in the Message-ID ledger when the exchange ended");
+    }
+    outcome
+}
+
+/// Keeps the Message ID `msgid` of a Quick Mode of ours in progress in the ledger for as long as the
+/// exchange may wait for its answer -- [`QUICK_MODE_ATTEMPTS`] times `timeout`, the waits' total -- and
+/// [`LEDGER_MARGIN`] more, when that is longer than the deadline the ledger gave it: a message 2 read after
+/// the record ended would be taken for a message of an exchange of ours that is over, and dropped. It never
+/// shortens the deadline, and a patience the clock cannot count leaves it as it is.
+fn keep_in_progress(st: &Phase1State, msgid: u32, timeout: Duration) {
+    let now = st.exchanges.now();
+    let Some(until) = now.checked_add(timeout.saturating_mul(QUICK_MODE_ATTEMPTS)).and_then(|end| end.checked_add(LEDGER_MARGIN)) else { return };
+    if let Some(MidRecord { state: MidState::Active { deadline }, .. }) = st.exchanges.id_record(msgid) {
+        if deadline < until {
+            st.exchanges.set_deadline(msgid, now, until);
+        }
+    }
+}
+
+/// [`await_quick_reply`] once the exchange table is on: the same bounded wait for message 2 of `qi`'s
+/// exchange -- `None` when none came in time -- with every datagram read through [`table::classify`] and
+/// answered as any other reader of the socket answers it ([`informational::serve_classified`]), so that
+/// nothing the peer says meanwhile is lost: an R-U-THERE is answered, a repeat of a message an earlier
+/// final message of ours answered gets that final message again, a message 1 of a Quick Mode the gateway
+/// starts goes to the inbox (it is never answered from inside this exchange), and every Delete -- of any
+/// SA, every SPI of every payload -- and every error Notify goes to the mailbox. What ends the wait
+/// before its time:
+/// - a Quick Mode message under the exchange's Message ID whose HASH(2) verifies
+///   ([`QuickInitiator::authenticates`]): the answer, returned. One whose HASH(2) does not verify is
+///   dropped, counted ([`table::ExchangeTable::count_unauthenticated_reply`]) and traced, and the wait goes
+///   on: a datagram that anyone who knows the cookies and the Message ID can send ends nothing;
+/// - an error Notify about this exchange ([`table::ExchangeTable::attribute_error_notify`]):
+///   [`IkeError::PeerRejected`]. One about a responder exchange of this side is recorded on it
+///   ([`table::ExchangeTable::note_responder_rejected`]) and one about no exchange that can be told is
+///   ignored; the wait goes on after either;
+/// - a Delete payload of Protocol-Id ISAKMP, whatever SPI it names (as the passive wait reads one),
+///   wherever it is among the Delete payloads of its message: [`IkeError::PeerTornDown`].
+///
+/// A message that carries both an error Notify about this exchange and a Delete payload of Protocol-Id
+/// ISAKMP ends it as refused, as the passive wait does (the Delete is in the mailbox for the caller all
+/// the same).
+#[allow(clippy::too_many_arguments)]
+fn await_quick_reply_enabled(
+    sock: &dyn IkeSocket,
+    st: &Phase1State,
+    entropy: &mut impl Entropy,
+    peer: SocketAddr,
+    qi: &QuickInitiator,
+    timeout: Duration,
+    what: &str,
+) -> Result<Option<Vec<u8>>, DriverError> {
+    let awaited = AwaitedQuick { msgid: qi.msgid, offered_spi: qi.local_spi };
+    // A `timeout` too long for the clock to count is not one the clock can end.
+    let deadline = Instant::now().checked_add(timeout);
+    let mut buf = [0u8; 8192];
+    loop {
+        let remaining = deadline.map_or(timeout, |deadline| deadline.saturating_duration_since(Instant::now()));
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        sock.set_read_timeout(Some(remaining))?;
+        let (n, from) = match sock.recv_from(&mut buf) {
+            Ok(r) => r,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        crate::debug::dump("<<<", from, &buf[..n]);
+        let classified = match table::classify(st, &buf[..n], None) {
+            Classified::RouteToOwn { msgid, message } if msgid == awaited.msgid => {
+                if qi.authenticates(&message) {
+                    return Ok(Some(message));
+                }
+                let dropped = st.exchanges.count_unauthenticated_reply();
+                ike_debug!(
+                    "Quick Mode ({what}): a message under msgid={msgid:08x} does not authenticate as its message 2 (HASH(2)) -- dropped ({dropped} so far), still waiting"
+                );
+                continue;
+            }
+            other => other,
+        };
+        informational::serve_classified(sock, st, entropy, peer, &classified);
+        let Classified::Informational(seen) = classified else { continue };
+        for notice in &seen.error_notifies {
+            let (notify_type, name) = (notice.msg_type, informational::error_notify_name(notice.msg_type));
+            match st.exchanges.attribute_error_notify(notice, seen.read_before, Some(awaited)) {
+                Attribution::OwnExchange => {
+                    ike_debug!("Quick Mode ({what}): gateway rejected the proposal with {name} (notify type {notify_type})");
+                    return Err(IkeError::PeerRejected { notify_type, name }.into());
+                }
+                Attribution::Responder(id) => {
+                    let recorded = st.exchanges.note_responder_rejected(id, notify_type);
+                    ike_debug!(
+                        "Quick Mode ({what}): error Notify {name} ({notify_type}) is about the gateway's Quick Mode msgid={id:08x}, not this exchange -- {}, still waiting",
+                        if recorded { "recorded on it" } else { "no responder exchange of that id yet, kept in the mailbox" }
+                    );
+                }
+                Attribution::None => {}
+            }
+        }
+        if seen.isakmp_deleted {
+            ike_debug!("Quick Mode ({what}): the peer deleted the ISAKMP SA while this exchange was in flight -- tunnel torn down");
+            return Err(IkeError::PeerTornDown.into());
+        }
+    }
+}
+
+#[cfg(test)]
+mod wait_tests;
 
 #[cfg(test)]
 mod tests {

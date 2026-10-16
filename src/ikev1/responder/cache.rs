@@ -274,7 +274,8 @@ pub struct ResponderEvents {
     /// Its message 3 authenticated (HASH(3) under the last cipher block of a message 2 sent), without the Commit
     /// bit.
     pub qm3_seen: bool,
-    /// A copy of one of its messages had the Commit bit set: its SA must never be used (DESIGN 3.6).
+    /// A copy of one of its messages had the Commit bit set: seen before the caller's proof decision, its SA must never
+    /// be used (DESIGN 3.6); one recorded after that decision is the caller's to say, the switch made already.
     pub commit_seen: bool,
     /// The gateway refused it with an error Notify of this type.
     pub peer_rejected: Option<u16>,

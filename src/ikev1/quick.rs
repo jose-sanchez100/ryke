@@ -112,6 +112,7 @@ use std::time::{Duration, Instant};
 use super::crypto1::{self, Prf};
 use super::informational;
 use super::isakmp::{self, exchange, payload, IsakmpHeader, Payload};
+use super::msgid::MidKind;
 use super::payloads::{
     id_type, life, life_duration_value, parse_attributes, protocol, AttrValue, Attribute, Id, Proposal, SaPayload, Transform, IPSEC_DOI,
     SIT_IDENTITY_ONLY,
@@ -925,9 +926,7 @@ fn initiate_quick_with_ids(
     let mut spi_b = [0u8; 4];
     entropy.fill(&mut spi_b);
     let local_spi = u32::from_be_bytes(spi_b);
-    let mut mid_b = [0u8; 4];
-    entropy.fill(&mut mid_b);
-    let msgid = u32::from_be_bytes(mid_b) | 1; // non-zero
+    let msgid = st.fresh_message_id(MidKind::Quick, entropy)?;
     let mut ni = vec![0u8; 16];
     entropy.fill(&mut ni);
 
@@ -4051,5 +4050,83 @@ mod tests {
         gateway.send_to(&awaited, client.local_addr().unwrap()).unwrap();
         let got = await_quick_reply(&client, &st, gateway.local_addr().unwrap(), 0x2222, Duration::MAX, "test").unwrap();
         assert_eq!(got, Some(awaited));
+    }
+
+    /// While the exchange table is passive -- every mode but the one that answers the
+    /// gateway's Quick Modes -- message 1 of our Quick Mode is what it was before the table
+    /// existed: the SPI drawn first, then the Message ID (`| 1`), then the nonce, from the
+    /// same entropy and no more of it, and the bytes on the wire unchanged (the digests were
+    /// taken from the code before the Message-ID ledger).
+    #[test]
+    fn a_passive_table_leaves_message_1_of_our_quick_mode_as_it_was() {
+        use sha2::{Digest, Sha256};
+        let (istate, _rstate, _ie, _re) = phase1_pair(0x6101, 0x6102, QM_ADDRS.0.parse().unwrap(), QM_ADDRS.1.parse().unwrap());
+        let pinned: [(u64, &str); 3] = [
+            (1, "00834f14a4b8fc15774ca1ab90da3389d4232ede6c70694be29d90bf4c4c286e"),
+            (0x6103, "977e835ea55d7af60bbbddce0f49b9a6d17fc959a86bd8c77ac06d70a3f0ddc1"),
+            (u64::MAX, "caba4dd089ed75c019d2e568f96f739ef5c0f1efdc7cc808d486f5229c006793"),
+        ];
+        for (seed, digest) in pinned {
+            let mut entropy = SeedEntropy::new(seed);
+            let (msg1, _qi) = initiate_quick(&istate, &mut entropy, SkCipher::Aes256Gcm, QM_TS, QM_TS, 3600).unwrap();
+            let mut before = SeedEntropy::new(seed);
+            let (mut spi, mut mid, mut ni) = ([0u8; 4], [0u8; 4], [0u8; 16]);
+            before.fill(&mut spi);
+            before.fill(&mut mid);
+            before.fill(&mut ni);
+            assert_eq!(IsakmpHeader::parse(&msg1).unwrap().message_id, u32::from_be_bytes(mid) | 1, "seed {seed:#x}");
+            assert_eq!(entropy.next_u64(), before.next_u64(), "seed {seed:#x}: the entropy was drawn as before, and no more");
+            let got: String = Sha256::digest(&msg1).iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, digest, "seed {seed:#x}");
+        }
+    }
+
+    /// With the table on, our Quick Mode never takes an id the table holds -- here the very one the
+    /// passive draw would have given, held by a gateway exchange -- and records the one it takes as
+    /// ours, in progress for `LOCAL_QUICK_DEADLINE` from the time by the table's clock (here one a
+    /// test moved half a minute on). The message is a message 1 like any other.
+    #[test]
+    fn an_enabled_table_gives_our_quick_mode_an_id_it_does_not_hold_and_records_it() {
+        use super::super::msgid::{Admission, MidState, Origin, LOCAL_QUICK_DEADLINE};
+        use super::super::phase1::TestClock;
+        let (mut istate, rstate, _ie, mut re) = phase1_pair(0x6201, 0x6202, QM_ADDRS.0.parse().unwrap(), QM_ADDRS.1.parse().unwrap());
+        let clock = TestClock::new();
+        istate.exchanges = clock.exchanges();
+        istate.enable_gateway_quick_mode();
+        clock.advance(Duration::from_secs(30));
+        let now = clock.now();
+        let seed = 0x6203;
+        let mut probe = SeedEntropy::new(seed);
+        let (mut spi, mut mid) = ([0u8; 4], [0u8; 4]);
+        probe.fill(&mut spi);
+        probe.fill(&mut mid);
+        let passive_id = u32::from_be_bytes(mid) | 1;
+        assert_eq!(istate.exchanges.record_authenticated(passive_id, MidKind::Quick, [7; 32], now, now + Duration::from_secs(60)), Admission::New);
+        let (qm1, _qi) = initiate_quick(&istate, &mut SeedEntropy::new(seed), SkCipher::Aes256Gcm, QM_TS, QM_TS, 3600).unwrap();
+        let msgid = IsakmpHeader::parse(&qm1).unwrap().message_id;
+        assert_ne!(msgid, passive_id, "the held id is not taken again");
+        let record = istate.exchanges.id_record(msgid).expect("recorded");
+        assert_eq!(
+            (record.origin, record.kind, record.first_seen, record.state),
+            (Origin::Local, MidKind::Quick, now, MidState::Active { deadline: now + LOCAL_QUICK_DEADLINE })
+        );
+        assert_eq!(istate.exchanges.id_record(passive_id).map(|r| r.origin), Some(Origin::Peer), "the gateway's record is left as it was");
+        respond_quick(&rstate, &qm1, &mut re).expect("the gateway answers it as any message 1");
+    }
+
+    /// Only an enabled table whose every id is held by an exchange in progress refuses our Quick
+    /// Mode an id, and the refusal is the exchange's failure.
+    #[test]
+    fn our_quick_mode_fails_when_every_id_is_held_by_an_exchange_in_progress() {
+        use super::super::msgid::{Admission, MID_CAP};
+        let (istate, _rstate, mut ie, _re) = phase1_pair(0x6301, 0x6302, QM_ADDRS.0.parse().unwrap(), QM_ADDRS.1.parse().unwrap());
+        istate.enable_gateway_quick_mode();
+        let at = Instant::now();
+        for n in 1..=MID_CAP as u32 {
+            assert_eq!(istate.exchanges.record_authenticated(n * 2, MidKind::Quick, [1; 32], at, at + Duration::from_secs(3600)), Admission::New);
+        }
+        let refused = initiate_quick(&istate, &mut ie, SkCipher::Aes256Gcm, QM_TS, QM_TS, 3600).err();
+        assert_eq!(refused, Some(IkeError::MessageIdsExhausted));
+        assert_eq!(istate.exchanges.ids_held(), MID_CAP);
     }
 }

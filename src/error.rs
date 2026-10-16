@@ -141,6 +141,13 @@ pub enum IkeError {
     /// §2.2): it must be rekeyed, which starts them over, or closed. The last
     /// few are kept for exactly that -- see
     /// `crate::ikev2::session::LivenessSession::message_ids_exhausted`.
+    ///
+    /// IKEv1 (random ids, RFC 2408 §3.1) gives it to an exchange of ours that
+    /// needs its Message ID recorded -- a Quick Mode or a Mode-Config request --
+    /// only when the ISAKMP SA's enabled exchange table holds the most ids it
+    /// keeps and every one of them is an exchange still in progress (see
+    /// `crate::ikev1::msgid`); never while the table is passive, never to an
+    /// Informational. The caller fails that exchange as it would any other.
     #[error("the IKE SA has used up its Message IDs; rekey it or close it")]
     MessageIdsExhausted,
 }

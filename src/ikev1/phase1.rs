@@ -18,6 +18,7 @@
 use super::crypto1::{self, Prf, AES_BLOCK};
 use super::exchange::ExchangeTable;
 use super::isakmp::{self, exchange, payload, IsakmpHeader};
+use super::msgid::MidKind;
 use super::phase2;
 use super::rtt::RoundTrips;
 use super::payloads::{
@@ -318,7 +319,7 @@ pub struct Phase1State {
     #[zeroize(skip)]
     pub(crate) rtt: RoundTrips,
     /// What this ISAKMP SA keeps of the exchanges that are not its client's own -- the peer's
-    /// Deletes so far (see [`ExchangeTable`]). Passive in every state this module builds, and a
+    /// Deletes so far, and the Message IDs of both sides (see [`ExchangeTable`]). Passive in every state this module builds, and a
     /// passive table changes nothing about how the state is read; [`Self::enable_gateway_quick_mode`]
     /// turns it on. Shared by every clone, so turning it on through one turns it on for all.
     #[zeroize(skip)]
@@ -457,7 +458,7 @@ impl RetainedFinals {
     }
 }
 
-/// A clock the test moves, for [`RetainedFinals::with_clock`].
+/// A clock the test moves, for [`RetainedFinals::with_clock`] and [`ExchangeTable::with_clock`].
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct TestClock(Arc<std::sync::Mutex<Instant>>);
@@ -475,6 +476,17 @@ impl TestClock {
     pub(crate) fn finals(&self) -> RetainedFinals {
         let now = self.0.clone();
         RetainedFinals::with_clock(Arc::new(move || *now.lock().unwrap()))
+    }
+
+    /// A passive exchange table that tells the time by this clock.
+    pub(crate) fn exchanges(&self) -> ExchangeTable {
+        let now = self.0.clone();
+        ExchangeTable::with_clock(Box::new(move || *now.lock().unwrap()))
+    }
+
+    /// What this clock says now.
+    pub(crate) fn now(&self) -> Instant {
+        *self.0.lock().unwrap()
     }
 }
 
@@ -875,6 +887,16 @@ impl Phase1State {
     /// there is no turning it off again.
     pub fn enable_gateway_quick_mode(&self) {
         self.exchanges.enable();
+    }
+
+    /// The Message ID of a new exchange of ours of `kind` -- a Quick Mode, an Informational, a
+    /// Mode-Config request -- drawn from `entropy`, and recorded at the time by the exchange table's
+    /// clock; see [`ExchangeTable::fresh_message_id`]. While the table is passive this is the draw
+    /// every caller made before the table existed, and no clock is read; it fails only with an
+    /// enabled table whose every Message ID is held by an exchange in progress
+    /// ([`IkeError::MessageIdsExhausted`]), and never for an Informational.
+    pub(crate) fn fresh_message_id(&self, kind: MidKind, entropy: &mut impl Entropy) -> Result<u32, IkeError> {
+        self.exchanges.fresh_message_id(kind, entropy)
     }
 
     /// Verify the initiator's `HASH_I` from Aggressive-Mode message 3

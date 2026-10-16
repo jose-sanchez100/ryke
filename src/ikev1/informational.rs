@@ -61,6 +61,7 @@ use std::time::{Duration, Instant};
 
 use super::crypto1;
 use super::isakmp::{exchange, payload, IsakmpHeader};
+use super::msgid::MidKind;
 use super::payloads::{protocol, IPSEC_DOI};
 use super::phase1::Phase1State;
 use super::phase2;
@@ -144,9 +145,7 @@ pub(crate) mod notify_type {
 /// each time (RFC 3706's ACK included — see this module's doc for why that
 /// one *looks* like a reply but isn't correlated via message-id).
 fn build_single_informational(st: &Phase1State, entropy: &mut impl Entropy, payload_type: u8, body: Vec<u8>) -> Result<Vec<u8>, IkeError> {
-    let mut mid_b = [0u8; 4];
-    entropy.fill(&mut mid_b);
-    let msgid = u32::from_be_bytes(mid_b) | 1; // non-zero
+    let msgid = st.fresh_message_id(MidKind::Informational, entropy)?;
 
     let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
     let hdr = info_header(st.cky_i, st.cky_r, msgid);
@@ -1371,5 +1370,61 @@ mod tests {
         let got = peek(&client_sock, &client_st, &mut e, gw_addr, std::time::Duration::from_millis(50), 0, None).unwrap();
         assert_eq!(got, Liveness::Alive);
         assert!(gw_sock.recv(&mut buf).is_err(), "past its time to live nothing is answered");
+    }
+
+    /// While the exchange table is passive, every Informational message we build draws its
+    /// Message ID as it did before the table existed (four octets of entropy, `| 1`, and no
+    /// other draw), and its bytes are unchanged (the digests were taken from the code before
+    /// the Message-ID ledger).
+    #[test]
+    fn a_passive_table_leaves_our_informational_messages_as_they_were() {
+        use sha2::{Digest, Sha256};
+        type Build = fn(&Phase1State, &mut SeedEntropy) -> Vec<u8>;
+        let (client_st, _gw_st) = phase1_pair();
+        let builds: [(&str, Build, &str); 4] = [
+            ("R-U-THERE", |st, e| build_r_u_there(st, e, 7).unwrap(), "58cb3e894c22525834736c5d3b2e51a7d478e6e6accdabe35131ef9f29744421"),
+            ("R-U-THERE-ACK", |st, e| build_r_u_there_ack(st, e, 7).unwrap(), "76011f27d7a7e8639ecca7225dd10ba66e3017ea641732dd9b4250ca26bfe1c3"),
+            ("ESP Delete", |st, e| build_esp_delete(st, e, 0xDEAD_BEEF).unwrap(), "876ec04ec00b87fd00ff87978bb07f8b043762e38d57ae97a4d6cb6facbefe5f"),
+            ("ISAKMP Delete", |st, e| build_isakmp_delete(st, e).unwrap(), "607f685459a90f473f37b12cb63439870a13bfd1b0e484685c22d8b2c769513c"),
+        ];
+        for (what, build, digest) in builds {
+            let mut entropy = SeedEntropy::new(0x5EED);
+            let msg = build(&client_st, &mut entropy);
+            let mut before = SeedEntropy::new(0x5EED);
+            let mut mid = [0u8; 4];
+            before.fill(&mut mid);
+            assert_eq!(IsakmpHeader::parse(&msg).unwrap().message_id, u32::from_be_bytes(mid) | 1, "{what}");
+            assert_eq!(entropy.next_u64(), before.next_u64(), "{what}: the entropy was drawn as before, and no more");
+            let got: String = Sha256::digest(&msg).iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, digest, "{what}");
+        }
+    }
+
+    /// With the table on, every Informational of ours is recorded as ours and over at once, and
+    /// one is built even when every id the table holds is an exchange in progress -- under an id
+    /// it does not hold, left unrecorded -- so neither a Delete nor a DPD answer is ever refused
+    /// for room.
+    #[test]
+    fn an_enabled_table_records_our_informationals_and_never_refuses_one() {
+        use crate::ikev1::msgid::{Admission, MidState, Origin, MID_CAP};
+        let (client_st, gw_st) = phase1_pair();
+        client_st.enable_gateway_quick_mode();
+        let mut e = SeedEntropy::new(0x5EED);
+        let ack = build_r_u_there_ack(&client_st, &mut e, 7).unwrap();
+        let id = IsakmpHeader::parse(&ack).unwrap().message_id;
+        let record = client_st.exchanges.id_record(id).expect("recorded");
+        assert_eq!((record.origin, record.kind, record.state), (Origin::Local, MidKind::Informational, MidState::Done));
+        let at = Instant::now();
+        for n in 1..=MID_CAP as u32 {
+            assert_eq!(client_st.exchanges.record_authenticated(n * 2, MidKind::Quick, [1; 32], at, at + Duration::from_secs(3600)), Admission::New);
+        }
+        assert_eq!(client_st.exchanges.id_record(id), None, "our finished Informational made room");
+        let delete = build_esp_delete(&client_st, &mut e, 0xDEAD_BEEF).expect("a Delete is never refused for room");
+        let id = IsakmpHeader::parse(&delete).unwrap().message_id;
+        assert_eq!(id % 2, 1);
+        assert_eq!(client_st.exchanges.id_record(id), None, "built, not recorded");
+        assert_eq!(client_st.exchanges.ids_held(), MID_CAP);
+        let named = decrypt_one(&gw_st, &delete);
+        assert_eq!(&named.data[8..12], &0xDEAD_BEEFu32.to_be_bytes(), "and the gateway reads it");
     }
 }

@@ -69,6 +69,8 @@ struct Report {
     child: ChildSa,
     /// The CHILD SA of the rekey, when the script asked for one.
     rekeyed: Option<ChildSa>,
+    /// The Message ID of the client's Mode-Config request, when the script served one.
+    mode_cfg_msgid: Option<u32>,
 }
 
 struct Gateway {
@@ -89,6 +91,7 @@ struct Gateway {
     /// Set while the gateway waits for the message 3 it has not seen (see
     /// [`Self::send_repeat`]).
     repeats_on_500: bool,
+    mode_cfg_msgid: Option<u32>,
 }
 
 impl Gateway {
@@ -208,7 +211,7 @@ impl Gateway {
         }
         let child = self.quick_mode(&st, self.script.lose_qm_msg3)?;
         let rekeyed = if self.script.lose_rekey_msg3 { Some(self.quick_mode(&st, true)?) } else { None };
-        Ok(Report { resent: self.resent, child, rekeyed })
+        Ok(Report { resent: self.resent, child, rekeyed, mode_cfg_msgid: self.mode_cfg_msgid })
     }
 
     /// The client's first message of `exchange_type`; with `lose_msg1`, the first
@@ -272,6 +275,7 @@ impl Gateway {
     fn mode_cfg(&mut self, st: &Phase1State) -> Result<(), String> {
         let request = self.recv(exchange::TRANSACTION)?;
         let msgid = IsakmpHeader::parse(&request).map_err(|e| format!("gateway: mode-config request: {e:?}"))?.message_id;
+        self.mode_cfg_msgid = Some(msgid);
         self.send(&cfg::test_gateway::handle_request(st, &request, msgid, Ipv4Addr::new(10, 9, 9, 9)));
         Ok(())
     }
@@ -361,6 +365,7 @@ fn connect_with_timeout(script: Script, timeout: Duration) -> Run {
         resent: Vec::new(),
         pending: Vec::new(),
         repeats_on_500: false,
+        mode_cfg_msgid: None,
     };
     let gateway = std::thread::spawn(move || gateway.serve());
 
@@ -496,6 +501,18 @@ fn mode_config_survives_every_gateway_reply_arriving_twice() {
     let report = run.gateway.join().unwrap().expect("gateway");
     assert_eq!(est.assigned_ip4, Some(Ipv4Addr::new(10, 9, 9, 9)));
     assert_eq!(est.child.inbound.spi(), report.child.outbound.spi());
+}
+
+/// The client's ISAKMP SA keeps its exchange table passive through `connect`, so the
+/// Mode-Config request draws its Message ID as it did before the table existed: same
+/// entropy, same value (taken from the code before the Message-ID ledger).
+#[test]
+fn the_mode_config_request_carries_the_message_id_it_always_did() {
+    let run = connect(Script { xauth: true, mode_cfg: true, ..Script::default() });
+    let est = run.established.expect("the handshake must complete");
+    let report = run.gateway.join().unwrap().expect("gateway");
+    assert!(!est.phase1.exchanges.is_enabled());
+    assert_eq!(report.mode_cfg_msgid, Some(0xA2E7_75AB));
 }
 
 /// A repeat of the XAUTH REQUEST that reaches the client after the SET, while

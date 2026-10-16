@@ -73,6 +73,7 @@ use crate::esp::ChildSa;
 use crate::ikev1::cfg as modecfg;
 use crate::ikev1::informational;
 use crate::ikev1::isakmp::{exchange, IsakmpHeader};
+use crate::ikev1::msgid::MidKind;
 use crate::ikev1::phase1::{
     initiate_aggressive, initiate_main, Ikev1ExchangeMode, Ikev1LocalAuth, InitiatorConfig, Phase1State,
 };
@@ -722,9 +723,7 @@ impl<E: Entropy> Client<E> {
         let (mut assigned_ip6, mut dns6, mut subnets6) = (None, Vec::new(), Vec::new());
         if cfg.mode_cfg {
             ike_debug!("Mode-Config: requesting an assigned IPv4{}", if cfg.ipv6 { " and IPv6" } else { "" });
-            let mut mid_b = [0u8; 4];
-            self.entropy.fill(&mut mid_b);
-            let msgid = u32::from_be_bytes(mid_b) | 1; // non-zero
+            let msgid = phase1.fresh_message_id(MidKind::ModeConfig, &mut self.entropy)?;
             let (request, next_iv) = modecfg::build_cfg_request_with(&phase1, msgid, cfg.ipv6)?;
             // No message id filter: a Mode-Config reply is taken under whichever id
             // the gateway chose (`parse_cfg_reply` decrypts under the request's IV).

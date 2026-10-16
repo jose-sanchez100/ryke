@@ -25,15 +25,28 @@
 //! [`parse_deletes`] is the pure reader of the Delete payloads of one
 //! authenticated message that feeds it, over every Delete payload and every SPI
 //! of each (RFC 2408 §3.15, §5.15).
+//!
+//! It also holds the **Message-ID ledger** of the ISAKMP SA
+//! ([`MessageIdLedger`], see [`super::msgid`]): the ids this side draws, the
+//! peer's ids it has admitted, and what it remembers of the peer's Quick Modes.
+//! Passive, the one thing the table still does is hand out our ids, and it hands
+//! them out exactly as every caller drew them before the table existed
+//! ([`ExchangeTable::fresh_message_id`]). The ledger is told the time by its
+//! callers, except for the ids of ours, which the table stamps by its own clock
+//! ([`ExchangeTable::now`]): the monotonic one, or the clock a test moves.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
+use super::informational::ChildFamily;
 use super::isakmp::{payload, Payload};
+use super::msgid::{self, Admission, MessageIdLedger, MidCounters, MidEnd, MidKind, MidRecord, Origin};
 use super::payloads::{protocol, IPSEC_DOI};
 use crate::debug::ike_debug;
+use crate::entropy::Entropy;
+use crate::error::IkeError;
 
 /// The most distinct events the mailbox holds before it drops new ones and sets
 /// its overflow flag. One message alone can name more distinct SPIs than this (about
@@ -201,11 +214,16 @@ impl Mailbox {
 #[derive(Default)]
 struct Books {
     mailbox: Mailbox,
+    ids: MessageIdLedger,
 }
 
 struct Shared {
     enabled: AtomicBool,
     books: Mutex<Books>,
+    /// What "now" is for the ids this side draws ([`ExchangeTable::now`]): the monotonic clock,
+    /// except in tests, which hold it still or move it, so that none of them sleeps. A passive
+    /// table never reads it.
+    clock: Box<dyn Fn() -> Instant + Send + Sync>,
 }
 
 /// The exchange table of one ISAKMP SA, shared by every clone (see the module doc).
@@ -223,7 +241,13 @@ impl Default for ExchangeTable {
 impl ExchangeTable {
     /// A table that records nothing, until [`Self::enable`] turns it on.
     pub(crate) fn passive() -> Self {
-        Self { shared: Arc::new(Shared { enabled: AtomicBool::new(false), books: Mutex::default() }) }
+        Self { shared: Arc::new(Shared { enabled: AtomicBool::new(false), books: Mutex::default(), clock: Box::new(Instant::now) }) }
+    }
+
+    /// A table that records nothing until [`Self::enable`], and tells the time by `clock`.
+    #[cfg(test)]
+    pub(crate) fn with_clock(clock: Box<dyn Fn() -> Instant + Send + Sync>) -> Self {
+        Self { shared: Arc::new(Shared { enabled: AtomicBool::new(false), books: Mutex::default(), clock }) }
     }
 
     /// A table that records from the start.
@@ -281,6 +305,115 @@ impl ExchangeTable {
     #[cfg(test)]
     fn events_held(&self) -> usize {
         self.books().mailbox.events.len()
+    }
+
+    /// `f` over the Message-ID ledger; `passive` without looking at it when the table is passive.
+    fn ledger<T>(&self, passive: T, f: impl FnOnce(&mut MessageIdLedger) -> T) -> T {
+        if !self.is_enabled() {
+            return passive;
+        }
+        f(&mut self.books().ids)
+    }
+
+    /// The time by this table's clock: the monotonic clock's, but in a test that moves its own.
+    /// What the ids of ours are stamped with ([`Self::fresh_message_id`]), and what a caller with
+    /// no clock of its own passes as `now` to the other methods, so that one clock runs the ledger.
+    pub(crate) fn now(&self) -> Instant {
+        (self.shared.clock)()
+    }
+
+    /// A Message ID for an exchange of ours of `kind`. Passive: exactly the draw every caller
+    /// made before the table existed -- four octets of `entropy`, `| 1` -- with the ledger and the
+    /// clock left alone, so an ISAKMP SA that never enables its table sends the ids it always did.
+    /// Enabled: [`MessageIdLedger::fresh`] at [`Self::now`] (never an id the ledger holds,
+    /// recorded as ours).
+    pub(crate) fn fresh_message_id(&self, kind: MidKind, entropy: &mut impl Entropy) -> Result<u32, IkeError> {
+        if !self.is_enabled() {
+            return Ok(msgid::draw(entropy));
+        }
+        let now = self.now();
+        self.books().ids.fresh(kind, entropy, now)
+    }
+
+    /// [`MessageIdLedger::sweep`]. Passive: nothing.
+    pub(crate) fn sweep(&self, now: Instant) {
+        self.ledger((), |ids| ids.sweep(now))
+    }
+
+    /// [`MessageIdLedger::would_admit`]. Passive: [`Admission::Passive`].
+    pub(crate) fn would_admit(&self, id: u32, kind: MidKind, fingerprint: &[u8; 32], now: Instant) -> Admission {
+        self.ledger(Admission::Passive, |ids| ids.would_admit(id, kind, fingerprint, now))
+    }
+
+    /// [`MessageIdLedger::record_authenticated`]. Passive: [`Admission::Passive`], nothing recorded.
+    pub(crate) fn record_authenticated(&self, id: u32, kind: MidKind, fingerprint: [u8; 32], now: Instant, deadline: Instant) -> Admission {
+        self.ledger(Admission::Passive, |ids| ids.record_authenticated(id, kind, fingerprint, now, deadline))
+    }
+
+    /// [`MessageIdLedger::origin_of`]. Passive: `None`.
+    pub(crate) fn origin_of(&self, id: u32) -> Option<Origin> {
+        self.ledger(None, |ids| ids.origin_of(id))
+    }
+
+    /// [`MessageIdLedger::record`]. Passive: `None`.
+    pub(crate) fn id_record(&self, id: u32) -> Option<MidRecord> {
+        self.ledger(None, |ids| ids.record(id))
+    }
+
+    /// [`MessageIdLedger::finish`]. Passive: `false`.
+    pub(crate) fn finish(&self, id: u32, now: Instant, end: MidEnd) -> bool {
+        self.ledger(false, |ids| ids.finish(id, now, end))
+    }
+
+    /// [`MessageIdLedger::set_deadline`]. Passive: `false`.
+    pub(crate) fn set_deadline(&self, id: u32, now: Instant, deadline: Instant) -> bool {
+        self.ledger(false, |ids| ids.set_deadline(id, now, deadline))
+    }
+
+    /// [`MessageIdLedger::attach_fingerprint`]. Passive: `false`.
+    pub(crate) fn attach_fingerprint(&self, id: u32, fingerprint: [u8; 32]) -> bool {
+        self.ledger(false, |ids| ids.attach_fingerprint(id, fingerprint))
+    }
+
+    /// [`MessageIdLedger::park`]. Passive: `false`.
+    pub(crate) fn park(&self, id: u32, now: Instant, until: Instant) -> bool {
+        self.ledger(false, |ids| ids.park(id, now, until))
+    }
+
+    /// [`MessageIdLedger::reconsider`]. Passive: `false`.
+    pub(crate) fn reconsider(&self, id: u32, now: Instant, deadline: Instant) -> bool {
+        self.ledger(false, |ids| ids.reconsider(id, now, deadline))
+    }
+
+    /// [`MessageIdLedger::seen_ni`]. Passive: `false`.
+    pub(crate) fn seen_ni(&self, family: ChildFamily, ni: &[u8]) -> bool {
+        self.ledger(false, |ids| ids.seen_ni(family, ni))
+    }
+
+    /// [`MessageIdLedger::remember_ni`]. Passive: nothing.
+    pub(crate) fn remember_ni(&self, family: ChildFamily, ni: &[u8]) {
+        self.ledger((), |ids| ids.remember_ni(family, ni))
+    }
+
+    /// [`MessageIdLedger::accept_allowed`]. Passive: `false` (a passive table admits no peer Quick Mode).
+    pub(crate) fn accept_allowed(&self, family: ChildFamily, now: Instant) -> bool {
+        self.ledger(false, |ids| ids.accept_allowed(family, now))
+    }
+
+    /// [`MessageIdLedger::responder_concluded`]. Passive: nothing.
+    pub(crate) fn responder_concluded(&self, family: ChildFamily, now: Instant) {
+        self.ledger((), |ids| ids.responder_concluded(family, now))
+    }
+
+    /// [`MessageIdLedger::counters`]. Passive: all zero.
+    pub(crate) fn id_counters(&self) -> MidCounters {
+        self.ledger(MidCounters::default(), |ids| ids.counters())
+    }
+
+    /// How many ids the ledger holds, whatever the switch says.
+    #[cfg(test)]
+    pub(crate) fn ids_held(&self) -> usize {
+        self.books().ids.len()
     }
 }
 
@@ -975,6 +1108,108 @@ mod tests {
         assert!(clone.drain_events().is_empty());
         table.enable();
         assert!(table.is_enabled() && clone.is_enabled(), "turning it on again changes nothing");
+    }
+
+    // ---- Message IDs through the table ----
+
+    /// A passive table hands out every id of ours exactly as the callers drew it before the table
+    /// existed -- one draw of four octets, `| 1`, nothing remembered, so the same draw twice is the
+    /// same id twice, and no clock read -- and every other ledger method is a no-op giving its
+    /// neutral answer; turning the table on afterwards finds nothing recorded.
+    #[test]
+    fn a_passive_table_draws_our_ids_as_before_and_leaves_the_ledger_alone() {
+        use crate::entropy::{Entropy, SeedEntropy};
+        use std::sync::atomic::AtomicUsize;
+        let at = Instant::now();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = reads.clone();
+        let table = ExchangeTable::with_clock(Box::new(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            at
+        }));
+        for seed in [0u64, 1, 7, 0xDEAD_BEEF, u64::MAX] {
+            for kind in [MidKind::Quick, MidKind::Informational, MidKind::ModeConfig] {
+                for _ in 0..2 {
+                    let mut entropy = SeedEntropy::new(seed);
+                    let mut before = SeedEntropy::new(seed);
+                    let mut mid_b = [0u8; 4];
+                    before.fill(&mut mid_b);
+                    assert_eq!(table.fresh_message_id(kind, &mut entropy), Ok(u32::from_be_bytes(mid_b) | 1), "seed {seed:#x}, {kind:?}");
+                    assert_eq!(entropy.next_u64(), before.next_u64(), "seed {seed:#x}, {kind:?}: one draw of four octets, no more");
+                }
+            }
+        }
+        let print = [1u8; 32];
+        let later = at + Duration::from_secs(60);
+        table.sweep(later);
+        assert_eq!(table.would_admit(3, MidKind::Quick, &print, at), Admission::Passive);
+        assert_eq!(table.record_authenticated(3, MidKind::Quick, print, at, later), Admission::Passive);
+        assert_eq!(table.origin_of(3), None);
+        assert_eq!(table.id_record(3), None);
+        assert!(!table.finish(3, at, MidEnd::Done));
+        assert!(!table.set_deadline(3, at, later));
+        assert!(!table.attach_fingerprint(3, print));
+        assert!(!table.park(3, at, later));
+        assert!(!table.reconsider(3, later, later));
+        table.remember_ni(ChildFamily::Primary, &[9; 16]);
+        assert!(!table.seen_ni(ChildFamily::Primary, &[9; 16]));
+        table.responder_concluded(ChildFamily::Primary, at);
+        assert!(!table.accept_allowed(ChildFamily::Primary, later), "a passive table admits no gateway Quick Mode");
+        assert_eq!(table.id_counters(), MidCounters::default());
+        assert_eq!(table.ids_held(), 0);
+        assert_eq!(reads.load(Ordering::Relaxed), 0, "a passive table never reads its clock");
+        table.enable();
+        assert_eq!(table.ids_held(), 0, "nothing was recorded while passive");
+        assert!(!table.seen_ni(ChildFamily::Primary, &[9; 16]), "nor remembered");
+        assert!(table.accept_allowed(ChildFamily::Primary, at), "nor a conclusion noted");
+        // On, the same draw twice is two ids: the second one is not the first.
+        let first = table.fresh_message_id(MidKind::Quick, &mut SeedEntropy::new(1)).unwrap();
+        let second = table.fresh_message_id(MidKind::Quick, &mut SeedEntropy::new(1)).unwrap();
+        assert_ne!(first, second);
+        assert_eq!((table.origin_of(first), table.origin_of(second)), (Some(Origin::Local), Some(Origin::Local)));
+        assert_eq!(table.ids_held(), 2);
+        assert_eq!(reads.load(Ordering::Relaxed), 2, "on, each id of ours is stamped by the table's clock");
+    }
+
+    /// Our ids are stamped by the table's clock, not by one the caller cannot see: with the clock a
+    /// test moves, our exchange starts when that clock says and stays in progress for its whole
+    /// time, however far the clock was moved before (the real clock would have it end at once).
+    #[test]
+    fn our_ids_are_stamped_by_the_table_clock() {
+        use crate::entropy::SeedEntropy;
+        use crate::ikev1::msgid::{MidState, LOCAL_QUICK_DEADLINE};
+        use crate::ikev1::phase1::TestClock;
+        let clock = TestClock::new();
+        let table = clock.exchanges();
+        table.enable();
+        clock.advance(Duration::from_secs(30));
+        let now = clock.now();
+        assert_eq!(table.now(), now);
+        assert_eq!(table.record_authenticated(2, MidKind::Quick, [1; 32], now, now + Duration::from_secs(15)), Admission::New);
+        let ours = table.fresh_message_id(MidKind::Quick, &mut SeedEntropy::new(9)).unwrap();
+        let record = table.id_record(ours).expect("recorded");
+        assert_eq!((record.first_seen, record.state), (now, MidState::Active { deadline: now + LOCAL_QUICK_DEADLINE }));
+        clock.advance(Duration::from_secs(1));
+        table.sweep(clock.now());
+        assert_eq!(table.id_record(ours).map(|r| r.state), Some(MidState::Active { deadline: now + LOCAL_QUICK_DEADLINE }), "a simulated second later");
+        clock.advance(LOCAL_QUICK_DEADLINE);
+        table.sweep(clock.now());
+        assert_eq!(table.id_record(ours).map(|r| r.state), Some(MidState::Done), "past its deadline by the same clock");
+    }
+
+    /// The ledger is the clones' together, like the mailbox: an id drawn through one is known through another.
+    #[test]
+    fn clones_share_the_ledger() {
+        use crate::entropy::SeedEntropy;
+        let table = ExchangeTable::enabled();
+        let clone = table.clone();
+        let at = Instant::now();
+        let ours = clone.fresh_message_id(MidKind::Quick, &mut SeedEntropy::new(5)).unwrap();
+        assert_eq!(table.origin_of(ours), Some(Origin::Local));
+        assert_eq!(table.record_authenticated(2, MidKind::Quick, [1; 32], at, at + Duration::from_secs(15)), Admission::New);
+        assert_eq!(clone.would_admit(2, MidKind::Quick, &[1; 32], at), Admission::Duplicate);
+        assert_eq!(table.id_counters().duplicates, 1);
+        assert_eq!(ExchangeTable::enabled().origin_of(ours), None, "another table holds nothing of it");
     }
 
     #[test]

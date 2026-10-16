@@ -17,6 +17,9 @@ mod exchange;
 pub mod informational;
 pub mod isakmp;
 pub mod modecfg;
+// The same for the ledger: only our own id draws use it outside the tests so far.
+#[cfg_attr(not(test), allow(dead_code))]
+mod msgid;
 pub mod payloads;
 pub mod phase1;
 pub mod phase2;

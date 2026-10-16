@@ -30,8 +30,8 @@ pub mod xauth;
 pub use client::{Client, Established};
 pub use exchange::{classify_peer_deletes, DeleteVerdict, FamilySpis, Generation, PeerEvent, PeerQuick, PeerSpi, SpiState};
 pub use responder::cache::{
-    DeferReason, EndReason, IllegalTransition, Outcome, PendingResponder, Proof, ResponderEvents, ResponderId, ResponderState, Transition, DEFER_MAX,
-    PEER_QM_HOLD_MAX, PEER_QM_PROOF_WAIT, RESP_RETAIN,
+    DeferReason, EndReason, IllegalTransition, Outcome, PendingResponder, Proof, ResponderEvents, ResponderId, ResponderState, Transition, ANSWERED_FOR,
+    DEFER_MAX, PEER_QM_HOLD_MAX, PEER_QM_PROOF_WAIT, RESP_RETAIN,
 };
 pub use responder::{answer_quick, AnsweredQuick, ExpectedQuick, HeldQuick, QuickExpectations, QuickVerdict, Refusal, ReleaseError, Silence};
 pub use server::{Server, ServerEvent};

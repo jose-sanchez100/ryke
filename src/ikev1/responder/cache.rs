@@ -70,8 +70,9 @@ pub const RESP_RETAIN: Duration = Duration::from_secs(120);
 /// How long an answered gateway Quick Mode stays in progress here at the longest (POLICY, DESIGN 4: the hold bound,
 /// [`PEER_QM_PROOF_WAIT`] and a margin, 15 s after message 2 left): longer than the daemon's proof phase and the
 /// commit or abandon after it, so that the caller ends it first. Past it the exchange is abandoned here
-/// ([`EndReason::Deadline`]) and its message 2 dropped.
-pub(crate) const ANSWERED_FOR: Duration = Duration::from_secs(15);
+/// ([`EndReason::Deadline`]) and its message 2 dropped. Public so that the caller's own bound for an answered
+/// exchange is this one, never a copy of it.
+pub const ANSWERED_FOR: Duration = Duration::from_secs(15);
 
 const _: () = assert!(ANSWERED_FOR.as_nanos() >= PEER_QM_HOLD_MAX.as_nanos() + PEER_QM_PROOF_WAIT.as_nanos());
 

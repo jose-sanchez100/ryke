@@ -99,7 +99,7 @@ fn info_header(cky_i: [u8; 8], cky_r: [u8; 8], msgid: u32) -> IsakmpHeader {
 
 /// RFC 2408 §3.14 Notification Payload body: `DOI(4) | Protocol-Id(1) |
 /// SPI-Size(1) | Notify-Msg-Type(2) | SPI | Notification-Data`.
-fn notify_body(protocol_id: u8, spi: &[u8], msg_type: u16, data: &[u8]) -> Vec<u8> {
+pub(super) fn notify_body(protocol_id: u8, spi: &[u8], msg_type: u16, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + spi.len() + data.len());
     out.extend_from_slice(&IPSEC_DOI.to_be_bytes());
     out.push(protocol_id);
@@ -147,7 +147,11 @@ pub(crate) mod notify_type {
 /// one *looks* like a reply but isn't correlated via message-id).
 fn build_single_informational(st: &Phase1State, entropy: &mut impl Entropy, payload_type: u8, body: Vec<u8>) -> Result<Vec<u8>, IkeError> {
     let msgid = st.fresh_message_id(MidKind::Informational, entropy)?;
+    build_informational_under(st, msgid, payload_type, body)
+}
 
+/// [`build_single_informational`] under the Message ID `msgid` the caller drew.
+fn build_informational_under(st: &Phase1State, msgid: u32, payload_type: u8, body: Vec<u8>) -> Result<Vec<u8>, IkeError> {
     let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
     let hdr = info_header(st.cky_i, st.cky_r, msgid);
     let (msg, _next) = phase2::build_encrypted(hdr, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0, &[(payload_type, body)])?;
@@ -531,11 +535,74 @@ pub(crate) fn peer_error_notify(st: &Phase1State, msg: &[u8]) -> Option<(u16, &'
     (1..16384).contains(&msg_type).then(|| (msg_type, error_notify_name(msg_type)))
 }
 
-/// Test double for a peer's rejection: an encrypted Informational carrying an
-/// error Notify of `msg_type` (the shape [`peer_error_notify`] recognizes).
-#[cfg(test)]
-pub(crate) fn build_error_notify(st: &Phase1State, entropy: &mut impl Entropy, msg_type: u16) -> Result<Vec<u8>, IkeError> {
-    build_single_informational(st, entropy, payload::NOTIFY, notify_body(protocol::ISAKMP, &isakmp_spi(st), msg_type, &[]))
+/// The error Notify types this side sends to refuse a message of the peer's (RFC 2408 §3.14.1 numbers them):
+/// these five, and no other. They are ISAKMP's own; the codes IKEv2 added for refusing a CHILD SA
+/// (NO_ADDITIONAL_SAS 35 and TEMPORARY_FAILURE 43, RFC 7296) are not ISAKMP Notify types and are never sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusalNotify {
+    /// INVALID-FLAGS (8): a copy of a message whose header has the Commit bit set, which this side does not
+    /// support. RFC 2408 §5.2 step 5: a message whose Flags field fails validation is discarded and an
+    /// INVALID-FLAGS Notify "MAY be sent"; the Commit bit is a defined value, so taking it for a failed
+    /// validation is this side's reading (POLICY).
+    InvalidFlags,
+    /// NO-PROPOSAL-CHOSEN (14): an offer that names no SA this side accepts (RFC 2408 §5.4).
+    NoProposalChosen,
+    /// BAD-PROPOSAL-SYNTAX (15): an SA payload whose proposals or transforms are not formed as RFC 2408
+    /// §3.5, §3.6 and §4.2 say (§5.5 step 3, §5.6 step 2).
+    BadProposalSyntax,
+    /// PAYLOAD-MALFORMED (16): a message whose payloads are not those RFC 2409 §5.5 gives a Quick Mode message,
+    /// or one whose content cannot be used as it stands.
+    PayloadMalformed,
+    /// INVALID-ID-INFORMATION (18): client identities this side does not accept (RFC 2409 §5.5: one "SHOULD"
+    /// be sent then; RFC 2408 §5.8).
+    InvalidIdInformation,
+}
+
+impl RefusalNotify {
+    /// Its Notify Message Type (RFC 2408 §3.14.1).
+    pub fn notify_type(self) -> u16 {
+        match self {
+            RefusalNotify::InvalidFlags => 8,
+            RefusalNotify::NoProposalChosen => 14,
+            RefusalNotify::BadProposalSyntax => 15,
+            RefusalNotify::PayloadMalformed => 16,
+            RefusalNotify::InvalidIdInformation => 18,
+        }
+    }
+}
+
+/// What a refusal names besides its type: the Protocol-Id and SPI of its Notify payload (RFC 2408 §3.14,
+/// "The receiving entity's SPI"). DOI 1, the IPsec DOI, either way, as for every Notify this module builds (RFC
+/// 3706 §5.3 has its ISAKMP Notifies carry it too: "SHOULD be set to IPSEC-DOI").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefusalSubject {
+    /// The message as such, not an SA it proposes (a header-level refusal): Protocol-Id ISAKMP, SPI size 0 (RFC
+    /// 2408 §3.14: for ISAKMP the SPI size "MAY be from zero (0) to sixteen (16)" and its content is ignored).
+    Message,
+    /// The ESP SA a proposal of the peer's would have made: Protocol-Id ESP, SPI size 4, and `spi`, the SPI the
+    /// peer proposed for its own inbound side -- the SPI of the entity receiving the Notify.
+    Proposal { spi: u32 },
+}
+
+/// An authenticated Informational (`HDR*, HASH(1), N`, RFC 2409 §5.7) that refuses the peer's exchange
+/// `refused_msgid` with an error Notify of `notify` about `subject` (no Notification Data), and the Message
+/// ID it goes under: a fresh one of ours, recorded as such by an enabled exchange table, and never
+/// `refused_msgid`, whether or not the ledger holds that one -- RFC 2409 §5.7 has the Informational's Message ID
+/// "MUST NOT be the same as the message ID of another phase 2 exchange which generated this informational
+/// exchange".
+pub(crate) fn build_error_notify(
+    st: &Phase1State,
+    entropy: &mut impl Entropy,
+    notify: RefusalNotify,
+    subject: RefusalSubject,
+    refused_msgid: u32,
+) -> Result<(u32, Vec<u8>), IkeError> {
+    let msgid = st.exchanges.fresh_message_id_other_than(MidKind::Informational, entropy, refused_msgid)?;
+    let body = match subject {
+        RefusalSubject::Message => notify_body(protocol::ISAKMP, &[], notify.notify_type(), &[]),
+        RefusalSubject::Proposal { spi } => notify_body(protocol::ESP, &spi.to_be_bytes(), notify.notify_type(), &[]),
+    };
+    Ok((msgid, build_informational_under(st, msgid, payload::NOTIFY, body)?))
 }
 
 /// RFC 2408 §3.14.1 names for the error Notify types a Quick Mode rejection

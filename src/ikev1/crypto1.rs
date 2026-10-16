@@ -15,6 +15,7 @@ use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, Ke
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
@@ -145,32 +146,39 @@ pub fn derive_cipher_key(prf: Prf, skeyid_e: &[u8], key_len: usize) -> Vec<u8> {
     ka
 }
 
+/// `K1 = prf(SKEYID_d, <seed>)`, `K(n) = prf(SKEYID_d, K(n-1) | <seed>)`, concatenated to `out_len` bytes (RFC
+/// 2409 §5.5). Every buffer of its own that holds a block of KEYMAT -- each block, each feedback input, the
+/// blocks gathered, which never grow past the room reserved for them, so no copy is left behind by a
+/// reallocation -- is wiped when dropped; only the bytes returned remain, the caller's to wipe. (The PRF's own
+/// state and output, inside the HMAC crate, are not reached from here.)
 fn keymat_inner(prf: Prf, skeyid_d: &[u8], seed: &[u8], out_len: usize) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut prev = prf.mac(skeyid_d, seed);
+    let mut out = Zeroizing::new(Vec::with_capacity(out_len + prf.output_len()));
+    let mut prev = Zeroizing::new(prf.mac(skeyid_d, seed));
     out.extend_from_slice(&prev);
     while out.len() < out_len {
         // K(n) = prf(SKEYID_d, K(n-1) | <seed>)
-        let mut input = prev.clone();
+        let mut input = Zeroizing::new(Vec::with_capacity(prev.len() + seed.len()));
+        input.extend_from_slice(&prev);
         input.extend_from_slice(seed);
-        prev = prf.mac(skeyid_d, &input);
+        prev = Zeroizing::new(prf.mac(skeyid_d, &input));
         out.extend_from_slice(&prev);
     }
-    out.truncate(out_len);
-    out
+    out[..out_len].to_vec()
 }
 
 /// Quick-Mode ESP keying material (RFC 2409 §5.5, no PFS):
 /// `KEYMAT = prf(SKEYID_d, protocol | SPI | Ni_b | Nr_b)`, expanded by feedback
 /// to `out_len` bytes.
 pub fn keymat(prf: Prf, skeyid_d: &[u8], protocol: u8, spi: &[u8], ni: &[u8], nr: &[u8], out_len: usize) -> Vec<u8> {
-    keymat_inner(prf, skeyid_d, &cat(&[&[protocol], spi, ni, nr]), out_len)
+    let seed = Zeroizing::new(cat(&[&[protocol], spi, ni, nr]));
+    keymat_inner(prf, skeyid_d, &seed, out_len)
 }
 
 /// Like [`keymat`], but for the **PFS** variant of Quick Mode (RFC 2409
 /// §5.5): `KEYMAT = prf(SKEYID_d, g(qm)^xy | protocol | SPI | Ni_b | Nr_b)`,
 /// with the fresh Quick-Mode Diffie-Hellman `shared_secret` folded into every
-/// feedback block's seed alongside the fixed protocol/SPI/nonce inputs.
+/// feedback block's seed alongside the fixed protocol/SPI/nonce inputs. The seed, which holds
+/// `g(qm)^xy`, is wiped when KEYMAT is derived, and so is every intermediate block (`keymat_inner`).
 #[allow(clippy::too_many_arguments)]
 pub fn keymat_pfs(
     prf: Prf,
@@ -182,7 +190,8 @@ pub fn keymat_pfs(
     nr: &[u8],
     out_len: usize,
 ) -> Vec<u8> {
-    keymat_inner(prf, skeyid_d, &cat(&[shared_secret, &[protocol], spi, ni, nr]), out_len)
+    let seed = Zeroizing::new(cat(&[shared_secret, &[protocol], spi, ni, nr]));
+    keymat_inner(prf, skeyid_d, &seed, out_len)
 }
 
 /// The Phase-1 CBC IV seed: `HASH(g^xi | g^xr)`, truncated to the block size.
@@ -453,5 +462,21 @@ mod tests {
         let km = keymat(Prf::Sha1, &[0x33; 20], 3, &[0xDE, 0xAD, 0xBE, 0xEF], &[1; 16], &[2; 16], 52);
         assert_eq!(km.len(), 52); // e.g. AES-256 (32) + HMAC-SHA1 (20)
         assert_ne!(km[..20], km[20..40]); // feedback blocks differ
+    }
+
+    /// KEYMAT with and without PFS, over several feedback blocks, is the RFC 2409 §5.5 expansion computed by
+    /// another implementation (Python's `hmac` and `hashlib`): the bytes on the wire do not depend on how the
+    /// intermediates are kept and wiped. Also: a length shorter than one block, and none.
+    #[test]
+    fn keymat_matches_known_answers_with_and_without_pfs() {
+        let unhex = |s: &str| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect::<Vec<u8>>();
+        // hmac(SKEYID_d, K(n-1) | 3 | deadbeef | 01*16 | 02*16, sha1), three blocks.
+        let plain = keymat(Prf::Sha1, &[0x33; 20], 3, &[0xDE, 0xAD, 0xBE, 0xEF], &[1; 16], &[2; 16], 52);
+        assert_eq!(plain, unhex("99f33ec432b8e1002d88e53413a73a7b28e63b8d1d037a53d4293002ed7de8396934e31ac6911e6d7a72c8fc9d29760734d20c0e"));
+        // hmac(SKEYID_d, K(n-1) | ab*128 | 3 | 01020304 | 05*16 | 06*16, sha256), two blocks.
+        let pfs = keymat_pfs(Prf::Sha256, &[0x44; 32], &[0xAB; 128], 3, &[1, 2, 3, 4], &[5; 16], &[6; 16], 52);
+        assert_eq!(pfs, unhex("c25121bb92a5f617b5d85f8b77cae83ecf380de8b1efbe3a883e577555b499b6d5abf71df38ef4f2d3735da3fdd90e2027822f23"));
+        assert_eq!(keymat(Prf::Sha1, &[0x33; 20], 3, &[0xDE, 0xAD, 0xBE, 0xEF], &[1; 16], &[2; 16], 7), plain[..7]);
+        assert!(keymat_pfs(Prf::Sha256, &[0x44; 32], &[0xAB; 128], 3, &[1, 2, 3, 4], &[5; 16], &[6; 16], 0).is_empty());
     }
 }

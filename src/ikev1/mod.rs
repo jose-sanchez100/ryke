@@ -20,6 +20,7 @@ pub mod payloads;
 pub mod phase1;
 pub mod phase2;
 pub mod quick;
+mod responder;
 #[cfg(test)]
 mod retransmit_tests;
 mod rtt;
@@ -28,6 +29,7 @@ pub mod xauth;
 
 pub use client::{Client, Established};
 pub use exchange::{classify_peer_deletes, DeleteVerdict, FamilySpis, Generation, PeerEvent, PeerQuick, PeerSpi, SpiState};
+pub use responder::{answer_quick, ExpectedQuick, HeldQuick, QuickExpectations, QuickVerdict, Refusal, Silence};
 pub use server::{Server, ServerEvent};
 
 use std::time::Duration;

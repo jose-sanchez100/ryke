@@ -147,7 +147,6 @@ pub(crate) enum MidState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MidEnd {
     Done,
-    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     Refused,
     #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     Superseded,
@@ -397,19 +396,28 @@ impl MessageIdLedger {
     /// made; if every one hits an id the ledger holds, the id taken is the next odd one after the
     /// last draw that it does not hold (at most [`MID_CAP`] steps on).
     pub(crate) fn fresh(&mut self, kind: MidKind, entropy: &mut impl Entropy, now: Instant) -> Result<u32, IkeError> {
+        self.fresh_other_than(kind, entropy, now, None)
+    }
+
+    /// [`Self::fresh`], and never `avoid` either, whether or not the ledger holds it: for an Informational about
+    /// the exchange `avoid`, whose Message ID RFC 2409 §5.7 forbids it to take ("MUST NOT be the same as the
+    /// message ID of another phase 2 exchange which generated this informational exchange") and which the ledger
+    /// may not hold (an exchange it never recorded). `None` is [`Self::fresh`].
+    pub(crate) fn fresh_other_than(&mut self, kind: MidKind, entropy: &mut impl Entropy, now: Instant, avoid: Option<u32>) -> Result<u32, IkeError> {
         self.sweep(now);
         let room = self.has_room();
         if !room && kind != MidKind::Informational {
             return Err(IkeError::MessageIdsExhausted);
         }
+        let taken = |records: &HashMap<u32, MidRecord>, id: u32| records.contains_key(&id) || avoid == Some(id);
         let mut id = draw(entropy);
         for _ in 1..MID_DRAWS {
-            if !self.records.contains_key(&id) {
+            if !taken(&self.records, id) {
                 break;
             }
             id = draw(entropy);
         }
-        while self.records.contains_key(&id) {
+        while taken(&self.records, id) {
             // An odd id plus two is odd: never 0, even across the wrap.
             id = id.wrapping_add(2);
         }

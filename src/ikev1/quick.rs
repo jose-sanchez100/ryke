@@ -187,7 +187,7 @@ pub struct SaLifetime {
 
 /// IPsec ESP SA attribute types (RFC 2407 §4.5) — a *different* registry from the
 /// Phase-1 IKE attributes: here KEY_LENGTH is 6, not 14.
-mod esp_attr {
+pub(super) mod esp_attr {
     pub const LIFE_TYPE: u16 = 1;
     pub const LIFE_DURATION: u16 = 2;
     /// PFS group -- present on the ESP proposal transform only when PFS is
@@ -203,7 +203,7 @@ mod esp_attr {
     /// §4.5) -- absent for an AEAD cipher, which needs no separate check.
     pub const AUTH_ALGORITHM: u16 = 5;
 }
-const ENCAP_TUNNEL: u16 = 1;
+pub(super) const ENCAP_TUNNEL: u16 = 1;
 /// UDP-encapsulated tunnel mode (RFC 3947 §5.1's UDP-Encapsulated-Tunnel, 3,
 /// registered in §9, as opposed to the legacy private-range 61443 some pre-RFC
 /// drafts used) --
@@ -212,16 +212,16 @@ const ENCAP_TUNNEL: u16 = 1;
 /// it: it selects the RFC-final value there too, never the draft one, since
 /// this crate only advertises the RFC 3947 Vendor ID -- see
 /// `phase1::NATT_RFC_VENDOR_ID`'s doc).
-const UDP_ENCAP_TUNNEL: u16 = 3;
+pub(super) const UDP_ENCAP_TUNNEL: u16 = 3;
 /// RFC 2407 §4.5: the lifetime of an SA that states none.
-const DEFAULT_LIFE_SECONDS: u32 = 28_800;
+pub(super) const DEFAULT_LIFE_SECONDS: u32 = 28_800;
 /// What a responder here grants an offer that states no lifetime in seconds --
 /// its own policy, and shorter than [`DEFAULT_LIFE_SECONDS`], which RFC 2407
 /// §4.5.4 lets it be.
 const RESPONDER_LIFE_SECONDS: u32 = 3600;
 /// The attributes a responder may change on its own (RFC 2407 §4.5.4), hence
 /// the ones an answer is not compared on.
-const LIFETIME_ATTRS: [u16; 2] = [esp_attr::LIFE_TYPE, esp_attr::LIFE_DURATION];
+pub(super) const LIFETIME_ATTRS: [u16; 2] = [esp_attr::LIFE_TYPE, esp_attr::LIFE_DURATION];
 
 /// This registry (RFC 2407 §4.5's ESP `AUTH_ALGORITHM` attribute values) is
 /// numbered independently of IKEv2's own INTEG transform IDs
@@ -269,9 +269,9 @@ fn find(ps: &[Payload], t: u8) -> Option<&Payload> {
 
 /// The limits one transform states, each `None` when it states none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StatedLifetime {
-    seconds: Option<u32>,
-    kilobytes: Option<u32>,
+pub(super) struct StatedLifetime {
+    pub(super) seconds: Option<u32>,
+    pub(super) kilobytes: Option<u32>,
 }
 
 /// The SA lifetime, in seconds and in kilobytes, that `t` states -- each `None`
@@ -286,7 +286,7 @@ struct StatedLifetime {
 /// durations for one unit. The two limits are independent: neither is ever read
 /// as the other, whatever their order -- see the module's "SA lifetimes"
 /// section.
-fn stated_lifetime(t: &Transform) -> Result<StatedLifetime, IkeError> {
+pub(super) fn stated_lifetime(t: &Transform) -> Result<StatedLifetime, IkeError> {
     stated_lifetime_in(&t.attributes)
 }
 
@@ -349,7 +349,7 @@ fn negotiated_p2_lifetime(ps: &[Payload], offered: u32) -> SaLifetime {
 }
 
 /// RFC 2407 §4.6.3.1's RESPONDER-LIFETIME status Notify Message Type.
-const RESPONDER_LIFETIME: u16 = 24576;
+pub(super) const RESPONDER_LIFETIME: u16 = 24576;
 
 /// The lifetime the RESPONDER-LIFETIME Notifies of an authentic message 2
 /// (`ps`) state for the SA it answers, each unit `None` when none states it.
@@ -456,7 +456,7 @@ fn single_sa(ps: &[Payload]) -> Result<SaPayload, IkeError> {
     SaPayload::parse(&first.data)
 }
 
-fn qm_header(cky_i: [u8; 8], cky_r: [u8; 8], msgid: u32) -> IsakmpHeader {
+pub(super) fn qm_header(cky_i: [u8; 8], cky_r: [u8; 8], msgid: u32) -> IsakmpHeader {
     IsakmpHeader {
         init_cookie: cky_i,
         resp_cookie: cky_r,
@@ -494,7 +494,7 @@ fn esp_sa(spi: u32, cipher: SkCipher, pfs_group: Option<DhGroup>, floated: bool,
 /// numbered `num`. It is also what a transform must equal, lifetimes apart, for
 /// [`select_offer`] to take it: each attribute once, basic-encoded, and no
 /// attribute that isn't part of the suite.
-fn esp_transform(num: u8, cipher: SkCipher, pfs_group: Option<DhGroup>, encap_mode: u16, life_duration: u32) -> Transform {
+pub(super) fn esp_transform(num: u8, cipher: SkCipher, pfs_group: Option<DhGroup>, encap_mode: u16, life_duration: u32) -> Transform {
     esp_transform_limited(num, cipher, pfs_group, encap_mode, life_duration, None)
 }
 
@@ -551,7 +551,7 @@ fn esp_sa_numbered(
 }
 
 /// An ID payload body for an IPv4 subnet traffic selector (`IDci`/`IDcr`).
-fn ts_id(addr: [u8; 4], mask: [u8; 4]) -> Vec<u8> {
+pub(super) fn ts_id(addr: [u8; 4], mask: [u8; 4]) -> Vec<u8> {
     let mut data = addr.to_vec();
     data.extend_from_slice(&mask);
     Id { id_type: id_type::IPV4_ADDR_SUBNET, protocol: 0, port: 0, data }.to_bytes()
@@ -561,7 +561,7 @@ fn ts_id(addr: [u8; 4], mask: [u8; 4]) -> Vec<u8> {
 /// netmask, 16 bytes each (RFC 2407 §4.6.2.7) -- the IPv6 twin of [`ts_id`].
 /// A host selector is `prefix_len` 128, same convention as the IPv4 side's
 /// `/32` narrowing to the assigned address.
-fn ts_id_v6(addr: Ipv6Addr, prefix_len: u8) -> Vec<u8> {
+pub(super) fn ts_id_v6(addr: Ipv6Addr, prefix_len: u8) -> Vec<u8> {
     let prefix_len = prefix_len.min(128);
     let mask = if prefix_len == 0 { 0 } else { u128::MAX << (128 - prefix_len) };
     let mut data = (u128::from(addr) & mask).to_be_bytes().to_vec();
@@ -678,7 +678,7 @@ fn select_offer(ps: &[Payload]) -> Result<Selection, IkeError> {
 /// address, a subnet wider than a host, the other family, a body that does not parse or has the wrong length
 /// for its type, and the reverse (this side never offers a single address, so an answer in the subnet form for
 /// one is not looked for).
-fn selector_id_matches(offered: &[u8], answered: &[u8]) -> bool {
+pub(super) fn selector_id_matches(offered: &[u8], answered: &[u8]) -> bool {
     if offered == answered {
         return true;
     }
@@ -743,7 +743,7 @@ fn check_answer(offered: &SaPayload, ps: &[Payload]) -> Result<u32, IkeError> {
 }
 
 /// `HASH(3) = prf(SKEYID_a, 0 | M-ID | Ni_b | Nr_b)`.
-fn hash3(prf: Prf, skeyid_a: &[u8], msgid: u32, ni: &[u8], nr: &[u8]) -> Vec<u8> {
+pub(super) fn hash3(prf: Prf, skeyid_a: &[u8], msgid: u32, ni: &[u8], nr: &[u8]) -> Vec<u8> {
     let mut h = vec![0u8];
     h.extend_from_slice(&msgid.to_be_bytes());
     h.extend_from_slice(ni);
@@ -755,11 +755,11 @@ fn hash3(prf: Prf, skeyid_a: &[u8], msgid: u32, ni: &[u8], nr: &[u8]) -> Vec<u8>
 /// `enc_material` is `cipher.key_len() + cipher.salt_len()` bytes (the shape
 /// [`EspSa::new_with_cipher`] wants), `integ_key` the trailing
 /// `cipher.integ_algorithm()`'s key length (empty for AEAD).
-fn split_esp_keymat(cipher: SkCipher, km: &[u8]) -> (&[u8], &[u8]) {
+pub(super) fn split_esp_keymat(cipher: SkCipher, km: &[u8]) -> (&[u8], &[u8]) {
     km.split_at(cipher.key_len() + cipher.salt_len())
 }
 
-fn esp_keymat_len(cipher: SkCipher) -> usize {
+pub(super) fn esp_keymat_len(cipher: SkCipher) -> usize {
     cipher.key_len() + cipher.salt_len() + cipher.integ_algorithm().map(IntegAlgorithm::key_len).unwrap_or(0)
 }
 
@@ -915,7 +915,7 @@ pub fn initiate_quick_ipv6(
 /// The address-family-agnostic body of the initiator entry points above:
 /// `id_local`/`id_remote` are the ready-made IDci/IDcr payload bodies.
 #[allow(clippy::too_many_arguments)]
-fn initiate_quick_with_ids(
+pub(super) fn initiate_quick_with_ids(
     st: &Phase1State,
     entropy: &mut impl Entropy,
     cipher: SkCipher,
@@ -1037,6 +1037,50 @@ impl QuickInitiator {
     /// not looked at here: one the offer does not accept is the peer's answer all the same.
     fn authenticates(&self, msg2: &[u8]) -> bool {
         phase2::decrypt_payloads(msg2, &self.enc_key, self.enc_block, &self.iv1).is_ok_and(|(_hdr, ps, _iv2)| self.check_hash2(&ps).is_ok())
+    }
+}
+
+#[cfg(test)]
+impl QuickInitiator {
+    /// The initiator's state after a message 1 a test built by hand, `msg1`, under `st` (the state of the side
+    /// that sent it): what [`Self::complete_with_lifetime`] checks message 2 against is read back from the message
+    /// -- its first SA payload as the offer (the SPI of its first proposal as the SPI offered), its nonce, its
+    /// identities, its lifetime in seconds (the DOI's 28800 when it states none) -- so that an answer to an offer
+    /// the public initiator never makes is still verified by the initiator's own code. `cipher` is the suite the
+    /// offer names, and `pfs` the group and private key its KE was made from.
+    pub(super) fn of_message_1(st: &Phase1State, msg1: &[u8], cipher: SkCipher, pfs: Option<(DhGroup, [u8; 32])>) -> QuickInitiator {
+        let msgid = IsakmpHeader::parse(msg1).expect("a test's message 1 has a header").message_id;
+        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
+        let (_hdr, ps, iv1) = phase2::parse_encrypted(msg1, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0).expect("a test's message 1 authenticates");
+        let offer = SaPayload::parse(&find(&ps, payload::SA).expect("an SA").data).expect("an SA that parses");
+        let local_spi = offer.proposals.first().and_then(|p| <[u8; 4]>::try_from(p.spi.as_slice()).ok()).map_or(0, u32::from_be_bytes);
+        let life_duration = offer
+            .proposals
+            .first()
+            .and_then(|p| p.transforms.first())
+            .and_then(|t| stated_lifetime(t).ok())
+            .and_then(|stated| stated.seconds)
+            .unwrap_or(DEFAULT_LIFE_SECONDS);
+        let ids: Vec<Vec<u8>> = ps.iter().filter(|p| p.payload_type == payload::ID).map(|p| p.data.clone()).collect();
+        QuickInitiator {
+            prf: st.prf,
+            skeyid_a: st.skeyid_a.clone(),
+            skeyid_d: st.skeyid_d.clone(),
+            enc_key: st.enc_key.clone(),
+            enc_block: st.enc_block,
+            cky_i: st.cky_i,
+            cky_r: st.cky_r,
+            msgid,
+            local_spi,
+            ni: find(&ps, payload::NONCE).map(|p| p.data.clone()).unwrap_or_default(),
+            iv1,
+            offer,
+            cipher,
+            pfs,
+            life_duration,
+            id_local: ids.first().cloned().unwrap_or_default(),
+            id_remote: ids.get(1).cloned().unwrap_or_default(),
+        }
     }
 }
 
@@ -2667,8 +2711,10 @@ mod tests {
         let (istate, rstate, mut ie, mut re) = phase1_pair(0x9501, 0x9502, iaddr, raddr);
         let responder = std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
-            rsock.recv(&mut buf).unwrap();
-            let reject = informational::build_error_notify(&rstate, &mut re, 18).unwrap();
+            let n = rsock.recv(&mut buf).unwrap();
+            let refused = IsakmpHeader::parse(&buf[..n]).unwrap().message_id;
+            let subject = informational::RefusalSubject::Message;
+            let (_, reject) = informational::build_error_notify(&rstate, &mut re, informational::RefusalNotify::InvalidIdInformation, subject, refused).unwrap();
             rsock.send_to(&reject, iaddr).unwrap();
         });
 

@@ -63,7 +63,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::crypto1;
-use super::informational::{error_notify_name, notify_type, ChildFamily};
+use super::informational::{error_notify_name, notify_type, ChildFamily, RefusalNotify};
 use super::isakmp::{exchange, flags, payload, IsakmpHeader, Payload};
 use super::msgid::{self, Admission, MessageIdLedger, MidCounters, MidEnd, MidKind, MidRecord, MidState, Origin};
 use super::payloads::{id_type, protocol, IPSEC_DOI};
@@ -116,6 +116,36 @@ const FOREIGN_REMEMBERED: usize = 16;
 /// The most R-U-THEREs of one Informational message answered (POLICY): RFC 3706 §5.2 puts one in a
 /// message; a message that carries more gets an answer for its first few distinct sequence numbers.
 pub(crate) const ACKS_PER_MESSAGE: usize = 4;
+
+/// How many refusals of the peer's Quick Modes this side sends per [`REFUSAL_WINDOW`] on one ISAKMP SA, at
+/// most (POLICY): beyond that a refusal is silence ([`ExchangeTable::charge_refusal`]). A gateway whose offers
+/// this side cannot take keeps offering them, and an error Notify answers no question of its; this keeps the
+/// answers to such a gateway few.
+pub(crate) const REFUSALS_PER_WINDOW: usize = 4;
+
+/// The window [`REFUSALS_PER_WINDOW`] counts over (POLICY).
+pub(crate) const REFUSAL_WINDOW: Duration = Duration::from_secs(60);
+
+/// How many refusals the table keeps -- the newest -- to send again unchanged for a copy of a message 1 it
+/// refused (POLICY): as many as may be counted in one [`REFUSAL_WINDOW`].
+pub(crate) const REFUSALS_KEPT: usize = REFUSALS_PER_WINDOW;
+
+/// The shortest time between two sendings of one kept refusal (POLICY): a copy of a refused message 1 read
+/// sooner after the last one is not answered ([`ExchangeTable::repeat_refusal`]). The same spacing as the
+/// answers to copies of a message 1 answered, one per 200 ms per Message ID: a peer that replays one copy at
+/// line rate gets at most five refusals a second, never one per datagram.
+pub(crate) const REFUSAL_RESEND_SPACING: Duration = Duration::from_millis(200);
+
+/// How many messages 1 of the peer's the table remembers a copy with the Commit bit of -- the newest -- by
+/// Message ID and fingerprint (POLICY, [`ExchangeTable::note_commit`]): a gateway rekeys one family at a time,
+/// so this outlasts every exchange that can still be answered, unless the peer sends this many other flagged
+/// messages in between.
+pub(crate) const COMMITS_REMEMBERED: usize = 16;
+
+/// How many answers given to the peer's Quick Modes still in progress the table remembers
+/// ([`ExchangeTable::note_accepted`]) (POLICY): the responder answers one exchange per family at a time, so
+/// this is never reached but by a caller that answers this many exchanges at once.
+pub(crate) const ACCEPTS_REMEMBERED: usize = 16;
 
 /// An SPI as a Delete or a Notify names it: up to sixteen octets, held inline so that an
 /// event is a plain value whatever the peer claims.
@@ -387,6 +417,53 @@ struct Books {
     /// Quick Mode messages under the id of an exchange of ours being waited for that did not authenticate
     /// as its message 2 ([`ExchangeTable::count_unauthenticated_reply`]).
     unauthenticated_replies: u64,
+    /// The refusals sent, for the rate limit and for the copies of what they refused.
+    refusals: Refusals,
+    /// The messages 1 of the peer's a copy with the Commit bit of was read, by Message ID and fingerprint,
+    /// oldest first: at most [`COMMITS_REMEMBERED`] ([`ExchangeTable::note_commit`]).
+    commits: VecDeque<(u32, [u8; 32])>,
+    /// The answers given to the peer's Quick Modes still in progress, by Message ID, fingerprint and how many
+    /// times the ledger had taken the exchange up again then ([`MidRecord::tries`]), oldest first: at most
+    /// [`ACCEPTS_REMEMBERED`] ([`ExchangeTable::note_accepted`]).
+    accepts: VecDeque<(u32, [u8; 32], u8)>,
+}
+
+/// The refusals of the peer's Quick Modes this side sent ([`ExchangeTable::charge_refusal`],
+/// [`ExchangeTable::keep_refusal`]).
+#[derive(Default)]
+struct Refusals {
+    /// When each refusal counted in the current window went, oldest first: at most [`REFUSALS_PER_WINDOW`].
+    charged: VecDeque<Instant>,
+    /// The refusals kept to be sent again, oldest first: at most [`REFUSALS_KEPT`].
+    kept: VecDeque<KeptRefusal>,
+}
+
+/// A refusal sent, with the copy of a message 1 it answered.
+#[derive(Clone)]
+pub(crate) struct KeptRefusal {
+    /// The Message ID of the refused message 1.
+    pub refused_msgid: u32,
+    /// Its fingerprint ([`msgid::fingerprint`]).
+    pub fingerprint: [u8; 32],
+    /// Whether the copy refused had the Commit bit set: a copy without it is not the same refusal's.
+    pub commit_flag: bool,
+    /// The Notify type it carried.
+    pub notify: RefusalNotify,
+    /// The Message ID of the Informational that carried it.
+    pub msgid: u32,
+    /// That Informational, exactly as built.
+    pub datagram: Vec<u8>,
+    /// When it was last handed out to be sent, by the table's clock: when it was built, then each time it was
+    /// handed out again ([`ExchangeTable::repeat_refusal`]).
+    pub last_sent: Instant,
+}
+
+/// What [`ExchangeTable::repeat_refusal`] makes of a copy of a refused message 1.
+pub(crate) enum RepeatRefusal {
+    /// The refusal kept, to be sent again as it was: [`REFUSAL_RESEND_SPACING`] or more since it was last.
+    Send(KeptRefusal),
+    /// The refusal was sent less than [`REFUSAL_RESEND_SPACING`] ago: nothing is sent now.
+    TooSoon,
 }
 
 /// The most responder exchanges [`ExchangeTable::register_responder`] keeps (POLICY): the responder
@@ -641,6 +718,26 @@ impl ExchangeTable {
         self.books().ids.fresh(kind, entropy, now)
     }
 
+    /// [`Self::fresh_message_id`], never `avoid` either ([`MessageIdLedger::fresh_other_than`]): the Message ID
+    /// of an Informational of ours about the exchange `avoid`. Passive: the draw of [`Self::fresh_message_id`],
+    /// drawn again while it is `avoid` (at most [`msgid::MID_DRAWS`] draws, then the next odd id), the ledger
+    /// and the clock left alone.
+    pub(crate) fn fresh_message_id_other_than(&self, kind: MidKind, entropy: &mut impl Entropy, avoid: u32) -> Result<u32, IkeError> {
+        if !self.is_enabled() {
+            let mut id = msgid::draw(entropy);
+            for _ in 1..msgid::MID_DRAWS {
+                if id != avoid {
+                    break;
+                }
+                id = msgid::draw(entropy);
+            }
+            // An odd id plus two is odd: never 0, and never `avoid` once it differed by two.
+            return Ok(if id == avoid { id.wrapping_add(2) } else { id });
+        }
+        let now = self.now();
+        self.books().ids.fresh_other_than(kind, entropy, now, Some(avoid))
+    }
+
     /// [`MessageIdLedger::sweep`]. Passive: nothing.
     pub(crate) fn sweep(&self, now: Instant) {
         self.ledger((), |ids| ids.sweep(now))
@@ -777,6 +874,128 @@ impl ExchangeTable {
         }
     }
 
+    /// Whether one more refusal of a peer Quick Mode may be sent now, by the table's clock, and charges it when
+    /// it may: at most [`REFUSALS_PER_WINDOW`] in any [`REFUSAL_WINDOW`] on this ISAKMP SA. A refusal sent again
+    /// for a copy of what it refused ([`Self::repeat_refusal`]) is not charged. Passive: `false`.
+    pub(crate) fn charge_refusal(&self) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        let now = self.now();
+        let charged = &mut self.books().refusals.charged;
+        while charged.front().is_some_and(|at| now.saturating_duration_since(*at) >= REFUSAL_WINDOW) {
+            charged.pop_front();
+        }
+        if charged.len() >= REFUSALS_PER_WINDOW {
+            return false;
+        }
+        charged.push_back(now);
+        true
+    }
+
+    /// Keeps `refusal`, sent for a copy of a message 1, to be sent again for a copy of the same message
+    /// ([`Self::repeat_refusal`]); beyond [`REFUSALS_KEPT`] the oldest gives way. Passive: nothing.
+    pub(crate) fn keep_refusal(&self, refusal: KeptRefusal) {
+        if !self.is_enabled() {
+            return;
+        }
+        let kept = &mut self.books().refusals.kept;
+        kept.retain(|held| (held.refused_msgid, held.fingerprint, held.commit_flag) != (refusal.refused_msgid, refusal.fingerprint, refusal.commit_flag));
+        if kept.len() >= REFUSALS_KEPT {
+            kept.pop_front();
+        }
+        kept.push_back(refusal);
+    }
+
+    /// The refusal kept for a copy of the message 1 `refused_msgid` whose fingerprint is `fingerprint` and whose
+    /// Commit bit is `commit_flag` -- the same message, whatever its last cipher block -- if one is kept, and
+    /// whether it is to be sent again now, by the table's clock: when it was last handed out
+    /// [`REFUSAL_RESEND_SPACING`] or more ago ([`RepeatRefusal::Send`], and handed out now), not sooner
+    /// ([`RepeatRefusal::TooSoon`]). Passive: `None`.
+    pub(crate) fn repeat_refusal(&self, refused_msgid: u32, fingerprint: &[u8; 32], commit_flag: bool) -> Option<RepeatRefusal> {
+        if !self.is_enabled() {
+            return None;
+        }
+        let now = self.now();
+        let mut books = self.books();
+        let kept = books.refusals.kept.iter_mut().find(|held| held.refused_msgid == refused_msgid && held.fingerprint == *fingerprint && held.commit_flag == commit_flag)?;
+        if now.saturating_duration_since(kept.last_sent) < REFUSAL_RESEND_SPACING {
+            return Some(RepeatRefusal::TooSoon);
+        }
+        kept.last_sent = now;
+        Some(RepeatRefusal::Send(kept.clone()))
+    }
+
+    /// The refusal kept for a copy of the message 1 `refused_msgid` whose fingerprint is `fingerprint` and whose
+    /// Commit bit is `commit_flag`, if one is kept; nothing changes.
+    #[cfg(test)]
+    pub(crate) fn kept_refusal(&self, refused_msgid: u32, fingerprint: &[u8; 32], commit_flag: bool) -> Option<KeptRefusal> {
+        self.books()
+            .refusals
+            .kept
+            .iter()
+            .find(|held| held.refused_msgid == refused_msgid && held.fingerprint == *fingerprint && held.commit_flag == commit_flag)
+            .cloned()
+    }
+
+    /// Remembers that a copy of the peer's message 1 `msgid` whose fingerprint is `fingerprint` had the Commit
+    /// bit set (RFC 2408 §3.1), whatever became of the copy -- refused, refused in silence for the budget,
+    /// dropped from a full inbox, or noted on another entry: the fact outlives the copy, so that whatever
+    /// answers a copy of the message without the bit, read before or after, knows it
+    /// ([`Self::commit_seen_for`]). Sticky: a pair remembered is not forgotten but by [`COMMITS_REMEMBERED`]
+    /// newer ones; one remembered again becomes the newest. No HASH covers the header, so the fact binds
+    /// nothing and is never acted on but to keep the SA answered from use. Passive: nothing.
+    pub(crate) fn note_commit(&self, msgid: u32, fingerprint: [u8; 32]) {
+        if !self.is_enabled() {
+            return;
+        }
+        let commits = &mut self.books().commits;
+        commits.retain(|held| *held != (msgid, fingerprint));
+        if commits.len() >= COMMITS_REMEMBERED {
+            commits.pop_front();
+        }
+        commits.push_back((msgid, fingerprint));
+    }
+
+    /// Whether a copy with the Commit bit of the peer's message 1 `msgid` whose fingerprint is `fingerprint`
+    /// was read ([`Self::note_commit`]). Passive: `false`.
+    pub(crate) fn commit_seen_for(&self, msgid: u32, fingerprint: &[u8; 32]) -> bool {
+        self.is_enabled() && self.books().commits.contains(&(msgid, *fingerprint))
+    }
+
+    /// Remembers that the responder answered the peer's Quick Mode `msgid`, whose message 1 has the fingerprint
+    /// `fingerprint`, in the exchange the ledger holds in progress now ([`Self::accept_outstanding`]); `false`,
+    /// and nothing remembered, when the ledger holds no such exchange. What is remembered is kept while that
+    /// exchange is in progress and has not been taken up again ([`MessageIdLedger::reconsider`]): beyond
+    /// [`ACCEPTS_REMEMBERED`] answers outstanding at once the oldest gives way. Passive: `false`.
+    pub(crate) fn note_accepted(&self, msgid: u32, fingerprint: [u8; 32]) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        let mut books = self.books();
+        let Books { ids, accepts, .. } = &mut *books;
+        let Some(tries) = answerable_spell(ids, msgid, &fingerprint) else { return false };
+        accepts.retain(|&(id, print, spell)| answerable_spell(ids, id, &print) == Some(spell) && id != msgid);
+        if accepts.len() >= ACCEPTS_REMEMBERED {
+            accepts.pop_front();
+        }
+        accepts.push_back((msgid, fingerprint, tries));
+        true
+    }
+
+    /// Whether the responder already answered the peer's Quick Mode `msgid`, whose message 1 has the
+    /// fingerprint `fingerprint`, in the exchange the ledger holds in progress now ([`Self::note_accepted`]): an
+    /// answer outstanding, which a second one must not replace (no new SPI, nonce or keys for the same message).
+    /// The ledger is read as the last call told the time left it. Passive: `false`.
+    pub(crate) fn accept_outstanding(&self, msgid: u32, fingerprint: &[u8; 32]) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        let books = self.books();
+        let Some(tries) = answerable_spell(&books.ids, msgid, fingerprint) else { return false };
+        books.accepts.contains(&(msgid, *fingerprint, tries))
+    }
+
     /// The error Notify type recorded for the responder exchange `msgid`, if it is registered and has one.
     #[cfg(test)]
     pub(crate) fn responder_rejected(&self, msgid: u32) -> Option<u16> {
@@ -883,6 +1102,16 @@ impl ExchangeTable {
             [_] => unattributed("the only exchange in progress is one of ours that nothing waits on here"),
             _ => unattributed("more than one exchange is in progress"),
         }
+    }
+}
+
+/// How many times the ledger took up again the peer's Quick Mode `msgid` ([`MidRecord::tries`]) when it holds
+/// it in progress with the fingerprint `fingerprint`: what tells one spell in progress of the exchange from
+/// the next ([`ExchangeTable::note_accepted`]). `None` when it holds no such exchange.
+fn answerable_spell(ids: &MessageIdLedger, msgid: u32, fingerprint: &[u8; 32]) -> Option<u8> {
+    match ids.record(msgid)? {
+        MidRecord { origin: Origin::Peer, kind: MidKind::Quick, state: MidState::Active { .. }, fingerprint: Some(print), tries, .. } if print == *fingerprint => Some(tries),
+        _ => None,
     }
 }
 
@@ -1268,7 +1497,8 @@ pub(crate) enum Classified {
 ///      Commit bit set, which is neither recorded nor remembered, so that it takes no id (no HASH
 ///      covers the header, RFC 2409 §5.5): it goes to the inbox with that fact when its message is
 ///      new, or in progress or parked for the ledger, and when the inbox holds that message without
-///      the bit, the fact is noted on it instead ([`Classified::CommitNoted`]).
+///      the bit, the fact is noted on it instead ([`Classified::CommitNoted`]). Whatever becomes of
+///      such a copy, the table remembers that its message had the bit ([`ExchangeTable::note_commit`]).
 /// 3. An Informational: decrypted with the IV of its own Message ID and checked by HASH(1) (RFC 2409
 ///    §5.7, Appendix B); a failure sets it aside. Its id is recorded as the peer's, so that no id of
 ///    ours reuses it -- only when it carries nothing but Notify and Delete payloads (§5.7: "HDR*,
@@ -1355,6 +1585,10 @@ fn classify_message_1(st: &Phase1State, header: &IsakmpHeader, message: &[u8], n
     }
     let print = msgid::fingerprint(msgid, &payloads);
     let commit_flag = header.flags & flags::COMMIT != 0;
+    if commit_flag {
+        // Whatever becomes of this copy, the fact outlives it (`ExchangeTable::note_commit`).
+        st.exchanges.note_commit(msgid, print);
+    }
     let admission = st.exchanges.would_admit(msgid, MidKind::Quick, &print, now);
     let new = match admission {
         Admission::New => true,

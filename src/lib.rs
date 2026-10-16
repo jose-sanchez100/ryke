@@ -87,14 +87,20 @@
 //! nothing looks there once `connect` has returned; and Quick Mode's third,
 //! sent by `connect` or a rekey, is sent again only when the caller next
 //! reads the socket ([`ikev1::informational::peek`],
-//! [`ikev1::informational::probe`], the next rekey), not in the background --
-//! until then a gateway whose Quick Mode second message was answered by
-//! nothing has no Quick Mode SA, and nothing here notices. What that
-//! recovery is worth is therefore how soon the caller reads: it is not a
-//! promise of service between the reads. Not done in IKEv1: a Quick Mode or
-//! a Phase 1 the gateway starts goes unanswered (the client is an initiator
-//! only; answering one would be a Quick Mode responder driven from the
-//! caller's loop, which nothing here does yet); the ISAKMP SA is never
+//! [`ikev1::informational::probe`], [`ikev1::informational::serve_turn`]
+//! while the ISAKMP SA's exchange table is on, the next rekey), not in the
+//! background -- until then a gateway whose Quick Mode second message was
+//! answered by nothing has no Quick Mode SA, and nothing here notices. What
+//! that recovery is worth is therefore how soon the caller reads: it is not
+//! a promise of service between the reads. A Quick Mode the gateway starts
+//! is answered (the `ikev1::responder` module: [`ikev1::answer_quick`],
+//! [`ikev1::HeldQuick`], [`ikev1::AnsweredQuick`]) only once the caller
+//! turns that table on
+//! ([`ikev1::phase1::Phase1State::enable_gateway_quick_mode`]) and drives
+//! the exchange from its own loop; the table is passive by default, and
+//! while it is passive such a Quick Mode goes unanswered, as it always did.
+//! Not done in IKEv1: a Phase 1 the gateway starts goes unanswered (the
+//! client is a Phase 1 initiator only); the ISAKMP SA is never
 //! rekeyed -- once its lifetime is up, a new `connect` is the way on; and a
 //! lifetime in kilobytes is refused in Phase 1, and in Phase 2 handed to the
 //! caller ([`ikev1::quick::SaLifetime`], `Established::p2_lifetime_kilobytes`)

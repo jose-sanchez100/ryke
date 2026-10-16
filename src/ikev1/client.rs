@@ -48,8 +48,9 @@
 //! however many other datagrams come in meanwhile.
 //!
 //! What this does not do: recognise a repeat that the gateway re-encrypted
-//! (only identical bytes count); answer a Quick Mode or a
-//! Phase 1 that the gateway starts (this is an initiator only); rekey the
+//! (only identical bytes count); answer a Phase 1 that the gateway starts
+//! (this module is an initiator only; a Quick Mode the gateway starts is
+//! `ikev1::responder`'s, [`crate::ikev1::answer_quick`]); rekey the
 //! ISAKMP SA; or count what an SA protects (a Phase-2 lifetime in kilobytes the
 //! gateway states is handed over as [`Established::p2_lifetime_kilobytes`] for
 //! the caller, which runs the data plane, to count -- see `quick`'s "SA
@@ -58,7 +59,8 @@
 //! while it waits: once `connect` has returned nothing looks there. Quick
 //! Mode's third message, sent by `connect` or by a rekey, is
 //! sent again only when the caller next reads the socket
-//! (`informational::peek`, `probe`, the next rekey), since nothing runs in the
+//! (`informational::peek`, `probe`, `serve_turn` while the exchange table is
+//! on, the next rekey), since nothing runs in the
 //! background: a gateway whose Quick Mode message 2 is answered by nothing waits
 //! until then.
 

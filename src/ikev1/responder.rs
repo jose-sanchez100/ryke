@@ -174,7 +174,7 @@ pub struct QuickExpectations<'a> {
     /// pending and retired SAs of both families, the SPIs ESP is sent to: a proposal naming one is not answered.
     pub peer_spis_in_use: &'a [u32],
     /// Every SPI this side chose for its inbound side of those SAs: the SPI drawn for a new one is none of them
-    /// (nor one of the gateway's).
+    /// (nor one of the gateway's), and a proposal naming one is not answered ([`Silence::InvalidSpi`]).
     pub local_spis_in_use: &'a [u32],
     /// The caller's clock now: when the keys of an accepted SA are derived ([`HeldQuick::t_held`]). Everything
     /// the exchange table records is stamped by the table's own clock.
@@ -200,7 +200,8 @@ pub enum Silence {
     /// one message 2 per message 1, never a second with another SPI, nonce or keys (owner point 3). The answer
     /// held first is the only one; a copy of the message is answered with it. Also an exchange of the message
     /// the responder saw end for good -- proven, abandoned, cancelled -- when the ledger no longer holds it (a
-    /// record that gave way): a message 2 that left is never replaced (D9). Nothing changed, nothing drawn.
+    /// record that gave way): a message 2 that left is not replaced (D9) while the responder's cache remembers that
+    /// end, its entry or one of its last `ENDS_REMEMBERED` (8) ends. Nothing changed, nothing drawn.
     AlreadyAnswered,
     /// A copy with the Commit bit set of a message whose exchange the ledger holds in progress -- read as a
     /// copy without the bit, answered or about to be. The fact is remembered by the exchange table, so that the
@@ -222,10 +223,19 @@ pub enum Silence {
     Deferred(DeferReason),
     /// One of this side's own messages 1 sent back to it: its IDci is this side's selector and its IDcr the
     /// gateway's, as in an offer of ours, never in one of the gateway's. The ledger ends the exchange as refused.
+    /// Told only for a family whose two selectors differ: when they are the same -- both 0.0.0.0/0, as a full tunnel's
+    /// IPv4 selectors are when Mode-Config assigned no address -- the identities of an offer of ours are those of a
+    /// gateway's. Such an offer sent back is then caught only while the ledger still holds its Message ID as ours, or
+    /// while its SPI is one of this side's inbound SPIs still held ([`Silence::InvalidSpi`]); beyond both it is read
+    /// as a gateway's message 1, as an old one replayed is (a limit, not a promise): answered, and abandoned with no
+    /// proof, the gateway never having installed what it answers.
     Reflection,
     /// The SPI the gateway proposes for its inbound side is 0, one of 1 to 255, or that of an SA of the tunnel
     /// still held ([`QuickExpectations::peer_spis_in_use`]) (POLICY): installing it would collide with what the
-    /// tunnel holds, and a gateway that rekeys never names one. The ledger ends the exchange as refused.
+    /// tunnel holds, and a gateway that rekeys never names one. Also one of this side's own inbound SPIs of an SA
+    /// still held ([`QuickExpectations::local_spis_in_use`]): an offer of this side's sent back, caught here even when
+    /// [`Silence::Reflection`] cannot tell it (POLICY: a gateway's own SPI is that only by a chance of about one in
+    /// 2^32 per SPI held). The ledger ends the exchange as refused.
     InvalidSpi,
     /// The message was to be refused with the Notify named, but the exchange table's budget of refusals is spent
     /// (POLICY: at most four a minute on an ISAKMP SA). The ledger ends the exchange as refused all the same,
@@ -833,7 +843,11 @@ pub(super) fn read_refused_copy(st: &Phase1State, header: &IsakmpHeader, message
 ///    [`RefusalNotify::InvalidIdInformation`]). Any other payload -- a NAT-OA (RFC 3947 §5.2: "SHOULD NOT" in
 ///    tunnel mode, not MUST NOT), a status or private Notify, a type this side does not know -- is passed over,
 ///    traced.
-/// 8. Our own offer sent back ([`Silence::Reflection`]), for any family the tunnel is configured for.
+/// 8. Our own offer sent back ([`Silence::Reflection`]), for any family the tunnel is configured for whose two
+///    selectors differ. When they are the same (both 0.0.0.0/0, say) the identities cannot tell it: an offer of ours
+///    sent back is then caught at step 10 while its SPI is one of this side's inbound SPIs still held, and beyond that
+///    -- once the ledger also let its Message ID go -- it is answered as a replayed gateway message 1 would be, its
+///    exchange abandoned with no proof (the limit [`Silence::Reflection`] states).
 /// 9. The family, by the types of IDci and IDcr, and one the tunnel is configured for
 ///    ([`RefusalNotify::InvalidIdInformation`]); then the family must be free ([`Silence::Deferred`]): holding a
 ///    current SA ([`ExpectedQuick::answerable`]), no other gateway Quick Mode of it held or answered (one at a time
@@ -842,7 +856,8 @@ pub(super) fn read_refused_copy(st: &Phase1State, header: &IsakmpHeader, message
 ///    family's slot ([`cache::DEFER_MAX`]).
 /// 10. The proposal: an SA payload that parses, with proposals and transforms in it (RFC 2408 §4.2,
 ///     [`RefusalNotify::BadProposalSyntax`]); the IPsec DOI and SIT_IDENTITY_ONLY; one proposal, for ESP, with a
-///     4-octet SPI; then the SPI ([`Silence::InvalidSpi`]); then a transform equal to the family's suite --
+///     4-octet SPI; then the SPI -- not 0 to 255, none of the gateway's SPIs held, none of this side's inbound ones
+///     ([`Silence::InvalidSpi`]); then a transform equal to the family's suite --
 ///     transform ID, key length, integrity algorithm, PFS group iff the family has one, encapsulation mode 3 iff
 ///     the ISAKMP SA floated else 1 (transport mode and anything else refused) -- whose lifetime pairs parse
 ///     (RFC 2407 §4.5, §4.5.2): the first such is taken, its Proposal # and Transform # kept (RFC 2408 §4.2:
@@ -1161,6 +1176,12 @@ fn check_offer<'a>(parts: Parts<'_, 'a>, expected: &QuickExpectations<'a>, float
     let peer_spi = u32::from_be_bytes(spi);
     if peer_spi <= SPI_RESERVED_MAX || expected.peer_spis_in_use.contains(&peer_spi) {
         return Err(Turn::Silent(Silence::InvalidSpi, "the SPI proposed is 0 to 255, or one of an SA the tunnel holds"));
+    }
+    // POLICY: the gateway chooses its SPI for its own inbound side, and names one of ours only by a chance of about one
+    // in 2^32 per SPI held; one of our inbound SPIs proposed is rather an offer of ours sent back, which step 8 cannot
+    // tell by the identities when both selectors are the same (both 0.0.0.0/0, say).
+    if expected.local_spis_in_use.contains(&peer_spi) {
+        return Err(Turn::Silent(Silence::InvalidSpi, "the SPI proposed is this side's own inbound SPI of an SA the tunnel holds: an offer of this side's sent back"));
     }
     // The ISAKMP SA's encapsulation, as for this side's own offers.
     let encap_mode = if floated { UDP_ENCAP_TUNNEL } else { ENCAP_TUNNEL };
@@ -2002,6 +2023,7 @@ mod tests {
             ("the SPI 255", || rekey_of(plain(), |q| q.proposal().spi = 255u32.to_be_bytes().to_vec()), Want::Silent(Silence::InvalidSpi)),
             ("the SPI 256", || rekey_of(plain(), |q| q.proposal().spi = 256u32.to_be_bytes().to_vec()), Want::Accepted),
             ("the SPI of an SA the tunnel holds", || rekey_of(plain(), |q| q.proposal().spi = 0x2222_0002u32.to_be_bytes().to_vec()), Want::Silent(Silence::InvalidSpi)),
+            ("this side's own inbound SPI of an SA the tunnel holds", || rekey_of(plain(), |q| q.proposal().spi = 0x3333_0003u32.to_be_bytes().to_vec()), Want::Silent(Silence::InvalidSpi)),
         ];
         let mut wrong = Vec::new();
         for (what, build, want) in cases {
@@ -2101,22 +2123,54 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
+    /// Both selectors 0.0.0.0/0, as a full tunnel's IPv4 selectors are when Mode-Config assigned no address.
+    pub(super) const ANY_V4: ([u8; 4], [u8; 4]) = ([0; 4], [0; 4]);
+
+    /// The SPI the first proposal of the message 1 `message` offers, read under `st`'s keys (the keys of a Quick Mode
+    /// message have no direction: either side reads the other's).
+    pub(super) fn offered_spi(st: &Phase1State, message: &[u8]) -> u32 {
+        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid_of(message), st.enc_block);
+        let (_header, payloads, _next) = phase2::decrypt_payloads(message, &st.enc_key, st.enc_block, &iv0).unwrap();
+        match subject_of(&payloads) {
+            RefusalSubject::Proposal { spi } => spi,
+            RefusalSubject::Message => panic!("a message 1 that offers no ESP SPI"),
+        }
+    }
+
     /// One of this side's own messages 1, sent back after the ledger forgot it was ours, is read as a gateway
     /// message 1 by the readers (nothing tells it apart before its identities are read) and is not answered:
     /// no Notify, nothing drawn, the exchange ended as refused -- for the IPv4 family held, and for the IPv6
-    /// family configured with no current SA, which an offer of ours was to make (listed, not answerable).
+    /// family configured with no current SA, which an offer of ours was to make (listed, not answerable), both told
+    /// by their identities; and for an IPv4 family whose two selectors are the same, which its identities cannot
+    /// tell, by its SPI, still one of this side's inbound SPIs held. Once that SPI is held no more, that last one is
+    /// answered: the limit `our_own_message_1_sent_back_with_both_selectors_the_same_is_answered_once_its_spi_is_held_no_more` pins.
     #[test]
     fn our_own_message_1_sent_back_after_the_ledger_forgot_it_is_not_answered() {
-        let rows: [(&str, bool); 2] = [("IPv4, the family held", false), ("IPv6, configured with no current SA", true)];
-        for (what, ipv6) in rows {
+        #[derive(Clone, Copy, Debug)]
+        enum Family {
+            V4,
+            V6NotReady,
+            V4BothAny,
+        }
+        let rows: [(&str, Family, Silence); 3] = [
+            ("IPv4, the family held", Family::V4, Silence::Reflection),
+            ("IPv6, configured with no current SA", Family::V6NotReady, Silence::Reflection),
+            ("IPv4, both selectors 0.0.0.0/0, its SPI one of ours still held", Family::V4BothAny, Silence::InvalidSpi),
+        ];
+        for (what, family, want) in rows {
             let (client, _gateway, clock) = pair(false);
-            let (tunnel, made) = if ipv6 {
-                (Tunnel::of(vec![plain(), v6(GCM, None).answerable(false)]), quick::initiate_quick_ipv6(&client, &mut SeedEntropy::new(0x5500), GCM, ours_v6(), gateways_v6(), None, 3600))
-            } else {
-                (Tunnel::of(vec![plain()]), quick::initiate_quick_with_pfs(&client, &mut SeedEntropy::new(0x5500), GCM, OURS_V4, GATEWAYS_V4, None, 3600))
+            let mut e = SeedEntropy::new(0x5500);
+            let (mut tunnel, made) = match family {
+                Family::V6NotReady => (Tunnel::of(vec![plain(), v6(GCM, None).answerable(false)]), quick::initiate_quick_ipv6(&client, &mut e, GCM, ours_v6(), gateways_v6(), None, 3600)),
+                Family::V4 => (Tunnel::of(vec![plain()]), quick::initiate_quick_with_pfs(&client, &mut e, GCM, OURS_V4, GATEWAYS_V4, None, 3600)),
+                Family::V4BothAny => (Tunnel::of(vec![ExpectedQuick::ipv4(GCM, None, ANY_V4, ANY_V4, None)]), quick::initiate_quick_with_pfs(&client, &mut e, GCM, ANY_V4, ANY_V4, None, 3600)),
             };
             let (ours, _qi) = made.unwrap();
             let msgid = msgid_of(&ours);
+            if matches!(family, Family::V4BothAny) {
+                // Our offer made the SA the tunnel holds now: its SPI is our inbound one.
+                tunnel.local_spis.push(offered_spi(&client, &ours));
+            }
             assert_eq!(client.exchanges.id_record(msgid).map(|record| record.origin), Some(Origin::Local), "{what}");
             assert_eq!(table::classify(&client, &ours, None), Classified::RouteToOwn { msgid, message: ours.clone() }, "{what}: while ours is in progress");
             clock.advance(Duration::from_secs(21));
@@ -2128,7 +2182,7 @@ mod tests {
             let quick = kept(&client, &ours);
             let mut entropy = Counting::new(0x5501);
             let verdict = answer_quick(&client, &mut entropy, &tunnel.expect(now), &quick);
-            assert!(matches!(verdict, QuickVerdict::Silent(Silence::Reflection)), "{what}: {verdict:?}");
+            assert!(matches!(verdict, QuickVerdict::Silent(got) if got == want), "{what}: {verdict:?}");
             assert_eq!(entropy.fills, 0, "{what}");
             assert_eq!(client.exchanges.id_record(msgid).map(|record| record.state), Some(MidState::Refused), "{what}");
             assert!(client.exchanges.kept_refusal(msgid, &quick.fingerprint, false).is_none(), "{what}");

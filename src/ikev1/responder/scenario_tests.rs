@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use super::cache::{
     DeferReason, EndReason, IllegalTransition, Outcome, PendingResponder, Proof, ResponderEvents, ResponderId, ResponderState, Transition, ANSWERED_FOR, ANSWER_SPACING,
-    DEFER_MAX, LAST_BLOCK_COVERED_MIN, PARKED_FOR, PEER_QM_HOLD_MAX, RESP_RETAIN,
+    DEFER_MAX, ENDS_REMEMBERED, LAST_BLOCK_COVERED_MIN, PARKED_FOR, PEER_QM_HOLD_MAX, RESP_RETAIN,
 };
-use super::tests::{accepted, gateways_v6, kept, msgid_of, on_the_wire, ours_v6, pair, plain, refused, v6, Counting, Qm1, Tunnel, GATEWAYS_V4, GCM, OURS_V4};
+use super::tests::{accepted, gateways_v6, kept, msgid_of, offered_spi, on_the_wire, ours_v6, pair, plain, refused, v6, Counting, Qm1, Tunnel, ANY_V4, GATEWAYS_V4, GCM, OURS_V4};
 use super::*;
 use crate::entropy::SeedEntropy;
 use crate::ikev1::exchange::{self as table, Attribution, Classified, ErrorNotice, ExchangeTable, Ignored, Message3, PeerSpi, ResponderDrop, REFUSAL_RESEND_SPACING};
@@ -218,6 +218,15 @@ impl World {
     fn state(&self, msgid: u32) -> Option<MidState> {
         self.client.exchanges.sweep(self.clock.now());
         self.client.exchanges.id_record(msgid).map(|record| record.state)
+    }
+
+    /// The ledger made to forget every record not in progress, ours first: as many Informationals of the gateway's
+    /// as it holds records, at the clock's time, under even ids (every Quick Mode here has an odd one).
+    fn crowd_out_the_ledger(&self) {
+        let now = self.clock.now();
+        for n in 1..=MID_CAP as u32 {
+            self.client.exchanges.record_authenticated(2 * n, MidKind::Informational, [7; 32], now, now);
+        }
     }
 }
 
@@ -759,20 +768,20 @@ fn an_answer_parked_and_given_anew_is_never_touched_through_the_first_one() {
     assert_eq!(w.client.conclude_responder(current, Outcome::Proven(Proof::Qm3)), Ok(ResponderState::Proven(Proof::Qm3)));
 }
 
-/// An exchange the responder saw end for good is never answered anew, even once the ledger and the nonce memory
-/// forgot it and a copy of its message 1 is read as a new message: nothing is drawn, no other SPI, nonce or keys.
+/// An exchange the responder saw end for good is not answered anew while the responder's cache remembers its end,
+/// even once the ledger and the nonce memory forgot it and a copy of its message 1 is read as a new message: nothing
+/// is drawn, no other SPI, nonce or keys. That end is the last of the three bounded memories that hold the exchange
+/// (the ledger record, the family's last [`NI_KEPT`] nonces, the last [`ENDS_REMEMBERED`] ends): past all three, the
+/// message is answered anew (`a_message_whose_exchange_ended_is_answered_anew_once_its_end_is_forgotten_too`).
 #[test]
-fn a_message_whose_exchange_ended_is_not_answered_anew_once_the_ledger_forgot_it() {
+fn a_message_whose_exchange_ended_is_not_answered_anew_while_its_end_is_remembered() {
     let w = World::new(false);
     let (qm1, _) = w.rekey(Primary, 0xC400);
     let held = w.hold(&qm1);
     let (msgid, id) = (held.msgid(), held.id());
     w.release(held);
     w.client.conclude_responder(id, Outcome::Abandoned(EndReason::NoProof)).unwrap();
-    let now = w.clock.now();
-    for n in 1..=MID_CAP as u32 {
-        w.client.exchanges.record_authenticated(2 * n, MidKind::Informational, [7; 32], now, now);
-    }
+    w.crowd_out_the_ledger();
     for n in 0..NI_KEPT {
         w.client.exchanges.remember_ni(Primary, &[n as u8; 16]);
     }
@@ -785,6 +794,71 @@ fn a_message_whose_exchange_ended_is_not_answered_anew_once_the_ledger_forgot_it
     assert!(matches!(verdict, QuickVerdict::Silent(Silence::AlreadyAnswered)), "{verdict:?}");
     assert_eq!(entropy.fills, 0, "nothing drawn");
     assert_eq!((w.client.responder_state(msgid), w.client.responder_pending(Primary)), (Some(ResponderState::Abandoned(EndReason::NoProof)), None));
+}
+
+/// The limit of those memories (docs sections 7 and 8.4): once [`ENDS_REMEMBERED`] more exchanges ended after it --
+/// and the ledger and the nonce memory forgot it too --, the message 1 of an exchange that ended, replayed, is read as
+/// a new message and answered anew: another SPI and nonce, its family's exchange pending. Released, nothing the
+/// gateway sends proves it, and the caller abandons it with no proof; the family is free again.
+#[test]
+fn a_message_whose_exchange_ended_is_answered_anew_once_its_end_is_forgotten_too() {
+    let w = World::new(false);
+    let (qm1, _) = w.rekey(Primary, 0xC400);
+    let held = w.hold(&qm1);
+    let (msgid, id, first_spi, first_nr) = (held.msgid(), held.id(), held.local_spi(), held.nr().to_vec());
+    w.release(held);
+    w.client.conclude_responder(id, Outcome::Abandoned(EndReason::NoProof)).unwrap();
+    for n in 0..ENDS_REMEMBERED as u64 {
+        w.advance(ACCEPT_SPACING);
+        let later = w.hold(&w.rekey(Primary, 0xC410 + n).0);
+        assert_eq!(w.client.responder_state(msgid), Some(ResponderState::Abandoned(EndReason::NoProof)), "{n} ends later: still remembered");
+        w.client.conclude_responder(later.id(), Outcome::Cancelled(EndReason::NotInstalled)).unwrap();
+    }
+    assert_eq!(w.client.responder_state(msgid), None, "its end forgotten");
+    w.crowd_out_the_ledger();
+    for n in 0..NI_KEPT {
+        w.client.exchanges.remember_ni(Primary, &[n as u8; 16]);
+    }
+    assert_eq!(w.client.exchanges.id_record(msgid), None, "the ledger forgot it");
+    w.advance(ACCEPT_SPACING);
+    assert_eq!(w.read(&qm1), Classified::PeerQuick { msgid }, "read as a new message 1");
+    let [entry] = <[PeerQuick; 1]>::try_from(w.client.take_peer_quick_modes()).expect("one entry");
+    let again = accepted(w.answer(&entry));
+    assert!(again.local_spi() != first_spi && again.nr() != first_nr.as_slice(), "answered anew: another SPI and nonce");
+    let again_id = again.id();
+    assert_eq!(w.client.responder_pending(Primary).map(|pending| pending.msgid), Some(msgid), "its family's exchange pending");
+    w.release(again);
+    w.advance(PEER_QM_PROOF_WAIT);
+    assert_eq!(w.client.take_responder_events(Primary), Some(no_events(msgid)), "nothing proves it");
+    assert_eq!(w.client.conclude_responder(again_id, Outcome::Abandoned(EndReason::NoProof)), Ok(ResponderState::Abandoned(EndReason::NoProof)));
+    assert_eq!(w.client.responder_pending(Primary), None, "the family free again");
+}
+
+/// The limit of the guard of an offer of ours sent back by its SPI (docs section 7): for a family whose two selectors
+/// are the same -- both 0.0.0.0/0 -- one of this side's own messages 1 sent back once the ledger forgot it was ours,
+/// its SPI no SA's this side holds any more, cannot be told from a gateway's message 1 replayed: it is answered, its
+/// SPI taken as the gateway's and another SPI and nonce drawn for this side, and, released, nothing proves it -- the
+/// gateway never installed what it answers --, so the caller abandons it with no proof. While its SPI is still held
+/// it is not answered (`our_own_message_1_sent_back_after_the_ledger_forgot_it_is_not_answered`).
+#[test]
+fn our_own_message_1_sent_back_with_both_selectors_the_same_is_answered_once_its_spi_is_held_no_more() {
+    let mut w = World::new(false);
+    w.tunnel = Tunnel::of(vec![ExpectedQuick::ipv4(GCM, None, ANY_V4, ANY_V4, None)]);
+    let (ours, _qi) = quick::initiate_quick_with_pfs(&w.client, &mut SeedEntropy::new(0xC500), GCM, ANY_V4, ANY_V4, None, 3600).unwrap();
+    let (msgid, spi) = (msgid_of(&ours), offered_spi(&w.client, &ours));
+    assert!(!w.tunnel.local_spis.contains(&spi) && !w.tunnel.peer_spis.contains(&spi), "its SPI held no more");
+    w.advance(Duration::from_secs(21));
+    w.crowd_out_the_ledger();
+    assert_eq!(w.client.exchanges.id_record(msgid), None, "the ledger forgot it was ours");
+    let held = w.hold(&ours);
+    assert_eq!((held.family(), held.peer_spi()), (Primary, spi), "answered as a gateway's: its own SPI taken as the gateway's");
+    assert_ne!(held.local_spi(), spi);
+    let id = held.id();
+    w.release(held);
+    w.advance(PEER_QM_PROOF_WAIT);
+    assert_eq!(w.client.take_responder_events(Primary), Some(no_events(msgid)), "nothing proves it");
+    assert_eq!(w.client.conclude_responder(id, Outcome::Abandoned(EndReason::NoProof)), Ok(ResponderState::Abandoned(EndReason::NoProof)));
+    assert_eq!(w.client.responder_pending(Primary), None);
 }
 
 /// A message 2 that left is never answered anew: once released, the entry handed to the responder again is the

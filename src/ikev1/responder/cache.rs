@@ -12,7 +12,12 @@
 //!
 //! A hold is legal only for a message never held here, or parked; held, answered, proven, abandoned or cancelled, it
 //! is never held again: it is answered already or its exchange ended for good (DESIGN 8.7: once a message 2 left, its
-//! Message ID is burned for new answers, and after an abandon its copies get silence).
+//! Message ID is burned for new answers, and after an abandon its copies get silence). The burn lasts as long as one
+//! of three bounded memories still holds the exchange: its record in the Message-ID ledger (the newest `MID_CAP` =
+//! 4096 records), its nonce among the family's last `NI_KEPT` = 16 gateway nonces, or its entry here or its end among
+//! the last [`ENDS_REMEMBERED`] = 8 ends. A message 1 replayed once all three let it go is read as a new one and may be
+//! answered anew -- held, then abandoned with no proof, as nothing of the gateway's answers it: a limit, not a promise
+//! (`docs/ikev1-gateway-quick-mode.md`, section 7).
 //!
 //! **Held**: message 2 built and the keys derived, nothing sent, for at most [`PEER_QM_HOLD_MAX`]: then it is
 //! parked, by the ledger at the same instant ([`super::super::msgid::AtDeadline::Park`]). **Answered**: message 2
@@ -110,8 +115,9 @@ pub(crate) const CACHE_ENTRIES: usize = 4;
 /// The most octets the entries of the cache hold together (POLICY): a message 2 is a few hundred octets.
 pub(crate) const CACHE_BYTES: usize = 16 * 1024;
 
-/// How many ended exchanges the cache remembers the end of, for a caller that asks about one after the fact.
-const ENDS_REMEMBERED: usize = 8;
+/// How many ended exchanges the cache remembers the end of, for a caller that asks about one after the fact -- and
+/// so that a message 1 whose exchange ended is not held again (one of the bounds of the module doc).
+pub(crate) const ENDS_REMEMBERED: usize = 8;
 
 /// Where a gateway Quick Mode this side answers stands (DESIGN 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -16,6 +16,7 @@
 //! RFC. See `quick.rs`'s "SA lifetimes" section.
 
 use super::crypto1::{self, Prf, AES_BLOCK};
+use super::exchange::ExchangeTable;
 use super::isakmp::{self, exchange, payload, IsakmpHeader};
 use super::phase2;
 use super::rtt::RoundTrips;
@@ -316,6 +317,12 @@ pub struct Phase1State {
     /// [`Phase1State::resume`], which has measured nothing.
     #[zeroize(skip)]
     pub(crate) rtt: RoundTrips,
+    /// What this ISAKMP SA keeps of the exchanges that are not its client's own -- the peer's
+    /// Deletes so far (see [`ExchangeTable`]). Passive in every state this module builds, and a
+    /// passive table changes nothing about how the state is read; [`Self::enable_gateway_quick_mode`]
+    /// turns it on. Shared by every clone, so turning it on through one turns it on for all.
+    #[zeroize(skip)]
+    pub(crate) exchanges: ExchangeTable,
 }
 
 /// The final message of an exchange -- Aggressive Mode message 3, the XAUTH
@@ -810,6 +817,7 @@ pub fn respond_aggressive(
         negotiated_lifetime_secs: initiator_offered_lifetime,
         finals: RetainedFinals::default(),
         rtt: RoundTrips::default(),
+        exchanges: ExchangeTable::passive(),
     };
     Ok((msg2, state))
 }
@@ -856,7 +864,17 @@ impl Phase1State {
             negotiated_lifetime_secs: 0,
             finals: RetainedFinals::default(),
             rtt: RoundTrips::default(),
+            exchanges: ExchangeTable::passive(),
         }
+    }
+
+    /// Turns on the exchange table of this ISAKMP SA, which every state starts with passive.
+    /// Whatever a reader of the socket does with the table it does only once the table is on, so a
+    /// caller that never calls this gets the behaviour the state had before the table existed.
+    /// Every clone of this state shares the switch (a copy made before the call sees it), and
+    /// there is no turning it off again.
+    pub fn enable_gateway_quick_mode(&self) {
+        self.exchanges.enable();
     }
 
     /// Verify the initiator's `HASH_I` from Aggressive-Mode message 3
@@ -1206,6 +1224,7 @@ impl AggressiveInitiator {
             negotiated_lifetime_secs,
             finals: RetainedFinals::default(),
             rtt: RoundTrips::default(),
+            exchanges: ExchangeTable::passive(),
         };
         Ok((msg3, state))
     }
@@ -1662,6 +1681,7 @@ impl MainIdSent {
             negotiated_lifetime_secs: self.negotiated_p1_lifetime_secs,
             finals: RetainedFinals::default(),
             rtt: RoundTrips::default(),
+            exchanges: ExchangeTable::passive(),
         };
         match verify {
             Ok(()) => Ok(state),
@@ -1950,6 +1970,7 @@ impl MainRespKeSent {
             negotiated_lifetime_secs: self.initiator_offered_lifetime,
             finals: RetainedFinals::default(),
             rtt: RoundTrips::default(),
+            exchanges: ExchangeTable::passive(),
         };
         Ok((msg6, state))
     }
@@ -1987,6 +2008,7 @@ mod tests {
             negotiated_lifetime_secs: 28800,
             finals: RetainedFinals::default(),
             rtt: RoundTrips::default(),
+            exchanges: ExchangeTable::passive(),
         };
         zeroize::Zeroize::zeroize(&mut state);
         assert!(state.skeyid.is_empty());
@@ -2204,6 +2226,52 @@ mod tests {
         match &auth {
             Ikev1LocalAuth::Psk(psk) => assert!(psk.is_empty(), "PSK was not wiped"),
             Ikev1LocalAuth::Sig { .. } => unreachable!(),
+        }
+    }
+
+    /// Every way this module makes a state -- both ends of an Aggressive Mode handshake and of a Main
+    /// Mode one, and `resume` -- starts with a passive exchange table of its own, so that a state
+    /// behaves as it did before the table existed until its caller turns it on.
+    #[test]
+    fn every_way_of_making_the_state_starts_with_a_passive_exchange_table_of_its_own() {
+        let psk = b"correct horse battery staple".to_vec();
+        let rcfg = Phase1Config {
+            local_auth: Ikev1LocalAuth::Psk(psk.clone()),
+            trusted_cas: Vec::new(),
+            now_unix: 0,
+            our_id: Id::ipv4([192, 168, 0, 1]),
+        };
+        let (ours, theirs): (SocketAddr, SocketAddr) = ("10.1.1.1:500".parse().unwrap(), "192.168.0.1:500".parse().unwrap());
+        let mut ie = SeedEntropy::new(0x5151);
+        let mut re = SeedEntropy::new(0x5252);
+
+        let aggressive = InitiatorConfig { mode: Ikev1ExchangeMode::Aggressive, ..main_mode_icfg(psk.clone()) };
+        let (msg1, initiator) = initiate_aggressive(&aggressive, &mut ie, ours, theirs);
+        let (msg2, aggressive_responder) = respond_aggressive(&rcfg, &msg1, &mut re, theirs, ours).unwrap();
+        let (_msg3, aggressive_initiator) = initiator.complete(&msg2, ours, theirs).unwrap();
+
+        let (msg1, sa_sent) = initiate_main(&main_mode_icfg(psk), &mut ie);
+        let (msg2, r1) = respond_main(&rcfg, &msg1, &mut re, theirs, ours).unwrap();
+        let (msg3, ke_sent) = sa_sent.complete_sa(&msg2, &mut ie, ours, theirs).unwrap();
+        let (msg4, r2) = r1.complete_ke(&msg3, &mut re).unwrap();
+        let (msg5, id_sent) = ke_sent.complete_ke(&msg4).unwrap();
+        let (msg6, main_responder) = r2.complete_id(&msg5).unwrap();
+        let main_initiator = id_sent.complete_id(&msg6, &mut ie).unwrap();
+
+        let resumed = Phase1State::resume(Prf::Sha256, DhGroup::Modp2048, [1; 8], [2; 8], vec![], vec![], vec![], vec![], AES_BLOCK, vec![]);
+        let states = [
+            ("Aggressive Mode responder", aggressive_responder),
+            ("Aggressive Mode initiator", aggressive_initiator),
+            ("Main Mode responder", main_responder),
+            ("Main Mode initiator", main_initiator),
+            ("resumed", resumed),
+        ];
+        for (how, st) in &states {
+            assert!(!st.exchanges.is_enabled(), "{how}: the table is not passive");
+        }
+        states[0].1.enable_gateway_quick_mode();
+        for (how, st) in &states {
+            assert_eq!(st.exchanges.is_enabled(), *how == "Aggressive Mode responder", "{how}: a table is shared with another state");
         }
     }
 

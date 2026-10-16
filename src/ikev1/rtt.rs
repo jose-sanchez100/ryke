@@ -150,6 +150,30 @@ impl RoundTrips {
         retransmit_plan(total, sends, self.estimator().rto(), self.floor)
     }
 
+    /// When the responder of a Quick Mode sends its message 2 again unasked, after it first went: the first time
+    /// the timer of this path -- the estimate, or with none the floor ([`MIN_RTO`]), never below the floor --, each
+    /// next one twice as long after the one before (RFC 2408 §5.1: "transmission timer values should be adjusted
+    /// dynamically based on measured round trip times" and "successive retransmissions of the same packet should be
+    /// separated by increasingly longer time intervals"), at most `at_most` of them, every one before `window` ends.
+    /// What it gives is measured nothing: the answer is a message 3 or ESP, which a gateway sends after work of its
+    /// own, so its time is no round trip.
+    pub(crate) fn responder_resends(&self, window: Duration, at_most: usize) -> Vec<Duration> {
+        let first = self.estimator().rto().unwrap_or(self.floor).max(self.floor);
+        let mut resends = Vec::new();
+        let (mut at, mut wait) = (Duration::ZERO, first);
+        while resends.len() < at_most {
+            match at.checked_add(wait) {
+                Some(next) if next < window && !wait.is_zero() => {
+                    resends.push(next);
+                    at = next;
+                    wait = wait.saturating_mul(2);
+                }
+                _ => break,
+            }
+        }
+        resends
+    }
+
     #[cfg(test)]
     pub(crate) fn with_floor(floor: Duration) -> Self {
         Self { floor, ..Self::default() }

@@ -1439,7 +1439,13 @@ pub fn rekey_child_ipv6_with_lifetime(
 /// Send `msg` to `peer`, wrapped with the non-ESP marker on port 4500 when
 /// `st` floated (RFC 3947/3948) -- the same rule `Client::send_step` applies.
 fn send_ike(sock: &dyn IkeSocket, st: &Phase1State, peer: SocketAddr, msg: &[u8]) -> std::io::Result<()> {
-    if st.floated {
+    send_framed(sock, st.floated, peer, msg)
+}
+
+/// [`send_ike`] for an ISAKMP SA that `floated` or not: what a sender that keeps the flag rather than the
+/// state sends a Quick Mode message with (the responder's resends of its message 2).
+pub(super) fn send_framed(sock: &dyn IkeSocket, floated: bool, peer: SocketAddr, msg: &[u8]) -> std::io::Result<()> {
+    if floated {
         let dest = SocketAddr::new(peer.ip(), crate::natt_port());
         let wire = wrap_ike_4500(msg);
         crate::debug::dump(">>>", dest, &wire);

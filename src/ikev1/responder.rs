@@ -14,6 +14,16 @@
 //!
 //! It never touches the socket, never starts an exchange of its own and never acts on a passive table.
 //!
+//! **After the answer.** An accepted exchange is held by the responder's cache ([`cache`]) until the caller
+//! sends its message 2 ([`HeldQuick::release`], then [`AnsweredQuick`]) or gives it up; the caller -- which
+//! hears the daemon -- ends it ([`Phase1State::conclude_responder`]), and nothing here decides a proof. Meanwhile
+//! every reader of the socket reads a Quick Mode message under its Message ID as that exchange's
+//! ([`read_under_responder`]): a copy of its message 1 is answered with the message 2 sent -- the same
+//! plaintext under the copy's own last cipher block when that block is another one, never a new SPI, nonce or
+//! key --, its message 3 is checked by HASH(3) and recorded, and what the gateway says of it is recorded for
+//! the caller ([`Phase1State::take_responder_events`]). A message 1 whose family is not free waits in that
+//! family's slot ([`Silence::Deferred`]).
+//!
 //! **Secrets.** The Quick Mode Diffie-Hellman private key and the shared secret `g(qm)^xy` live in
 //! zeroizing buffers that are wiped as soon as KEYMAT is derived, before [`answer_quick`] returns (RFC 2409
 //! §5.5: the exponential "is irretreivably removed from the current state"); the KEYMAT of both directions is
@@ -22,13 +32,16 @@
 //! takes the [`Phase1State`]. No `Debug` here prints key material or nonces.
 
 use std::fmt;
-use std::net::Ipv6Addr;
-use std::time::Instant;
+use std::net::{Ipv6Addr, SocketAddr};
+use std::time::{Duration, Instant};
 
 use zeroize::{Zeroize, Zeroizing};
 
 use super::crypto1;
-use super::exchange::{KeptRefusal, PeerQuick, RepeatRefusal, REFUSALS_PER_WINDOW, REFUSAL_RESEND_SPACING, REFUSAL_WINDOW};
+use super::exchange::{
+    AnswerAgain, Classified, Deferral, ExchangeTable, Ignored, KeptRefusal, PeerQuick, RepeatRefusal, ResponderDrop, REFUSALS_PER_WINDOW, REFUSAL_RESEND_SPACING,
+    REFUSAL_WINDOW,
+};
 use super::informational::{self, ChildFamily, RefusalNotify, RefusalSubject};
 use super::isakmp::{self, exchange, flags, payload, IsakmpHeader, Payload};
 use super::msgid::{self, MidEnd, MidKind, MidRecord, MidState, Origin};
@@ -44,6 +57,13 @@ use crate::debug::ike_debug;
 use crate::entropy::Entropy;
 use crate::error::IkeError;
 use crate::ikev2::sk::SkCipher;
+use crate::transport::IkeSocket;
+
+pub(super) mod cache;
+#[cfg(test)]
+mod scenario_tests;
+
+use cache::{DeferReason, HoldRefused, Retained, ResponderEntry, ResponderId, ResponderState, Variant, PARKED_FOR, PEER_QM_PROOF_WAIT, QM2_RESENDS, QM2_VARIANTS};
 
 /// RFC 2407 §4.6.2.1: ID_IPV4_ADDR_RANGE, a selector this side never accepts.
 const ID_IPV4_ADDR_RANGE: u8 = 7;
@@ -120,8 +140,8 @@ impl ExpectedQuick {
     /// The same family, `answerable` or not: whether it holds a current SA a gateway Quick Mode can renew now
     /// (DESIGN 4.5's `family_has_current_sa`). A family configured but without one -- its SA ended and not made
     /// again yet, or being made by an exchange of ours -- is listed all the same, not answerable: a gateway
-    /// message 1 for it is then a passing silence ([`Silence::FamilyNotReady`]), never a refusal that would tell
-    /// the gateway its offer is incompatible (D7, D9).
+    /// message 1 for it then waits for the family ([`Silence::Deferred`] with [`DeferReason::NotReady`]), never a
+    /// refusal that would tell the gateway its offer is incompatible (D7, D9).
     pub fn answerable(mut self, answerable: bool) -> Self {
         self.answerable = answerable;
         self
@@ -177,7 +197,9 @@ pub enum Silence {
     NotInProgress,
     /// The message was answered already, in the exchange the ledger still holds in progress: this side gives
     /// one message 2 per message 1, never a second with another SPI, nonce or keys (owner point 3). The answer
-    /// held first is the only one; a copy of the message is answered with it. Nothing changed.
+    /// held first is the only one; a copy of the message is answered with it. Also an exchange of the message
+    /// the responder saw end for good -- proven, abandoned, cancelled -- when the ledger no longer holds it (a
+    /// record that gave way): a message 2 that left is never replaced (D9). Nothing changed, nothing drawn.
     AlreadyAnswered,
     /// A copy with the Commit bit set of a message whose exchange the ledger holds in progress -- read as a
     /// copy without the bit, answered or about to be. The fact is remembered by the exchange table, so that the
@@ -188,10 +210,15 @@ pub enum Silence {
     /// was last handed out (POLICY): the refusal is not sent again so soon, so that a copy replayed at line rate
     /// does not get one Informational per datagram. Nothing changed; a copy read later gets the refusal again.
     RepeatTooSoon,
-    /// A family the tunnel is configured for but holds no current SA of now ([`ExpectedQuick::answerable`]):
-    /// a passing state, not an incompatible offer (D7, D9). The ledger is left as it was: the exchange stays in
-    /// progress until its deadline, and nothing was drawn.
-    FamilyNotReady,
+    /// The message's family is not free now, for the reason named: it holds no current SA to renew
+    /// ([`ExpectedQuick::answerable`]), another gateway Quick Mode of it is held or answered, the spacing after the
+    /// last one has not passed, or the responder's cache is full of exchanges in progress -- passing states, not an
+    /// incompatible offer (D7, D8, D9). The message waits in its family's slot, the latest read winning, at most
+    /// [`cache::DEFER_MAX`] from its read, and is offered again ([`Phase1State::take_peer_quick_modes`]) once the
+    /// table no longer keeps the family; the ledger keeps the exchange in progress meanwhile, and parks it if it
+    /// waited its time (nothing sent, D9). Nothing was drawn, unless the cache was found full only once message 2
+    /// was built.
+    Deferred(DeferReason),
     /// One of this side's own messages 1 sent back to it: its IDci is this side's selector and its IDcr the
     /// gateway's, as in an offer of ours, never in one of the gateway's. The ledger ends the exchange as refused.
     Reflection,
@@ -204,10 +231,12 @@ pub enum Silence {
     /// unless the copy refused had the Commit bit set, which the ledger never recorded.
     RateLimited(RefusalNotify),
     /// No inbound SPI of ours could be drawn that the tunnel does not hold already: entropy that is broken. A
-    /// passing failure, before anything was sent: the ledger is left as it was.
+    /// passing failure, before anything was sent: the ledger parks the exchange (D9), so that a copy of its
+    /// message 1 the gateway sends again may be answered, twice at most in all.
     NoFreeSpi,
     /// The answer or the refusal could not be built (an error of the encryption underneath, never something the
-    /// peer chose). A passing failure: the ledger is left as it was, but for a refusal, which it ends all the same.
+    /// peer chose). A passing failure: the ledger parks the exchange as for [`Silence::NoFreeSpi`], but for a
+    /// refusal, which it ends all the same.
     NotBuilt,
 }
 
@@ -251,9 +280,12 @@ impl fmt::Debug for Refusal {
 /// What [`answer_quick`] made of one gateway message 1.
 #[derive(Debug)]
 pub enum QuickVerdict {
-    /// Accepted: message 2 built and the keys derived, nothing sent and nothing installed. The caller installs the
-    /// new SA beside the one it replaces, then sends [`HeldQuick::qm2`]; if it does neither, it drops the
-    /// [`HeldQuick`] and the gateway, unanswered, sends its message 1 again or lets the exchange go.
+    /// Accepted: message 2 built and the keys derived, nothing sent and nothing installed; the exchange is held
+    /// ([`ResponderState::Held`]). The caller installs the new SA beside the one it replaces, then sends message 2
+    /// ([`HeldQuick::release`]); if it does neither, it parks the exchange ([`Phase1State::park_responder`] with
+    /// [`HeldQuick::id`]) or lets
+    /// the hold run out ([`cache::PEER_QM_HOLD_MAX`]), and the gateway, unanswered, sends its message 1 again or lets
+    /// the exchange go.
     Accept(Box<HeldQuick>),
     /// Refused: the caller sends [`Refusal::datagram`]. The ledger holds the exchange as refused, except for
     /// INVALID-FLAGS about a copy with the Commit bit, which the ledger never recorded: a copy without the bit
@@ -294,6 +326,9 @@ fn wipe(keys: &mut RekeyedChild) {
 /// over once.
 pub struct HeldQuick {
     msgid: u32,
+    /// Which hold of the message it is: [`ResponderId::unheld`] until [`answer_quick`] holds it, which it does
+    /// before handing it out.
+    id: ResponderId,
     family: ChildFamily,
     fingerprint: [u8; 32],
     peer_spi: u32,
@@ -316,6 +351,13 @@ impl HeldQuick {
     /// The Message ID of the exchange.
     pub fn msgid(&self) -> u32 {
         self.msgid
+    }
+
+    /// Which answer of this side's it is: what every move of the caller names ([`Phase1State::park_responder`],
+    /// [`Phase1State::conclude_responder`]). A message parked with nothing sent and answered again is another hold
+    /// with another id; this one then names nothing the responder holds.
+    pub fn id(&self) -> ResponderId {
+        self.id
     }
 
     /// The family of the SA it renews.
@@ -410,7 +452,8 @@ impl HeldQuick {
     /// -- refused, refused in silence for the budget, or never kept -- or while the entry waited. RFC 2408 §3.1
     /// then has this side wait for the gateway's CONNECTED Notify before it sends encrypted traffic, which this
     /// side does not support: an SA so answered is never to be used. A copy with the bit read after the answer
-    /// was given is not reflected here; the exchange table remembers it all the same.
+    /// was given is not reflected here: the readers record it on the exchange, and the caller takes it with the other
+    /// facts ([`Phase1State::take_responder_events`]).
     pub fn commit_seen(&self) -> bool {
         self.commit_seen
     }
@@ -419,7 +462,7 @@ impl HeldQuick {
 impl fmt::Debug for HeldQuick {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HeldQuick")
-            .field("msgid", &format_args!("{:08x}", self.msgid))
+            .field("id", &self.id)
             .field("family", &self.family)
             .field("peer_spi", &format_args!("{:08x}", self.peer_spi))
             .field("local_spi", &format_args!("{:08x}", self.local_spi))
@@ -433,14 +476,315 @@ impl fmt::Debug for HeldQuick {
     }
 }
 
+impl HeldQuick {
+    /// Sends message 2 to `peer` -- its exact bytes, with the non-ESP marker on port 4500 once the ISAKMP SA
+    /// floated -- once the caller installed the new SA beside the one it replaces (DESIGN 2, RELEASE), and moves the
+    /// exchange from held to answered ([`ResponderState::Answered`]): from now on the readers answer a copy of its
+    /// message 1 with it and check its message 3, and this side resends it unasked as [`AnsweredQuick`] plans.
+    /// `now` is the caller's clock, what the resends are planned from. Keys left in it ([`Self::take_keys`]) are
+    /// wiped.
+    ///
+    /// The exchange is answered before message 2 is sent, at one instant of the exchange table's clock: the hold bound cannot fall between the check that it is held and the
+    /// send, so a message 2 never leaves for an exchange the responder parked, and one that left is never followed
+    /// by a "not held". Refused, nothing sent, when the responder does not hold this answer
+    /// ([`ReleaseError::NotHeld`] with the state of this hold: its hold ran out and it was parked, it was cancelled,
+    /// or -- parked and answered anew since -- it is an earlier answer than the one held now, which it never touches).
+    /// A message 2 that could not be sent left nothing: the exchange is parked (D9: its message 1 may be answered
+    /// anew) and [`ReleaseError::NotSent`] says why -- unless a reader sent message 2 for a copy of message 1
+    /// meanwhile, which leaves the exchange answered, and released.
+    pub fn release(self, sock: &dyn IkeSocket, st: &Phase1State, peer: SocketAddr, now: Instant) -> Result<AnsweredQuick, ReleaseError> {
+        let (id, msgid) = (self.id, self.msgid);
+        if let Err(illegal) = st.exchanges.begin_release(id) {
+            ike_debug!("QUICK: gateway Quick Mode msgid={msgid:08x} not released: the responder holds this answer as {:?}", illegal.from);
+            return Err(ReleaseError::NotHeld(illegal.from));
+        }
+        if let Err(e) = quick::send_framed(sock, st.floated, peer, &self.qm2) {
+            match st.exchanges.release_failed(id) {
+                Ok(ResponderState::Answered) => {
+                    ike_debug!("QUICK: message 2 of gateway Quick Mode msgid={msgid:08x} could not be sent ({e}), but went for a copy of message 1 meanwhile -- answered");
+                }
+                Ok(_) => {
+                    ike_debug!("QUICK: message 2 of gateway Quick Mode msgid={msgid:08x} could not be sent ({e}) -- parked, nothing left");
+                    return Err(ReleaseError::NotSent(e.kind()));
+                }
+                Err(illegal) => {
+                    ike_debug!("QUICK: message 2 of gateway Quick Mode msgid={msgid:08x} could not be sent ({e}) -- {illegal}");
+                    return Err(ReleaseError::NotSent(e.kind()));
+                }
+            }
+        }
+        let resends = st.rtt.responder_resends(PEER_QM_PROOF_WAIT, QM2_RESENDS);
+        ike_debug!("QUICK: message 2 of gateway Quick Mode msgid={msgid:08x} sent to {peer} -- answered; resent unasked after {resends:?} unless it ends first");
+        Ok(AnsweredQuick {
+            id,
+            family: self.family,
+            local_spi: self.local_spi,
+            peer_spi: self.peer_spi,
+            sent_at: now,
+            resends,
+            done: 0,
+            table: st.exchanges.clone(),
+            floated: st.floated,
+        })
+    }
+}
+
+/// Why [`HeldQuick::release`] sent nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseError {
+    /// The responder does not hold this answer: the state of its hold now (`None` when it no longer knows it).
+    NotHeld(Option<ResponderState>),
+    /// Sending message 2 failed: nothing left, and the exchange is parked.
+    NotSent(std::io::ErrorKind),
+}
+
+/// A gateway Quick Mode whose message 2 this side sent ([`HeldQuick::release`]), and this side's own resends of it:
+/// RFC 2408 §5.1 has the transmitting entity set a timer and resend on its expiry, and "Implementations MUST NOT use
+/// a fixed timer. Instead, transmission timer values should be adjusted dynamically based on measured round trip
+/// times. In addition, successive retransmissions of the same packet should be separated by increasingly longer
+/// time intervals (e.g., exponential backoff)". The first resend comes the round-trip estimate of this ISAKMP SA
+/// after message 2 left ([`Phase1State`]'s, the one its own exchanges keep), at least a second (the floor of
+/// that estimate), each next one twice as long after the one before, at most two in all and every one
+/// inside [`PEER_QM_PROOF_WAIT`] (POLICY) -- with the floor that is one resend, two only on a path whose estimate
+/// lets both fit. No resend goes once the exchange is no longer answered (proven, abandoned, cancelled, past its
+/// time), nor within 200 ms of a message 2 the readers sent for a copy of message 1. A resend is the encryption of
+/// message 2 handed out last, byte for byte: the one the release sent, or the one a reader answered the latest copy
+/// of message 1 with, under that copy's last cipher block (POLICY: the gateway reads a message 2 only under the last
+/// block of the message 1 it sent, and the copy answered last is the best sign of which that is).
+pub struct AnsweredQuick {
+    id: ResponderId,
+    family: ChildFamily,
+    local_spi: u32,
+    peer_spi: u32,
+    sent_at: Instant,
+    /// When each resend is due, after `sent_at`.
+    resends: Vec<Duration>,
+    /// How many of `resends` are past.
+    done: usize,
+    table: ExchangeTable,
+    floated: bool,
+}
+
+impl AnsweredQuick {
+    /// The Message ID of the exchange.
+    pub fn msgid(&self) -> u32 {
+        self.id.msgid()
+    }
+
+    /// Which answer of this side's it is ([`HeldQuick::id`]).
+    pub fn id(&self) -> ResponderId {
+        self.id
+    }
+
+    /// The family of the SA it renews.
+    pub fn family(&self) -> ChildFamily {
+        self.family
+    }
+
+    /// This side's inbound SPI of the new SA.
+    pub fn local_spi(&self) -> u32 {
+        self.local_spi
+    }
+
+    /// The gateway's: this side's outbound SPI of the new SA.
+    pub fn peer_spi(&self) -> u32 {
+        self.peer_spi
+    }
+
+    /// When message 2 left, by the caller's clock.
+    pub fn sent_at(&self) -> Instant {
+        self.sent_at
+    }
+
+    /// When the next resend of message 2 is due -- it may be `now` or past -- or `None` when no resend is left: all
+    /// went, `now` is past [`PEER_QM_PROOF_WAIT`] after message 2, or the exchange is no longer answered.
+    pub fn next_resend(&self, now: Instant) -> Option<Instant> {
+        if self.sent_at.checked_add(PEER_QM_PROOF_WAIT).is_some_and(|end| now >= end) || self.table.responder_state_of(self.id) != Some(ResponderState::Answered) {
+            return None;
+        }
+        self.resends.get(self.done).and_then(|after| self.sent_at.checked_add(*after))
+    }
+
+    /// Sends message 2 again to `peer` when a resend is due at `now` ([`Self::next_resend`]); `true` when it went.
+    /// Resends due since a call that came late count as one: none is made up for.
+    pub fn resend_due(&mut self, now: Instant, sock: &dyn IkeSocket, peer: SocketAddr) -> std::io::Result<bool> {
+        let Some(due) = self.next_resend(now) else { return Ok(false) };
+        if due > now {
+            return Ok(false);
+        }
+        let elapsed = now.saturating_duration_since(self.sent_at);
+        self.done = self.resends.iter().filter(|after| **after <= elapsed).count().max(self.done + 1);
+        let msgid = self.id.msgid();
+        let Some(message) = self.table.resend_answer(self.id) else {
+            ike_debug!("QUICK: message 2 of gateway Quick Mode msgid={msgid:08x} went less than 200 ms ago, or the exchange ended -- this resend is skipped");
+            return Ok(false);
+        };
+        ike_debug!("QUICK: no proof yet for gateway Quick Mode msgid={msgid:08x} -- message 2 sent again ({} of {} resends)", self.done, self.resends.len());
+        quick::send_framed(sock, self.floated, peer, &message)?;
+        Ok(true)
+    }
+}
+
+impl fmt::Debug for AnsweredQuick {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnsweredQuick")
+            .field("id", &self.id)
+            .field("family", &self.family)
+            .field("local_spi", &format_args!("{:08x}", self.local_spi))
+            .field("peer_spi", &format_args!("{:08x}", self.peer_spi))
+            .field("sent_at", &self.sent_at)
+            .field("resends", &self.resends)
+            .field("done", &self.done)
+            .finish()
+    }
+}
+
+/// A Quick Mode message `message` under the id of the responder's exchange `entry` (as the exchange table held it a
+/// moment ago), for [`super::exchange::classify`]: a copy of its message 1 or its message 3, never read with the
+/// checks of a new message 1. In order:
+/// - With its IV and HASH(1) (RFC 2409 §5.5, Appendix B) it authenticates as a message 1, a HASH and an SA first:
+///   a Commit bit on it is remembered of the message ([`ExchangeTable::note_commit`]); another fingerprint is another
+///   message under the id, dropped ([`ResponderDrop::OtherMessage`]); a copy with the Commit bit, or one while message
+///   2 is held, is not answered; one of an answered or proven exchange is answered with its message 2 -- the one sent
+///   under the same last cipher block, byte for byte, or the plaintext encrypted under this copy's last block when
+///   that is another one (the same SPI, nonce, KE and HASH(2): nothing is derived again), at most two encryptions
+///   kept and one answer per 200 ms ([`Classified::AnswerAgain`]).
+/// - Otherwise, decrypted under the last cipher block of each message 2 sent (RFC 2409 Appendix B), its first payload
+///   is the HASH(3) of the exchange, `prf(SKEYID_a, 0 | M-ID | Ni_b | Nr_b)` (RFC 2409 §5.5): its message 3, recorded
+///   ([`Classified::Message3`]) -- with the Commit bit, as that fact only, never as a proof (DESIGN 3.6).
+/// - Otherwise it is dropped, counted: while message 2 is held nothing is its message 3 yet.
+///
+/// No header flag changes a state: none is covered by a HASH (RFC 2409 §5.5).
+pub(super) fn read_under_responder(st: &Phase1State, header: &IsakmpHeader, message: &[u8], entry: &ResponderEntry) -> Classified {
+    let msgid = header.message_id;
+    let commit_flag = header.flags & flags::COMMIT != 0;
+    if header.encrypted() {
+        let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
+        if let Ok((_header, payloads, last_block)) = phase2::parse_encrypted(message, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0) {
+            if matches!(payloads.as_slice(), [hash, sa, ..] if hash.payload_type == payload::HASH && sa.payload_type == payload::SA) {
+                return copy_of_message_1(st, msgid, entry, &payloads, &last_block, commit_flag);
+            }
+        }
+        let hash3 = quick::hash3(st.prf, &st.skeyid_a, msgid, &entry.retained.ni, &entry.retained.nr);
+        for variant in entry.retained.variants.iter().filter(|variant| variant.sent) {
+            let Ok((_header, payloads, _next)) = phase2::decrypt_payloads(message, &st.enc_key, st.enc_block, &variant.qm2_last_block) else { continue };
+            if !matches!(payloads.first(), Some(first) if first.payload_type == payload::HASH && first.data == hash3) {
+                continue;
+            }
+            if payloads.len() > 1 {
+                ike_debug!("QUICK: message 3 of gateway Quick Mode msgid={msgid:08x} carries {} payloads after its HASH(3) -- passed over", payloads.len() - 1);
+            }
+            let read = st.exchanges.note_message_3(entry.id(), commit_flag);
+            ike_debug!("QUICK: message 3 of gateway Quick Mode msgid={msgid:08x} authenticated (HASH(3)) -- {read:?}, recorded for the caller");
+            return Classified::Message3 { msgid, read };
+        }
+    }
+    let (drop, counted) = if entry.state == ResponderState::Held {
+        let counted = st.exchanges.count_responder(|counters| counters.qm3_while_held += 1);
+        (ResponderDrop::WhileHeld, counted.qm3_while_held)
+    } else {
+        let counted = st.exchanges.count_responder(|counters| counters.qm3_invalid += 1);
+        (ResponderDrop::NotMessage3, counted.qm3_invalid)
+    };
+    ike_debug!("QUICK: a message under the id of gateway Quick Mode msgid={msgid:08x} ({:?}) is neither a copy of its message 1 nor its message 3 -- dropped ({counted} so far)", entry.state);
+    Classified::Ignored(Ignored::Responder(drop))
+}
+
+/// The first step of [`read_under_responder`]: a copy of a message 1, `payloads` as it decrypted under its IV and
+/// `last_block` its last cipher block.
+fn copy_of_message_1(st: &Phase1State, msgid: u32, entry: &ResponderEntry, payloads: &[Payload], last_block: &[u8], commit_flag: bool) -> Classified {
+    let print = msgid::fingerprint(msgid, payloads);
+    if commit_flag {
+        st.exchanges.note_commit(msgid, print);
+    }
+    if print != entry.fingerprint {
+        let counted = st.exchanges.count_responder(|counters| counters.other_messages += 1);
+        ike_debug!("QUICK: another message 1 under the id of gateway Quick Mode msgid={msgid:08x} -- dropped ({} so far)", counted.other_messages);
+        return Classified::Ignored(Ignored::Responder(ResponderDrop::OtherMessage));
+    }
+    let unanswered = |drop: ResponderDrop, why: &str| {
+        st.exchanges.count_responder(|counters| counters.copies_unanswered += 1);
+        ike_debug!("QUICK: a copy of gateway message 1 under msgid={msgid:08x} -- not answered: {why}");
+        Classified::Ignored(Ignored::Responder(drop))
+    };
+    if commit_flag {
+        st.exchanges.note_responder_commit(msgid);
+        return unanswered(ResponderDrop::CopyWithCommit, "its header has the Commit bit set (noted: what answers the exchange is never used)");
+    }
+    if entry.state == ResponderState::Held {
+        return unanswered(ResponderDrop::CopyWhileHeld, "its message 2 is held, not sent yet");
+    }
+    let known = entry.retained.variants.iter().any(|variant| variant.sent && variant.qm1_last_block == last_block);
+    let new_variant = if known || entry.retained.variants.len() >= QM2_VARIANTS {
+        None
+    } else {
+        match seal(st, msgid, entry.retained.first_payload, &entry.retained.plaintext, last_block) {
+            Ok((qm2, qm2_last_block)) => Some(Variant { qm1_last_block: last_block.to_vec(), qm2, qm2_last_block, sent: true }),
+            Err(e) => {
+                ike_debug!("QUICK: message 2 of msgid={msgid:08x} could not be encrypted under another last block: {e}");
+                None
+            }
+        }
+    };
+    match st.exchanges.answer_copy_again(entry.id(), last_block, new_variant) {
+        AnswerAgain::Send(message) => {
+            ike_debug!("QUICK: a copy of gateway message 1 under msgid={msgid:08x} -- its message 2 again{}", if known { "" } else { ", under the copy's last cipher block" });
+            Classified::AnswerAgain { msgid, message }
+        }
+        AnswerAgain::TooSoon => {
+            ike_debug!("QUICK: a copy of gateway message 1 under msgid={msgid:08x} -- message 2 went less than 200 ms ago, not answered");
+            Classified::Ignored(Ignored::Responder(ResponderDrop::CopyTooSoon))
+        }
+        AnswerAgain::NoRoom => {
+            ike_debug!("QUICK: a copy of gateway message 1 under msgid={msgid:08x} -- under a third last cipher block, or with no room for its message 2: not answered");
+            Classified::Ignored(Ignored::Responder(ResponderDrop::CopyNoRoom))
+        }
+        AnswerAgain::NotNow(state) => unanswered(ResponderDrop::NotInProgress, &format!("the exchange is {state:?}")),
+    }
+}
+
+/// A Quick Mode message under the id of a message 1 this side refused and keeps the refusal of
+/// ([`super::exchange::ResponderLookup::Refused`]): when it authenticates as a copy of that message 1 (its IV,
+/// HASH(1), a HASH and an SA first, the same fingerprint and Commit bit as the copy refused), the refusal again --
+/// the same bytes, not counted against the budget, at most once per 200 ms ([`ExchangeTable::repeat_refusal`]).
+/// `None` for anything else, which the caller reads as any message under an id of the peer's. A Commit bit on it is
+/// remembered of the message either way.
+pub(super) fn read_refused_copy(st: &Phase1State, header: &IsakmpHeader, message: &[u8]) -> Option<Classified> {
+    let msgid = header.message_id;
+    if !header.encrypted() {
+        return None;
+    }
+    let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
+    let (_header, payloads, _next) = phase2::parse_encrypted(message, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0).ok()?;
+    if !matches!(payloads.as_slice(), [hash, sa, ..] if hash.payload_type == payload::HASH && sa.payload_type == payload::SA) {
+        return None;
+    }
+    let print = msgid::fingerprint(msgid, &payloads);
+    let commit_flag = header.flags & flags::COMMIT != 0;
+    if commit_flag {
+        st.exchanges.note_commit(msgid, print);
+    }
+    match st.exchanges.repeat_refusal(msgid, &print, commit_flag)? {
+        RepeatRefusal::Send(kept) => {
+            ike_debug!("QUICK: a copy of gateway message 1 under msgid={msgid:08x}, refused before -- the same refusal again");
+            Some(Classified::RefusalAgain { msgid, message: kept.datagram })
+        }
+        RepeatRefusal::TooSoon => {
+            ike_debug!("QUICK: a copy of gateway message 1 under msgid={msgid:08x}, refused less than {REFUSAL_RESEND_SPACING:?} ago -- not answered");
+            Some(Classified::Ignored(Ignored::Responder(ResponderDrop::RefusalTooSoon)))
+        }
+    }
+}
+
 /// Answers one message 1 of a Quick Mode the gateway started, `quick` (as the inbox of an enabled exchange table
 /// keeps it), for the tunnel `expected` describes: see [`QuickVerdict`]. Sends nothing.
 ///
-/// Each entry is answered at most once. While the exchange is in progress, a second call for a message already
-/// accepted is [`Silence::AlreadyAnswered`]: the [`HeldQuick`] given first is the one answer to the message
-/// (owner point 3: no new SPI, nonce or keys for a copy), and whoever holds it answers the copies of the
-/// message with its message 2. The responder registry that routes those copies past the readers comes with the
-/// rest of the responder; until a caller has it, the exchange table remembers the answers outstanding.
+/// Each entry is answered at most once. An accepted exchange is held by the responder's cache from then on
+/// ([`cache::ResponderState::Held`], for at most [`cache::PEER_QM_HOLD_MAX`]): a second call for the message while
+/// it is in progress is [`Silence::AlreadyAnswered`] -- the [`HeldQuick`] given first is the one answer to the
+/// message (owner point 3: no new SPI, nonce or keys for a copy) -- and the readers answer the copies of the
+/// message with its message 2 once it left. An exchange parked with nothing sent holds
+/// no answer any more: a copy of its message 1 the ledger takes up again is answered anew (D9).
 ///
 /// In this order, the first that fails deciding:
 /// 1. A passive table: [`Silence::Passive`], nothing looked at.
@@ -469,7 +813,11 @@ impl fmt::Debug for HeldQuick {
 ///    traced.
 /// 8. Our own offer sent back ([`Silence::Reflection`]), for any family the tunnel is configured for.
 /// 9. The family, by the types of IDci and IDcr, and one the tunnel is configured for
-///    ([`RefusalNotify::InvalidIdInformation`]) and holds a current SA of ([`Silence::FamilyNotReady`]).
+///    ([`RefusalNotify::InvalidIdInformation`]); then the family must be free ([`Silence::Deferred`]): holding a
+///    current SA ([`ExpectedQuick::answerable`]), no other gateway Quick Mode of it held or answered (one at a time
+///    per family, DESIGN 8.6), 200 ms (`ACCEPT_SPACING`) past since the last one ended, and room in the
+///    responder's cache for one more exchange in progress. A message that is not answered for that waits in the
+///    family's slot ([`cache::DEFER_MAX`]).
 /// 10. The proposal: an SA payload that parses, with proposals and transforms in it (RFC 2408 §4.2,
 ///     [`RefusalNotify::BadProposalSyntax`]); the IPsec DOI and SIT_IDENTITY_ONLY; one proposal, for ESP, with a
 ///     4-octet SPI; then the SPI ([`Silence::InvalidSpi`]); then a transform equal to the family's suite --
@@ -496,7 +844,9 @@ impl fmt::Debug for HeldQuick {
 /// than the offer's, a RESPONDER-LIFETIME Notify (RFC 2407 §4.5.4, choices 2 and 3; layout §4.6.3.1: the IPsec
 /// DOI, ESP, this side's inbound SPI) states every limit in force. KEYMAT for each direction is
 /// `prf(SKEYID_d, [g(qm)^xy |] protocol | SPI | Ni_b | Nr_b)`, the SPI the one the destination of that direction
-/// chose, Ni_b the gateway's nonce and Nr_b this side's.
+/// chose, Ni_b the gateway's nonce and Nr_b this side's. The exchange is held in the responder's cache with what
+/// its message 2 is made of (no key), and the ledger keeps it in progress for [`cache::PEER_QM_HOLD_MAX`] and parks
+/// it then: nothing was sent.
 ///
 /// A refusal ([`QuickVerdict::Refuse`]) is an Informational under a fresh Message ID of ours with the Notify
 /// about the gateway's proposed SPI (ESP) when the message names one, about the message otherwise; INVALID-FLAGS
@@ -524,6 +874,7 @@ pub fn answer_quick(st: &Phase1State, entropy: &mut impl Entropy, expected: &Qui
     if read.commit_flag {
         st.exchanges.note_commit(msgid, quick.fingerprint);
         if in_progress {
+            st.exchanges.note_responder_commit(msgid);
             ike_debug!(
                 "QUICK: a copy of gateway message 1 under msgid={msgid:08x} has the Commit bit set, and the exchange is in progress -- noted, not refused: what answers it is never used"
             );
@@ -551,36 +902,77 @@ pub fn answer_quick(st: &Phase1State, entropy: &mut impl Entropy, expected: &Qui
         );
         return QuickVerdict::Silent(Silence::NotInProgress);
     }
-    if st.exchanges.accept_outstanding(msgid, &quick.fingerprint) {
-        ike_debug!("QUICK: gateway message 1 under msgid={msgid:08x} not answered again: its message 2 is held already");
+    if st.exchanges.answered_already(msgid) {
+        ike_debug!("QUICK: gateway message 1 under msgid={msgid:08x} not answered again: the responder holds its answer, or saw its exchange end");
         return QuickVerdict::Silent(Silence::AlreadyAnswered);
     }
-    let outcome = check_message_1(&read.payloads, expected, st.floated).and_then(|checked| build_answer(st, entropy, expected, quick, &read, checked));
-    match outcome {
-        Ok(held) => {
-            if !st.exchanges.note_accepted(msgid, quick.fingerprint) {
+    let parts = match check_family(&read.payloads, expected) {
+        Ok(parts) => parts,
+        Err(turn) => return turned(st, entropy, quick, &read, turn),
+    };
+    let family = parts.expected.family;
+    let busy = if parts.expected.answerable { st.exchanges.responder_admission(family) } else { Some(DeferReason::NotReady) };
+    if let Some(reason) = busy {
+        return defer(st, family, quick, reason);
+    }
+    let outcome = check_offer(parts, expected, st.floated).and_then(|checked| build_answer(st, entropy, expected, quick, &read, checked));
+    let mut held = match outcome {
+        Ok(held) => held,
+        Err(turn) => return turned(st, entropy, quick, &read, turn),
+    };
+    let variant = Variant { qm1_last_block: held.qm1_last_block.clone(), qm2: held.qm2.clone(), qm2_last_block: held.qm2_last_block.clone(), sent: false };
+    let retained = Retained { plaintext: held.qm2_plaintext.clone(), first_payload: held.qm2_first_payload, ni: held.ni.clone(), nr: held.nr.clone(), variants: vec![variant] };
+    match st.exchanges.hold_responder(msgid, held.family, held.fingerprint, held.local_spi, retained, held.commit_seen) {
+        Ok(id) => held.id = id,
+        Err(HoldRefused::Busy) => return defer(st, family, quick, DeferReason::Busy),
+        Err(HoldRefused::Full) => return defer(st, family, quick, DeferReason::CacheFull),
+        Err(HoldRefused::Illegal(illegal)) => {
+            ike_debug!("QUICK: gateway message 1 under msgid={msgid:08x} not held: {illegal}");
+            return QuickVerdict::Silent(Silence::AlreadyAnswered);
+        }
+    }
+    ike_debug!(
+        "QUICK: gateway message 1 under msgid={msgid:08x} accepted for the {:?} CHILD SA -- message 2 built, held, not sent (spi_in={:08x} spi_out={:08x}, lifetime {}s{}{})",
+        held.family,
+        held.local_spi,
+        held.peer_spi,
+        held.lifetime.seconds,
+        held.lifetime.kilobytes.map(|kb| format!(" / {kb} KB")).unwrap_or_default(),
+        if held.responder_lifetime_added { ", RESPONDER-LIFETIME stated" } else { "" }
+    );
+    QuickVerdict::Accept(Box::new(held))
+}
+
+/// What [`answer_quick`] does when a check ended the answer with `turn`: a refusal is sent and kept; our own
+/// offer sent back and an SPI not to be taken end the exchange as refused; a passing failure before anything was
+/// sent ([`Silence::NoFreeSpi`], [`Silence::NotBuilt`]) parks it (D9).
+fn turned(st: &Phase1State, entropy: &mut impl Entropy, quick: &PeerQuick, read: &ReadMessage1, turn: Turn) -> QuickVerdict {
+    let msgid = quick.msgid;
+    match turn {
+        Turn::Refuse(notify, why) => refuse(st, entropy, quick, false, notify, subject_of(&read.payloads), why),
+        Turn::Silent(silence, why) => {
+            ike_debug!("QUICK: gateway message 1 under msgid={msgid:08x} not answered: {why}");
+            let now = st.exchanges.now();
+            if matches!(silence, Silence::Reflection | Silence::InvalidSpi) && !st.exchanges.finish(msgid, now, MidEnd::Refused) {
                 ike_debug!("QUICK: msgid={msgid:08x} was no longer in progress in the Message-ID ledger");
             }
-            ike_debug!(
-                "QUICK: gateway message 1 under msgid={msgid:08x} accepted for the {:?} CHILD SA -- message 2 built, not sent (spi_in={:08x} spi_out={:08x}, lifetime {}s{}{})",
-                held.family,
-                held.local_spi,
-                held.peer_spi,
-                held.lifetime.seconds,
-                held.lifetime.kilobytes.map(|kb| format!(" / {kb} KB")).unwrap_or_default(),
-                if held.responder_lifetime_added { ", RESPONDER-LIFETIME stated" } else { "" }
-            );
-            QuickVerdict::Accept(Box::new(held))
-        }
-        Err(Turn::Refuse(notify, why)) => refuse(st, entropy, quick, false, notify, subject_of(&read.payloads), why),
-        Err(Turn::Silent(silence, why)) => {
-            ike_debug!("QUICK: gateway message 1 under msgid={msgid:08x} not answered: {why}");
-            if matches!(silence, Silence::Reflection | Silence::InvalidSpi) && !st.exchanges.finish(msgid, st.exchanges.now(), MidEnd::Refused) {
-                ike_debug!("QUICK: msgid={msgid:08x} was no longer in progress in the Message-ID ledger");
+            if matches!(silence, Silence::NoFreeSpi | Silence::NotBuilt) && !st.exchanges.park(msgid, now, now.checked_add(PARKED_FOR).unwrap_or(now)) {
+                ike_debug!("QUICK: msgid={msgid:08x} not parked: taken up as often as it may be already, or no longer in progress");
             }
             QuickVerdict::Silent(silence)
         }
     }
+}
+
+/// Puts `quick`, of `family`, in the family's slot ([`ExchangeTable::defer_peer_quick`]): [`Silence::Deferred`].
+fn defer(st: &Phase1State, family: ChildFamily, quick: &PeerQuick, reason: DeferReason) -> QuickVerdict {
+    let msgid = quick.msgid;
+    match st.exchanges.defer_peer_quick(family, quick) {
+        Deferral::Waits => ike_debug!("QUICK: gateway message 1 under msgid={msgid:08x} waits for its {family:?} family ({reason:?}) -- not answered now"),
+        Deferral::StillWaits => {}
+        Deferral::Parked => ike_debug!("QUICK: gateway message 1 under msgid={msgid:08x} has waited {:?} for its {family:?} family already -- parked", cache::DEFER_MAX),
+    }
+    QuickVerdict::Silent(Silence::Deferred(reason))
 }
 
 /// How a check of [`answer_quick`] ended the answer.
@@ -628,6 +1020,17 @@ fn read_message_1(st: &Phase1State, quick: &PeerQuick) -> Result<ReadMessage1, (
     Ok(ReadMessage1 { payloads, last_block, commit_flag: header.flags & flags::COMMIT != 0 })
 }
 
+/// What steps 7 to 9 of [`answer_quick`] took from a message 1: the family's expectation, and the payloads the
+/// later steps read.
+struct Parts<'p, 'a> {
+    expected: &'a ExpectedQuick,
+    first_sa: &'p Payload,
+    ni: &'p Payload,
+    kes: Vec<&'p Payload>,
+    idci: &'p [u8],
+    idcr: &'p [u8],
+}
+
 /// What steps 7 to 11 of [`answer_quick`] took from a message 1.
 struct Checked<'a> {
     expected: &'a ExpectedQuick,
@@ -645,13 +1048,24 @@ struct Checked<'a> {
     idcr: Vec<u8>,
 }
 
-/// Steps 7 to 11 of [`answer_quick`], on an ISAKMP SA that `floated` to UDP 4500 or not
-/// ([`Phase1State::floated`]).
-fn check_message_1<'a>(payloads: &[Payload], expected: &QuickExpectations<'a>, floated: bool) -> Result<Checked<'a>, Turn> {
-    let malformed = |why| Turn::Refuse(RefusalNotify::PayloadMalformed, why);
-    let no_proposal = |why| Turn::Refuse(RefusalNotify::NoProposalChosen, why);
-    let bad_syntax = |why| Turn::Refuse(RefusalNotify::BadProposalSyntax, why);
-    let bad_id = |why| Turn::Refuse(RefusalNotify::InvalidIdInformation, why);
+fn malformed(why: &'static str) -> Turn {
+    Turn::Refuse(RefusalNotify::PayloadMalformed, why)
+}
+
+fn no_proposal(why: &'static str) -> Turn {
+    Turn::Refuse(RefusalNotify::NoProposalChosen, why)
+}
+
+fn bad_syntax(why: &'static str) -> Turn {
+    Turn::Refuse(RefusalNotify::BadProposalSyntax, why)
+}
+
+fn bad_id(why: &'static str) -> Turn {
+    Turn::Refuse(RefusalNotify::InvalidIdInformation, why)
+}
+
+/// Steps 7 to 9 of [`answer_quick`] -- the structure, our own offer sent back, the family -- and what they took.
+fn check_family<'p, 'a>(payloads: &'p [Payload], expected: &QuickExpectations<'a>) -> Result<Parts<'p, 'a>, Turn> {
 
     // 7. Structure (RFC 2409 §5.5): "a HASH payload MUST immediately follow the ISAKMP header and a SA payload
     // MUST immediately follow the HASH".
@@ -684,10 +1098,10 @@ fn check_message_1<'a>(payloads: &[Payload], expected: &QuickExpectations<'a>, f
         return Err(no_proposal("more than one SA payload (POLICY: one SA per Quick Mode)"));
     }
     let [idci, idcr] = ids.as_slice() else { return Err(bad_id("no client identities (POLICY: the SA of a tunnel has selectors)")) };
-    let (idci, idcr) = (&idci.data, &idcr.data);
+    let (idci, idcr) = (idci.data.as_slice(), idcr.data.as_slice());
 
     // 8. Our own offer sent back: IDci ours and IDcr the gateway's.
-    if expected.families.iter().any(|e| e.our_selector != e.gateway_selector && *idci == e.our_selector && *idcr == e.gateway_selector) {
+    if expected.families.iter().any(|e| e.our_selector != e.gateway_selector && idci == e.our_selector && idcr == e.gateway_selector) {
         return Err(Turn::Silent(Silence::Reflection, "its IDci is this side's selector and its IDcr the gateway's: an offer of this side's sent back"));
     }
 
@@ -697,9 +1111,14 @@ fn check_message_1<'a>(payloads: &[Payload], expected: &QuickExpectations<'a>, f
         return Err(bad_id("IDci and IDcr are of different families"));
     }
     let Some(exp) = expected.families.iter().find(|e| e.family == family) else { return Err(bad_id("a family this tunnel is not configured for")) };
-    if !exp.answerable {
-        return Err(Turn::Silent(Silence::FamilyNotReady, "a family the tunnel is configured for, with no current SA to renew now"));
-    }
+    // Whether the family is free now is the caller's step (it asks the exchange table).
+    Ok(Parts { expected: exp, first_sa, ni, kes, idci, idcr })
+}
+
+/// Steps 10 and 11 of [`answer_quick`] on what [`check_family`] took, on an ISAKMP SA that `floated` to UDP 4500
+/// or not ([`Phase1State::floated`]).
+fn check_offer<'a>(parts: Parts<'_, 'a>, expected: &QuickExpectations<'a>, floated: bool) -> Result<Checked<'a>, Turn> {
+    let Parts { expected: exp, first_sa, ni, kes, idci, idcr } = parts;
 
     // 10. The proposal.
     let sa = SaPayload::parse(&first_sa.data).map_err(|_| bad_syntax("an SA payload that does not parse"))?;
@@ -769,8 +1188,8 @@ fn check_message_1<'a>(payloads: &[Payload], expected: &QuickExpectations<'a>, f
         stated,
         ni: ni.data.clone(),
         gxi,
-        idci: idci.clone(),
-        idcr: idcr.clone(),
+        idci: idci.to_vec(),
+        idcr: idcr.to_vec(),
     })
 }
 
@@ -912,6 +1331,7 @@ fn build_answer(st: &Phase1State, entropy: &mut impl Entropy, expected: &QuickEx
     let keys = derive_keys(st, exp.cipher, pfs.as_ref().map(|(_, shared)| shared.as_slice()), &checked.ni, &nr, local_spi, checked.peer_spi);
     Ok(HeldQuick {
         msgid: quick.msgid,
+        id: ResponderId::unheld(quick.msgid),
         family: exp.family,
         fingerprint: quick.fingerprint,
         peer_spi: checked.peer_spi,
@@ -1014,29 +1434,29 @@ mod tests {
     use crate::transport::IkeSocket;
 
     /// This side's IPv4 selector (its assigned address) and the gateway's.
-    const OURS_V4: ([u8; 4], [u8; 4]) = ([10, 212, 134, 202], [255, 255, 255, 255]);
-    const GATEWAYS_V4: ([u8; 4], [u8; 4]) = ([10, 9, 0, 0], [255, 255, 0, 0]);
+    pub(super) const OURS_V4: ([u8; 4], [u8; 4]) = ([10, 212, 134, 202], [255, 255, 255, 255]);
+    pub(super) const GATEWAYS_V4: ([u8; 4], [u8; 4]) = ([10, 9, 0, 0], [255, 255, 0, 0]);
 
-    fn ours_v6() -> (Ipv6Addr, u8) {
+    pub(super) fn ours_v6() -> (Ipv6Addr, u8) {
         ("fd00:1::2a".parse().unwrap(), 128)
     }
 
-    fn gateways_v6() -> (Ipv6Addr, u8) {
+    pub(super) fn gateways_v6() -> (Ipv6Addr, u8) {
         ("fd00:9::".parse().unwrap(), 64)
     }
 
-    const GCM: SkCipher = SkCipher::Aes256Gcm;
-    const CBC: SkCipher = SkCipher::Aes128Cbc(IntegAlgorithm::HmacSha2_256_128);
+    pub(super) const GCM: SkCipher = SkCipher::Aes256Gcm;
+    pub(super) const CBC: SkCipher = SkCipher::Aes128Cbc(IntegAlgorithm::HmacSha2_256_128);
 
     /// The SPI the gateway proposes in the messages 1 these tests build field by field.
-    const GATEWAY_SPI: u32 = 0x6A7E_0001;
+    pub(super) const GATEWAY_SPI: u32 = 0x6A7E_0001;
 
     /// The private key of the gateway's KE in those messages.
     const GATEWAY_DH: [u8; 32] = [0x5A; 32];
 
     /// A client whose exchange table is on, telling the time by the clock returned, and its gateway; both
     /// floated to UDP 4500 when `floated`.
-    fn pair(floated: bool) -> (Phase1State, Phase1State, TestClock) {
+    pub(super) fn pair(floated: bool) -> (Phase1State, Phase1State, TestClock) {
         let (mut client, mut gateway) = phase1_pair();
         client.floated = floated;
         gateway.floated = floated;
@@ -1047,40 +1467,40 @@ mod tests {
         (client, gateway, clock)
     }
 
-    fn v4(cipher: SkCipher, pfs: Option<DhGroup>) -> ExpectedQuick {
+    pub(super) fn v4(cipher: SkCipher, pfs: Option<DhGroup>) -> ExpectedQuick {
         ExpectedQuick::ipv4(cipher, pfs, OURS_V4, GATEWAYS_V4, None)
     }
 
-    fn v6(cipher: SkCipher, pfs: Option<DhGroup>) -> ExpectedQuick {
+    pub(super) fn v6(cipher: SkCipher, pfs: Option<DhGroup>) -> ExpectedQuick {
         ExpectedQuick::ipv6(cipher, pfs, ours_v6(), gateways_v6(), None)
     }
 
     /// The tunnel as the client holds it: its families and the SPIs in use.
-    struct Tunnel {
-        families: Vec<ExpectedQuick>,
-        peer_spis: Vec<u32>,
-        local_spis: Vec<u32>,
+    pub(super) struct Tunnel {
+        pub(super) families: Vec<ExpectedQuick>,
+        pub(super) peer_spis: Vec<u32>,
+        pub(super) local_spis: Vec<u32>,
     }
 
     impl Tunnel {
         /// The SPIs in use are none of those the tests propose.
-        fn of(families: Vec<ExpectedQuick>) -> Self {
+        pub(super) fn of(families: Vec<ExpectedQuick>) -> Self {
             Self { families, peer_spis: vec![0x1111_0001, 0x2222_0002], local_spis: vec![0x3333_0003] }
         }
 
-        fn expect(&self, now: Instant) -> QuickExpectations<'_> {
+        pub(super) fn expect(&self, now: Instant) -> QuickExpectations<'_> {
             QuickExpectations { families: &self.families, peer_spis_in_use: &self.peer_spis, local_spis_in_use: &self.local_spis, now }
         }
     }
 
     /// An entropy that counts what is drawn from it.
-    struct Counting {
+    pub(super) struct Counting {
         inner: SeedEntropy,
-        fills: usize,
+        pub(super) fills: usize,
     }
 
     impl Counting {
-        fn new(seed: u64) -> Self {
+        pub(super) fn new(seed: u64) -> Self {
             Self { inner: SeedEntropy::new(seed), fills: 0 }
         }
     }
@@ -1092,12 +1512,12 @@ mod tests {
         }
     }
 
-    fn msgid_of(message: &[u8]) -> u32 {
+    pub(super) fn msgid_of(message: &[u8]) -> u32 {
         IsakmpHeader::parse(message).unwrap().message_id
     }
 
     /// `message` as a datagram of the client's socket: with the non-ESP marker once floated.
-    fn on_the_wire(client: &Phase1State, message: &[u8]) -> Vec<u8> {
+    pub(super) fn on_the_wire(client: &Phase1State, message: &[u8]) -> Vec<u8> {
         if client.floated {
             wrap_ike_4500(message)
         } else {
@@ -1106,7 +1526,7 @@ mod tests {
     }
 
     /// What the client's readers keep of the gateway's `qm1`: it must go to the inbox, as its one entry.
-    fn kept(client: &Phase1State, qm1: &[u8]) -> PeerQuick {
+    pub(super) fn kept(client: &Phase1State, qm1: &[u8]) -> PeerQuick {
         let msgid = msgid_of(qm1);
         assert_eq!(table::classify(client, &on_the_wire(client, qm1), None), Classified::PeerQuick { msgid }, "the readers keep it");
         let mut entries = client.take_peer_quick_modes();
@@ -1118,14 +1538,14 @@ mod tests {
         answer_quick(client, &mut SeedEntropy::new(0xC5A0), &tunnel.expect(clock.now()), quick)
     }
 
-    fn accepted(verdict: QuickVerdict) -> Box<HeldQuick> {
+    pub(super) fn accepted(verdict: QuickVerdict) -> Box<HeldQuick> {
         match verdict {
             QuickVerdict::Accept(held) => held,
             other => panic!("not accepted: {other:?}"),
         }
     }
 
-    fn refused(verdict: QuickVerdict) -> Refusal {
+    pub(super) fn refused(verdict: QuickVerdict) -> Refusal {
         match verdict {
             QuickVerdict::Refuse(refusal) => refusal,
             other => panic!("not refused: {other:?}"),
@@ -1149,7 +1569,7 @@ mod tests {
 
     /// The Notify of a refusal, as the gateway reads it: the Informational must authenticate (HASH(1) under its
     /// own Message ID, RFC 2409 §5.7) and carry nothing but it.
-    fn refusal_notify(gw: &Phase1State, refusal: &Refusal) -> Vec<u8> {
+    pub(super) fn refusal_notify(gw: &Phase1State, refusal: &Refusal) -> Vec<u8> {
         let header = IsakmpHeader::parse(&refusal.datagram).unwrap();
         assert_eq!((header.exchange_type, header.message_id, header.flags & flags::ENCRYPTION), (exchange::INFORMATIONAL, refusal.msgid, flags::ENCRYPTION));
         let iv0 = crypto1::phase2_iv(gw.prf, &gw.phase1_iv, refusal.msgid, gw.enc_block);
@@ -1166,10 +1586,10 @@ mod tests {
 
     /// A message 1 of the gateway's, field by field, for a test to change before it is built.
     #[derive(Clone)]
-    struct Qm1 {
-        msgid: u32,
-        sas: Vec<SaPayload>,
-        ni: Vec<u8>,
+    pub(super) struct Qm1 {
+        pub(super) msgid: u32,
+        pub(super) sas: Vec<SaPayload>,
+        pub(super) ni: Vec<u8>,
         ke: Option<Vec<u8>>,
         ids: Vec<Vec<u8>>,
         /// Payloads after the identities.
@@ -1177,14 +1597,14 @@ mod tests {
         /// The payloads after the HASH, in place of those the fields above make, when set.
         replaced: Option<Vec<(u8, Vec<u8>)>>,
         /// Header flags besides ENCRYPTION.
-        flags: u8,
+        pub(super) flags: u8,
         /// Whether the ISAKMP SA it goes on floated to UDP 4500: the tests make their pair so.
         floated: bool,
     }
 
     impl Qm1 {
         /// [`Self::rekeying_on`] an ISAKMP SA that did not float.
-        fn rekeying(exp: &ExpectedQuick, seed: u64) -> Self {
+        pub(super) fn rekeying(exp: &ExpectedQuick, seed: u64) -> Self {
             Self::rekeying_on(false, exp, seed)
         }
 
@@ -1212,7 +1632,7 @@ mod tests {
             &mut self.proposal().transforms[0]
         }
 
-        fn set_attribute(&mut self, attr_type: u16, value: u16) {
+        pub(super) fn set_attribute(&mut self, attr_type: u16, value: u16) {
             let attributes = &mut self.transform().attributes;
             attributes.retain(|a| a.attr_type != attr_type);
             attributes.push(Attribute::short(attr_type, value));
@@ -1232,7 +1652,7 @@ mod tests {
 
         /// The message under `gw`'s keys, HASH(1) over every payload after it but a HASH -- what the client
         /// verifies (`phase2::parse_encrypted`).
-        fn message(&self, gw: &Phase1State) -> Vec<u8> {
+        pub(super) fn message(&self, gw: &Phase1State) -> Vec<u8> {
             let after = self.payloads();
             let hashed: Vec<(u8, Vec<u8>)> = after.iter().filter(|(t, _)| *t != payload::HASH).cloned().collect();
             let (_first, body) = isakmp::encode_payloads(&hashed);
@@ -1367,7 +1787,8 @@ mod tests {
 
     /// The inbound SPI drawn for the new SA is none the tunnel holds, of ours or of the gateway's: a draw that is
     /// one is drawn again. Entropy that gives nothing but SPIs not to be taken (0 here), [`SPI_DRAWS`] times, is a
-    /// silence that leaves the exchange in progress (a passing failure, before anything was sent).
+    /// silence that parks the exchange (a passing failure, before anything was sent, D9): a copy of its message 1
+    /// read a second later is taken up again.
     #[test]
     fn the_inbound_spi_drawn_is_none_in_use_and_the_draws_give_up_after_a_bound() {
         let first_draw = |seed: u64| {
@@ -1403,7 +1824,10 @@ mod tests {
         let verdict = answer_quick(&client, &mut zeros, &Tunnel::of(vec![plain()]).expect(clock.now()), &quick);
         assert!(matches!(verdict, QuickVerdict::Silent(Silence::NoFreeSpi)), "{verdict:?}");
         assert_eq!(zeros.0, SPI_DRAWS);
-        assert!(matches!(client.exchanges.id_record(quick.msgid).map(|record| record.state), Some(MidState::Active { .. })));
+        assert!(matches!(client.exchanges.id_record(quick.msgid).map(|record| record.state), Some(MidState::Parked { .. })));
+        assert!(client.exchanges.responder_state(quick.msgid).is_none(), "nothing held");
+        clock.advance(RECONSIDER_GAP);
+        assert_eq!(table::classify(&client, &message, None), Classified::PeerQuick { msgid: quick.msgid }, "taken up again");
     }
 
     // ---- Refused or not answered ----
@@ -1435,7 +1859,7 @@ mod tests {
         (vec![held], Qm1::rekeying(&offered, 0x5300))
     }
 
-    fn plain() -> ExpectedQuick {
+    pub(super) fn plain() -> ExpectedQuick {
         v4(GCM, None)
     }
 
@@ -1545,9 +1969,9 @@ mod tests {
             ("IPv6 configured with no current SA: a rekey of it", || {
                 let (_, q) = rekey_of(v6(GCM, None), |_| {});
                 (vec![plain(), v6(GCM, None).answerable(false)], q)
-            }, Want::Silent(Silence::FamilyNotReady)),
+            }, Want::Silent(Silence::Deferred(DeferReason::NotReady))),
             ("IPv6 configured with no current SA: a rekey of IPv4", || (vec![plain(), v6(GCM, None).answerable(false)], Qm1::rekeying(&plain(), 0x5300)), Want::Accepted),
-            ("the family with no current SA, offered in a mode this side would refuse", || rekey_of(plain().answerable(false), |q| q.set_attribute(esp_attr::ENCAP_MODE, 2)), Want::Silent(Silence::FamilyNotReady)),
+            ("the family with no current SA, offered in a mode this side would refuse", || rekey_of(plain().answerable(false), |q| q.set_attribute(esp_attr::ENCAP_MODE, 2)), Want::Silent(Silence::Deferred(DeferReason::NotReady))),
             // The SPI proposed (POLICY).
             ("the SPI 0", || rekey_of(plain(), |q| q.proposal().spi = vec![0; 4]), Want::Silent(Silence::InvalidSpi)),
             ("the SPI 255", || rekey_of(plain(), |q| q.proposal().spi = 255u32.to_be_bytes().to_vec()), Want::Silent(Silence::InvalidSpi)),
@@ -1797,7 +2221,7 @@ mod tests {
 
     /// An entry for `message` handed to the responder as the readers would keep it, but without them (which
     /// remember a Commit bit themselves): its fingerprint and Commit bit as the message has them.
-    fn unread_entry(gw: &Phase1State, message: &[u8], at: Instant) -> PeerQuick {
+    pub(super) fn unread_entry(gw: &Phase1State, message: &[u8], at: Instant) -> PeerQuick {
         let msgid = msgid_of(message);
         let (_h, payloads, _) = phase2::decrypt_payloads(message, &gw.enc_key, gw.enc_block, &crypto1::phase2_iv(gw.prf, &gw.phase1_iv, msgid, gw.enc_block)).unwrap();
         let commit_flag = IsakmpHeader::parse(message).unwrap().flags & flags::COMMIT != 0;
@@ -1805,7 +2229,7 @@ mod tests {
     }
 
     /// The message of `qm1` under `gw`'s keys, without the Commit bit and with it.
-    fn clean_and_flagged(gw: &Phase1State, qm1: &Qm1) -> (Vec<u8>, Vec<u8>) {
+    pub(super) fn clean_and_flagged(gw: &Phase1State, qm1: &Qm1) -> (Vec<u8>, Vec<u8>) {
         let clean = qm1.message(gw);
         let mut flagged = clean.clone();
         flagged[19] |= flags::COMMIT;
@@ -1923,10 +2347,10 @@ mod tests {
                 assert_eq!(entropy.fills, 0);
             }
         };
-        accepted(answer(&client, &tunnel, &clock, &entry));
+        let held = accepted(answer(&client, &tunnel, &clock, &entry));
         again(Silence::AlreadyAnswered);
         let msgid = entry.msgid;
-        assert!(client.exchanges.park(msgid, clock.now(), clock.now() + PEER_QUICK_WAIT));
+        assert_eq!(client.park_responder(held.id()), Ok(ResponderState::Parked));
         clock.advance(RECONSIDER_GAP);
         assert!(client.exchanges.reconsider(msgid, clock.now(), clock.now() + PEER_QUICK_WAIT));
         accepted(answer(&client, &tunnel, &clock, &entry));

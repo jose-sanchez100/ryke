@@ -55,6 +55,17 @@
 //! everything they keep while it waits: a message under its Message ID is handed to it
 //! ([`Classified::RouteToOwn`]) and is its answer only once its HASH(2) verifies, and an error Notify
 //! ends it only when [`ExchangeTable::attribute_error_notify`] tells that the Notify is about it.
+//!
+//! **The responder's exchanges.** A gateway Quick Mode this side answers is held by the table's
+//! responder cache from the moment its answer is built ([`ExchangeTable::hold_responder`], see
+//! `super::responder::cache` for its states and bounds), and every reader then reads a Quick Mode
+//! message under its Message ID as that exchange's ([`ExchangeTable::responder_exchange`]): a copy of its
+//! message 1 gets its message 2 again once it left, its message 3 is checked by HASH(3) and recorded,
+//! and what the gateway says of it -- a Commit bit, an error Notify, the ISAKMP SA deleted -- is recorded
+//! as a fact for the caller ([`ExchangeTable::take_events`]). Nothing here acts on a fact; the caller
+//! ends the exchange ([`ExchangeTable::conclude`], [`ExchangeTable::park_responder`]). A message 1 whose
+//! family is not free waits in one slot per family ([`ExchangeTable::defer_peer_quick`]) and comes back
+//! out of the inbox once the family is ([`ExchangeTable::take_inbox`]).
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -65,10 +76,14 @@ use std::time::{Duration, Instant};
 use super::crypto1;
 use super::informational::{error_notify_name, notify_type, ChildFamily, RefusalNotify};
 use super::isakmp::{exchange, flags, payload, IsakmpHeader, Payload};
-use super::msgid::{self, Admission, MessageIdLedger, MidCounters, MidEnd, MidKind, MidRecord, MidState, Origin};
+use super::msgid::{self, Admission, AtDeadline, MessageIdLedger, MidCounters, MidEnd, MidKind, MidRecord, MidState, Origin};
 use super::payloads::{id_type, protocol, IPSEC_DOI};
 use super::phase1::Phase1State;
 use super::phase2;
+use super::responder::cache::{
+    DeferReason, HoldRefused, IllegalTransition, Outcome, PendingResponder, Retained, ResponderCache, ResponderCounters, ResponderEntry, ResponderEvents, ResponderId,
+    ResponderState, Transition, Variant, ANSWERED_FOR, ANSWER_SPACING, DEFER_MAX, PARKED_FOR,
+};
 use crate::debug::ike_debug;
 use crate::entropy::Entropy;
 use crate::error::IkeError;
@@ -141,11 +156,6 @@ pub(crate) const REFUSAL_RESEND_SPACING: Duration = Duration::from_millis(200);
 /// so this outlasts every exchange that can still be answered, unless the peer sends this many other flagged
 /// messages in between.
 pub(crate) const COMMITS_REMEMBERED: usize = 16;
-
-/// How many answers given to the peer's Quick Modes still in progress the table remembers
-/// ([`ExchangeTable::note_accepted`]) (POLICY): the responder answers one exchange per family at a time, so
-/// this is never reached but by a caller that answers this many exchanges at once.
-pub(crate) const ACCEPTS_REMEMBERED: usize = 16;
 
 /// An SPI as a Delete or a Notify names it: up to sixteen octets, held inline so that an
 /// event is a plain value whatever the peer claims.
@@ -412,8 +422,14 @@ struct Books {
     inbox: Inbox,
     /// The cookie pairs of other ISAKMP SAs already traced, oldest first.
     foreign: VecDeque<[u8; 16]>,
-    /// The responder exchanges registered, oldest first ([`ExchangeTable::register_responder`]).
-    responders: VecDeque<ResponderEntry>,
+    /// The gateway Quick Modes the responder answers ([`ExchangeTable::hold_responder`]).
+    responders: ResponderCache,
+    /// One message 1 per family waiting for its family to be free ([`ExchangeTable::defer_peer_quick`]), indexed
+    /// by [`msgid::family_index`].
+    deferred: [Option<PeerQuick>; 2],
+    /// The message 1 each family's slot last handed out ([`ExchangeTable::take_inbox`]), by Message ID, fingerprint
+    /// and time read: deferred again, it still waits, and is not traced as a new wait.
+    deferred_offered: [Option<(u32, [u8; 32], Instant)>; 2],
     /// Quick Mode messages under the id of an exchange of ours being waited for that did not authenticate
     /// as its message 2 ([`ExchangeTable::count_unauthenticated_reply`]).
     unauthenticated_replies: u64,
@@ -422,10 +438,19 @@ struct Books {
     /// The messages 1 of the peer's a copy with the Commit bit of was read, by Message ID and fingerprint,
     /// oldest first: at most [`COMMITS_REMEMBERED`] ([`ExchangeTable::note_commit`]).
     commits: VecDeque<(u32, [u8; 32])>,
-    /// The answers given to the peer's Quick Modes still in progress, by Message ID, fingerprint and how many
-    /// times the ledger had taken the exchange up again then ([`MidRecord::tries`]), oldest first: at most
-    /// [`ACCEPTS_REMEMBERED`] ([`ExchangeTable::note_accepted`]).
-    accepts: VecDeque<(u32, [u8; 32], u8)>,
+}
+
+impl Books {
+    /// Ends what has come to its time in the responder's cache at `now` ([`ResponderCache::sweep`]), and tells the
+    /// ledger when each family's exchange in progress ended, for the spacing of the next one
+    /// ([`MessageIdLedger::responder_concluded`]). Every method of the table that reads or changes an entry of the
+    /// cache calls it first, at the table's clock, so that no exchange is read as it was before its time came; only
+    /// the counters ([`ExchangeTable::count_responder`]) and the test accessors do without.
+    fn sweep_responders(&mut self, now: Instant) {
+        for (family, at) in self.responders.sweep(now) {
+            self.ids.responder_concluded(family, at);
+        }
+    }
 }
 
 /// The refusals of the peer's Quick Modes this side sent ([`ExchangeTable::charge_refusal`],
@@ -464,23 +489,6 @@ pub(crate) enum RepeatRefusal {
     Send(KeptRefusal),
     /// The refusal was sent less than [`REFUSAL_RESEND_SPACING`] ago: nothing is sent now.
     TooSoon,
-}
-
-/// The most responder exchanges [`ExchangeTable::register_responder`] keeps (POLICY): the responder
-/// answers one gateway Quick Mode per family at a time and keeps a concluded one a while for the copies
-/// of its message 1 that may still come; beyond this many the oldest gives way.
-const RESPONDERS_KEPT: usize = 4;
-
-/// What the readers know of one responder exchange of this side: what an error Notify of the peer's can
-/// name it by besides its Message ID, and whether one did.
-struct ResponderEntry {
-    msgid: u32,
-    /// The SPI this side chose for its inbound SA in the exchange's message 2: the SPI a refusal of that
-    /// message names (RFC 2408 §3.14: "The receiving entity's SPI").
-    inbound_spi: u32,
-    /// The type of the first error Notify the peer refused the exchange with
-    /// ([`ExchangeTable::note_responder_rejected`]).
-    peer_rejected: Option<u16>,
 }
 
 struct Shared {
@@ -649,12 +657,39 @@ impl ExchangeTable {
         Queued::Added
     }
 
-    /// Every message 1 the inbox holds, oldest first; the inbox is empty after it. Passive: none.
+    /// Every message 1 the inbox holds, and every deferred one whose family the table no longer keeps
+    /// ([`Self::defer_peer_quick`]: no gateway Quick Mode of the family in progress, the spacing after the last one
+    /// past, room in the responder's cache), oldest read first; both are empty of them after it. A deferred message
+    /// that has waited [`DEFER_MAX`] is dropped instead (the ledger parked its exchange at that instant). Passive:
+    /// none.
     pub(crate) fn take_inbox(&self) -> Vec<PeerQuick> {
         if !self.is_enabled() {
             return Vec::new();
         }
-        std::mem::take(&mut self.books().inbox.entries).into()
+        let now = self.now();
+        let mut guard = self.books();
+        let books = &mut *guard;
+        books.sweep_responders(now);
+        let mut taken = Vec::new();
+        for family in [ChildFamily::Primary, ChildFamily::Ipv6] {
+            let slot = msgid::family_index(family);
+            let Some(waiting) = &books.deferred[slot] else { continue };
+            if waiting.arrived.checked_add(DEFER_MAX).is_none_or(|end| now >= end) {
+                ike_debug!("QUICK: gateway message 1 under msgid={:08x} waited {DEFER_MAX:?} for its family -- dropped", waiting.msgid);
+                books.deferred[slot] = None;
+                continue;
+            }
+            let free = books.responders.pending(family).is_none() && books.responders.room_for_one_more() && books.ids.accept_allowed(family, now);
+            if free {
+                if let Some(offered) = books.deferred[slot].take() {
+                    books.deferred_offered[slot] = Some((offered.msgid, offered.fingerprint, offered.arrived));
+                    taken.push(offered);
+                }
+            }
+        }
+        taken.extend(std::mem::take(&mut books.inbox.entries));
+        taken.sort_by_key(|quick| quick.arrived);
+        taken
     }
 
     /// How many entries the inbox holds, whatever the switch says.
@@ -683,10 +718,24 @@ impl ExchangeTable {
 
     /// The exchange of the peer's under `msgid` that this side answers as the responder, when there
     /// is one: a Quick Mode message under its id is that exchange's (a copy of its message 1, or its
-    /// message 3), and goes to it rather than through the checks of a new message 1. There is no
-    /// responder yet, so every id is [`ResponderLookup::Unknown`] here, and a Quick Mode message under
-    /// an id of the peer's is read as a message 1 whose fate the ledger decides.
-    pub(crate) fn responder_exchange(&self, _msgid: u32) -> ResponderLookup {
+    /// message 3), and goes to it rather than through the checks of a new message 1 -- a message 3 is never
+    /// read with the IV and the HASH(1) of a message 1. Otherwise, when this side refused a message 1 under the
+    /// id and keeps the refusal ([`Self::repeat_refusal`]), a copy of it gets that refusal again
+    /// ([`ResponderLookup::Refused`]); otherwise the message is a message 1 whose fate the ledger decides.
+    /// Passive: [`ResponderLookup::Unknown`].
+    pub(crate) fn responder_exchange(&self, msgid: u32) -> ResponderLookup {
+        if !self.is_enabled() {
+            return ResponderLookup::Unknown;
+        }
+        let now = self.now();
+        let mut books = self.books();
+        books.sweep_responders(now);
+        if let Some(entry) = books.responders.get(msgid) {
+            return ResponderLookup::Exchange(Box::new(entry.clone()));
+        }
+        if books.refusals.kept.iter().any(|kept| kept.refused_msgid == msgid) {
+            return ResponderLookup::Refused;
+        }
         ResponderLookup::Unknown
     }
 
@@ -800,13 +849,11 @@ impl ExchangeTable {
     }
 
     /// [`MessageIdLedger::accept_allowed`]. Passive: `false` (a passive table admits no peer Quick Mode).
-    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     pub(crate) fn accept_allowed(&self, family: ChildFamily, now: Instant) -> bool {
         self.ledger(false, |ids| ids.accept_allowed(family, now))
     }
 
     /// [`MessageIdLedger::responder_concluded`]. Passive: nothing.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     pub(crate) fn responder_concluded(&self, family: ChildFamily, now: Instant) {
         self.ledger((), |ids| ids.responder_concluded(family, now))
     }
@@ -840,34 +887,31 @@ impl ExchangeTable {
         self.books().unauthenticated_replies
     }
 
-    /// Registers the responder exchange `msgid`, whose message 2 gives `inbound_spi` as this side's
-    /// inbound SPI, so that an error Notify naming either is told to be about it
-    /// ([`Self::attribute_error_notify`]). Registering an id again replaces its entry; beyond
-    /// [`RESPONDERS_KEPT`] the oldest gives way. Passive: nothing.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
-    pub(crate) fn register_responder(&self, msgid: u32, inbound_spi: u32) {
-        if !self.is_enabled() {
-            return;
-        }
-        let responders = &mut self.books().responders;
-        responders.retain(|entry| entry.msgid != msgid);
-        if responders.len() >= RESPONDERS_KEPT {
-            responders.pop_front();
-        }
-        responders.push_back(ResponderEntry { msgid, inbound_spi, peer_rejected: None });
+    /// Holds a primary-family responder exchange `msgid` whose message 2 gives `inbound_spi` as this side's
+    /// inbound SPI and retains nothing, as [`Self::hold_responder`] holds one, and returns its id: test-only by
+    /// nature (the responder holds an exchange when it builds its answer), for the tests of what the readers do
+    /// with an exchange that is held. Panics when it cannot be held.
+    #[cfg(test)]
+    pub(crate) fn register_responder(&self, msgid: u32, inbound_spi: u32) -> ResponderId {
+        let retained = Retained { plaintext: Vec::new(), first_payload: payload::HASH, ni: Vec::new(), nr: Vec::new(), variants: Vec::new() };
+        self.hold_responder(msgid, ChildFamily::Primary, [0; 32], inbound_spi, retained, false).expect("a responder exchange held")
     }
 
     /// Records that the peer refused the responder exchange `msgid` with an error Notify of `msg_type`
-    /// ([`Attribution::Responder`]); the first such Notify is the one kept. `false`, and nothing recorded,
-    /// when no responder exchange of that id is registered: a peer Quick Mode the responder has not taken
-    /// up, say, whose Notify only the mailbox keeps. Passive: `false`.
+    /// ([`Attribution::Responder`]): a fact of the exchange for its caller ([`Self::take_events`]), never acted on
+    /// here; the first such Notify is the one kept. `false`, and nothing recorded, when the responder holds no
+    /// exchange of that id: a peer Quick Mode the responder has not taken up, say, whose Notify only the mailbox
+    /// keeps. Passive: `false`.
     pub(crate) fn note_responder_rejected(&self, msgid: u32, msg_type: u16) -> bool {
         if !self.is_enabled() {
             return false;
         }
-        match self.books().responders.iter_mut().find(|entry| entry.msgid == msgid) {
+        let now = self.now();
+        let mut books = self.books();
+        books.sweep_responders(now);
+        match books.responders.get_mut(msgid) {
             Some(entry) => {
-                entry.peer_rejected.get_or_insert(msg_type);
+                entry.facts.peer_rejected.get_or_insert(msg_type);
                 true
             }
             None => false,
@@ -963,43 +1007,452 @@ impl ExchangeTable {
         self.is_enabled() && self.books().commits.contains(&(msgid, *fingerprint))
     }
 
-    /// Remembers that the responder answered the peer's Quick Mode `msgid`, whose message 1 has the fingerprint
-    /// `fingerprint`, in the exchange the ledger holds in progress now ([`Self::accept_outstanding`]); `false`,
-    /// and nothing remembered, when the ledger holds no such exchange. What is remembered is kept while that
-    /// exchange is in progress and has not been taken up again ([`MessageIdLedger::reconsider`]): beyond
-    /// [`ACCEPTS_REMEMBERED`] answers outstanding at once the oldest gives way. Passive: `false`.
-    pub(crate) fn note_accepted(&self, msgid: u32, fingerprint: [u8; 32]) -> bool {
-        if !self.is_enabled() {
-            return false;
-        }
-        let mut books = self.books();
-        let Books { ids, accepts, .. } = &mut *books;
-        let Some(tries) = answerable_spell(ids, msgid, &fingerprint) else { return false };
-        accepts.retain(|&(id, print, spell)| answerable_spell(ids, id, &print) == Some(spell) && id != msgid);
-        if accepts.len() >= ACCEPTS_REMEMBERED {
-            accepts.pop_front();
-        }
-        accepts.push_back((msgid, fingerprint, tries));
-        true
-    }
-
-    /// Whether the responder already answered the peer's Quick Mode `msgid`, whose message 1 has the
-    /// fingerprint `fingerprint`, in the exchange the ledger holds in progress now ([`Self::note_accepted`]): an
-    /// answer outstanding, which a second one must not replace (no new SPI, nonce or keys for the same message).
-    /// The ledger is read as the last call told the time left it. Passive: `false`.
-    pub(crate) fn accept_outstanding(&self, msgid: u32, fingerprint: &[u8; 32]) -> bool {
-        if !self.is_enabled() {
-            return false;
-        }
-        let books = self.books();
-        let Some(tries) = answerable_spell(&books.ids, msgid, fingerprint) else { return false };
-        books.accepts.contains(&(msgid, *fingerprint, tries))
-    }
-
-    /// The error Notify type recorded for the responder exchange `msgid`, if it is registered and has one.
+    /// The error Notify type recorded for the responder exchange `msgid`, if the responder holds it and one was.
     #[cfg(test)]
     pub(crate) fn responder_rejected(&self, msgid: u32) -> Option<u16> {
-        self.books().responders.iter().find(|entry| entry.msgid == msgid).and_then(|entry| entry.peer_rejected)
+        self.books().responders.get(msgid).and_then(|entry| entry.facts.peer_rejected)
+    }
+
+    // ---- The responder's exchanges (see `super::responder::cache`) ----
+
+    /// Holds the gateway Quick Mode `msgid` of `family` whose message 1 has the fingerprint `fingerprint`: its
+    /// message 2, built and not sent, is `retained`, with `inbound_spi` this side's inbound SPI of the new SA, and
+    /// `commit_seen` whether a copy of its message 1 had the Commit bit. [`ResponderCache::hold`] at the table's clock
+    /// (the hold's own id, which every later move names), and the ledger keeps the exchange in progress as long --
+    /// [`super::responder::cache::PEER_QM_HOLD_MAX`] -- and parks it then (nothing was sent, D9). A refusal kept for a
+    /// copy of a message 1 under the id -- one with the Commit bit, refused with INVALID-FLAGS -- is dropped: the message
+    /// is answered now, and a flagged copy of it gets silence from then on, never that refusal again. Passive: refused,
+    /// nothing held.
+    pub(crate) fn hold_responder(&self, msgid: u32, family: ChildFamily, fingerprint: [u8; 32], inbound_spi: u32, retained: Retained, commit_seen: bool) -> Result<ResponderId, HoldRefused> {
+        if !self.is_enabled() {
+            return Err(HoldRefused::Illegal(IllegalTransition { msgid, from: None, to: Transition::Hold }));
+        }
+        let now = self.now();
+        let mut guard = self.books();
+        let books = &mut *guard;
+        books.sweep_responders(now);
+        let entry = ResponderEntry::held(msgid, family, fingerprint, inbound_spi, retained, commit_seen, now);
+        let until = entry.until;
+        let id = books.responders.hold(entry)?;
+        books.refusals.kept.retain(|kept| kept.refused_msgid != msgid);
+        let parked_until = until.checked_add(PARKED_FOR).unwrap_or(until);
+        if !books.ids.set_deadline_then(msgid, now, until, AtDeadline::Park { until: parked_until }) {
+            ike_debug!("QUICK: msgid={msgid:08x} held, but the Message-ID ledger holds it as no exchange in progress");
+        }
+        Ok(id)
+    }
+
+    /// The first step of a release ([`super::responder::HeldQuick::release`]), before anything is sent:
+    /// [`ResponderCache::answered`] for the hold `id` at the table's clock, swept at that same instant, so that the hold
+    /// bound cannot fall between the check that it is held and the move -- a message 2 is sent only for a hold that
+    /// was answered first, never for one parked meanwhile. The ledger keeps the exchange in progress until
+    /// [`ANSWERED_FOR`] after it, then ends it (a message 2 that left is never answered anew). Refused, nothing
+    /// changed, for a hold that is not held: parked, ended, or an earlier hold of a message held again. Passive:
+    /// refused.
+    pub(crate) fn begin_release(&self, id: ResponderId) -> Result<ResponderState, IllegalTransition> {
+        if !self.is_enabled() {
+            return Err(IllegalTransition { msgid: id.msgid(), from: None, to: Transition::Answer });
+        }
+        let now = self.now();
+        let msgid = id.msgid();
+        let mut guard = self.books();
+        let books = &mut *guard;
+        books.sweep_responders(now);
+        let state = books.responders.answered(id, now)?;
+        let until = now.checked_add(ANSWERED_FOR).unwrap_or(now);
+        if !books.ids.set_deadline_then(msgid, now, until, AtDeadline::Done) {
+            ike_debug!("QUICK: msgid={msgid:08x} answered, but the Message-ID ledger holds it as no exchange in progress");
+        }
+        Ok(state)
+    }
+
+    /// The message 2 [`Self::begin_release`] answered the hold `id` for could not be sent:
+    /// [`ResponderCache::release_failed`] at the table's clock. Parked when no message 2 went since -- the ledger parks
+    /// the exchange for [`PARKED_FOR`] (a copy of its message 1 may be taken up again, at most
+    /// [`msgid::RECONSIDER_MAX`] times in all) and the spacing of its family's next one starts --; still answered when
+    /// one went for a copy of its message 1 meanwhile. Passive: refused.
+    pub(crate) fn release_failed(&self, id: ResponderId) -> Result<ResponderState, IllegalTransition> {
+        if !self.is_enabled() {
+            return Err(IllegalTransition { msgid: id.msgid(), from: None, to: Transition::Park });
+        }
+        let now = self.now();
+        let msgid = id.msgid();
+        let (family, state) = {
+            let mut guard = self.books();
+            let books = &mut *guard;
+            books.sweep_responders(now);
+            let family = books.responders.get(msgid).map(|entry| entry.family);
+            let state = books.responders.release_failed(id)?;
+            if state == ResponderState::Parked && !books.ids.park(msgid, now, now.checked_add(PARKED_FOR).unwrap_or(now)) {
+                ike_debug!("QUICK: gateway Quick Mode msgid={msgid:08x} not parked in the Message-ID ledger: taken up as often as it may be already, or no longer in progress");
+            }
+            (family, state)
+        };
+        if let (ResponderState::Parked, Some(family)) = (state, family) {
+            self.responder_concluded(family, now);
+        }
+        Ok(state)
+    }
+
+    /// Ends the gateway Quick Mode hold `id` as the caller decided, at the table's clock: [`ResponderCache::proven`],
+    /// [`ResponderCache::abandon`] or [`ResponderCache::cancel`]. The ledger ends the exchange (Done: no copy of its
+    /// message 1 is answered anew), and the spacing of its family's next gateway Quick Mode starts. Refused, nothing
+    /// changed, for an earlier hold of a message held again. Passive: refused.
+    pub(crate) fn conclude(&self, id: ResponderId, outcome: Outcome) -> Result<ResponderState, IllegalTransition> {
+        let msgid = id.msgid();
+        if !self.is_enabled() {
+            let to = match outcome {
+                Outcome::Proven(_) => Transition::Prove,
+                Outcome::Abandoned(_) => Transition::Abandon,
+                Outcome::Cancelled(_) => Transition::Cancel,
+            };
+            return Err(IllegalTransition { msgid, from: None, to });
+        }
+        let now = self.now();
+        let (family, state) = {
+            let mut guard = self.books();
+            let books = &mut *guard;
+            books.sweep_responders(now);
+            let family = books.responders.get(msgid).map(|entry| entry.family);
+            let state = match outcome {
+                Outcome::Proven(proof) => books.responders.proven(id, proof, now),
+                Outcome::Abandoned(reason) => books.responders.abandon(id, reason),
+                Outcome::Cancelled(reason) => books.responders.cancel(id, reason),
+            }?;
+            books.ids.finish(msgid, now, MidEnd::Done);
+            (family, state)
+        };
+        if let Some(family) = family {
+            self.responder_concluded(family, now);
+        }
+        ike_debug!("QUICK: gateway Quick Mode msgid={msgid:08x} concluded: {state:?}");
+        Ok(state)
+    }
+
+    /// [`ResponderCache::park`] at the table's clock: the held exchange of the hold `id` ends with nothing sent, and
+    /// the ledger parks it for [`PARKED_FOR`] -- a copy of its message 1 may be taken up again, at most
+    /// [`msgid::RECONSIDER_MAX`] times in all, after which it is over -- and the spacing of its family's next one
+    /// starts. Refused, nothing changed, for a hold not held, an earlier hold of a message held again included.
+    /// Passive: refused.
+    pub(crate) fn park_responder(&self, id: ResponderId) -> Result<ResponderState, IllegalTransition> {
+        let msgid = id.msgid();
+        if !self.is_enabled() {
+            return Err(IllegalTransition { msgid, from: None, to: Transition::Park });
+        }
+        let now = self.now();
+        let (family, state) = {
+            let mut guard = self.books();
+            let books = &mut *guard;
+            books.sweep_responders(now);
+            let family = books.responders.get(msgid).map(|entry| entry.family);
+            let state = books.responders.park(id)?;
+            if !books.ids.park(msgid, now, now.checked_add(PARKED_FOR).unwrap_or(now)) {
+                ike_debug!("QUICK: gateway Quick Mode msgid={msgid:08x} not parked in the Message-ID ledger: taken up as often as it may be already, or no longer in progress");
+            }
+            (family, state)
+        };
+        if let Some(family) = family {
+            self.responder_concluded(family, now);
+        }
+        Ok(state)
+    }
+
+    /// The gateway Quick Mode of `family` held or answered now, if there is one. Passive: `None`.
+    pub(crate) fn pending(&self, family: ChildFamily) -> Option<PendingResponder> {
+        if !self.is_enabled() {
+            return None;
+        }
+        let now = self.now();
+        let mut books = self.books();
+        books.sweep_responders(now);
+        books.responders.pending(family).map(|entry| PendingResponder { id: entry.id(), msgid: entry.msgid, state: entry.state, inbound_spi: entry.inbound_spi })
+    }
+
+    /// The facts recorded about the gateway Quick Mode of `family` in progress since the last call, each once
+    /// ([`ResponderEvents`]): its message 3, a Commit bit on a copy of one of its messages -- the table's memory of
+    /// such copies of its message 1 included ([`Self::note_commit`]) --, an error Notify about it, the ISAKMP SA
+    /// deleted. `None` when nothing of the family is in progress. Passive: `None`.
+    pub(crate) fn take_events(&self, family: ChildFamily) -> Option<ResponderEvents> {
+        if !self.is_enabled() {
+            return None;
+        }
+        let now = self.now();
+        let mut guard = self.books();
+        let books = &mut *guard;
+        books.sweep_responders(now);
+        let entry = books.responders.pending_mut(family)?;
+        let noted = books.commits.contains(&(entry.msgid, entry.fingerprint));
+        Some(entry.take_facts(noted))
+    }
+
+    /// The state of the responder's exchange `msgid` -- its latest hold's --, or the end it left with while that is
+    /// remembered. Passive: `None`.
+    pub(crate) fn responder_state(&self, msgid: u32) -> Option<ResponderState> {
+        if !self.is_enabled() {
+            return None;
+        }
+        let now = self.now();
+        let mut books = self.books();
+        books.sweep_responders(now);
+        books.responders.state(msgid)
+    }
+
+    /// The state of the hold `id`, or the end it left with while that is remembered; never a later hold's of the same
+    /// message. Passive: `None`.
+    pub(crate) fn responder_state_of(&self, id: ResponderId) -> Option<ResponderState> {
+        if !self.is_enabled() {
+            return None;
+        }
+        let now = self.now();
+        let mut books = self.books();
+        books.sweep_responders(now);
+        books.responders.state_of(id)
+    }
+
+    /// Whether the responder may not answer the message 1 `msgid` with a new answer ([`ResponderCache::may_hold`]):
+    /// it holds or answered it in an exchange in progress -- its answer is given, and a second one must not replace it
+    /// (no new SPI, nonce or keys for the same message, owner point 3) --, or the exchange ended for good (proven,
+    /// abandoned, cancelled: a message 2 that left is never replaced, D9). An exchange parked -- nothing sent -- holds
+    /// no answer any more. Passive: `false`.
+    pub(crate) fn answered_already(&self, msgid: u32) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        let now = self.now();
+        let mut books = self.books();
+        books.sweep_responders(now);
+        books.responders.may_hold(msgid).is_err()
+    }
+
+    /// Why a message 1 of `family` must wait now, by what the table holds: an exchange of the family in progress, the
+    /// spacing after its last one ([`msgid::ACCEPT_SPACING`]), no room in the responder's cache. `None` when it may be
+    /// answered. Passive: `None` (a passive table answers nothing anyway).
+    pub(crate) fn responder_admission(&self, family: ChildFamily) -> Option<DeferReason> {
+        if !self.is_enabled() {
+            return None;
+        }
+        let now = self.now();
+        let (busy, room) = {
+            let mut books = self.books();
+            books.sweep_responders(now);
+            (books.responders.pending(family).is_some(), books.responders.room_for_one_more())
+        };
+        if busy {
+            Some(DeferReason::Busy)
+        } else if !self.accept_allowed(family, now) {
+            Some(DeferReason::Spacing)
+        } else if !room {
+            Some(DeferReason::CacheFull)
+        } else {
+            None
+        }
+    }
+
+    /// Keeps the gateway message 1 `quick`, read as an exchange of `family`, in that family's slot until the family is
+    /// free or [`DEFER_MAX`] after it was read (DESIGN 8.6): the latest message wins, the one it displaces is parked
+    /// (nothing was sent, D9), and the ledger keeps the exchange in progress for that long and parks it then. The wait
+    /// is not counted against the times its message may be taken up again. The same message deferred again -- still
+    /// in the slot, or handed out of it by [`Self::take_inbox`] and not answerable yet -- stays as it was, its time
+    /// counting from its first read ([`Deferral::StillWaits`]). What became of it ([`Deferral`]); passive: nothing,
+    /// [`Deferral::Parked`].
+    pub(crate) fn defer_peer_quick(&self, family: ChildFamily, quick: &PeerQuick) -> Deferral {
+        if !self.is_enabled() {
+            return Deferral::Parked;
+        }
+        let now = self.now();
+        let mut guard = self.books();
+        let books = &mut *guard;
+        let index = msgid::family_index(family);
+        let offered_again = books.deferred_offered[index].take() == Some((quick.msgid, quick.fingerprint, quick.arrived));
+        let slot = &mut books.deferred[index];
+        if let Some(waiting) = slot.as_mut().filter(|waiting| waiting.msgid == quick.msgid && waiting.fingerprint == quick.fingerprint) {
+            waiting.commit_seen |= quick.commit_seen;
+            return Deferral::StillWaits;
+        }
+        let parked_until = |at: Instant| at.checked_add(PARKED_FOR).unwrap_or(at);
+        let Some(end) = quick.arrived.checked_add(DEFER_MAX).filter(|end| now < *end) else {
+            books.ids.park(quick.msgid, now, parked_until(now));
+            return Deferral::Parked;
+        };
+        let displaced = slot.replace(quick.clone());
+        books.ids.set_deadline_then(quick.msgid, now, end, AtDeadline::Park { until: parked_until(end) });
+        if let Some(displaced) = displaced {
+            let parked = books.ids.park(displaced.msgid, now, parked_until(now));
+            ike_debug!(
+                "QUICK: gateway message 1 under msgid={:08x} gives its family's wait to the later msgid={:08x}{}",
+                displaced.msgid,
+                quick.msgid,
+                if parked { " -- parked, it may be taken up again" } else { "" }
+            );
+        }
+        if offered_again {
+            Deferral::StillWaits
+        } else {
+            Deferral::Waits
+        }
+    }
+
+    /// How many messages 1 wait in the families' slots, and of which Message IDs.
+    #[cfg(test)]
+    pub(crate) fn deferred_held(&self) -> Vec<u32> {
+        self.books().deferred.iter().flatten().map(|quick| quick.msgid).collect()
+    }
+
+    /// Records the facts of an ISAKMP SA deleted on every gateway Quick Mode in progress ([`ResponderEvents::torn_down`]).
+    pub(crate) fn note_responders_torn_down(&self) {
+        if !self.is_enabled() {
+            return;
+        }
+        let now = self.now();
+        let mut books = self.books();
+        books.sweep_responders(now);
+        for entry in books.responders.entries_mut().filter(|entry| entry.state.in_progress()) {
+            entry.facts.torn_down = true;
+        }
+    }
+
+    /// Records a Commit bit read on a copy of one of the messages of the responder's exchange `msgid`
+    /// ([`ResponderEvents::commit_seen`]).
+    pub(crate) fn note_responder_commit(&self, msgid: u32) {
+        if !self.is_enabled() {
+            return;
+        }
+        let now = self.now();
+        let mut books = self.books();
+        books.sweep_responders(now);
+        if let Some(entry) = books.responders.get_mut(msgid) {
+            entry.facts.commit = true;
+        }
+    }
+
+    /// The message 2 for a copy of the message 1 of the responder's hold `id` whose last cipher block is `last_block`,
+    /// at the table's clock: the encryption kept under that block, or else `new_variant`, the plaintext encrypted under
+    /// it by the caller, kept as the second encryption ([`super::responder::cache::QM2_VARIANTS`]). Only for an
+    /// answered or proven exchange of that hold -- a reader that read an earlier hold of a message held again since
+    /// gets nothing --, and at most once per [`ANSWER_SPACING`], whatever sent it last. The encryption handed out is
+    /// the one a resend sends next ([`Self::resend_answer`]).
+    pub(crate) fn answer_copy_again(&self, id: ResponderId, last_block: &[u8], new_variant: Option<Variant>) -> AnswerAgain {
+        if !self.is_enabled() {
+            return AnswerAgain::NotNow(None);
+        }
+        let now = self.now();
+        let mut guard = self.books();
+        let books = &mut *guard;
+        books.sweep_responders(now);
+        let state = books.responders.state_of(id);
+        let Some(entry) = books.responders.get_hold_mut(id) else { return AnswerAgain::NotNow(state) };
+        if !matches!(entry.state, ResponderState::Answered | ResponderState::Proven(_)) {
+            return AnswerAgain::NotNow(Some(entry.state));
+        }
+        if entry.last_answer.is_some_and(|last| now.saturating_duration_since(last) < ANSWER_SPACING) {
+            books.responders.counters.copies_unanswered += 1;
+            return AnswerAgain::TooSoon;
+        }
+        let kept = entry.retained.variants.iter().position(|variant| variant.sent && variant.qm1_last_block == last_block);
+        let (index, message) = match (kept, new_variant) {
+            (Some(index), _) => match entry.retained.variants.get(index) {
+                Some(variant) => (index, variant.qm2.clone()),
+                None => return AnswerAgain::NoRoom,
+            },
+            (None, Some(variant)) => {
+                let message = variant.qm2.clone();
+                let Some(index) = books.responders.add_variant(id, variant) else {
+                    books.responders.counters.copies_unanswered += 1;
+                    return AnswerAgain::NoRoom;
+                };
+                (index, message)
+            }
+            (None, None) => {
+                books.responders.counters.copies_unanswered += 1;
+                return AnswerAgain::NoRoom;
+            }
+        };
+        if let Some(entry) = books.responders.get_hold_mut(id) {
+            entry.last_answer = Some(now);
+            entry.answers = entry.answers.saturating_add(1);
+            entry.last_variant = index;
+        }
+        books.responders.counters.answered_again += 1;
+        AnswerAgain::Send(message)
+    }
+
+    /// The message 2 of the responder's answered hold `id` for this side's own resend of it, at the table's clock: the
+    /// encryption handed out last, byte for byte -- the one the release sent, or the one a reader answered the latest
+    /// copy of message 1 with, under that copy's last cipher block (POLICY: the gateway reads a message 2 only under the
+    /// last block of the message 1 it sent, and the copy answered last is the best guess of which one that is). `None`
+    /// when the hold is no longer answered, or message 2 went less than [`ANSWER_SPACING`] ago.
+    pub(crate) fn resend_answer(&self, id: ResponderId) -> Option<Vec<u8>> {
+        if !self.is_enabled() {
+            return None;
+        }
+        let now = self.now();
+        let mut guard = self.books();
+        let books = &mut *guard;
+        books.sweep_responders(now);
+        let entry = books.responders.get_hold_mut(id).filter(|entry| entry.state == ResponderState::Answered)?;
+        if entry.last_answer.is_some_and(|last| now.saturating_duration_since(last) < ANSWER_SPACING) {
+            return None;
+        }
+        let message = entry.retained.variants.get(entry.last_variant).map(|variant| variant.qm2.clone())?;
+        entry.last_answer = Some(now);
+        entry.answers = entry.answers.saturating_add(1);
+        Some(message)
+    }
+
+    /// Records the authenticated message 3 of the responder's hold `id`, read with the Commit bit set or not: a fact
+    /// for the caller, never a change of state ([`Message3`]). A hold that is not the one in the cache now -- an earlier
+    /// hold of a message held again -- records nothing.
+    pub(crate) fn note_message_3(&self, id: ResponderId, commit_flag: bool) -> Message3 {
+        if !self.is_enabled() {
+            return Message3::NotInProgress;
+        }
+        let now = self.now();
+        let mut guard = self.books();
+        let books = &mut *guard;
+        books.sweep_responders(now);
+        books.responders.counters.qm3 += 1;
+        let Some(entry) = books.responders.get_hold_mut(id) else { return Message3::NotInProgress };
+        match entry.state {
+            ResponderState::Answered if commit_flag => {
+                entry.facts.commit = true;
+                Message3::WithCommit
+            }
+            ResponderState::Answered if entry.facts.qm3 => Message3::Again,
+            ResponderState::Answered => {
+                entry.facts.qm3 = true;
+                Message3::First
+            }
+            ResponderState::Proven(_) => Message3::AfterProof,
+            _ => Message3::NotInProgress,
+        }
+    }
+
+    /// Counts what a reader made of a datagram under the id of a responder exchange ([`ResponderCounters`]).
+    pub(crate) fn count_responder(&self, count: impl FnOnce(&mut ResponderCounters)) -> ResponderCounters {
+        if !self.is_enabled() {
+            return ResponderCounters::default();
+        }
+        let mut books = self.books();
+        count(&mut books.responders.counters);
+        books.responders.counters
+    }
+
+    /// What the readers counted of the datagrams under the ids of responder exchanges.
+    #[cfg(test)]
+    pub(crate) fn responder_counters(&self) -> ResponderCounters {
+        self.books().responders.counters
+    }
+
+    /// The responder's cache: (entries, octets).
+    #[cfg(test)]
+    pub(crate) fn responder_cache_held(&self) -> (usize, usize) {
+        self.books().responders.held()
+    }
+
+    /// Gives the responder a cache of these bounds, empty: for a test of what a full cache does.
+    #[cfg(test)]
+    pub(crate) fn set_responder_cache_limits(&self, max_entries: usize, max_bytes: usize) {
+        self.books().responders = ResponderCache::with_limits(max_entries, max_bytes);
     }
 
     /// Which exchange of this ISAKMP SA the error Notify `notice` is about, for a reader of an enabled
@@ -1018,7 +1471,7 @@ impl ExchangeTable {
     ///    Quick Mode of the peer's in progress in the ledger ([`Attribution::Responder`]); or another
     ///    exchange of ours in progress, which nobody waits on here ([`Attribution::None`]).
     /// 2. It is about ESP and names, as a 4-octet SPI, the SPI this side offered in `awaited`'s message 1,
-    ///    or the inbound SPI of a registered responder exchange ([`Self::register_responder`]).
+    ///    or the inbound SPI of a responder exchange the responder holds ([`Self::hold_responder`]).
     /// 3. Nothing in it names an exchange, and exactly one exchange is in progress -- `awaited` and the
     ///    Quick Modes the ledger holds in progress, of either side, each counted once: that one. Nothing
     ///    names an exchange when the ledger holds its Message ID as no exchange (as the peer's
@@ -1034,9 +1487,10 @@ impl ExchangeTable {
     /// Rule 3 takes only a Notify with no discriminator, never one whose discriminator the rules before did
     /// not know: a peer that puts an unrelated SPI or Message ID in a real refusal of our Quick Mode makes
     /// the waiting reader run to its timeout instead of failing at once, which is the safer way to fail --
-    /// the other way, a Notify about something else ends an exchange it is not about. The ledger is read
-    /// at the table's clock, swept first. Passive: [`Attribution::None`] -- the readers of a passive table
-    /// keep their own rule, that any error Notify ends the wait.
+    /// the other way, a Notify about something else ends an exchange it is not about. The ledger and the
+    /// responder's cache are read at the table's clock, both swept first: an exchange whose time came is not
+    /// given a Notify. Passive: [`Attribution::None`] -- the readers of a passive table keep their own rule,
+    /// that any error Notify ends the wait.
     pub(crate) fn attribute_error_notify(&self, notice: &ErrorNotice, read_before: bool, awaited: Option<AwaitedQuick>) -> Attribution {
         if !self.is_enabled() {
             return Attribution::None;
@@ -1044,6 +1498,7 @@ impl ExchangeTable {
         let now = self.now();
         let mut guard = self.books();
         let books = &mut *guard;
+        books.sweep_responders(now);
         books.ids.sweep(now);
         let msgid = notice.msgid;
         let is_awaited = |id: u32| awaited.is_some_and(|own| own.msgid == id);
@@ -1071,7 +1526,7 @@ impl ExchangeTable {
             if awaited.is_some_and(|own| own.offered_spi == spi) {
                 return Attribution::OwnExchange;
             }
-            if let Some(entry) = books.responders.iter().find(|entry| entry.inbound_spi == spi) {
+            if let Some(entry) = books.responders.entries().find(|entry| entry.inbound_spi == spi) {
                 return Attribution::Responder(entry.msgid);
             }
         }
@@ -1105,16 +1560,6 @@ impl ExchangeTable {
     }
 }
 
-/// How many times the ledger took up again the peer's Quick Mode `msgid` ([`MidRecord::tries`]) when it holds
-/// it in progress with the fingerprint `fingerprint`: what tells one spell in progress of the exchange from
-/// the next ([`ExchangeTable::note_accepted`]). `None` when it holds no such exchange.
-fn answerable_spell(ids: &MessageIdLedger, msgid: u32, fingerprint: &[u8; 32]) -> Option<u8> {
-    match ids.record(msgid)? {
-        MidRecord { origin: Origin::Peer, kind: MidKind::Quick, state: MidState::Active { .. }, fingerprint: Some(print), tries, .. } if print == *fingerprint => Some(tries),
-        _ => None,
-    }
-}
-
 /// The Quick Mode of ours a reader waits on, as [`ExchangeTable::attribute_error_notify`] needs it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AwaitedQuick {
@@ -1137,10 +1582,53 @@ pub(crate) enum Attribution {
 }
 
 /// What [`ExchangeTable::responder_exchange`] knows of an id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum ResponderLookup {
-    /// No responder exchange of this side has the id.
+    /// No responder exchange of this side has the id, and no refusal is kept for it.
     Unknown,
+    /// The responder's exchange of that id, as the cache holds it now.
+    Exchange(Box<ResponderEntry>),
+    /// No exchange, but a refusal of a message 1 under the id is kept.
+    Refused,
+}
+
+/// What [`ExchangeTable::defer_peer_quick`] did with a message 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Deferral {
+    /// It waits in its family's slot now.
+    Waits,
+    /// It waited there already, and still does.
+    StillWaits,
+    /// It had waited its time ([`DEFER_MAX`]) already: parked instead (or the table is passive).
+    Parked,
+}
+
+/// What [`ExchangeTable::answer_copy_again`] gives for a copy of a message 1 the responder answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AnswerAgain {
+    /// The message 2 to send for it.
+    Send(Vec<u8>),
+    /// Message 2 went less than 200 ms ago: not now.
+    TooSoon,
+    /// A copy under a third last cipher block, or one whose encryption does not fit the cache: not answered.
+    NoRoom,
+    /// The exchange is not answered or proven (its state, `None` when the responder no longer holds it).
+    NotNow(Option<ResponderState>),
+}
+
+/// What [`ExchangeTable::note_message_3`] recorded of an authenticated message 3 of a responder exchange.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Message3 {
+    /// The first one of the exchange: [`ResponderEvents::qm3_seen`].
+    First,
+    /// A copy of one recorded already: nothing new.
+    Again,
+    /// A copy with the Commit bit set: never a proof, only [`ResponderEvents::commit_seen`] (DESIGN 3.6).
+    WithCommit,
+    /// One for an exchange proven already: ignored.
+    AfterProof,
+    /// One for an exchange no longer in progress: ignored.
+    NotInProgress,
 }
 
 /// Why a Delete payload was not read (it names nothing); every case is the peer's doing,
@@ -1345,6 +1833,33 @@ pub(crate) enum Ignored {
     /// A copy with the Commit bit of a message 1 the inbox does not hold, while the inbox is full of
     /// copies without it ([`Queued::Full`]).
     InboxFull,
+    /// A Quick Mode message under the id of a gateway Quick Mode the responder holds, answered or proved,
+    /// not answered and recording nothing but what is said.
+    Responder(ResponderDrop),
+}
+
+/// Why a Quick Mode message under the id of a responder exchange of this side got no answer
+/// ([`Ignored::Responder`]). Every case is counted ([`ResponderCounters`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResponderDrop {
+    /// A copy of its message 1 while its message 2 is held: nothing is sent before the daemon releases it.
+    CopyWhileHeld,
+    /// A copy of its message 1 with the Commit bit set: noted ([`ResponderEvents::commit_seen`]), not answered.
+    CopyWithCommit,
+    /// A copy of its message 1 less than 200 ms after its message 2 last went ([`ANSWER_SPACING`]).
+    CopyTooSoon,
+    /// A copy of its message 1 under a third last cipher block, or one whose encryption does not fit the cache.
+    CopyNoRoom,
+    /// Another message 1 under its id (another fingerprint).
+    OtherMessage,
+    /// No copy of its message 1, while message 2 is held: nothing can be its message 3 yet.
+    WhileHeld,
+    /// Neither a copy of its message 1 nor its message 3 (HASH(3) under the last block of a message 2 sent).
+    NotMessage3,
+    /// A copy of a message 1 this side refused, less than 200 ms after the refusal last went.
+    RefusalTooSoon,
+    /// A copy of its message 1 read as the exchange ended.
+    NotInProgress,
 }
 
 /// What an authenticated Informational said, as [`classify`] read it.
@@ -1461,6 +1976,16 @@ pub(crate) enum Classified {
     RouteToOwn { msgid: u32, message: Vec<u8> },
     /// An authenticated message 1 of a Quick Mode the peer started, now in the inbox.
     PeerQuick { msgid: u32 },
+    /// A copy of the message 1 of a gateway Quick Mode the responder answered or proved: its message 2
+    /// (`message`, the ISAKMP message without the non-ESP marker), for the reader to send as it was -- or the
+    /// same plaintext encrypted under this copy's last cipher block, when that block is another one.
+    AnswerAgain { msgid: u32, message: Vec<u8> },
+    /// A copy of a message 1 this side refused: the refusal kept (`message`, an Informational), for the reader to
+    /// send again as it was.
+    RefusalAgain { msgid: u32, message: Vec<u8> },
+    /// The authenticated message 3 of a gateway Quick Mode the responder answered: recorded as said, a fact
+    /// for the caller, never a change of state.
+    Message3 { msgid: u32, read: Message3 },
     /// A copy with the Commit bit of an authenticated message 1 the inbox holds without it: noted on
     /// that entry ([`PeerQuick::commit_seen`]).
     CommitNoted { msgid: u32 },
@@ -1484,8 +2009,12 @@ pub(crate) enum Classified {
 ///      which is never a new message 1 and never what an exchange in progress waits for;
 ///    - under the id of a Quick Mode of ours in progress, [`Classified::RouteToOwn`];
 ///    - under any other id of ours, [`Ignored::OurId`];
-///    - under the id of a responder exchange of this side (there is none yet, see
-///      [`ExchangeTable::responder_exchange`]): that exchange's;
+///    - under the id of a gateway Quick Mode the responder holds, answered or proved
+///      ([`ExchangeTable::responder_exchange`]): that exchange's, read as a copy of its message 1 (its IV and
+///      HASH(1), the same fingerprint: [`Classified::AnswerAgain`] once its message 2 left) or as its message 3
+///      (HASH(3) under the last cipher block of each message 2 sent: [`Classified::Message3`]), never as a
+///      new message 1; under the id of a message 1 this side refused, a copy of it gets the refusal again
+///      ([`Classified::RefusalAgain`]);
 ///    - otherwise a message 1 candidate: a Message ID that is not 0 and the ENCRYPTION flag set, then
 ///      decrypted with the IV of its Message ID and checked by HASH(1) (RFC 2409 §5.5, Appendix B),
 ///      then its HASH first and an SA right after it (§5.5): no HASH covers the exchange type, and an
@@ -1560,6 +2089,8 @@ fn classify_quick(st: &Phase1State, header: &IsakmpHeader, message: &[u8], now: 
     }
     match st.exchanges.responder_exchange(msgid) {
         ResponderLookup::Unknown => classify_message_1(st, header, message, now),
+        ResponderLookup::Exchange(entry) => super::responder::read_under_responder(st, header, message, &entry),
+        ResponderLookup::Refused => super::responder::read_refused_copy(st, header, message).unwrap_or_else(|| classify_message_1(st, header, message, now)),
     }
 }
 
@@ -1693,6 +2224,11 @@ fn classify_informational(st: &Phase1State, header: &IsakmpHeader, message: &[u8
     for named in &deletes.named {
         seen.isakmp_deleted |= named.protocol == protocol::ISAKMP;
         seen.keep(st, named.event(now));
+    }
+    if seen.isakmp_deleted {
+        // A fact of every gateway Quick Mode in progress, whoever reads it: the ISAKMP SA it runs under is
+        // deleted (the meaning a Delete of Protocol-Id ISAKMP has always had here, whatever SPI it names).
+        st.exchanges.note_responders_torn_down();
     }
     for notify in payloads.iter().filter(|p| p.payload_type == payload::NOTIFY) {
         seen.read_notify(st, &notify.data, expect_ack_seq, now);
@@ -3314,28 +3850,28 @@ mod tests {
         assert_eq!(passive.attribute_error_notify(&notice(0x11, protocol::ESP, &OFFERED.to_be_bytes()), FIRST, Some(mine)), Attribution::None, "passive: never asked");
     }
 
-    /// A responder exchange is known by its Message ID and its inbound SPI; registered again under its id it
-    /// replaces its entry, and beyond four the oldest gives way. The first refusal recorded on it is the one
-    /// kept; nothing is recorded for an id not registered, and a passive table registers nothing.
+    /// A responder exchange is known by its Message ID and its inbound SPI while the responder holds it: the first
+    /// refusal recorded on it is the one kept, nothing is recorded for an id it does not hold, and once the exchange
+    /// ended its SPI names nothing any more. A passive table holds nothing.
     #[test]
     fn responder_exchanges_are_known_by_id_and_spi_and_keep_the_first_refusal() {
+        use crate::ikev1::responder::cache::{EndReason, Outcome, ResponderState};
         let table = ExchangeTable::enabled();
         let naming = |spi: u32| notice(0x7000_0000, protocol::ESP, &spi.to_be_bytes());
-        for n in 0..5u32 {
-            table.register_responder(0x100 + 2 * n, 0xA000 + n);
-        }
-        assert_eq!(table.attribute_error_notify(&naming(0xA000), false, None), Attribution::None, "the oldest gave way");
-        assert_eq!(table.attribute_error_notify(&naming(0xA004), false, None), Attribution::Responder(0x108));
-        table.register_responder(0x108, 0xB000);
-        assert_eq!(table.attribute_error_notify(&naming(0xA004), false, None), Attribution::None, "registered again under another SPI");
+        let id = table.register_responder(0x108, 0xB000);
         assert_eq!(table.attribute_error_notify(&naming(0xB000), false, None), Attribution::Responder(0x108));
+        assert_eq!(table.attribute_error_notify(&naming(0xA000), false, None), Attribution::None, "an SPI of nobody's");
         assert!(table.note_responder_rejected(0x108, 14));
         assert!(table.note_responder_rejected(0x108, 18));
         assert_eq!(table.responder_rejected(0x108), Some(14), "the first refusal stays");
+        assert!(!table.note_responder_rejected(0x102, 14), "an id the responder does not hold");
         assert_eq!(table.responder_rejected(0x102), None);
-        assert!(!table.note_responder_rejected(0x100, 14), "the oldest is gone");
+        assert_eq!(table.conclude(id, Outcome::Cancelled(EndReason::PeerRejected)), Ok(ResponderState::Cancelled(EndReason::PeerRejected)));
+        assert_eq!(table.attribute_error_notify(&naming(0xB000), false, None), Attribution::None, "ended: its SPI names nothing");
+        assert!(!table.note_responder_rejected(0x108, 14));
         let passive = ExchangeTable::passive();
-        passive.register_responder(0x108, 0xB000);
+        let retained = Retained { plaintext: Vec::new(), first_payload: payload::HASH, ni: Vec::new(), nr: Vec::new(), variants: Vec::new() };
+        assert!(passive.hold_responder(0x108, ChildFamily::Primary, [0; 32], 0xB000, retained, false).is_err());
         assert!(!passive.note_responder_rejected(0x108, 14));
         assert_eq!(passive.responder_rejected(0x108), None);
         assert_eq!(passive.attribute_error_notify(&naming(0xB000), false, None), Attribution::None);

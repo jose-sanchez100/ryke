@@ -60,7 +60,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use super::crypto1;
-use super::exchange::{self as table, Classified};
+use super::exchange::{self as table, Attribution, Classified};
 use super::isakmp::{exchange, payload, IsakmpHeader};
 use super::msgid::MidKind;
 use super::payloads::{protocol, IPSEC_DOI};
@@ -696,6 +696,7 @@ pub(crate) struct Served {
     acked: usize,
     new_quick: usize,
     events_pushed: usize,
+    answered_again: usize,
 }
 
 /// Sends the R-U-THERE-ACK owed for the peer's R-U-THERE `seq` (RFC 3706 §6.1: "A responder to an
@@ -718,12 +719,30 @@ fn answer_r_u_there(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl E
 }
 
 /// One datagram read by a reader of an enabled table, through [`table::classify`], and the only
-/// answers sent on the way: the R-U-THERE-ACKs an Informational asked for, and a final message of
-/// ours again for a bit-exact repeat of what it answered. Everything else it found is kept in the
-/// table or dropped there; a Quick Mode message for an exchange of ours that nobody waits on here is
-/// dropped.
+/// answers sent on the way: the R-U-THERE-ACKs an Informational asked for, a final message of ours
+/// again for a bit-exact repeat of what it answered, and what a gateway Quick Mode this side answered or
+/// refused gets for a copy of its message 1 (its message 2, or its refusal, again). Everything else it
+/// found is kept in the table or dropped there; a Quick Mode message for an exchange of ours that nobody
+/// waits on here is dropped. An error Notify about a gateway Quick Mode this side answers is recorded on
+/// it ([`table::ExchangeTable::attribute_error_notify`] with no exchange of ours waited on): a fact for
+/// its caller, never acted on here.
 fn serve_datagram(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, datagram: &[u8], expect_ack_seq: Option<u32>) -> Served {
-    serve_classified(sock, st, entropy, peer, &table::classify(st, datagram, expect_ack_seq))
+    let classified = table::classify(st, datagram, expect_ack_seq);
+    let served = serve_classified(sock, st, entropy, peer, &classified);
+    if let Classified::Informational(seen) = &classified {
+        for notice in &seen.error_notifies {
+            if let Attribution::Responder(msgid) = st.exchanges.attribute_error_notify(notice, seen.read_before, None) {
+                if st.exchanges.note_responder_rejected(msgid, notice.msg_type) {
+                    ike_debug!(
+                        "INFORMATIONAL: error Notify {} ({}) is about gateway Quick Mode msgid={msgid:08x} -- recorded on it",
+                        error_notify_name(notice.msg_type),
+                        notice.msg_type
+                    );
+                }
+            }
+        }
+    }
+    served
 }
 
 /// The answers [`serve_datagram`] sends for a datagram [`table::classify`] read as `classified`, for a
@@ -737,6 +756,14 @@ pub(crate) fn serve_classified(sock: &dyn IkeSocket, st: &Phase1State, entropy: 
             ike_debug!("QUICK: a message under msgid={msgid:08x}, an exchange of ours that nothing waits on here -- dropped");
         }
         Classified::PeerQuick { .. } => served.new_quick += 1,
+        Classified::AnswerAgain { msgid, message } => match super::quick::send_framed(sock, st.floated, peer, message) {
+            Ok(()) => served.answered_again += 1,
+            Err(e) => ike_debug!("QUICK: failed to send message 2 of gateway Quick Mode msgid={msgid:08x} again: {e}"),
+        },
+        Classified::RefusalAgain { msgid, message } => match send_ike(sock, st, peer, message) {
+            Ok(()) => served.answered_again += 1,
+            Err(e) => ike_debug!("QUICK: failed to send the refusal of gateway message 1 msgid={msgid:08x} again: {e}"),
+        },
         Classified::Informational(seen) => {
             for &seq in &seen.r_u_there {
                 if answer_r_u_there(sock, st, entropy, peer, seq) {
@@ -746,7 +773,7 @@ pub(crate) fn serve_classified(sock: &dyn IkeSocket, st: &Phase1State, entropy: 
             served.ack_matched = seen.ack_matched;
             served.events_pushed = seen.events_pushed;
         }
-        Classified::CommitNoted { .. } | Classified::Foreign | Classified::Ignored(_) => {}
+        Classified::CommitNoted { .. } | Classified::Message3 { .. } | Classified::Foreign | Classified::Ignored(_) => {}
     }
     served
 }
@@ -793,6 +820,9 @@ pub struct TurnReport {
     pub new_quick: usize,
     /// Events added to the mailbox ([`Phase1State::drain_peer_events`]).
     pub events_pushed: usize,
+    /// Messages sent again for copies of a gateway message 1 this side answered or refused: its message 2, or
+    /// its refusal.
+    pub answered_again: usize,
 }
 
 /// One turn of attention to the IKEv1 socket between the commands of whoever owns it: the reader
@@ -802,8 +832,12 @@ pub struct TurnReport {
 /// nothing is read). Each datagram goes through the same classification as the liveness checks'
 /// ([`peek`], [`probe`]): an R-U-THERE is answered, a bit-exact repeat of a message a final message of
 /// ours answered gets that final message again, an authenticated message 1 of a gateway Quick Mode
-/// goes to the inbox, Deletes and error Notifies go to the mailbox, and an R-U-THERE-ACK -- nobody
-/// waits for one here -- is dropped. It never starts an exchange of its own.
+/// goes to the inbox -- it is never answered here: the caller answers it ([`crate::ikev1::answer_quick`]) --,
+/// a copy of the message 1 of a gateway Quick Mode this side answered gets its message 2 again and its
+/// message 3 is checked and recorded, a copy of one this side refused gets the refusal again, Deletes and
+/// error Notifies go to the mailbox (an error Notify about a gateway Quick Mode this side answers is also
+/// recorded on it), and an R-U-THERE-ACK -- nobody waits for one here -- is dropped. It never starts an
+/// exchange of its own.
 ///
 /// While the exchange table is passive -- in every mode but the ones that turned it on
 /// ([`Phase1State::enable_gateway_quick_mode`]) -- it does nothing and does not touch the socket.
@@ -833,6 +867,7 @@ pub fn serve_turn(
         report.acked_dpd += served.acked;
         report.new_quick += served.new_quick;
         report.events_pushed += served.events_pushed;
+        report.answered_again += served.answered_again;
     }
     Ok(report)
 }
@@ -1904,8 +1939,8 @@ pub(crate) mod tests {
         let slice = Duration::from_millis(20);
         let mut e = SeedEntropy::new(0x6602);
         let turns: [(TurnReport, usize); 3] = [
-            (TurnReport { datagrams_read: 8, acked_dpd: 8, new_quick: 0, events_pushed: 0 }, 8),
-            (TurnReport { datagrams_read: 2, acked_dpd: 2, new_quick: 0, events_pushed: 0 }, 11),
+            (TurnReport { datagrams_read: 8, acked_dpd: 8, new_quick: 0, events_pushed: 0, answered_again: 0 }, 8),
+            (TurnReport { datagrams_read: 2, acked_dpd: 2, new_quick: 0, events_pushed: 0, answered_again: 0 }, 11),
             (TurnReport::default(), 12),
         ];
         for (n, (expected, reads)) in turns.into_iter().enumerate() {
@@ -1948,7 +1983,7 @@ pub(crate) mod tests {
         let (for_ours, _) = quick_mode_pair(&client_st, ours);
         let sock = Scripted::with([msg1.clone(), many, late_ack, for_ours]);
         let report = serve_turn(&sock, &client_st, &mut SeedEntropy::new(0x6803), gateway_addr(), 8, Duration::from_millis(20)).unwrap();
-        assert_eq!(report, TurnReport { datagrams_read: 4, acked_dpd: 0, new_quick: 1, events_pushed: crate::ikev1::exchange::MAILBOX_CAP });
+        assert_eq!(report, TurnReport { datagrams_read: 4, acked_dpd: 0, new_quick: 1, events_pushed: crate::ikev1::exchange::MAILBOX_CAP, answered_again: 0 });
         assert!(sock.sent().is_empty(), "nothing answered");
         assert_eq!(client_st.take_peer_quick_modes().iter().map(|q| q.datagram.clone()).collect::<Vec<_>>(), [msg1]);
         assert_eq!(esp_named(&client_st.drain_peer_events()), spis[..crate::ikev1::exchange::MAILBOX_CAP]);
@@ -1967,7 +2002,7 @@ pub(crate) mod tests {
         let probe_msg = build_r_u_there(&gw_st, &mut ge, 9).unwrap();
         let sock = Scripted::with([msg1.clone(), wrap_ike_4500(&msg1), wrap_ike_4500(&probe_msg), vec![0xFF]]);
         let report = serve_turn(&sock, &client_st, &mut SeedEntropy::new(0x6902), gateway_addr(), 8, Duration::from_millis(20)).unwrap();
-        assert_eq!(report, TurnReport { datagrams_read: 4, acked_dpd: 1, new_quick: 1, events_pushed: 0 });
+        assert_eq!(report, TurnReport { datagrams_read: 4, acked_dpd: 1, new_quick: 1, events_pushed: 0, answered_again: 0 });
         let sent = sock.sent();
         assert_eq!(sent.len(), 1);
         assert_eq!(gateway_reads_notify(&gw_st, &sent[0]), (notify_type::R_U_THERE_ACK, 9u32.to_be_bytes().to_vec()));

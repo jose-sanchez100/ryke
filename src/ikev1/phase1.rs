@@ -17,6 +17,8 @@
 
 use super::crypto1::{self, Prf, AES_BLOCK};
 use super::exchange::{ExchangeTable, PeerEvent, PeerQuick};
+use super::informational::ChildFamily;
+use super::responder::cache::{IllegalTransition, Outcome, PendingResponder, ResponderEvents, ResponderId, ResponderState};
 use super::isakmp::{self, exchange, payload, IsakmpHeader};
 use super::msgid::MidKind;
 use super::phase2;
@@ -890,11 +892,50 @@ impl Phase1State {
     }
 
     /// The authenticated message-1 copies of Quick Modes the gateway started that the readers of
-    /// the socket kept since the last call, oldest first (at most four: a full inbox drops its
-    /// oldest); nothing of them has been answered or validated beyond their HASH(1). Empty while the
-    /// exchange table is passive ([`Self::enable_gateway_quick_mode`]).
+    /// the socket kept since the last call (at most four: a full inbox drops its oldest), and those
+    /// [`crate::ikev1::answer_quick`] deferred whose family nothing of the gateway's keeps now (one per family, at
+    /// most [`crate::ikev1::DEFER_MAX`] after it was read: [`crate::ikev1::Silence::Deferred`]), oldest read first;
+    /// nothing of them has been answered or validated beyond their HASH(1). Empty while the exchange table is passive
+    /// ([`Self::enable_gateway_quick_mode`]).
     pub fn take_peer_quick_modes(&self) -> Vec<PeerQuick> {
         self.exchanges.take_inbox()
+    }
+
+    /// The gateway Quick Mode of `family` this side holds the answer of or answered, if there is one: one at a time per
+    /// family. `None` while the exchange table is passive.
+    pub fn responder_pending(&self, family: ChildFamily) -> Option<PendingResponder> {
+        self.exchanges.pending(family)
+    }
+
+    /// What the readers of the socket recorded about the gateway Quick Mode of `family` in progress since the last
+    /// call, each fact once ([`ResponderEvents`]): its message 3 authenticated, a Commit bit on a copy of one of its
+    /// messages, an error Notify about it, the ISAKMP SA deleted. Nothing here acts on any of them: the caller, which
+    /// hears the daemon, decides. `None` when nothing of the family is in progress, and while the table is passive.
+    pub fn take_responder_events(&self, family: ChildFamily) -> Option<ResponderEvents> {
+        self.exchanges.take_events(family)
+    }
+
+    /// Ends the gateway Quick Mode answer `id` ([`crate::ikev1::HeldQuick::id`], [`PendingResponder::id`]) as the caller
+    /// decided ([`Outcome`]): proven -- its message 2 kept to answer copies of message 1 for
+    /// [`crate::ikev1::RESP_RETAIN`] --, abandoned or cancelled -- its message 2 dropped at once, copies of message 1 and
+    /// a late message 3 met with silence. Refused, nothing changed, when its state does not allow it, when it is an
+    /// earlier answer to a message the responder answered anew since ([`IllegalTransition`]), and while the table is
+    /// passive.
+    pub fn conclude_responder(&self, id: ResponderId, outcome: Outcome) -> Result<ResponderState, IllegalTransition> {
+        self.exchanges.conclude(id, outcome)
+    }
+
+    /// Ends the held gateway Quick Mode answer `id` with nothing sent (the daemon refused it, or its family changed):
+    /// parked, a copy of its message 1 may be answered anew (D9). Refused, nothing changed, when it is not held -- an
+    /// earlier answer to a message the responder answered anew since included ([`IllegalTransition`]).
+    pub fn park_responder(&self, id: ResponderId) -> Result<ResponderState, IllegalTransition> {
+        self.exchanges.park_responder(id)
+    }
+
+    /// The state of the gateway Quick Mode `msgid` -- of its latest answer --, or the end it left with while that is
+    /// remembered.
+    pub fn responder_state(&self, msgid: u32) -> Option<ResponderState> {
+        self.exchanges.responder_state(msgid)
     }
 
     /// What the gateway's authenticated Informationals named since the last call -- its Deletes and

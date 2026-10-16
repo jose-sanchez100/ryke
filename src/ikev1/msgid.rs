@@ -15,8 +15,10 @@
 //!   peer message ([`Origin::Peer`]), at most [`MID_CAP`]. An [`MidState::Active`] record is an
 //!   exchange in progress and carries the deadline it ends at, at the latest: every method
 //!   that is told the time first sweeps ([`MessageIdLedger::sweep`]) the Active records whose
-//!   deadline has come into [`MidState::Done`], so a record nobody finishes stops being Active
-//!   all the same, and no background thread is needed.
+//!   deadline has come into [`MidState::Done`] -- or, for a peer Quick Mode that waited with
+//!   nothing sent and was told so ([`AtDeadline::Park`]), into [`MidState::Parked`] as of its
+//!   deadline -- so a record nobody finishes stops being Active all the same, and no background
+//!   thread is needed.
 //! - **Retention and saturation.** A full ledger makes room by forgetting the oldest record
 //!   that is not Active: ours first -- our Informationals, then our Quick Modes and Mode-Config
 //!   requests -- and then the peer's. An Active record is never forgotten. Only when every one
@@ -67,8 +69,9 @@ use crate::entropy::Entropy;
 use crate::error::IkeError;
 
 /// The most records the ledger holds (POLICY; see the module doc for what that covers). A
-/// record is about a hundred octets in the map and its place in an order 32 more; with the map's
-/// spare room and the tree's nodes a full ledger is about 1 MiB.
+/// record is 120 octets in the map at most (with what it becomes at its deadline, [`AtDeadline`]) and
+/// its place in an order 32 more; with the map's spare room and the tree's nodes a full ledger is
+/// about 1.2 MB.
 pub(crate) const MID_CAP: usize = 4096;
 
 /// How many random draws [`MessageIdLedger::fresh`] makes before it takes the next id the
@@ -102,7 +105,6 @@ pub(crate) const NI_KEPT: usize = 16;
 /// The least time between the conclusion of a peer Quick Mode of a family and the admission of
 /// the next one of that family (POLICY): the cap of the spacing the worker keeps between two
 /// renewals of its own (its `I_min`).
-#[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
 pub(crate) const ACCEPT_SPACING: Duration = Duration::from_millis(200);
 
 /// How often, at most, a saturated ledger writes that it refused a peer Quick Mode.
@@ -167,8 +169,23 @@ pub(crate) struct MidRecord {
     /// most). Kept on the record, not in [`MidState::Parked`], because it must outlast the Active
     /// spell between two parkings.
     pub tries: u8,
+    /// What the record becomes at its deadline, while it is Active ([`MessageIdLedger::sweep`]); [`AtDeadline::Done`]
+    /// for every record but a peer Quick Mode that waits with nothing sent ([`MessageIdLedger::set_deadline_then`]).
+    pub at_deadline: AtDeadline,
     /// Breaks ties of `first_seen`: the order the records were made in.
     seq: u64,
+}
+
+/// What an Active record becomes when its deadline comes ([`MessageIdLedger::sweep`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AtDeadline {
+    /// [`MidState::Done`]: the exchange is over.
+    Done,
+    /// Parked as [`MessageIdLedger::park`] parks it, at the deadline and until `until`: a peer Quick Mode that waited
+    /// for a passing reason with nothing sent -- an answer held for the daemon, a message 1 deferred while its family
+    /// was busy -- whose message 1 the peer may send again (D9). One taken up again [`RECONSIDER_MAX`] times already,
+    /// or whose `until` is not past the deadline, is Done instead.
+    Park { until: Instant },
 }
 
 /// How many places the eviction order has ([`MidRecord::rank`]).
@@ -300,11 +317,10 @@ struct FamilyMemory {
     /// The SHA-256 of the peer's last [`NI_KEPT`] nonces, oldest first: the nonce itself is not kept.
     nonces: VecDeque<[u8; 32]>,
     /// When the last peer Quick Mode of the family concluded.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     concluded: Option<Instant>,
 }
 
-fn family_index(family: ChildFamily) -> usize {
+pub(crate) fn family_index(family: ChildFamily) -> usize {
     match family {
         ChildFamily::Primary => 0,
         ChildFamily::Ipv6 => 1,
@@ -334,9 +350,16 @@ impl MessageIdLedger {
     /// method told the time calls it first.
     pub(crate) fn sweep(&mut self, now: Instant) {
         while self.orders.deadlines.first().is_some_and(|(deadline, ..)| *deadline <= now) {
-            let Some((_, _, id)) = self.orders.deadlines.pop_first() else { break };
+            let Some((deadline, _, id)) = self.orders.deadlines.pop_first() else { break };
             if let Some(record) = self.records.get_mut(&id) {
-                record.state = MidState::Done;
+                // What it becomes is fixed by its deadline, not by when the sweep runs.
+                record.state = match record.at_deadline {
+                    AtDeadline::Park { until } if record.tries < RECONSIDER_MAX && deadline < until => {
+                        MidState::Parked { not_before: deadline.checked_add(RECONSIDER_GAP).unwrap_or(deadline), until }
+                    }
+                    _ => MidState::Done,
+                };
+                record.at_deadline = AtDeadline::Done;
                 self.orders.add(record);
             }
         }
@@ -369,7 +392,7 @@ impl MessageIdLedger {
         if self.records.contains_key(&id) || (self.records.len() >= MID_CAP && !self.evict_one()) {
             return false;
         }
-        let record = MidRecord { id, origin, kind, state, first_seen: now, fingerprint, tries: 0, seq: self.next_seq };
+        let record = MidRecord { id, origin, kind, state, first_seen: now, fingerprint, tries: 0, at_deadline: AtDeadline::Done, seq: self.next_seq };
         self.next_seq += 1;
         self.orders.add(&record);
         self.records.insert(id, record);
@@ -381,6 +404,9 @@ impl MessageIdLedger {
         if let Some(record) = self.records.get_mut(&id) {
             self.orders.remove(record);
             record.state = state;
+            if !matches!(state, MidState::Active { .. }) {
+                record.at_deadline = AtDeadline::Done;
+            }
             self.orders.add(record);
         }
     }
@@ -556,6 +582,21 @@ impl MessageIdLedger {
         active
     }
 
+    /// [`Self::set_deadline`], and what the record becomes at that deadline, `then` ([`AtDeadline`]): the
+    /// responder's exchanges wait for passing reasons with nothing sent, parked when their time runs out, then
+    /// with their answer sent, over when it runs out. Only a peer Quick Mode is parked at its deadline: for any
+    /// other record `then` is taken as [`AtDeadline::Done`].
+    pub(crate) fn set_deadline_then(&mut self, id: u32, now: Instant, deadline: Instant, then: AtDeadline) -> bool {
+        if !self.set_deadline(id, now, deadline) {
+            return false;
+        }
+        if let Some(record) = self.records.get_mut(&id) {
+            let parkable = record.origin == Origin::Peer && record.kind == MidKind::Quick;
+            record.at_deadline = if parkable { then } else { AtDeadline::Done };
+        }
+        true
+    }
+
     /// Sets the [`fingerprint`] the record of `id` is compared against; `false` when there is no record.
     #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     pub(crate) fn attach_fingerprint(&mut self, id: u32, fingerprint: [u8; 32]) -> bool {
@@ -628,7 +669,6 @@ impl MessageIdLedger {
     /// Whether a peer Quick Mode of `family` may be admitted at `now`: [`ACCEPT_SPACING`] after
     /// the last one of the family concluded ([`Self::responder_concluded`]), or at any time before
     /// the first did.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     pub(crate) fn accept_allowed(&mut self, family: ChildFamily, now: Instant) -> bool {
         self.sweep(now);
         self.families[family_index(family)].concluded.is_none_or(|last| now.saturating_duration_since(last) >= ACCEPT_SPACING)
@@ -636,7 +676,6 @@ impl MessageIdLedger {
 
     /// A peer Quick Mode of `family` concluded at `now`, however it ended. A `now` earlier than one
     /// already noted changes nothing.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     pub(crate) fn responder_concluded(&mut self, family: ChildFamily, now: Instant) {
         self.sweep(now);
         let concluded = &mut self.families[family_index(family)].concluded;
@@ -1011,7 +1050,7 @@ mod tests {
     /// What [`MID_CAP`]'s doc says a full ledger costs rests on these sizes.
     #[test]
     fn a_record_and_its_place_in_an_order_are_as_small_as_the_cap_assumes() {
-        assert!(std::mem::size_of::<(u32, MidRecord)>() <= 104);
+        assert!(std::mem::size_of::<(u32, MidRecord)>() <= 120);
         assert!(std::mem::size_of::<(Instant, u64, u32)>() <= 32);
     }
 
@@ -1200,6 +1239,80 @@ mod tests {
         assert_eq!(ids.state(0x10), Some(MidState::Superseded));
         assert!(!ids.finish(0x14, t0 + secs(10), MidEnd::Done));
         ids.check();
+    }
+
+    /// An Active record told what it becomes at its deadline ([`MessageIdLedger::set_deadline_then`]): a peer Quick
+    /// Mode to be parked is parked exactly as `park` at its deadline would park it -- from a second after the deadline
+    /// until the `until` given -- whenever the sweep runs; one taken up again twice already, or whose `until` is not
+    /// past its deadline, is Done instead; any other record is Done whatever it was told; and a deadline moved by
+    /// `set_deadline` keeps what was told, while a record parked or ended and taken up again is Done at its deadline.
+    #[test]
+    fn a_record_told_to_be_parked_at_its_deadline_is_parked_then_whenever_the_sweep_runs() {
+        let t0 = Instant::now();
+        let (deadline, until) = (t0 + secs(8), t0 + secs(28));
+        let parked = MidState::Parked { not_before: deadline + RECONSIDER_GAP, until };
+        type Setup = fn(&mut MessageIdLedger, Instant) -> u32;
+        let cases: [(&str, Setup, Duration, MidState); 7] = [
+            ("a peer Quick Mode, swept at its deadline", |ids, t0| {
+                peer_quick(ids, 0x10, 1, t0, t0 + secs(30));
+                0x10
+            }, secs(0), parked),
+            ("a peer Quick Mode, swept a minute late", |ids, t0| {
+                peer_quick(ids, 0x10, 1, t0, t0 + secs(30));
+                0x10
+            }, secs(60), parked),
+            ("a peer Quick Mode taken up again twice", |ids, t0| {
+                peer_quick(ids, 0x10, 1, t0, t0 + secs(30));
+                for n in 0..RECONSIDER_MAX as u64 {
+                    let at = t0 + ms(n);
+                    assert!(ids.park(0x10, at, at + secs(30)));
+                    assert!(ids.reconsider(0x10, at + RECONSIDER_GAP, t0 + secs(30)));
+                }
+                0x10
+            }, secs(0), MidState::Done),
+            ("our own Quick Mode", |ids, t0| ids.fresh(MidKind::Quick, &mut Scripted::new(&[0x21]), t0).unwrap(), secs(0), MidState::Done),
+            ("a peer Mode-Config exchange", |ids, t0| {
+                assert_eq!(ids.record_authenticated(0x30, MidKind::ModeConfig, fp(3), t0, t0 + secs(30)), Admission::New);
+                ids.restate(0x30, MidState::Active { deadline: t0 + secs(30) });
+                0x30
+            }, secs(0), MidState::Done),
+            ("its deadline moved later by set_deadline: still parked, at the new one", |ids, t0| {
+                peer_quick(ids, 0x10, 1, t0, t0 + secs(30));
+                0x10
+            }, secs(0), parked),
+            ("parked and taken up again: Done at its next deadline", |ids, t0| {
+                peer_quick(ids, 0x10, 1, t0, t0 + secs(30));
+                0x10
+            }, secs(0), MidState::Done),
+        ];
+        for (n, (what, setup, late, want)) in cases.into_iter().enumerate() {
+            let mut ids = MessageIdLedger::default();
+            let id = setup(&mut ids, t0);
+            match n {
+                5 => {
+                    assert!(ids.set_deadline_then(id, t0, t0 + secs(4), AtDeadline::Park { until }), "{what}");
+                    assert!(ids.set_deadline(id, t0, deadline), "{what}");
+                }
+                6 => {
+                    assert!(ids.set_deadline_then(id, t0, t0 + secs(4), AtDeadline::Park { until }), "{what}");
+                    assert!(ids.park(id, t0 + secs(1), t0 + secs(30)), "{what}");
+                    assert!(ids.reconsider(id, t0 + secs(2), deadline), "{what}");
+                }
+                _ => assert!(ids.set_deadline_then(id, t0, deadline, AtDeadline::Park { until }), "{what}"),
+            }
+            ids.sweep(deadline - Duration::from_nanos(1));
+            assert_eq!(ids.state(id), Some(MidState::Active { deadline }), "{what}: before its deadline");
+            ids.sweep(deadline + late);
+            assert_eq!(ids.state(id), Some(want), "{what}");
+            assert_eq!(ids.record(id).map(|record| record.at_deadline), Some(AtDeadline::Done), "{what}: told nothing any more");
+            ids.check();
+        }
+        let mut ids = MessageIdLedger::default();
+        peer_quick(&mut ids, 0x10, 1, t0, t0 + secs(30));
+        assert!(ids.set_deadline_then(0x10, t0, deadline, AtDeadline::Park { until: deadline }));
+        ids.sweep(deadline);
+        assert_eq!(ids.state(0x10), Some(MidState::Done), "an until not past the deadline parks nothing");
+        assert!(!ids.set_deadline_then(0x99, t0, deadline, AtDeadline::Park { until }), "no record");
     }
 
     /// Every method told the time sweeps first: after any of them, at an exchange's deadline, the

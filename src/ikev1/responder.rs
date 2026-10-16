@@ -19,10 +19,11 @@
 //! hears the daemon -- ends it ([`Phase1State::conclude_responder`]), and nothing here decides a proof. Meanwhile
 //! every reader of the socket reads a Quick Mode message under its Message ID as that exchange's
 //! ([`read_under_responder`]): a copy of its message 1 is answered with the message 2 sent -- the same
-//! plaintext under the copy's own last cipher block when that block is another one, never a new SPI, nonce or
-//! key --, its message 3 is checked by HASH(3) and recorded, and what the gateway says of it is recorded for
-//! the caller ([`Phase1State::take_responder_events`]). A message 1 whose family is not free waits in that
-//! family's slot ([`Silence::Deferred`]).
+//! plaintext under the copy's own last cipher block when that block is another one and the copy's padding leaves
+//! at least [`cache::LAST_BLOCK_COVERED_MIN`] octets of the payload chain in it, never a new SPI, nonce or key --,
+//! its message 3 is checked by HASH(3) and recorded, and what the gateway says of it is recorded for the caller
+//! ([`Phase1State::take_responder_events`]). A message 1 whose family is not free waits in that family's slot
+//! ([`Silence::Deferred`]).
 //!
 //! **Secrets.** The Quick Mode Diffie-Hellman private key and the shared secret `g(qm)^xy` live in
 //! zeroizing buffers that are wiped as soon as KEYMAT is derived, before [`answer_quick`] returns (RFC 2409
@@ -63,7 +64,7 @@ pub(super) mod cache;
 #[cfg(test)]
 mod scenario_tests;
 
-use cache::{DeferReason, HoldRefused, Retained, ResponderEntry, ResponderId, ResponderState, Variant, PARKED_FOR, PEER_QM_PROOF_WAIT, QM2_RESENDS, QM2_VARIANTS};
+use cache::{DeferReason, HoldRefused, Retained, ResponderEntry, ResponderId, ResponderState, Variant, LAST_BLOCK_COVERED_MIN, PARKED_FOR, PEER_QM_PROOF_WAIT, QM2_RESENDS, QM2_VARIANTS};
 
 /// RFC 2407 §4.6.2.1: ID_IPV4_ADDR_RANGE, a selector this side never accepts.
 const ID_IPV4_ADDR_RANGE: u8 = 7;
@@ -648,7 +649,12 @@ impl fmt::Debug for AnsweredQuick {
 ///   2 is held, is not answered; one of an answered or proven exchange is answered with its message 2 -- the one sent
 ///   under the same last cipher block, byte for byte, or the plaintext encrypted under this copy's last block when
 ///   that is another one (the same SPI, nonce, KE and HASH(2): nothing is derived again), at most two encryptions
-///   kept and one answer per 200 ms ([`Classified::AnswerAgain`]).
+///   kept and one answer per 200 ms ([`Classified::AnswerAgain`]). A copy under another last block is that only when
+///   its padding leaves at least [`LAST_BLOCK_COVERED_MIN`] (4) octets of the payload chain in its last block (RFC 2409
+///   Appendix B pads "up to the nearest block size"): a last block put in place of the sender's decrypts to the `n`
+///   octets of the chain it carries once in 2^(8n) tries, and to a block of padding only always -- no HASH covers
+///   padding (§5.5), and nothing the header's length. Any other copy under another last block is dropped as another
+///   message ([`ResponderDrop::OtherMessage`]), with nothing moved.
 /// - Otherwise, decrypted under the last cipher block of each message 2 sent (RFC 2409 Appendix B), its first payload
 ///   is the HASH(3) of the exchange, `prf(SKEYID_a, 0 | M-ID | Ni_b | Nr_b)` (RFC 2409 §5.5): its message 3, recorded
 ///   ([`Classified::Message3`]) -- with the Commit bit, as that fact only, never as a proof (DESIGN 3.6).
@@ -662,7 +668,8 @@ pub(super) fn read_under_responder(st: &Phase1State, header: &IsakmpHeader, mess
         let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, msgid, st.enc_block);
         if let Ok((_header, payloads, last_block)) = phase2::parse_encrypted(message, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0) {
             if matches!(payloads.as_slice(), [hash, sa, ..] if hash.payload_type == payload::HASH && sa.payload_type == payload::SA) {
-                return copy_of_message_1(st, msgid, entry, &payloads, &last_block, commit_flag);
+                let padding = phase2::padding_len(message, &payloads);
+                return copy_of_message_1(st, msgid, entry, &payloads, &last_block, padding, commit_flag);
             }
         }
         let hash3 = quick::hash3(st.prf, &st.skeyid_a, msgid, &entry.retained.ni, &entry.retained.nr);
@@ -690,9 +697,10 @@ pub(super) fn read_under_responder(st: &Phase1State, header: &IsakmpHeader, mess
     Classified::Ignored(Ignored::Responder(drop))
 }
 
-/// The first step of [`read_under_responder`]: a copy of a message 1, `payloads` as it decrypted under its IV and
-/// `last_block` its last cipher block.
-fn copy_of_message_1(st: &Phase1State, msgid: u32, entry: &ResponderEntry, payloads: &[Payload], last_block: &[u8], commit_flag: bool) -> Classified {
+/// The first step of [`read_under_responder`]: a copy of a message 1, `payloads` as it decrypted under its IV,
+/// `last_block` its last cipher block and `padding` the octets of its plaintext after that payload chain
+/// ([`phase2::padding_len`]).
+fn copy_of_message_1(st: &Phase1State, msgid: u32, entry: &ResponderEntry, payloads: &[Payload], last_block: &[u8], padding: usize, commit_flag: bool) -> Classified {
     let print = msgid::fingerprint(msgid, payloads);
     if commit_flag {
         st.exchanges.note_commit(msgid, print);
@@ -715,6 +723,20 @@ fn copy_of_message_1(st: &Phase1State, msgid: u32, entry: &ResponderEntry, paylo
         return unanswered(ResponderDrop::CopyWhileHeld, "its message 2 is held, not sent yet");
     }
     let known = entry.retained.variants.iter().any(|variant| variant.sent && variant.qm1_last_block == last_block);
+    if !known && padding.saturating_add(LAST_BLOCK_COVERED_MIN) > st.enc_block {
+        // A last cipher block put in place of the sender's leaves every plaintext block before it as it was and makes
+        // the last one random (CBC), so the copy passes HASH(1) and the fingerprint when that block decrypts to the
+        // octets of the payload chain it carries: once in 2^(8n) tries for n octets, and always for a block of padding
+        // only -- a block appended on the path, the header's length raised: nothing covers padding (RFC 2409 §5.5). A
+        // last block with fewer than LAST_BLOCK_COVERED_MIN octets of the chain (POLICY) may be anyone's: that copy
+        // creates no encryption of message 2, and moves neither the one a resend sends nor the spacing of the answers.
+        let counted = st.exchanges.count_responder(|counters| counters.other_messages += 1);
+        ike_debug!(
+            "QUICK: a copy of gateway message 1 under msgid={msgid:08x} carries {padding} octets of padding, another last cipher block with fewer than {LAST_BLOCK_COVERED_MIN} octets of its payload chain -- not answered, dropped ({} so far)",
+            counted.other_messages
+        );
+        return Classified::Ignored(Ignored::Responder(ResponderDrop::OtherMessage));
+    }
     let new_variant = if known || entry.retained.variants.len() >= QM2_VARIANTS {
         None
     } else {
@@ -1012,6 +1034,9 @@ fn read_message_1(st: &Phase1State, quick: &PeerQuick) -> Result<ReadMessage1, (
         return Err(unauthenticated("its payloads are not encrypted"));
     }
     let iv0 = crypto1::phase2_iv(st.prf, &st.phase1_iv, quick.msgid, st.enc_block);
+    // No padding bound on the first copy (unlike `copy_of_message_1`): the ledger holds it in progress already, so a
+    // silence would turn the gateway's own copies away as duplicates, even those whose last block carries enough of
+    // the payload chain for an encryption of their own.
     let (_header, payloads, last_block) = phase2::parse_encrypted(&quick.datagram, st.prf, &st.skeyid_a, &st.enc_key, st.enc_block, &iv0)
         .map_err(|_| unauthenticated("it does not authenticate as a message 1 (HASH(1))"))?;
     if msgid::fingerprint(quick.msgid, &payloads) != quick.fingerprint {
@@ -1611,7 +1636,7 @@ mod tests {
         /// What a gateway sends to rekey the SA of `exp` on an ISAKMP SA that `floated` or not: its suite, the
         /// encapsulation mode of the ISAKMP SA, 3600 s, its selectors (IDci the gateway's), the SPI
         /// [`GATEWAY_SPI`] and, with PFS, a KE of [`GATEWAY_DH`]; Message ID and nonce drawn from `seed`.
-        fn rekeying_on(floated: bool, exp: &ExpectedQuick, seed: u64) -> Self {
+        pub(super) fn rekeying_on(floated: bool, exp: &ExpectedQuick, seed: u64) -> Self {
             let mut entropy = SeedEntropy::new(seed);
             let msgid = msgid::draw(&mut entropy);
             let mut ni = vec![0u8; 16];

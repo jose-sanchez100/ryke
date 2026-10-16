@@ -139,6 +139,16 @@ pub fn parse_encrypted(
     Ok((header, payloads, next))
 }
 
+/// How many octets of the encrypted body of `data` follow the payload chain `payloads` read from it
+/// ([`parse_encrypted`], [`decrypt_payloads`]): the padding added for encryption and whatever else comes after the
+/// last payload. No HASH covers them (RFC 2409 §5.5: HASH(1) excludes "any padding added for encryption"), and the
+/// header's length, which "MUST include the length of the pad" (RFC 2409 Appendix B), is covered by none either.
+pub fn padding_len(data: &[u8], payloads: &[Payload]) -> usize {
+    // Each payload read is its 4-octet generic header and its body, back to back from the start of the plaintext.
+    let chain = payloads.iter().fold(0usize, |len, p| len.saturating_add(4).saturating_add(p.data.len()));
+    data.len().saturating_sub(IsakmpHeader::LEN).saturating_sub(chain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +184,41 @@ mod tests {
         // A wrong key must fail the HASH check.
         let bad = [0x99u8; 32];
         assert!(parse_encrypted(&msg, prf, &bad, &enc_key, AES_BLOCK, &iv).is_err());
+    }
+
+    /// The padding of a message is what its body holds after the payload chain read from it: none for a chain that
+    /// fills its last block, the rest of the block otherwise, and a block more for each block appended after the
+    /// message (its header's length raised to match), which still authenticates.
+    #[test]
+    fn the_padding_is_the_body_after_the_payload_chain() {
+        let prf = Prf::Sha256;
+        let (skeyid_a, enc_key, iv) = ([0x11u8; 32], [0x22u8; 32], [0x33u8; AES_BLOCK]);
+        let header = IsakmpHeader {
+            init_cookie: [1; 8],
+            resp_cookie: [2; 8],
+            next_payload: payload::NONE,
+            version: IsakmpHeader::VERSION_1_0,
+            exchange_type: exchange::QUICK,
+            flags: 0,
+            message_id: 0x0BAD_CAFE,
+            length: 0,
+        };
+        // HASH (4 + 32 octets) and an SA of `body` octets: a chain of 40 + body octets.
+        let rows: [(&str, usize, usize, usize); 5] = [
+            ("a chain that fills its last block", 8, 0, 0),
+            ("one octet short of a block", 7, 0, 1),
+            ("one octet past a block", 9, 0, 15),
+            ("a block appended", 8, 1, 16),
+            ("two blocks appended to a padded message", 1, 2, 7 + 32),
+        ];
+        for (what, body, appended, want) in rows {
+            let sa = vec![(payload::SA, vec![0x5A; body])];
+            let (mut msg, _next) = build_encrypted(header.clone(), prf, &skeyid_a, &enc_key, AES_BLOCK, &iv, &sa).unwrap();
+            msg.resize(msg.len() + appended * AES_BLOCK, 0xA5);
+            let length = msg.len() as u32;
+            msg[24..28].copy_from_slice(&length.to_be_bytes());
+            let (_h, payloads, _next) = parse_encrypted(&msg, prf, &skeyid_a, &enc_key, AES_BLOCK, &iv).expect(what);
+            assert_eq!(padding_len(&msg, &payloads), want, "{what}");
+        }
     }
 }

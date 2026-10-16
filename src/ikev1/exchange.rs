@@ -1850,7 +1850,11 @@ pub(crate) enum ResponderDrop {
     CopyTooSoon,
     /// A copy of its message 1 under a third last cipher block, or one whose encryption does not fit the cache.
     CopyNoRoom,
-    /// Another message 1 under its id (another fingerprint).
+    /// Another message 1 under its id: another fingerprint, or the same one under a last cipher block no message 2 was
+    /// sent under that carries fewer than [`LAST_BLOCK_COVERED_MIN`](super::responder::cache::LAST_BLOCK_COVERED_MIN)
+    /// (4) octets of the payload chain -- its padding longer than a cipher block less that, or a block or more. A last
+    /// block put in place of the sender's passes HASH(1) when it decrypts to the `n` octets of the chain it carries,
+    /// once in 2^(8n) tries, and always when it is padding only (RFC 2409 §5.5: no HASH covers padding).
     OtherMessage,
     /// No copy of its message 1, while message 2 is held: nothing can be its message 3 yet.
     WhileHeld,
@@ -1978,7 +1982,9 @@ pub(crate) enum Classified {
     PeerQuick { msgid: u32 },
     /// A copy of the message 1 of a gateway Quick Mode the responder answered or proved: its message 2
     /// (`message`, the ISAKMP message without the non-ESP marker), for the reader to send as it was -- or the
-    /// same plaintext encrypted under this copy's last cipher block, when that block is another one.
+    /// same plaintext encrypted under this copy's last cipher block, when that block is another one and the copy's
+    /// padding leaves at least [`LAST_BLOCK_COVERED_MIN`](super::responder::cache::LAST_BLOCK_COVERED_MIN) octets of
+    /// the payload chain in it.
     AnswerAgain { msgid: u32, message: Vec<u8> },
     /// A copy of a message 1 this side refused: the refusal kept (`message`, an Informational), for the reader to
     /// send again as it was.

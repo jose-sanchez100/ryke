@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use super::cache::{
     DeferReason, EndReason, IllegalTransition, Outcome, PendingResponder, Proof, ResponderEvents, ResponderId, ResponderState, Transition, ANSWERED_FOR, ANSWER_SPACING,
-    DEFER_MAX, PARKED_FOR, PEER_QM_HOLD_MAX, RESP_RETAIN,
+    DEFER_MAX, LAST_BLOCK_COVERED_MIN, PARKED_FOR, PEER_QM_HOLD_MAX, RESP_RETAIN,
 };
 use super::tests::{accepted, gateways_v6, kept, msgid_of, on_the_wire, ours_v6, pair, plain, refused, v6, Counting, Qm1, Tunnel, GATEWAYS_V4, GCM, OURS_V4};
 use super::*;
@@ -158,6 +158,20 @@ impl World {
         .unwrap()
     }
 
+    /// The gateway's rekey of the IPv4 SA, field by field ([`Qm1`]), with `padding` octets of padding, fewer than a
+    /// cipher block: its nonce made as many octets longer than the 16 drawn from `seed` as that takes, 15 at most
+    /// (RFC 2409 §5: 8 to 256 octets).
+    fn rekey_padded(&self, padding: usize, seed: u64) -> Vec<u8> {
+        let block = self.gw.enc_block;
+        assert!(padding < block, "{padding} octets of padding, a block or more");
+        let mut qm1 = Qm1::rekeying_on(self.client.floated, &plain(), seed);
+        let longer = (padding_of(&self.gw, &qm1.message(&self.gw)) + block - padding) % block;
+        qm1.ni.resize(qm1.ni.len() + longer, 0x4E);
+        let message = qm1.message(&self.gw);
+        assert_eq!(padding_of(&self.gw, &message), padding);
+        message
+    }
+
     /// The gateway-side initiator of `qm1` as the gateway sent it (no PFS): a fresh one for each message 2 tried.
     fn initiator(&self, qm1: &[u8]) -> QuickInitiator {
         QuickInitiator::of_message_1(&self.gw, qm1, GCM, None)
@@ -208,13 +222,36 @@ impl World {
 }
 
 /// `message` with one more cipher block of `fill` after its last: the same authenticated content (the payload chain
-/// ends before it), another last cipher block.
+/// ends before it), another last cipher block -- one anybody on the path can append, the header's length raised.
 fn appended(message: &[u8], fill: u8) -> Vec<u8> {
     let mut longer = message.to_vec();
     longer.extend_from_slice(&[fill; 16]);
     let length = longer.len() as u32;
     longer[24..28].copy_from_slice(&length.to_be_bytes());
     longer
+}
+
+/// The octets of padding of `message`, a message 1 of the gateway's (`gw`): what its body holds after the payload chain.
+fn padding_of(gw: &Phase1State, message: &[u8]) -> usize {
+    let iv0 = crypto1::phase2_iv(gw.prf, &gw.phase1_iv, msgid_of(message), gw.enc_block);
+    let (_header, payloads, _next) = phase2::decrypt_payloads(message, &gw.enc_key, gw.enc_block, &iv0).unwrap();
+    phase2::padding_len(message, &payloads)
+}
+
+/// `message`, a message 1 of the gateway's (`gw`), encrypted again by the gateway with its padding made of `fill`
+/// octets: the same length and authenticated content, another last cipher block -- what a gateway that pads each copy
+/// anew would send, and what a last block put in place of the gateway's that decrypts to the octets of the chain it
+/// carries is too. Its padding is one octet at least and shorter than a block, as the gateway-side code pads.
+fn repadded(gw: &Phase1State, message: &[u8], fill: u8) -> Vec<u8> {
+    let iv0 = crypto1::phase2_iv(gw.prf, &gw.phase1_iv, msgid_of(message), gw.enc_block);
+    let padding = padding_of(gw, message);
+    assert!((1..gw.enc_block).contains(&padding), "a message 1 padded with {padding} octets");
+    let mut plaintext = crypto1::cbc_decrypt(gw.enc_block, &gw.enc_key, &iv0, &message[IsakmpHeader::LEN..]).unwrap();
+    let chain = plaintext.len() - padding;
+    plaintext[chain..].fill(fill);
+    let mut copy = message[..IsakmpHeader::LEN].to_vec();
+    copy.extend(crypto1::cbc_encrypt(gw.enc_block, &gw.enc_key, &iv0, &plaintext).unwrap());
+    copy
 }
 
 /// The payload chain of `qm2` decrypted under `iv`.
@@ -335,35 +372,129 @@ fn a_copy_of_message_1_after_message_2_was_lost_gets_the_message_2_held_byte_for
     }
 }
 
-/// A copy of message 1 under another last cipher block (the same content: a block appended on the path, read first):
-/// message 2 answers it under that copy's block, which the gateway cannot read; the gateway's own copy, read next,
-/// gets the same plaintext encrypted under its own last block -- the same SPI, nonce and identities --, the gateway's
-/// initiator takes that, and its message 3, encrypted under the second encryption's last block, is recorded. A copy
-/// under a third last block is not answered; the gateway's copy again gets the second encryption byte for byte.
+/// A copy of message 1 under another last cipher block -- the same content and length, its padding other octets, as a
+/// gateway that pads each copy anew would send it, here with as much padding as still leaves
+/// [`LAST_BLOCK_COVERED_MIN`] octets of the payload chain in its last block -- gets the same plaintext encrypted under
+/// its own last block (the same SPI, nonce and identities, nothing drawn), which that copy's initiator takes and the
+/// first one's does not; the message 3 that answers either encryption authenticates and is recorded. A copy under a
+/// third last block is not answered, nor is one with a block appended; each of the two copies gets its own encryption
+/// again, byte for byte, at most once per 200 ms.
 #[test]
 fn a_copy_under_another_last_block_is_answered_under_its_own_and_message_3_is_checked_against_both() {
     let w = World::new(false);
-    let (genuine, _) = w.rekey(Primary, 0xB300);
-    let raced = appended(&genuine, 0xA5);
-    let held = w.hold(&raced);
+    let genuine = w.rekey_padded(crypto1::AES_BLOCK - LAST_BLOCK_COVERED_MIN, 0xB300);
+    let anew = repadded(&w.gw, &genuine, 0xA5);
+    assert_eq!(anew.len(), genuine.len());
+    assert_ne!(last_block(&anew), last_block(&genuine), "another last block");
+    let held = w.hold(&genuine);
     let msgid = held.msgid();
-    assert_eq!(held.qm1_last_block(), last_block(&raced).as_slice());
     let (_answered, first) = w.release(held);
-    assert!(w.initiator(&genuine).complete_with_lifetime(&first).is_err(), "encrypted under the raced copy's block");
     w.advance(ANSWER_SPACING);
-    let (_, sent) = w.serve(&[&genuine]);
+    let (_, sent) = w.serve(&[&anew]);
     let [second] = <[Vec<u8>; 1]>::try_from(sent).expect("answered");
     assert_ne!(second, first);
-    assert_eq!(decrypted(&w.gw, &second, &last_block(&genuine)), decrypted(&w.gw, &first, &last_block(&raced)), "the same message 2 under another IV");
-    let (qm3, ..) = w.initiator(&genuine).complete_with_lifetime(&second).expect("the gateway takes the second encryption");
-    assert_eq!(w.read(&qm3), Classified::Message3 { msgid, read: Message3::First }, "checked against the second encryption");
+    assert_eq!(decrypted(&w.gw, &second, &last_block(&anew)), decrypted(&w.gw, &first, &last_block(&genuine)), "the same message 2 under another IV");
+    assert!(w.initiator(&genuine).complete_with_lifetime(&second).is_err(), "encrypted under the other copy's block");
+    let (qm3_second, ..) = w.initiator(&anew).complete_with_lifetime(&second).expect("the other copy's initiator takes the second encryption");
+    let (qm3_first, ..) = w.initiator(&genuine).complete_with_lifetime(&first).expect("the first copy's takes the first");
+    assert_ne!(qm3_second, qm3_first);
+    assert_eq!(w.read(&qm3_second), Classified::Message3 { msgid, read: Message3::First }, "checked against the second encryption");
+    assert_eq!(w.read(&qm3_first), Classified::Message3 { msgid, read: Message3::Again }, "and against the first");
     w.advance(ANSWER_SPACING);
-    assert_eq!(w.read(&appended(&genuine, 0x5A)), Classified::Ignored(Ignored::Responder(ResponderDrop::CopyNoRoom)), "a third last block");
+    assert_eq!(w.read(&repadded(&w.gw, &genuine, 0x5A)), Classified::Ignored(Ignored::Responder(ResponderDrop::CopyNoRoom)), "a third last block");
+    assert_eq!(w.read(&appended(&genuine, 0x5A)), Classified::Ignored(Ignored::Responder(ResponderDrop::OtherMessage)), "a block appended");
+    assert_eq!(w.serve(&[&genuine]).1, [first.as_slice()]);
+    assert_eq!(w.serve(&[&anew]).1, Vec::<Vec<u8>>::new(), "within 200 ms");
     w.advance(ANSWER_SPACING);
-    assert_eq!(w.serve(&[&genuine]).1, [second.as_slice()]);
-    assert_eq!(w.serve(&[&raced]).1, Vec::<Vec<u8>>::new(), "within 200 ms");
-    w.advance(ANSWER_SPACING);
-    assert_eq!(w.serve(&[&raced]).1, [first], "the raced copy's encryption, kept too");
+    assert_eq!(w.serve(&[&anew]).1, [second], "the second encryption, kept too");
+}
+
+/// A copy of message 1 under another last cipher block gets an encryption of message 2 of its own only when that
+/// block carries [`LAST_BLOCK_COVERED_MIN`] (4) octets of the payload chain or more -- with padding of 1 octet up to a
+/// cipher block less 4, re-padded by the gateway (or a last block put in place of the gateway's that decrypts to those
+/// octets, which reads the same) --; with 3, 2 or 1 such octets, or none -- a block appended, the header's length
+/// raised --, it is another message, on a plain and on a floated tunnel, however many come. Answered, its encryption
+/// is what the next copy within 200 ms waits for and what the resend sends, which that copy's initiator reads; dropped,
+/// nothing is sent for it and it moves neither the spacing of the answers -- the gateway's own copy right after it gets
+/// message 2 at once, the encryption the release sent -- nor the encryption a resend sends: with that message 2 lost,
+/// the resend is still the release's, which the gateway reads.
+#[test]
+fn a_copy_under_another_last_block_gets_its_own_message_2_only_with_four_octets_of_the_chain_in_that_block() {
+    #[derive(Clone, Copy, Debug)]
+    enum Gets {
+        ItsOwn,
+        Nothing,
+    }
+    type Make = fn(&Phase1State, &[u8], u8) -> Vec<u8>;
+    let ms = Duration::from_millis;
+    let (block, min) = (crypto1::AES_BLOCK, LAST_BLOCK_COVERED_MIN);
+    let anew: Make = repadded;
+    let longer: Make = |_gw, message, fill| appended(message, fill);
+    let rows: [(&str, usize, Make, bool, Gets); 10] = [
+        ("re-padded, 1 octet of padding", 1, anew, false, Gets::ItsOwn),
+        ("re-padded, 4 octets of the chain in the last block", block - min, anew, false, Gets::ItsOwn),
+        ("re-padded, 4 octets of the chain in the last block, floated", block - min, anew, true, Gets::ItsOwn),
+        ("re-padded, 3 octets of the chain in the last block", block - min + 1, anew, false, Gets::Nothing),
+        ("re-padded, 2 octets of the chain in the last block", block - 2, anew, false, Gets::Nothing),
+        ("re-padded, 1 octet of the chain in the last block", block - 1, anew, false, Gets::Nothing),
+        ("re-padded, 1 octet of the chain in the last block, floated", block - 1, anew, true, Gets::Nothing),
+        ("a block appended to a message with no padding: a whole block of it", 0, longer, false, Gets::Nothing),
+        ("a block appended to a message with 4 octets of the chain in its last block", block - min, longer, false, Gets::Nothing),
+        ("a block appended, floated", block - min, longer, true, Gets::Nothing),
+    ];
+    for (row, (what, padding, make, floated, gets)) in rows.into_iter().enumerate() {
+        let seed = 0xB310 + 2 * row as u64;
+        let w = World::new(floated);
+        assert_eq!(w.gw.enc_block, block);
+        let genuine = w.rekey_padded(padding, seed);
+        let (_answered, released) = w.release(w.hold(&genuine));
+        w.advance(ANSWER_SPACING);
+        let (report, sent) = w.serve(&[&make(&w.gw, &genuine, 0xA5), &make(&w.gw, &genuine, 0x5A)]);
+        let counters = w.client.exchanges.responder_counters();
+        let read = (report.datagrams_read, report.answered_again, counters.other_messages, counters.answered_again, counters.copies_unanswered);
+        match gets {
+            Gets::ItsOwn => {
+                // The second copy, under a third last block, comes within 200 ms of the first one's answer.
+                assert_eq!(read, (2, 1, 0, 1, 1), "{what}");
+                let [own] = <[Vec<u8>; 1]>::try_from(sent).expect(what);
+                assert_ne!(own, released, "{what}");
+                w.initiator(&make(&w.gw, &genuine, 0xA5)).complete_with_lifetime(&own).expect(what);
+                assert!(w.serve(&[&genuine]).1.is_empty(), "{what}: the gateway's own copy, within 200 ms of that answer");
+            }
+            Gets::Nothing => {
+                assert_eq!(read, (2, 0, 2, 0, 0), "{what}: nothing for it");
+                assert!(sent.is_empty(), "{what}");
+                assert_eq!(w.read(&make(&w.gw, &genuine, 0x3C)), Classified::Ignored(Ignored::Responder(ResponderDrop::OtherMessage)), "{what}");
+                assert_eq!(w.serve(&[&genuine]).1, [released.as_slice()], "{what}: the gateway's own copy, answered at once with the release's message 2");
+            }
+        }
+
+        // Message 2 lost, such a copy after the release: the resend sends the encryption handed out last.
+        let mut w = World::new(floated);
+        w.client.rtt = RoundTrips::with_floor(ms(500));
+        let genuine = w.rekey_padded(padding, seed + 1);
+        let copy = make(&w.gw, &genuine, 0xA5);
+        let (mut answered, lost) = w.release(w.hold(&genuine));
+        let sent_at = w.clock.now();
+        w.advance(ANSWER_SPACING);
+        let sent = w.serve(&[&copy]).1;
+        assert_eq!(answered.next_resend(w.clock.now()), Some(sent_at + ms(500)), "{what}");
+        w.advance(ms(300));
+        let wire = Wire::default();
+        assert!(answered.resend_due(w.clock.now(), &wire, gateway()).unwrap(), "{what}: the resend, at 500 ms");
+        let [resent] = <[Vec<u8>; 1]>::try_from(wire.messages(floated)).expect("one resend");
+        match gets {
+            Gets::ItsOwn => {
+                assert_eq!(sent, [resent.as_slice()], "{what}: the copy's encryption");
+                w.initiator(&copy).complete_with_lifetime(&resent).expect(what);
+            }
+            Gets::Nothing => {
+                assert!(sent.is_empty(), "{what}");
+                assert_eq!(resent, lost, "{what}: the release's encryption");
+                w.initiator(&genuine).complete_with_lifetime(&resent).expect("which the gateway reads");
+            }
+        }
+    }
 }
 
 // ---- Message 3 ----
@@ -899,6 +1030,7 @@ fn a_resend_sends_the_encryption_of_message_2_handed_out_last() {
     let mut w = World::new(false);
     w.client.rtt = RoundTrips::with_floor(ms(500));
     let (genuine, _) = w.rekey(Primary, 0xC700);
+    assert!(padding_of(&w.gw, &genuine) + LAST_BLOCK_COVERED_MIN <= w.gw.enc_block, "enough of the chain in its last block for an encryption of its own");
     let raced = appended(&genuine, 0xA5);
     let (mut answered, first) = w.release(w.hold(&raced));
     w.advance(ANSWER_SPACING);

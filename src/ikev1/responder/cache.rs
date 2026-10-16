@@ -86,9 +86,20 @@ pub(crate) const PARKED_FOR: Duration = DEFER_MAX;
 pub(crate) const ANSWER_SPACING: Duration = Duration::from_millis(200);
 
 /// How many encryptions of message 2 an entry keeps (POLICY, review P2): the one sent under the last cipher block
-/// of the message 1 answered, and one under the last block of a copy that ended otherwise -- a copy with another
-/// last block, the same content. A third is not answered.
+/// of the message 1 answered, and one under the last block of a copy that ended otherwise -- the same content, its
+/// padding other octets, its last block still carrying at least [`LAST_BLOCK_COVERED_MIN`] octets of the payload
+/// chain (a copy with fewer makes none: [`super::super::exchange::ResponderDrop::OtherMessage`]). A third is not
+/// answered.
 pub(crate) const QM2_VARIANTS: usize = 2;
+
+/// How many octets of the payload chain the last cipher block of a copy of message 1 must carry for that copy to get
+/// an encryption of message 2 of its own (POLICY): at most a cipher block less this of padding. A last block put in
+/// place of the sender's leaves every plaintext block before it as it was and makes the last one random (CBC: it is
+/// the decryption of the last cipher block XOR the block before it), so the copy still passes HASH(1) and the
+/// fingerprint when that block happens to decrypt to the `n` octets of the chain it carries: once in 2^(8n) tries,
+/// so once in 2^32 tries at worst with this bound. A block of padding only passes always: nothing covers padding
+/// (RFC 2409 §5.5).
+pub(crate) const LAST_BLOCK_COVERED_MIN: usize = 4;
 
 /// How many unasked resends of message 2 the responder makes at most (POLICY, DESIGN 2).
 pub(crate) const QM2_RESENDS: usize = 2;
@@ -439,7 +450,8 @@ pub(crate) struct ResponderCounters {
     /// Copies of a message 1 not answered: while held, sooner than [`ANSWER_SPACING`] after the last answer, with the
     /// Commit bit set, or under a third last cipher block.
     pub copies_unanswered: u64,
-    /// Other messages 1 under the id of a responder exchange (another fingerprint).
+    /// Other messages 1 under the id of a responder exchange: another fingerprint, or the same one under another last
+    /// cipher block that carries fewer than [`LAST_BLOCK_COVERED_MIN`] octets of the payload chain.
     pub other_messages: u64,
     /// Messages 3 that authenticated.
     pub qm3: u64,

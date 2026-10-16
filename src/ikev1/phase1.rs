@@ -16,7 +16,7 @@
 //! RFC. See `quick.rs`'s "SA lifetimes" section.
 
 use super::crypto1::{self, Prf, AES_BLOCK};
-use super::exchange::ExchangeTable;
+use super::exchange::{ExchangeTable, PeerEvent, PeerQuick};
 use super::isakmp::{self, exchange, payload, IsakmpHeader};
 use super::msgid::MidKind;
 use super::phase2;
@@ -887,6 +887,31 @@ impl Phase1State {
     /// there is no turning it off again.
     pub fn enable_gateway_quick_mode(&self) {
         self.exchanges.enable();
+    }
+
+    /// The authenticated message-1 copies of Quick Modes the gateway started that the readers of
+    /// the socket kept since the last call, oldest first (at most four: a full inbox drops its
+    /// oldest); nothing of them has been answered or validated beyond their HASH(1). Empty while the
+    /// exchange table is passive ([`Self::enable_gateway_quick_mode`]).
+    pub fn take_peer_quick_modes(&self) -> Vec<PeerQuick> {
+        self.exchanges.take_inbox()
+    }
+
+    /// What the gateway's authenticated Informationals named since the last call -- its Deletes and
+    /// its error Notifies -- as raw facts, in the order they arrived and each once
+    /// ([`crate::ikev1::classify_peer_deletes`] reads the Deletes against the SPIs held now). Empty
+    /// while the exchange table is passive: the liveness checks then act on a Delete themselves, as
+    /// they always did.
+    pub fn drain_peer_events(&self) -> Vec<PeerEvent> {
+        self.exchanges.drain_events()
+    }
+
+    /// Whether an event was dropped since the last call because the mailbox was full (it holds 256):
+    /// what [`Self::drain_peer_events`] gives is then not all the gateway said, and only asking it (a
+    /// liveness probe) tells the rest. Taking it clears it. Always `false` while the exchange table
+    /// is passive.
+    pub fn take_peer_event_overflow(&self) -> bool {
+        self.exchanges.take_overflow()
     }
 
     /// The Message ID of a new exchange of ours of `kind` -- a Quick Mode, an Informational, a

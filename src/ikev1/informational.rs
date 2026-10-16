@@ -60,6 +60,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use super::crypto1;
+use super::exchange::{self as table, Classified};
 use super::isakmp::{exchange, payload, IsakmpHeader};
 use super::msgid::MidKind;
 use super::payloads::{protocol, IPSEC_DOI};
@@ -367,6 +368,11 @@ fn peer_esp_delete(spi: &[u8], current_peer_spi: u32, current_peer_spi_ipv6: Opt
 /// UDP datagram the peer already sent sits in the kernel's receive buffer
 /// regardless of how long ago it arrived, so even a short `timeout`
 /// reliably catches anything already pending.
+///
+/// All of the above is what a **passive** exchange table gets, which every
+/// state starts with: once the table is on
+/// ([`Phase1State::enable_gateway_quick_mode`]) the wait is
+/// [`watch_enabled`]'s instead, and the SPIs given here are not looked at.
 fn watch(
     sock: &dyn IkeSocket,
     st: &Phase1State,
@@ -377,6 +383,9 @@ fn watch(
     current_peer_spi: u32,
     current_peer_spi_ipv6: Option<u32>,
 ) -> std::io::Result<Seen> {
+    if st.exchanges.is_enabled() {
+        return watch_enabled(sock, st, entropy, peer, timeout, expect_ack_seq);
+    }
     // A `timeout` too long for the clock to count is not one the clock can end.
     let deadline = Instant::now().checked_add(timeout);
     let mut buf = [0u8; 8192];
@@ -525,7 +534,7 @@ pub(crate) fn build_error_notify(st: &Phase1State, entropy: &mut impl Entropy, m
 
 /// RFC 2408 §3.14.1 names for the error Notify types a Quick Mode rejection
 /// realistically carries; everything else reads as a generic error.
-fn error_notify_name(t: u16) -> &'static str {
+pub(crate) fn error_notify_name(t: u16) -> &'static str {
     match t {
         14 => "NO_PROPOSAL_CHOSEN",
         15 => "BAD_PROPOSAL_SYNTAX",
@@ -551,6 +560,12 @@ fn error_notify_name(t: u16) -> &'static str {
 /// on its own is [`Liveness::ChildDeleted`] rather than
 /// [`Liveness::PeerTornDown`] whenever the other family (or, for the
 /// primary, none at all) is still up.
+///
+/// With the exchange table on ([`Phase1State::enable_gateway_quick_mode`]) no
+/// Delete is a verdict here: what the peer's Informationals name is kept as
+/// raw events for the caller to read against the SPIs it holds
+/// ([`Phase1State::drain_peer_events`]), the SPIs given here are not looked
+/// at, and the answer is [`Liveness::Alive`].
 pub fn peek(
     sock: &dyn IkeSocket,
     st: &Phase1State,
@@ -573,6 +588,8 @@ pub fn peek(
 /// to have advertised support first; a caller that never confirmed that
 /// should keep using [`peek`] only, exactly as before this function existed.
 /// `current_peer_spi`/`current_peer_spi_ipv6` are the same as [`peek`]'s.
+/// With the exchange table on, the answer is [`Liveness::Alive`] (the ACK came)
+/// or [`Liveness::NoReply`]: a Delete is kept for the caller as for [`peek`].
 pub fn probe(
     sock: &dyn IkeSocket,
     st: &Phase1State,
@@ -597,8 +614,151 @@ pub fn probe(
     }
 }
 
+// ---- Once the exchange table is on: one classification for every reader ----
+
+/// What [`serve_datagram`] did with one datagram.
+#[derive(Default)]
+struct Served {
+    ack_matched: bool,
+    acked: usize,
+    new_quick: usize,
+    events_pushed: usize,
+}
+
+/// Sends the R-U-THERE-ACK owed for the peer's R-U-THERE `seq` (RFC 3706 §6.1: "A responder to an
+/// R-U-THERE message MUST send an R-U-THERE-ACK with the same sequence number"); whether it went.
+fn answer_r_u_there(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, seq: u32) -> bool {
+    ike_debug!("DPD: peer sent R-U-THERE seq={seq} -- answering with R-U-THERE-ACK");
+    match build_r_u_there_ack(st, entropy, seq) {
+        Ok(ack) => match send_ike(sock, st, peer, &ack) {
+            Ok(()) => true,
+            Err(e) => {
+                ike_debug!("DPD: failed to send R-U-THERE-ACK seq={seq}: {e}");
+                false
+            }
+        },
+        Err(e) => {
+            ike_debug!("DPD: failed to build R-U-THERE-ACK seq={seq}: {e}");
+            false
+        }
+    }
+}
+
+/// One datagram read by a reader of an enabled table, through [`table::classify`], and the only
+/// answers sent on the way: the R-U-THERE-ACKs an Informational asked for, and a final message of
+/// ours again for a bit-exact repeat of what it answered. Everything else it found is kept in the
+/// table or dropped there; a Quick Mode message for an exchange of ours that nobody waits on here is
+/// dropped.
+fn serve_datagram(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, datagram: &[u8], expect_ack_seq: Option<u32>) -> Served {
+    let mut served = Served::default();
+    match table::classify(st, datagram, expect_ack_seq) {
+        Classified::ResendFinal(final_message) => super::quick::send_final_again(sock, st, peer, &final_message),
+        Classified::RouteToOwn { msgid, .. } => {
+            ike_debug!("QUICK: a message under msgid={msgid:08x}, an exchange of ours that nothing waits on here -- dropped");
+        }
+        Classified::PeerQuick { .. } => served.new_quick += 1,
+        Classified::Informational(seen) => {
+            for seq in seen.r_u_there {
+                if answer_r_u_there(sock, st, entropy, peer, seq) {
+                    served.acked += 1;
+                }
+            }
+            served.ack_matched = seen.ack_matched;
+            served.events_pushed = seen.events_pushed;
+        }
+        Classified::CommitNoted { .. } | Classified::Foreign | Classified::Ignored(_) => {}
+    }
+    served
+}
+
+/// [`watch`] once the exchange table is on: the same bounded wait, each datagram read through
+/// [`table::classify`] ([`serve_datagram`]). It ends only with an R-U-THERE-ACK of `expect_ack_seq`
+/// ([`Seen::AckMatched`]) or at the deadline ([`Seen::Nothing`]): a Delete or an error Notify the peer
+/// sends is kept as a raw event in the table's mailbox
+/// ([`Phase1State::drain_peer_events`]) for the caller to read against the SPIs it holds, and is
+/// never a verdict of the wait.
+fn watch_enabled(sock: &dyn IkeSocket, st: &Phase1State, entropy: &mut impl Entropy, peer: SocketAddr, timeout: Duration, expect_ack_seq: Option<u32>) -> std::io::Result<Seen> {
+    // A `timeout` too long for the clock to count is not one the clock can end.
+    let deadline = Instant::now().checked_add(timeout);
+    let mut buf = [0u8; 8192];
+    loop {
+        let remaining = deadline.map_or(timeout, |deadline| deadline.saturating_duration_since(Instant::now()));
+        if remaining.is_zero() {
+            return Ok(Seen::Nothing);
+        }
+        sock.set_read_timeout(Some(remaining))?;
+        let (n, from) = match sock.recv_from(&mut buf) {
+            Ok(r) => r,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                return Ok(Seen::Nothing);
+            }
+            Err(e) => return Err(e),
+        };
+        crate::debug::dump("<<<", from, &buf[..n]);
+        if serve_datagram(sock, st, entropy, peer, &buf[..n], expect_ack_seq).ack_matched {
+            return Ok(Seen::AckMatched);
+        }
+    }
+}
+
+/// What one [`serve_turn`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TurnReport {
+    /// Datagrams read off the socket, whatever they were.
+    pub datagrams_read: usize,
+    /// R-U-THERE-ACKs sent.
+    pub acked_dpd: usize,
+    /// Authenticated message-1 copies of gateway Quick Modes put in the inbox
+    /// ([`Phase1State::take_peer_quick_modes`]).
+    pub new_quick: usize,
+    /// Events added to the mailbox ([`Phase1State::drain_peer_events`]).
+    pub events_pushed: usize,
+}
+
+/// One turn of attention to the IKEv1 socket between the commands of whoever owns it: the reader
+/// that keeps the gateway answered while nothing else reads. It reads at most `max_datagrams`
+/// datagrams, waiting at most `slice` for each and ending at the first wait that runs out, so it
+/// never waits longer than `max_datagrams` times `slice` in all (a zero `slice` is no time to wait:
+/// nothing is read). Each datagram goes through the same classification as the liveness checks'
+/// ([`peek`], [`probe`]): an R-U-THERE is answered, a bit-exact repeat of a message a final message of
+/// ours answered gets that final message again, an authenticated message 1 of a gateway Quick Mode
+/// goes to the inbox, Deletes and error Notifies go to the mailbox, and an R-U-THERE-ACK -- nobody
+/// waits for one here -- is dropped. It never starts an exchange of its own.
+///
+/// While the exchange table is passive -- in every mode but the ones that turned it on
+/// ([`Phase1State::enable_gateway_quick_mode`]) -- it does nothing and does not touch the socket.
+pub fn serve_turn(
+    sock: &dyn IkeSocket,
+    st: &Phase1State,
+    entropy: &mut impl Entropy,
+    peer: SocketAddr,
+    max_datagrams: usize,
+    slice: Duration,
+) -> Result<TurnReport, DriverError> {
+    let mut report = TurnReport::default();
+    if !st.exchanges.is_enabled() || slice.is_zero() {
+        return Ok(report);
+    }
+    let mut buf = [0u8; 8192];
+    while report.datagrams_read < max_datagrams {
+        sock.set_read_timeout(Some(slice))?;
+        let (n, from) = match sock.recv_from(&mut buf) {
+            Ok(r) => r,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+            Err(e) => return Err(e.into()),
+        };
+        report.datagrams_read += 1;
+        crate::debug::dump("<<<", from, &buf[..n]);
+        let served = serve_datagram(sock, st, entropy, peer, &buf[..n], None);
+        report.acked_dpd += served.acked;
+        report.new_quick += served.new_quick;
+        report.events_pushed += served.events_pushed;
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::crypto::DhGroup;
     use crate::entropy::SeedEntropy;
@@ -632,7 +792,7 @@ mod tests {
         assert!(note.contains("<malformed>") && !note.contains("spi_in"), "{note}");
     }
 
-    fn phase1_pair() -> (Phase1State, Phase1State) {
+    pub(crate) fn phase1_pair() -> (Phase1State, Phase1State) {
         let psk = b"correct horse battery staple".to_vec();
         let icfg = InitiatorConfig {
             local_auth: Ikev1LocalAuth::Psk(psk.clone()),
@@ -1026,7 +1186,7 @@ mod tests {
     // never got an R-U-THERE-ACK and tore the tunnel down (confirmed live on a
     // FortiGate with a floated IKEv1 tunnel).
 
-    fn floated_pair() -> (Phase1State, Phase1State) {
+    pub(crate) fn floated_pair() -> (Phase1State, Phase1State) {
         let (mut c, mut g) = phase1_pair();
         c.floated = true;
         g.floated = true;
@@ -1426,5 +1586,311 @@ mod tests {
         assert_eq!(client_st.exchanges.ids_held(), MID_CAP);
         let named = decrypt_one(&gw_st, &delete);
         assert_eq!(&named.data[8..12], &0xDEAD_BEEFu32.to_be_bytes(), "and the gateway reads it");
+    }
+
+    // --- The exchange table: what a passive one leaves as it was, and the readers once it is on.
+
+    use crate::ikev1::exchange::{ExchangeTable, PeerEvent};
+    use crate::ikev1::phase1::TestClock;
+    use crate::ikev1::quick;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// An `IkeSocket` that hands out the datagrams it was given, in order, and then answers every read with
+    /// an error of kind `end` -- `WouldBlock` by default, what a read that timed out gives -- recording what
+    /// was asked of it. No network, no waiting.
+    struct Scripted {
+        incoming: RefCell<VecDeque<Vec<u8>>>,
+        end: std::io::ErrorKind,
+        timeouts: RefCell<Vec<Option<Duration>>>,
+        sent: RefCell<Vec<(Vec<u8>, SocketAddr)>>,
+        reads: Cell<usize>,
+    }
+
+    impl Scripted {
+        fn with(datagrams: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            Self::ending(datagrams, std::io::ErrorKind::WouldBlock)
+        }
+
+        fn ending(datagrams: impl IntoIterator<Item = Vec<u8>>, end: std::io::ErrorKind) -> Self {
+            Self { incoming: RefCell::new(datagrams.into_iter().collect()), end, timeouts: RefCell::default(), sent: RefCell::default(), reads: Cell::new(0) }
+        }
+
+        fn sent(&self) -> Vec<Vec<u8>> {
+            self.sent.borrow().iter().map(|(datagram, _)| datagram.clone()).collect()
+        }
+    }
+
+    impl IkeSocket for Scripted {
+        fn send_to(&self, buf: &[u8], dest: SocketAddr) -> std::io::Result<usize> {
+            self.sent.borrow_mut().push((buf.to_vec(), dest));
+            Ok(buf.len())
+        }
+        fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+            self.timeouts.borrow_mut().push(dur);
+            Ok(())
+        }
+        fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            self.reads.set(self.reads.get() + 1);
+            let Some(datagram) = self.incoming.borrow_mut().pop_front() else { return Err(self.end.into()) };
+            buf[..datagram.len()].copy_from_slice(&datagram);
+            Ok((datagram.len(), gateway_addr()))
+        }
+    }
+
+    /// An `IkeSocket` that nothing may touch.
+    struct Untouchable;
+
+    impl IkeSocket for Untouchable {
+        fn send_to(&self, _buf: &[u8], _dest: SocketAddr) -> std::io::Result<usize> {
+            panic!("the socket was written to");
+        }
+        fn set_read_timeout(&self, _dur: Option<Duration>) -> std::io::Result<()> {
+            panic!("the socket's timeout was set");
+        }
+        fn recv_from(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            panic!("the socket was read");
+        }
+    }
+
+    /// The gateway's address as these tests give it (TEST-NET-1, RFC 5737): nothing is sent anywhere.
+    fn gateway_addr() -> SocketAddr {
+        "192.0.2.1:500".parse().unwrap()
+    }
+
+    /// Turns `client`'s exchange table on, telling the time by the clock returned.
+    fn enable(client: &mut Phase1State) -> TestClock {
+        let clock = TestClock::new();
+        client.exchanges = clock.exchanges();
+        client.enable_gateway_quick_mode();
+        clock
+    }
+
+    fn gateway_qm1(gw_st: &Phase1State, entropy: &mut SeedEntropy) -> Vec<u8> {
+        quick::initiate_quick(gw_st, entropy, SkCipher::Aes256Gcm, ([10, 9, 0, 0], [255, 255, 0, 0]), ([0; 4], [0; 4]), 3600).unwrap().0
+    }
+
+    /// An Informational of the gateway's with one ESP Delete payload naming `spis`, in that order.
+    fn delete_naming(gw_st: &Phase1State, entropy: &mut SeedEntropy, spis: &[u32]) -> Vec<u8> {
+        let mut body = IPSEC_DOI.to_be_bytes().to_vec();
+        body.extend_from_slice(&[protocol::ESP, 4]);
+        body.extend_from_slice(&(spis.len() as u16).to_be_bytes());
+        for spi in spis {
+            body.extend_from_slice(&spi.to_be_bytes());
+        }
+        build_single_informational(gw_st, entropy, payload::DELETE, body).unwrap()
+    }
+
+    fn esp_named(events: &[PeerEvent]) -> Vec<u32> {
+        events.iter().filter_map(|event| match event {
+            PeerEvent::Delete { protocol: protocol::ESP, spi, .. } => spi.esp(),
+            _ => None,
+        }).collect()
+    }
+
+    /// With the table passive, ten thousand authentic gateway Quick Mode messages 1 read by `peek` are dropped
+    /// undecrypted as they always were: the check reports the tunnel alive, sends nothing, records nothing and
+    /// never asks the table's clock, which every enabled reading does.
+    #[test]
+    fn a_passive_table_lets_peek_drop_ten_thousand_gateway_message_1s_as_before() {
+        let (mut client_st, gw_st) = phase1_pair();
+        let clock_reads = Arc::new(AtomicUsize::new(0));
+        let counted = clock_reads.clone();
+        let at = Instant::now();
+        client_st.exchanges = ExchangeTable::with_clock(Box::new(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            at
+        }));
+        let mut ge = SeedEntropy::new(0x6001);
+        let sock = Scripted::with((0..10_000).map(|_| gateway_qm1(&gw_st, &mut ge)));
+        let got = peek(&sock, &client_st, &mut SeedEntropy::new(0x6002), gateway_addr(), Duration::from_secs(60), 0x1234_5678, None).unwrap();
+        assert_eq!(got, Liveness::Alive);
+        assert_eq!(sock.reads.get(), 10_001, "every datagram read, then the read that found none");
+        assert!(sock.sent().is_empty(), "nothing answered");
+        assert_eq!((client_st.exchanges.ids_held(), client_st.exchanges.inbox_held()), (0, 0), "nothing recorded");
+        assert_eq!(clock_reads.load(Ordering::Relaxed), 0, "nothing was classified");
+        client_st.enable_gateway_quick_mode();
+        assert!(client_st.take_peer_quick_modes().is_empty() && client_st.drain_peer_events().is_empty());
+    }
+
+    /// A Delete naming two SPIs: with the table passive `peek` acts on the first alone, as before (the
+    /// SA in use named first tears the tunnel down; named second it goes unseen); with the table on the wait
+    /// gives no verdict and both SPIs are kept, in order, for the reader.
+    #[test]
+    fn a_passive_table_reads_the_first_spi_of_a_delete_only_and_an_enabled_one_keeps_every_spi() {
+        let (current, other) = (0xAAAA_0001u32, 0xBBBB_0002u32);
+        for (spis, passive) in [([current, other], Liveness::PeerTornDown), ([other, current], Liveness::Alive)] {
+            let (client_st, gw_st) = phase1_pair();
+            let sock = Scripted::with([delete_naming(&gw_st, &mut SeedEntropy::new(0x6101), &spis)]);
+            let got = peek(&sock, &client_st, &mut SeedEntropy::new(0x6102), gateway_addr(), Duration::from_secs(5), current, None).unwrap();
+            assert_eq!(got, passive, "passive, {spis:08x?}");
+            let (mut client_st, gw_st) = phase1_pair();
+            enable(&mut client_st);
+            let sock = Scripted::with([delete_naming(&gw_st, &mut SeedEntropy::new(0x6101), &spis)]);
+            let got = peek(&sock, &client_st, &mut SeedEntropy::new(0x6102), gateway_addr(), Duration::from_secs(5), current, None).unwrap();
+            assert_eq!(got, Liveness::Alive, "enabled, {spis:08x?}");
+            assert_eq!(esp_named(&client_st.drain_peer_events()), spis, "enabled, {spis:08x?}");
+        }
+    }
+
+    /// With the table on, `probe` waits for its own ACK past a Delete of the ISAKMP SA and an ACK of another
+    /// probe -- the Delete is kept, not a verdict -- and without its ACK it is `NoReply`, the Delete kept the same.
+    #[test]
+    fn an_enabled_probe_keeps_a_delete_for_the_reader_and_waits_for_its_own_ack() {
+        let (mut client_st, gw_st) = phase1_pair();
+        enable(&mut client_st);
+        let mut ge = SeedEntropy::new(0x6201);
+        let (_esp, isakmp) = build_delete(&gw_st, &mut ge, 1).unwrap();
+        let wrong_ack = build_r_u_there_ack(&gw_st, &mut ge, 76).unwrap();
+        let ack = build_r_u_there_ack(&gw_st, &mut ge, 77).unwrap();
+        let sock = Scripted::with([isakmp.clone(), wrong_ack.clone(), ack]);
+        let got = probe(&sock, &client_st, &mut SeedEntropy::new(0x6202), gateway_addr(), 77, Duration::from_secs(5), 0x1234, None).unwrap();
+        assert_eq!(got, Liveness::Alive);
+        assert_eq!(sock.sent().len(), 1, "the R-U-THERE, and nothing else");
+        let events = client_st.drain_peer_events();
+        assert!(matches!(events.as_slice(), [PeerEvent::Delete { protocol: protocol::ISAKMP, .. }]), "{events:?}");
+        let sock = Scripted::with([isakmp, wrong_ack]);
+        let got = probe(&sock, &client_st, &mut SeedEntropy::new(0x6203), gateway_addr(), 77, Duration::from_secs(5), 0x1234, None).unwrap();
+        assert_eq!(got, Liveness::NoReply);
+        assert_eq!(client_st.drain_peer_events().len(), 1, "the Delete again, kept again");
+    }
+
+    /// With the table on, every R-U-THERE is answered, a repeat of one answered before included, and on a
+    /// floated tunnel the ACK goes back marked.
+    #[test]
+    fn an_enabled_peek_answers_a_repeated_r_u_there_every_time() {
+        let (mut client_st, gw_st) = floated_pair();
+        enable(&mut client_st);
+        let probe_msg = wrap_ike_4500(&build_r_u_there(&gw_st, &mut SeedEntropy::new(0x6301), 7).unwrap());
+        let sock = Scripted::with([probe_msg.clone(), probe_msg]);
+        let got = peek(&sock, &client_st, &mut SeedEntropy::new(0x6302), gateway_addr(), Duration::from_secs(5), 0, None).unwrap();
+        assert_eq!(got, Liveness::Alive);
+        let sent = sock.sent();
+        assert_eq!(sent.len(), 2, "one ACK per R-U-THERE");
+        for ack in &sent {
+            assert_eq!(gateway_reads_notify(&gw_st, ack), (notify_type::R_U_THERE_ACK, 7u32.to_be_bytes().to_vec()));
+        }
+        assert_ne!(sent[0], sent[1], "two ACKs, each under an id of its own");
+    }
+
+    /// With the table on, the reads between exchanges still send message 3 again for each repeat of the message 2
+    /// it answered -- to the port the tunnel uses -- and send nothing for any other Quick Mode message.
+    #[test]
+    fn an_enabled_peek_sends_message_3_again_for_a_repeated_message_2() {
+        for floated in [false, true] {
+            let (mut client_st, gw_st) = if floated { floated_pair() } else { phase1_pair() };
+            enable(&mut client_st);
+            let (message_2, message_3) = quick_mode_pair(&client_st, 0x1111_2222);
+            client_st.finals.retain(&message_2, &message_3);
+            let (other, _) = quick_mode_pair(&client_st, 0x3333_4444);
+            let frame = |m: &[u8]| if floated { wrap_ike_4500(m) } else { m.to_vec() };
+            let sock = Scripted::with([frame(&message_2), frame(&other), frame(&message_2)]);
+            let got = peek(&sock, &client_st, &mut SeedEntropy::new(0x6401), gateway_addr(), Duration::from_secs(5), 0, None).unwrap();
+            assert_eq!(got, Liveness::Alive, "floated: {floated}");
+            let port = if floated { crate::natt_port() } else { gateway_addr().port() };
+            let sent = sock.sent.borrow().clone();
+            assert_eq!(sent, vec![(frame(&message_3), SocketAddr::new(gateway_addr().ip(), port)); 2], "floated: {floated}");
+            assert_eq!(client_st.exchanges.inbox_held(), 0, "floated: {floated}: no message 1 among them");
+            let _ = gw_st;
+        }
+    }
+
+    /// While the table is passive the serving turn does nothing at all: the socket is not touched, whatever the
+    /// bounds; with the table on, no datagram to read or no time to wait for one touches it neither.
+    #[test]
+    fn a_serving_turn_does_not_touch_the_socket_while_the_table_is_passive() {
+        let (mut client_st, _gw_st) = phase1_pair();
+        for (max, slice) in [(8, Duration::from_millis(20)), (1, Duration::from_secs(1)), (0, Duration::ZERO)] {
+            let report = serve_turn(&Untouchable, &client_st, &mut SeedEntropy::new(0x6501), gateway_addr(), max, slice).unwrap();
+            assert_eq!(report, TurnReport::default(), "passive, {max} x {slice:?}");
+        }
+        enable(&mut client_st);
+        for (max, slice) in [(0, Duration::from_millis(20)), (8, Duration::ZERO)] {
+            let report = serve_turn(&Untouchable, &client_st, &mut SeedEntropy::new(0x6502), gateway_addr(), max, slice).unwrap();
+            assert_eq!(report, TurnReport::default(), "enabled, {max} x {slice:?}");
+        }
+    }
+
+    /// A serving turn reads at most `max_datagrams`, each read bounded by `slice`, and ends at the first read that
+    /// finds nothing; what it leaves is the next turn's.
+    #[test]
+    fn a_serving_turn_reads_at_most_its_count_each_wait_bounded_by_its_slice() {
+        let (mut client_st, gw_st) = phase1_pair();
+        enable(&mut client_st);
+        let mut ge = SeedEntropy::new(0x6601);
+        let sock = Scripted::with((1..=10).map(|seq| build_r_u_there(&gw_st, &mut ge, seq).unwrap()));
+        let slice = Duration::from_millis(20);
+        let mut e = SeedEntropy::new(0x6602);
+        let turns: [(TurnReport, usize); 3] = [
+            (TurnReport { datagrams_read: 8, acked_dpd: 8, new_quick: 0, events_pushed: 0 }, 8),
+            (TurnReport { datagrams_read: 2, acked_dpd: 2, new_quick: 0, events_pushed: 0 }, 11),
+            (TurnReport::default(), 12),
+        ];
+        for (n, (expected, reads)) in turns.into_iter().enumerate() {
+            assert_eq!(serve_turn(&sock, &client_st, &mut e, gateway_addr(), 8, slice).unwrap(), expected, "turn {n}");
+            assert_eq!(sock.reads.get(), reads, "turn {n}: reads so far");
+        }
+        assert!(sock.timeouts.borrow().iter().all(|t| *t == Some(slice)), "every wait is one slice");
+        assert_eq!(sock.timeouts.borrow().len(), 12, "one per read");
+        assert_eq!(sock.sent().len(), 10, "every R-U-THERE answered");
+    }
+
+    /// A read that runs out of time, by either kind the OS gives it, ends the turn quietly; any other error of
+    /// the socket is the caller's.
+    #[test]
+    fn a_serving_turn_ends_quietly_on_a_timeout_and_reports_any_other_socket_error() {
+        let (mut client_st, _gw_st) = phase1_pair();
+        enable(&mut client_st);
+        for end in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+            let sock = Scripted::ending([], end);
+            assert_eq!(serve_turn(&sock, &client_st, &mut SeedEntropy::new(0x6701), gateway_addr(), 8, Duration::from_millis(5)).unwrap(), TurnReport::default(), "{end:?}");
+        }
+        let sock = Scripted::ending([], std::io::ErrorKind::ConnectionReset);
+        let got = serve_turn(&sock, &client_st, &mut SeedEntropy::new(0x6702), gateway_addr(), 8, Duration::from_millis(5));
+        assert!(matches!(got, Err(DriverError::Io(ref e)) if e.kind() == std::io::ErrorKind::ConnectionReset), "{got:?}");
+    }
+
+    /// What one turn does with each kind of datagram: a gateway message 1 goes to the inbox, a Delete naming more
+    /// SPIs than the mailbox holds fills it and sets the overflow flag, an ACK nobody waits for and a message
+    /// for an exchange of ours nobody waits on here are dropped -- and none of it is answered.
+    #[test]
+    fn a_serving_turn_keeps_what_it_reads_and_answers_none_of_it() {
+        let (mut client_st, gw_st) = phase1_pair();
+        enable(&mut client_st);
+        let mut ge = SeedEntropy::new(0x6801);
+        let msg1 = gateway_qm1(&gw_st, &mut ge);
+        let spis: Vec<u32> = (1..=300).collect();
+        let many = delete_naming(&gw_st, &mut ge, &spis);
+        let late_ack = build_r_u_there_ack(&gw_st, &mut ge, 5).unwrap();
+        let ours = client_st.fresh_message_id(crate::ikev1::msgid::MidKind::Quick, &mut SeedEntropy::new(0x6802)).unwrap();
+        let (for_ours, _) = quick_mode_pair(&client_st, ours);
+        let sock = Scripted::with([msg1.clone(), many, late_ack, for_ours]);
+        let report = serve_turn(&sock, &client_st, &mut SeedEntropy::new(0x6803), gateway_addr(), 8, Duration::from_millis(20)).unwrap();
+        assert_eq!(report, TurnReport { datagrams_read: 4, acked_dpd: 0, new_quick: 1, events_pushed: crate::ikev1::exchange::MAILBOX_CAP });
+        assert!(sock.sent().is_empty(), "nothing answered");
+        assert_eq!(client_st.take_peer_quick_modes().iter().map(|q| q.datagram.clone()).collect::<Vec<_>>(), [msg1]);
+        assert_eq!(esp_named(&client_st.drain_peer_events()), spis[..crate::ikev1::exchange::MAILBOX_CAP]);
+        assert!(client_st.take_peer_event_overflow(), "the mailbox says it is incomplete");
+        assert!(!client_st.take_peer_event_overflow(), "once");
+    }
+
+    /// On a floated tunnel a turn reads the marked datagrams only: a marked message 1 and a marked R-U-THERE,
+    /// whose ACK goes back marked; the unmarked copy of the message 1 is ESP as far as that port is concerned.
+    #[test]
+    fn a_floated_serving_turn_reads_marked_datagrams_only() {
+        let (mut client_st, gw_st) = floated_pair();
+        enable(&mut client_st);
+        let mut ge = SeedEntropy::new(0x6901);
+        let msg1 = gateway_qm1(&gw_st, &mut ge);
+        let probe_msg = build_r_u_there(&gw_st, &mut ge, 9).unwrap();
+        let sock = Scripted::with([msg1.clone(), wrap_ike_4500(&msg1), wrap_ike_4500(&probe_msg), vec![0xFF]]);
+        let report = serve_turn(&sock, &client_st, &mut SeedEntropy::new(0x6902), gateway_addr(), 8, Duration::from_millis(20)).unwrap();
+        assert_eq!(report, TurnReport { datagrams_read: 4, acked_dpd: 1, new_quick: 1, events_pushed: 0 });
+        let sent = sock.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(gateway_reads_notify(&gw_st, &sent[0]), (notify_type::R_U_THERE_ACK, 9u32.to_be_bytes().to_vec()));
+        assert_eq!(client_st.take_peer_quick_modes().iter().map(|q| q.datagram.clone()).collect::<Vec<_>>(), [msg1]);
     }
 }

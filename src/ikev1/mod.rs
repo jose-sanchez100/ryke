@@ -11,14 +11,10 @@
 pub mod cfg;
 pub mod client;
 pub mod crypto1;
-// Nothing but the tests reads the table's mailbox or the Delete parser yet: they are what the readers will use.
-#[cfg_attr(not(test), allow(dead_code))]
 mod exchange;
 pub mod informational;
 pub mod isakmp;
 pub mod modecfg;
-// The same for the ledger: only our own id draws use it outside the tests so far.
-#[cfg_attr(not(test), allow(dead_code))]
 mod msgid;
 pub mod payloads;
 pub mod phase1;
@@ -31,6 +27,7 @@ pub mod server;
 pub mod xauth;
 
 pub use client::{Client, Established};
+pub use exchange::{classify_peer_deletes, DeleteVerdict, FamilySpis, Generation, PeerEvent, PeerQuick, PeerSpi, SpiState};
 pub use server::{Server, ServerEvent};
 
 use std::time::Duration;

@@ -1406,8 +1406,15 @@ fn send_ike(sock: &dyn IkeSocket, st: &Phase1State, peer: SocketAddr, msg: &[u8]
 /// by exchange type).
 pub(crate) fn resend_final_if_repeat(sock: &dyn IkeSocket, st: &Phase1State, peer: SocketAddr, datagram: &[u8]) {
     let Some(final_message) = st.finals.answer_to(datagram) else { return };
+    send_final_again(sock, st, peer, &final_message);
+}
+
+/// Sends `final_message` -- a final message of ours that [`Phase1State::finals`] gave for a peer
+/// message it answered, which the peer repeated -- again, untouched, the way
+/// [`resend_final_if_repeat`] does once it found it.
+pub(crate) fn send_final_again(sock: &dyn IkeSocket, st: &Phase1State, peer: SocketAddr, final_message: &[u8]) {
     ike_debug!("the peer repeated a message our final message answered -- sending that final message again ({} bytes) to {peer}", final_message.len());
-    if let Err(e) = send_ike(sock, st, peer, &final_message) {
+    if let Err(e) = send_ike(sock, st, peer, final_message) {
         ike_debug!("failed to send the final message again: {e}");
     }
 }

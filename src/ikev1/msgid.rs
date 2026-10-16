@@ -100,6 +100,7 @@ pub(crate) const NI_KEPT: usize = 16;
 /// The least time between the conclusion of a peer Quick Mode of a family and the admission of
 /// the next one of that family (POLICY): the cap of the spacing the worker keeps between two
 /// renewals of its own (its `I_min`).
+#[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
 pub(crate) const ACCEPT_SPACING: Duration = Duration::from_millis(200);
 
 /// How often, at most, a saturated ledger writes that it refused a peer Quick Mode.
@@ -131,16 +132,19 @@ pub(crate) enum MidState {
     /// of ours waits on it), and so is one of ours.
     Done,
     /// Over: this side refused it.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     Refused,
     /// A peer Quick Mode that failed for a passing reason before its answer left, and may be taken
     /// up again when the peer repeats it, from `not_before` and before `until`
     /// ([`MessageIdLedger::reconsider`]). From `until` on it reads as Done.
     Parked { not_before: Instant, until: Instant },
     /// Over: a later message of the peer replaced it.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     Superseded,
 }
 
 /// How a caller ends an exchange ([`MessageIdLedger::finish`]).
+#[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MidEnd {
     Done,
@@ -296,6 +300,7 @@ struct FamilyMemory {
     /// The SHA-256 of the peer's last [`NI_KEPT`] nonces, oldest first: the nonce itself is not kept.
     nonces: VecDeque<[u8; 32]>,
     /// When the last peer Quick Mode of the family concluded.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     concluded: Option<Instant>,
 }
 
@@ -498,6 +503,7 @@ impl MessageIdLedger {
     /// Active one -- after the sweep, so not one whose deadline has come, which ended Done then,
     /// swept or not -- or a Parked one before its `until`. `false`, and nothing changed, for any
     /// other, or an id the ledger does not hold.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     pub(crate) fn finish(&mut self, id: u32, now: Instant, end: MidEnd) -> bool {
         self.sweep(now);
         let live = self.records.get(&id).is_some_and(|record| match record.state {
@@ -519,6 +525,7 @@ impl MessageIdLedger {
     /// Moves the deadline of the Active record of `id` to `deadline`, at `now`; `false`, and nothing
     /// changed, for any other. The sweep comes first, so an exchange whose deadline has come is not
     /// brought back, whether or not anything swept the ledger since.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     pub(crate) fn set_deadline(&mut self, id: u32, now: Instant, deadline: Instant) -> bool {
         self.sweep(now);
         let active = self.records.get(&id).is_some_and(|record| matches!(record.state, MidState::Active { .. }));
@@ -529,6 +536,7 @@ impl MessageIdLedger {
     }
 
     /// Sets the [`fingerprint`] the record of `id` is compared against; `false` when there is no record.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     pub(crate) fn attach_fingerprint(&mut self, id: u32, fingerprint: [u8; 32]) -> bool {
         match self.records.get_mut(&id) {
             Some(record) => {
@@ -599,6 +607,7 @@ impl MessageIdLedger {
     /// Whether a peer Quick Mode of `family` may be admitted at `now`: [`ACCEPT_SPACING`] after
     /// the last one of the family concluded ([`Self::responder_concluded`]), or at any time before
     /// the first did.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     pub(crate) fn accept_allowed(&mut self, family: ChildFamily, now: Instant) -> bool {
         self.sweep(now);
         self.families[family_index(family)].concluded.is_none_or(|last| now.saturating_duration_since(last) >= ACCEPT_SPACING)
@@ -606,6 +615,7 @@ impl MessageIdLedger {
 
     /// A peer Quick Mode of `family` concluded at `now`, however it ended. A `now` earlier than one
     /// already noted changes nothing.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the gateway Quick Mode responder will use it; until then only the tests do"))]
     pub(crate) fn responder_concluded(&mut self, family: ChildFamily, now: Instant) {
         self.sweep(now);
         let concluded = &mut self.families[family_index(family)].concluded;
@@ -617,6 +627,7 @@ impl MessageIdLedger {
     }
 
     /// How many ids the ledger holds.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.records.len()
     }
